@@ -1,0 +1,26 @@
+# Rust
+/target
+**/target
+Cargo.lock
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# maturin build artifacts
+python/etlhouse/*.so
+python/etlhouse/*.pyd
+python/etlhouse/_etlhouse*.so
+python/etlhouse/_etlhouse*.pyd
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+.claude

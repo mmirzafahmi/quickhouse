@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/etlhouse-core",
+    "crates/etlhouse-py",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["etlhouse contributors"]
+repository = "https://github.com/mmirzafahmi/etlhouse"
+rust-version = "1.75"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-serde_json-1", "with-uuid-1"] }
+futures = "0.3"
+arrow = { version = "53", features = ["ipc"] }
+arrow-array = "53"
+arrow-schema = "53"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "gzip"] }
+bytes = "1"
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+uuid = { version = "1", features = ["v4"] }
+flate2 = "1"
+
+# Faster release builds for the shipped wheel.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3

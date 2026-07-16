@@ -1,0 +1,33 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "etlhouse"
+version = "0.1.0"
+description = "Fast PostgreSQL -> ClickHouse ETL with a Rust engine (parallel, bounded-memory, Arrow-based)."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "M Mirza Fahmi", email = "m.mirzafahmi@fore.coffee" }]
+keywords = ["etl", "postgresql", "clickhouse", "arrow", "rust", "data-engineering"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Topic :: Database",
+    "Intended Audience :: Developers",
+]
+
+[project.urls]
+Repository = "https://github.com/mmirzafahmi/etlhouse"
+
+[project.optional-dependencies]
+test = ["pytest>=7", "psycopg[binary]>=3.1", "clickhouse-connect>=0.7"]
+
+[tool.maturin]
+# The compiled extension module lives at etlhouse._etlhouse; the pure-Python
+# package under python/ wraps it with a friendly, typed API.
+python-source = "python"
+module-name = "etlhouse._etlhouse"
+manifest-path = "crates/etlhouse-py/Cargo.toml"
+features = ["pyo3/extension-module"]
