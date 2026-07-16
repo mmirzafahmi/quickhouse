@@ -138,6 +138,40 @@ docker-compose.yml      # local PostgreSQL + ClickHouse
 - No CLI yet — a config-driven CLI over the same engine is planned.
 - Logical-replication CDC and arbitrary transform callbacks are future work.
 
+## Releasing
+
+CI (`.github/workflows/release.yml`) builds wheels for Linux (manylinux x86_64),
+macOS (Intel + Apple Silicon), and Windows (x86_64) plus an sdist, then publishes
+via **PyPI Trusted Publishing** (OIDC — no API tokens stored anywhere).
+
+**One-time setup:**
+
+1. In the GitHub repo settings, create two **Environments**: `testpypi` and `pypi`
+   (Settings → Environments). On `pypi`, add yourself as a **required reviewer** —
+   this gives you a manual approval gate before the irreversible real-PyPI publish.
+2. On [test.pypi.org](https://test.pypi.org) and [pypi.org](https://pypi.org),
+   add a **Trusted Publisher** for the `etlhouse` project (Account settings →
+   Publishing), pointing at this repo, workflow file `release.yml`, and the
+   matching environment name (`testpypi` / `pypi`). Since the project doesn't
+   exist yet on either index, use each site's "publish a new project" /
+   pending-publisher flow.
+
+**Cutting a release:**
+
+```bash
+# bump the version in Cargo.toml and pyproject.toml, commit, then:
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+Pushing the tag triggers the workflow: it builds all wheels, publishes to
+TestPyPI automatically, then waits for your approval on the `pypi` environment
+before publishing the real release. Verify the TestPyPI install first:
+
+```bash
+pip install --index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/ etlhouse
+```
+
 ## License
 
 MIT

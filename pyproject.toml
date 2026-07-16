@@ -9,17 +9,23 @@ description = "Fast PostgreSQL -> ClickHouse ETL with a Rust engine (parallel, b
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
-authors = [{ name = "M Mirza Fahmi", email = "m.mirzafahmi@fore.coffee" }]
+authors = [{ name = "M Mirza Fahmi", email = "mr.sm1l3yz@gmail.com" }]
 keywords = ["etl", "postgresql", "clickhouse", "arrow", "rust", "data-engineering"]
 classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
     "Programming Language :: Rust",
     "Programming Language :: Python :: 3",
     "Topic :: Database",
-    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Libraries",
 ]
 
 [project.urls]
-Repository = "https://github.com/mmirzafahmi/etlhouse"
+Homepage = "https://github.com/mmirzafahmi/etl-house"
+Repository = "https://github.com/mmirzafahmi/etl-house"
+Issues = "https://github.com/mmirzafahmi/etl-house/issues"
 
 [project.optional-dependencies]
 test = ["pytest>=7", "psycopg[binary]>=3.1", "clickhouse-connect>=0.7"]

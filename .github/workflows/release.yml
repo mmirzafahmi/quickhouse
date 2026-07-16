@@ -1,0 +1,137 @@
+# Builds wheels for Linux (manylinux x86_64), macOS (Intel + Apple Silicon),
+# and Windows (x86_64), plus an sdist, then publishes via PyPI Trusted
+# Publishing (OIDC, no stored secrets).
+#
+# Flow: push a `v*` tag -> build all wheels -> publish to TestPyPI -> publish
+# to PyPI. The `pypi` GitHub Environment should have a required reviewer
+# configured (Settings > Environments) so the real PyPI publish needs a
+# manual approval click after TestPyPI succeeds.
+#
+# One-time setup (see README "Releasing" section):
+#   - Create GitHub Environments named `testpypi` and `pypi`.
+#   - Add a Trusted Publisher on test.pypi.org and pypi.org for this repo,
+#     scoped to this workflow file and the matching environment name.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.9"
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: x86_64
+          args: --release --out dist
+          manylinux: auto
+      - uses: actions/upload-artifact@v6
+        with:
+          name: wheels-linux-x86_64
+          path: dist
+
+  macos:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - runner: macos-13
+            target: x86_64
+          - runner: macos-14
+            target: aarch64
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.9"
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist
+      - uses: actions/upload-artifact@v6
+        with:
+          name: wheels-macos-${{ matrix.target }}
+          path: dist
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.9"
+          architecture: x64
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: x64
+          args: --release --out dist
+      - uses: actions/upload-artifact@v6
+        with:
+          name: wheels-windows-x64
+          path: dist
+
+  sdist:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v6
+        with:
+          name: wheels-sdist
+          path: dist
+
+  publish-testpypi:
+    name: Publish to TestPyPI
+    runs-on: ubuntu-22.04
+    needs: [linux, macos, windows, sdist]
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/etlhouse
+    permissions:
+      id-token: write # required for Trusted Publishing
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          packages-dir: dist
+
+  publish-pypi:
+    name: Publish to PyPI
+    runs-on: ubuntu-22.04
+    needs: publish-testpypi
+    environment:
+      name: pypi
+      url: https://pypi.org/p/etlhouse
+    permissions:
+      id-token: write # required for Trusted Publishing
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
