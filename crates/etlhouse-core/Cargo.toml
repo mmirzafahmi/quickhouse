@@ -23,6 +23,9 @@ serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
 flate2.workspace = true
+rustls.workspace = true
+tokio-postgres-rustls.workspace = true
+webpki-roots.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true

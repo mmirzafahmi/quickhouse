@@ -1,15 +1,35 @@
 //! PostgreSQL source: schema resolution, parallel range partitioning, and
 //! binary `COPY` streaming.
 //!
-//! TLS is out of scope for v1 (uses `NoTls`); add a TLS connector here when a
-//! deployment needs encrypted connections.
+//! Connections use rustls for TLS (matching the pure-Rust, no-OpenSSL stack
+//! used elsewhere in this crate). Whether TLS is actually negotiated is
+//! controlled the normal libpq way, via `sslmode` in the connection string
+//! (`disable` | `prefer` (default) | `require`); the connector here just
+//! makes TLS available when the server offers or requires it. Only
+//! publicly-trusted CA certificates are supported for now (via
+//! `webpki-roots`) — no custom CA bundles or client-cert (mTLS) auth yet.
 
 use bytes::Bytes;
 use futures::Stream;
-use tokio_postgres::{Client, NoTls};
+use rustls::{ClientConfig, RootCertStore};
+use tokio_postgres::Client;
+use tokio_postgres_rustls::MakeRustlsConnect;
 
 use crate::error::{EtlError, Result};
 use crate::types::{map_oid, oid, ColumnType};
+
+fn tls_connector() -> MakeRustlsConnect {
+    // Ignore the error: it just means some other crate in the process (e.g.
+    // reqwest) already installed a default crypto provider, which is fine.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let mut roots = RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    MakeRustlsConnect::new(config)
+}
 
 /// A unit of parallel work: an optional `WHERE` predicate over the source.
 #[derive(Debug, Clone)]
@@ -34,7 +54,7 @@ impl PgSource {
 
     /// Open a fresh connection. Each parallel COPY stream should use its own.
     pub async fn connect(&self) -> Result<Client> {
-        let (client, connection) = tokio_postgres::connect(&self.dsn, NoTls).await?;
+        let (client, connection) = tokio_postgres::connect(&self.dsn, tls_connector()).await?;
         // The connection future must be driven for the client to work.
         tokio::spawn(async move {
             if let Err(e) = connection.await {

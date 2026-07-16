@@ -6,7 +6,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT"
 authors = ["etlhouse contributors"]
@@ -31,6 +31,9 @@ serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 uuid = { version = "1", features = ["v4"] }
 flate2 = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+tokio-postgres-rustls = "0.13"
+webpki-roots = "0.26"
 
 # Faster release builds for the shipped wheel.
 [profile.release]

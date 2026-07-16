@@ -132,8 +132,11 @@ docker-compose.yml      # local PostgreSQL + ClickHouse
 
 ## Limitations / roadmap (v1)
 
-- TLS to PostgreSQL is not yet wired (uses `NoTls`); add a connector in
-  `source/postgres.rs`.
+- TLS to PostgreSQL uses rustls with publicly-trusted CA roots
+  (`webpki-roots`); whether it's used follows the normal libpq `sslmode`
+  query parameter on the DSN (`disable` | `prefer` (default) | `require`).
+  Custom/private CA bundles and client-certificate (mTLS) auth aren't
+  supported yet — add that in `source/postgres.rs::tls_connector()`.
 - Array and `time` types have limited support; extend `types.rs` + `decode.rs`.
 - No CLI yet — a config-driven CLI over the same engine is planned.
 - Logical-replication CDC and arbitrary transform callbacks are future work.
