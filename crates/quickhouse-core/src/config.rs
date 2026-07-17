@@ -119,6 +119,12 @@ pub struct TransferConfig {
     // ---- parallelism / batching ----
     pub parallelism: usize,
     pub batch_rows: usize,
+    /// Flush a RecordBatch once its accumulated (estimated) source bytes
+    /// reach this many, even if `batch_rows` hasn't been hit yet — caps peak
+    /// memory for wide-row tables, where row-count alone is a poor proxy for
+    /// actual bytes buffered. `0` disables the byte-based trigger (row count
+    /// alone decides, as before this option existed).
+    pub batch_bytes: usize,
     /// Column used to split the table into parallel range partitions.
     /// Defaults to the first `key` column, else the sync falls back to a single stream.
     pub partition_column: Option<String>,

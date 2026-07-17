@@ -1,6 +1,6 @@
-"""Optional tqdm-backed progress bar for :func:`etlhouse.sync`'s ``on_progress``.
+"""Optional tqdm-backed progress bar for :func:`quickhouse.sync`'s ``on_progress``.
 
-Requires ``tqdm`` (``pip install etlhouse[progress]``); not a hard dependency
+Requires ``tqdm`` (``pip install quickhouse[progress]``); not a hard dependency
 of the package since it's a convenience, not core functionality.
 """
 
@@ -16,7 +16,7 @@ __all__ = ["progress_bar"]
 def progress_bar(total: Optional[int] = None, **tqdm_kwargs) -> Iterator[Callable[[object], None]]:
     """Context manager yielding an ``on_progress`` callback backed by tqdm.
 
-    Pass the yielded callback straight to :func:`etlhouse.sync`'s
+    Pass the yielded callback straight to :func:`quickhouse.sync`'s
     ``on_progress``. The bar is closed automatically on exit, including when
     ``sync()`` raises.
 
@@ -31,17 +31,17 @@ def progress_bar(total: Optional[int] = None, **tqdm_kwargs) -> Iterator[Callabl
 
     Example
     -------
-    >>> import etlhouse
-    >>> with etlhouse.progress_bar() as on_progress:
-    ...     etlhouse.sync(src, dst, dest_table="t", source_table="t",
+    >>> import quickhouse
+    >>> with quickhouse.progress_bar() as on_progress:
+    ...     quickhouse.sync(src, dst, dest_table="t", source_table="t",
     ...                   on_progress=on_progress)
     """
     try:
         from tqdm import tqdm
     except ImportError as e:
         raise ImportError(
-            "etlhouse.progress_bar() requires tqdm — install with "
-            "`pip install etlhouse[progress]` or `pip install tqdm`"
+            "quickhouse.progress_bar() requires tqdm — install with "
+            "`pip install quickhouse[progress]` or `pip install tqdm`"
         ) from e
 
     tqdm_kwargs.setdefault("unit", "rows")

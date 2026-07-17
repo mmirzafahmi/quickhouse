@@ -1,18 +1,18 @@
 [package]
-name = "etlhouse-py"
+name = "quickhouse-py"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "PyO3 bindings exposing etlhouse-core to Python."
+description = "PyO3 bindings exposing quickhouse-core to Python."
 
 [lib]
-name = "_etlhouse"
+name = "_quickhouse"
 crate-type = ["cdylib"]
 
 [dependencies]
-etlhouse-core = { path = "../etlhouse-core" }
+quickhouse-core = { path = "../quickhouse-core" }
 pyo3 = { version = "0.22", features = ["abi3-py39"] }
 tracing-subscriber.workspace = true

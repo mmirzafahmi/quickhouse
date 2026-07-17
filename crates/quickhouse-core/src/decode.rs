@@ -216,13 +216,19 @@ pub struct CopyDecoder {
     header_done: bool,
     finished: bool,
     rows_in_batch: usize,
+    bytes_in_batch: usize,
     batch_rows: usize,
+    batch_bytes: usize,
     /// Total rows decoded across the whole stream.
     pub rows_total: u64,
 }
 
 impl CopyDecoder {
     pub fn new(columns: &[ColumnType], batch_rows: usize) -> Result<Self> {
+        Self::with_batch_bytes(columns, batch_rows, 0)
+    }
+
+    pub fn with_batch_bytes(columns: &[ColumnType], batch_rows: usize, batch_bytes: usize) -> Result<Self> {
         let fields: Vec<Field> = columns
             .iter()
             .map(|c| Field::new(&c.name, c.arrow.clone(), c.nullable))
@@ -239,7 +245,9 @@ impl CopyDecoder {
             header_done: false,
             finished: false,
             rows_in_batch: 0,
+            bytes_in_batch: 0,
             batch_rows,
+            batch_bytes,
             rows_total: 0,
         })
     }
@@ -273,7 +281,10 @@ impl CopyDecoder {
                     cursor += n;
                     self.rows_in_batch += 1;
                     self.rows_total += 1;
-                    if self.rows_in_batch >= self.batch_rows {
+                    self.bytes_in_batch += n;
+                    if self.rows_in_batch >= self.batch_rows
+                        || (self.batch_bytes > 0 && self.bytes_in_batch >= self.batch_bytes)
+                    {
                         out.push(self.flush_batch()?);
                     }
                 }
@@ -305,6 +316,7 @@ impl CopyDecoder {
     fn flush_batch(&mut self) -> Result<RecordBatch> {
         let cols: Vec<ArrayRef> = self.builders.iter_mut().map(|b| b.finish()).collect();
         self.rows_in_batch = 0;
+        self.bytes_in_batch = 0;
         RecordBatch::try_new(self.schema.clone(), cols).map_err(EtlError::from)
     }
 
@@ -446,6 +458,64 @@ mod tests {
             .unwrap();
         assert_eq!(names.value(0), "hi");
         assert!(names.is_null(1));
+    }
+
+    /// A COPY stream of `n` rows, each `(id: int4, text of `payload_len` bytes)`.
+    fn wide_rows_stream(n: usize, payload_len: usize) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(SIGNATURE);
+        v.extend_from_slice(&0i32.to_be_bytes());
+        v.extend_from_slice(&0i32.to_be_bytes());
+        let payload = vec![b'x'; payload_len];
+        for i in 0..n {
+            v.extend_from_slice(&2i16.to_be_bytes());
+            v.extend_from_slice(&4i32.to_be_bytes());
+            v.extend_from_slice(&(i as i32).to_be_bytes());
+            v.extend_from_slice(&(payload_len as i32).to_be_bytes());
+            v.extend_from_slice(&payload);
+        }
+        v.extend_from_slice(&(-1i16).to_be_bytes());
+        v
+    }
+
+    #[test]
+    fn batch_bytes_flushes_before_batch_rows_for_wide_rows() {
+        let cols = vec![
+            col("id", oid::INT4, DataType::Int32, false),
+            col("payload", oid::TEXT, DataType::Utf8, false),
+        ];
+        // 10 rows of ~100 bytes each; batch_rows is high enough to never
+        // trigger on its own, but batch_bytes should force multiple flushes.
+        let mut dec = CopyDecoder::with_batch_bytes(&cols, 1_000, 250).unwrap();
+        let mut batches = dec.feed(&wide_rows_stream(10, 100)).unwrap();
+        if let Some(b) = dec.finish().unwrap() {
+            batches.push(b);
+        }
+        assert!(dec.saw_trailer());
+        assert!(
+            batches.len() > 1,
+            "expected batch_bytes to force multiple flushes, got {}",
+            batches.len()
+        );
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 10);
+        // No single batch should wildly exceed the byte budget.
+        for b in &batches {
+            assert!(b.num_rows() <= 3, "batch too large for a 250-byte budget at ~106B/row");
+        }
+    }
+
+    #[test]
+    fn batch_bytes_zero_disables_byte_based_flush() {
+        let cols = vec![
+            col("id", oid::INT4, DataType::Int32, false),
+            col("payload", oid::TEXT, DataType::Utf8, false),
+        ];
+        let mut dec = CopyDecoder::with_batch_bytes(&cols, 1_000, 0).unwrap();
+        let mut batches = dec.feed(&wide_rows_stream(10, 100)).unwrap();
+        if let Some(b) = dec.finish().unwrap() {
+            batches.push(b);
+        }
+        assert_eq!(batches.len(), 1, "batch_bytes=0 should leave row count as the only trigger");
     }
 
     #[test]

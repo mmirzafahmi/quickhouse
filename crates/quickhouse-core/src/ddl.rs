@@ -101,7 +101,7 @@ pub fn create_state_table(db: &str) -> String {
          \x20   rows UInt64,\n\
          \x20   run_ts DateTime64(3) DEFAULT now64(3)\n\
          )\nENGINE = ReplacingMergeTree(run_ts)\nORDER BY (source_table, dest_table)",
-        qualified(db, "_etlhouse_state")
+        qualified(db, "_quickhouse_state")
     )
 }
 
@@ -137,6 +137,7 @@ mod tests {
             primary_key: vec![],
             parallelism: 4,
             batch_rows: 1000,
+            batch_bytes: 0,
             partition_column: None,
             type_overrides: HashMap::new(),
             rename: HashMap::new(),

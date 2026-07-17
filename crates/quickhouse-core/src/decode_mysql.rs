@@ -192,16 +192,35 @@ impl ColBuilder {
     }
 }
 
+/// Rough encoded-size estimate for a MySQL cell, used only to decide when to
+/// flush a batch (a proxy for actual bytes, not an exact wire size).
+fn value_size(v: &Value) -> usize {
+    match v {
+        Value::NULL => 0,
+        Value::Bytes(b) => b.len(),
+        Value::Int(_) | Value::UInt(_) | Value::Double(_) => 8,
+        Value::Float(_) => 4,
+        Value::Date(..) => 7,
+        Value::Time(..) => 8,
+    }
+}
+
 pub struct MySqlBatcher {
     schema: SchemaRef,
     builders: Vec<ColBuilder>,
     batch_rows: usize,
+    batch_bytes: usize,
     rows_in_batch: usize,
+    bytes_in_batch: usize,
     pub rows_total: u64,
 }
 
 impl MySqlBatcher {
     pub fn new(columns: &[ColumnType], batch_rows: usize) -> Result<Self> {
+        Self::with_batch_bytes(columns, batch_rows, 0)
+    }
+
+    pub fn with_batch_bytes(columns: &[ColumnType], batch_rows: usize, batch_bytes: usize) -> Result<Self> {
         let fields: Vec<Field> = columns
             .iter()
             .map(|c| Field::new(&c.name, c.arrow.clone(), c.nullable))
@@ -214,7 +233,9 @@ impl MySqlBatcher {
             schema: Arc::new(Schema::new(fields)),
             builders,
             batch_rows,
+            batch_bytes,
             rows_in_batch: 0,
+            bytes_in_batch: 0,
             rows_total: 0,
         })
     }
@@ -223,7 +244,7 @@ impl MySqlBatcher {
         self.schema.clone()
     }
 
-    /// Append one row; returns a flushed batch if `batch_rows` was reached.
+    /// Append one row; returns a flushed batch if `batch_rows`/`batch_bytes` was reached.
     pub fn append_row(&mut self, row: Row) -> Result<Option<RecordBatch>> {
         let n = row.len();
         if n != self.builders.len() {
@@ -232,13 +253,18 @@ impl MySqlBatcher {
                 self.builders.len()
             )));
         }
+        let mut row_bytes = 0usize;
         for (i, builder) in self.builders.iter_mut().enumerate() {
             let value = row.as_ref(i).cloned().unwrap_or(Value::NULL);
+            row_bytes += value_size(&value);
             builder.append_value(value)?;
         }
         self.rows_in_batch += 1;
         self.rows_total += 1;
-        if self.rows_in_batch >= self.batch_rows {
+        self.bytes_in_batch += row_bytes;
+        if self.rows_in_batch >= self.batch_rows
+            || (self.batch_bytes > 0 && self.bytes_in_batch >= self.batch_bytes)
+        {
             Ok(Some(self.flush_batch()?))
         } else {
             Ok(None)
@@ -257,6 +283,7 @@ impl MySqlBatcher {
     fn flush_batch(&mut self) -> Result<RecordBatch> {
         let cols: Vec<ArrayRef> = self.builders.iter_mut().map(|b| b.finish()).collect();
         self.rows_in_batch = 0;
+        self.bytes_in_batch = 0;
         RecordBatch::try_new(self.schema.clone(), cols).map_err(EtlError::from)
     }
 }

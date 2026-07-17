@@ -13,19 +13,19 @@ import uuid
 
 import pytest
 
-PG_DSN = os.environ.get("ETLHOUSE_PG_DSN", "postgresql://etl:etl@localhost:5432/etl")
-MYSQL_DSN = os.environ.get("ETLHOUSE_MYSQL_DSN", "mysql://etl:etl@localhost:3306/etl")
-MYSQL_HOST = os.environ.get("ETLHOUSE_MYSQL_HOST", "localhost")
-MYSQL_PORT = int(os.environ.get("ETLHOUSE_MYSQL_PORT", "3306"))
-MYSQL_USER = os.environ.get("ETLHOUSE_MYSQL_USER", "etl")
-MYSQL_PASSWORD = os.environ.get("ETLHOUSE_MYSQL_PASSWORD", "etl")
-MYSQL_DB = os.environ.get("ETLHOUSE_MYSQL_DB", "etl")
-CH_URL = os.environ.get("ETLHOUSE_CH_URL", "http://localhost:8123")
-CH_HOST = os.environ.get("ETLHOUSE_CH_HOST", "localhost")
-CH_PORT = int(os.environ.get("ETLHOUSE_CH_PORT", "8123"))
-CH_DB = os.environ.get("ETLHOUSE_CH_DB", "default")
-CH_USER = os.environ.get("ETLHOUSE_CH_USER", "default")
-CH_PASSWORD = os.environ.get("ETLHOUSE_CH_PASSWORD", "")
+PG_DSN = os.environ.get("QUICKHOUSE_PG_DSN", "postgresql://etl:etl@localhost:5432/etl")
+MYSQL_DSN = os.environ.get("QUICKHOUSE_MYSQL_DSN", "mysql://etl:etl@localhost:3306/etl")
+MYSQL_HOST = os.environ.get("QUICKHOUSE_MYSQL_HOST", "localhost")
+MYSQL_PORT = int(os.environ.get("QUICKHOUSE_MYSQL_PORT", "3306"))
+MYSQL_USER = os.environ.get("QUICKHOUSE_MYSQL_USER", "etl")
+MYSQL_PASSWORD = os.environ.get("QUICKHOUSE_MYSQL_PASSWORD", "etl")
+MYSQL_DB = os.environ.get("QUICKHOUSE_MYSQL_DB", "etl")
+CH_URL = os.environ.get("QUICKHOUSE_CH_URL", "http://localhost:8123")
+CH_HOST = os.environ.get("QUICKHOUSE_CH_HOST", "localhost")
+CH_PORT = int(os.environ.get("QUICKHOUSE_CH_PORT", "8123"))
+CH_DB = os.environ.get("QUICKHOUSE_CH_DB", "default")
+CH_USER = os.environ.get("QUICKHOUSE_CH_USER", "default")
+CH_PASSWORD = os.environ.get("QUICKHOUSE_CH_PASSWORD", "")
 
 
 @pytest.fixture(scope="session")
@@ -78,22 +78,22 @@ def unique_name():
 
 @pytest.fixture
 def pg_source():
-    import etlhouse
+    import quickhouse
 
-    return etlhouse.Postgres(PG_DSN)
+    return quickhouse.Postgres(PG_DSN)
 
 
 @pytest.fixture
 def mysql_source():
-    import etlhouse
+    import quickhouse
 
-    return etlhouse.MySQL(MYSQL_DSN)
+    return quickhouse.MySQL(MYSQL_DSN)
 
 
 @pytest.fixture
 def ch_target():
-    import etlhouse
+    import quickhouse
 
-    return etlhouse.ClickHouse(
+    return quickhouse.ClickHouse(
         CH_URL, database=CH_DB, user=CH_USER, password=CH_PASSWORD, compression="gzip"
     )

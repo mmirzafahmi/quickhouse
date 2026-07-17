@@ -1,4 +1,4 @@
-# etlhouse
+# quickhouse
 
 Fast **PostgreSQL/MySQL/BigQuery → ClickHouse** ETL with a **Rust engine**, driven from Python.
 
@@ -8,14 +8,14 @@ bounded-memory streaming (backpressure), automatic DDL, and both full-refresh
 and incremental (watermark) sync modes. The Python layer is a thin, typed API.
 
 ```python
-import etlhouse
+import quickhouse
 
-src = etlhouse.Postgres("postgresql://user:pw@localhost:5432/odoo")
-# or: src = etlhouse.MySQL("mysql://user:pw@localhost:3306/odoo")
-# or: src = etlhouse.BigQuery("my-gcp-project")  # source_table="dataset.table"
-dst = etlhouse.ClickHouse("http://localhost:8123", database="analytics")
+src = quickhouse.Postgres("postgresql://user:pw@localhost:5432/odoo")
+# or: src = quickhouse.MySQL("mysql://user:pw@localhost:3306/odoo")
+# or: src = quickhouse.BigQuery("my-gcp-project")  # source_table="dataset.table"
+dst = quickhouse.ClickHouse("http://localhost:8123", database="analytics")
 
-result = etlhouse.sync(
+result = quickhouse.sync(
     src, dst,
     dest_table="account_move_line",
     source_table="account_move_line",
@@ -33,8 +33,8 @@ result = etlhouse.sync(
 print(result)   # rows_read, rows_written, bytes_written, duration_secs, new_watermark
 ```
 
-`source` accepts `etlhouse.Postgres(...)`, `etlhouse.MySQL(...)`, or
-`etlhouse.BigQuery(...)` — everything else about `sync()` is identical
+`source` accepts `quickhouse.Postgres(...)`, `quickhouse.MySQL(...)`, or
+`quickhouse.BigQuery(...)` — everything else about `sync()` is identical
 either way.
 
 ## Why it's fast
@@ -43,7 +43,7 @@ either way.
 | --- | --- |
 | Deserialization | PostgreSQL: binary `COPY` decoded straight into Arrow in Rust. MySQL: `mysql_async`'s typed binary-protocol rows appended straight into Arrow builders. BigQuery: the Storage Read API's wire format is already Arrow. Either way, no per-row Python objects. |
 | Parallelism | Postgres/MySQL: table split into key ranges, one connection + Tokio task per partition. BigQuery: `parallelism` is passed as a stream-count hint to BigQuery's own server-side parallel preparation (see the BigQuery note below). |
-| Memory | Batches flushed every `batch_rows` rows and streamed to ClickHouse — RSS stays flat regardless of table size |
+| Memory | Batches flushed every `batch_rows` rows *or* `batch_bytes` (whichever hits first) and streamed to ClickHouse — RSS stays flat regardless of table size, and wide-row tables can't blow past the byte budget the way a rows-only cap would |
 | GIL | Entire transfer runs inside `Python::allow_threads`; the GIL is only touched for `on_progress` |
 | Insert | Arrow IPC stream ingested by ClickHouse's native `ArrowStream` format, gzip on the wire |
 
@@ -52,7 +52,7 @@ either way.
 - **`full`** — loads into a staging table, then `EXCHANGE TABLES` to swap it into
   place atomically. A crash mid-run never leaves the destination empty/partial.
 - **`incremental`** — reads the last watermark from an internal
-  `_etlhouse_state` table in ClickHouse, copies only rows past it (snapshotting
+  `_quickhouse_state` table in ClickHouse, copies only rows past it (snapshotting
   the current max up front for consistency), and dedupes via
   `ReplacingMergeTree(<watermark>)`. Re-running with no new data is a no-op.
 
@@ -60,12 +60,12 @@ either way.
 
 `on_progress` is a plain callback (see `sync()` parameters below), so you can
 wire up anything — a `print`, a logger, a custom UI. For a ready-made
-progress bar, `etlhouse.progress_bar()` wraps [tqdm](https://github.com/tqdm/tqdm)
-(`pip install etlhouse[progress]`):
+progress bar, `quickhouse.progress_bar()` wraps [tqdm](https://github.com/tqdm/tqdm)
+(`pip install quickhouse[progress]`):
 
 ```python
-with etlhouse.progress_bar() as on_progress:
-    etlhouse.sync(src, dst, dest_table="t", source_table="t", on_progress=on_progress)
+with quickhouse.progress_bar() as on_progress:
+    quickhouse.sync(src, dst, dest_table="t", source_table="t", on_progress=on_progress)
 ```
 
 Pass `total=<row count>` if you know it in advance (e.g. from a prior
@@ -84,12 +84,12 @@ complementary to, `on_progress`/`progress_bar()` above — the callback only
 fires during the actual row-ingestion loop (never during connect/DDL/swap),
 while the log lines cover the whole pipeline including setup and teardown.
 
-Default level is `INFO` for `etlhouse_core` (dependency internals like
+Default level is `INFO` for `quickhouse_core` (dependency internals like
 tokio/hyper/tonic stay quiet). Override with the standard `RUST_LOG`
 environment variable, e.g.:
 
 ```bash
-RUST_LOG=etlhouse_core=debug python my_script.py   # + actual SQL/DDL text
+RUST_LOG=quickhouse_core=debug python my_script.py   # + actual SQL/DDL text
 RUST_LOG=debug python my_script.py                 # everything, incl. deps
 ```
 
@@ -105,13 +105,13 @@ RUST_LOG=debug python my_script.py                 # everything, incl. deps
 # From the repo root
 pip install maturin
 maturin develop --release        # compiles the Rust engine, installs into the active venv
-python -c "import etlhouse; print(etlhouse.version())"
+python -c "import quickhouse; print(quickhouse.version())"
 ```
 
 Build a wheel to distribute:
 
 ```bash
-maturin build --release          # produces target/wheels/etlhouse-*.whl
+maturin build --release          # produces target/wheels/quickhouse-*.whl
 ```
 
 ## Running the tests
@@ -125,7 +125,7 @@ maturin develop --release
 pytest -v
 
 # Rust unit tests (decoders, type map, DDL) need no services:
-cargo test -p etlhouse-core
+cargo test -p quickhouse-core
 ```
 
 ## `sync()` parameters
@@ -140,7 +140,8 @@ cargo test -p etlhouse-core
 | `create_if_missing` | Auto-run generated `CREATE TABLE` when the destination is absent |
 | `engine`, `order_by`, `partition_by`, `primary_key` | DDL knobs (sensible defaults per mode) |
 | `parallelism` | Number of concurrent partition streams |
-| `batch_rows` | Rows per Arrow batch / insert flush (memory vs round-trips) |
+| `batch_rows` | Max rows per Arrow batch / insert flush (memory vs round-trips) |
+| `batch_bytes` | Max estimated source bytes per batch before flushing, even under `batch_rows` — default 4 MiB; caps peak memory for wide-row tables. `0` disables (row count alone decides) |
 | `partition_column` | Integer column to range-split on (defaults to first `key`) |
 | `type_overrides` | Per-column ClickHouse type (e.g. `{"qty": "Decimal(18, 3)"}`) |
 | `rename` | Source → destination column renames |
@@ -208,7 +209,7 @@ the Postgres/MySQL sources.
 ## Project layout
 
 ```
-crates/etlhouse-core/   # pure-Rust engine (unit-testable, no Python)
+crates/quickhouse-core/   # pure-Rust engine (unit-testable, no Python)
   src/source/postgres.rs   # PostgreSQL: binary COPY, schema/partition queries
   src/source/mysql.rs      # MySQL: streaming SELECT, schema/partition queries
   src/source/bigquery.rs   # BigQuery: auth, schema resolution, Storage Read API
@@ -217,8 +218,8 @@ crates/etlhouse-core/   # pure-Rust engine (unit-testable, no Python)
   src/decode_bigquery.rs    # BigQuery typed rows -> Arrow
   src/types.rs              # per-source type -> Arrow -> ClickHouse mapping
   src/sync.rs               # orchestration; dispatches on the `Source` enum
-crates/etlhouse-py/     # PyO3 bindings (cdylib -> etlhouse._etlhouse)
-python/etlhouse/        # typed Python surface (__init__.py, .pyi stubs)
+crates/quickhouse-py/     # PyO3 bindings (cdylib -> quickhouse._quickhouse)
+python/quickhouse/        # typed Python surface (__init__.py, .pyi stubs)
 tests/                  # pytest integration tests
 docker-compose.yml      # local PostgreSQL + MySQL + ClickHouse
 ```
@@ -257,7 +258,7 @@ via **PyPI Trusted Publishing** (OIDC — no API tokens stored anywhere).
    (Settings → Environments). On `pypi`, add yourself as a **required reviewer** —
    this gives you a manual approval gate before the irreversible real-PyPI publish.
 2. On [test.pypi.org](https://test.pypi.org) and [pypi.org](https://pypi.org),
-   add a **Trusted Publisher** for the `etlhouse` project (Account settings →
+   add a **Trusted Publisher** for the `quickhouse` project (Account settings →
    Publishing), pointing at this repo, workflow file `release.yml`, and the
    matching environment name (`testpypi` / `pypi`). Since the project doesn't
    exist yet on either index, use each site's "publish a new project" /
@@ -276,7 +277,7 @@ TestPyPI automatically, then waits for your approval on the `pypi` environment
 before publishing the real release. Verify the TestPyPI install first:
 
 ```bash
-pip install --index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/ etlhouse
+pip install --index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/ quickhouse
 ```
 
 ## License

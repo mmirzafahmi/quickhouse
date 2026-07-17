@@ -3,7 +3,7 @@ requires = ["maturin>=1.5,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "etlhouse"
+name = "quickhouse"
 version = "0.2.0"
 description = "Fast PostgreSQL/MySQL/BigQuery -> ClickHouse ETL with a Rust engine (parallel, bounded-memory, Arrow-based)."
 readme = "README.md"
@@ -23,20 +23,20 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/mmirzafahmi/etl-house"
-Repository = "https://github.com/mmirzafahmi/etl-house"
-Issues = "https://github.com/mmirzafahmi/etl-house/issues"
+Homepage = "https://github.com/mmirzafahmi/quickhouse"
+Repository = "https://github.com/mmirzafahmi/quickhouse"
+Issues = "https://github.com/mmirzafahmi/quickhouse/issues"
 
 [project.optional-dependencies]
 progress = ["tqdm>=4.60"]
 test = ["pytest>=7", "psycopg[binary]>=3.1", "pymysql>=1.1", "clickhouse-connect>=0.7", "tqdm>=4.60"]
 
 [tool.maturin]
-# The compiled extension module lives at etlhouse._etlhouse; the pure-Python
+# The compiled extension module lives at quickhouse._quickhouse; the pure-Python
 # package under python/ wraps it with a friendly, typed API.
 python-source = "python"
-module-name = "etlhouse._etlhouse"
-manifest-path = "crates/etlhouse-py/Cargo.toml"
+module-name = "quickhouse._quickhouse"
+manifest-path = "crates/quickhouse-py/Cargo.toml"
 features = ["pyo3/extension-module"]
 # Metadata declares License-File: LICENSE (auto-detected), but maturin's
 # sdist packaging doesn't bundle root-level files unless told to explicitly.

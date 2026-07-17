@@ -1,4 +1,4 @@
-//! PyO3 bindings for etlhouse-core.
+//! PyO3 bindings for quickhouse-core.
 //!
 //! Exposes `Postgres`, `ClickHouse`, `sync(...)`, and the result/progress types.
 //! The transfer runs on a Tokio runtime inside `Python::allow_threads`, so the
@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Once};
 
-use etlhouse_core as core;
+use quickhouse_core as core;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
@@ -17,19 +17,19 @@ fn map_err(e: core::EtlError) -> PyErr {
 
 static INIT_LOGGING: Once = Once::new();
 
-/// Print `etlhouse_core`'s step-by-step `tracing` logs to stderr the first
+/// Print `quickhouse_core`'s step-by-step `tracing` logs to stderr the first
 /// time `sync()` runs. Defaults to INFO level for our own crate (connect,
 /// schema resolution, DDL, per-partition progress, watermark handling, swap)
 /// while staying quiet about noisy dependency internals (tokio/hyper/tonic/
 /// etc.); override with the `RUST_LOG` env var, e.g. `RUST_LOG=debug` for
-/// everything or `RUST_LOG=etlhouse_core=debug` for just this crate's SQL/DDL
+/// everything or `RUST_LOG=quickhouse_core=debug` for just this crate's SQL/DDL
 /// text. This is separate from `on_progress`/`progress_bar()`, which only
 /// fires during the actual row-ingestion loop.
 fn init_logging() {
     INIT_LOGGING.call_once(|| {
         use tracing_subscriber::EnvFilter;
         let filter =
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("etlhouse_core=info"));
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("quickhouse_core=info"));
         let _ = tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_target(false)
@@ -298,6 +298,7 @@ fn parse_compression(c: &str) -> PyResult<core::Compression> {
     primary_key=None,
     parallelism=4,
     batch_rows=100_000,
+    batch_bytes=4_194_304,
     partition_column=None,
     type_overrides=None,
     rename=None,
@@ -323,6 +324,7 @@ fn sync(
     primary_key: Option<Vec<String>>,
     parallelism: usize,
     batch_rows: usize,
+    batch_bytes: usize,
     partition_column: Option<String>,
     type_overrides: Option<HashMap<String, String>>,
     rename: Option<HashMap<String, String>>,
@@ -353,6 +355,7 @@ fn sync(
         primary_key: primary_key.unwrap_or_default(),
         parallelism,
         batch_rows,
+        batch_bytes,
         partition_column,
         type_overrides: type_overrides.unwrap_or_default(),
         rename: rename.unwrap_or_default(),
@@ -397,7 +400,7 @@ fn version() -> &'static str {
 }
 
 #[pymodule]
-fn _etlhouse(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _quickhouse(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Postgres>()?;
     m.add_class::<MySQL>()?;
     m.add_class::<BigQuery>()?;

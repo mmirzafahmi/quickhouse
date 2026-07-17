@@ -20,7 +20,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Rust unit tests
-        run: cargo test -p etlhouse-core
+        run: cargo test -p quickhouse-core
 
       - uses: actions/setup-python@v6
         with:
@@ -33,11 +33,11 @@ jobs:
           args: --out dist -i python3.12
           manylinux: auto
 
-      - name: Install etlhouse + test deps
+      - name: Install quickhouse + test deps
         run: |
           python -m venv .venv
           source .venv/bin/activate
-          pip install --find-links dist --no-index etlhouse
+          pip install --find-links dist --no-index quickhouse
           pip install pytest 'psycopg[binary]>=3.1' 'clickhouse-connect>=0.7'
 
       - name: Start Postgres + ClickHouse

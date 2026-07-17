@@ -1,4 +1,4 @@
-"""etlhouse — fast PostgreSQL/MySQL → ClickHouse ETL powered by a Rust engine.
+"""quickhouse — fast PostgreSQL/MySQL → ClickHouse ETL powered by a Rust engine.
 
 The heavy lifting (wire-protocol decoding, Arrow batching, parallel streaming,
 and ClickHouse ingestion) runs in native Rust. This module is a thin, typed
@@ -6,10 +6,10 @@ Python surface over the compiled extension.
 
 Example
 -------
->>> import etlhouse
->>> src = etlhouse.Postgres("postgresql://user:pw@localhost:5432/odoo")
->>> dst = etlhouse.ClickHouse("http://localhost:8123", database="analytics")
->>> result = etlhouse.sync(
+>>> import quickhouse
+>>> src = quickhouse.Postgres("postgresql://user:pw@localhost:5432/odoo")
+>>> dst = quickhouse.ClickHouse("http://localhost:8123", database="analytics")
+>>> result = quickhouse.sync(
 ...     src, dst, dest_table="account_move_line",
 ...     source_table="account_move_line",
 ...     mode="incremental", watermark="write_date", key=["id"],
@@ -18,21 +18,21 @@ Example
 ... )
 >>> print(result)
 
-``source`` also accepts an :class:`etlhouse.MySQL` connection descriptor for
-MySQL (e.g. AWS RDS for MySQL) sources, or an :class:`etlhouse.BigQuery`
+``source`` also accepts an :class:`quickhouse.MySQL` connection descriptor for
+MySQL (e.g. AWS RDS for MySQL) sources, or an :class:`quickhouse.BigQuery`
 descriptor for Google BigQuery — everything else about ``sync()`` stays the
 same:
 
->>> src = etlhouse.BigQuery("my-gcp-project")  # or credentials_file="key.json"
->>> etlhouse.sync(src, dst, dest_table="t", source_table="my_dataset.my_table")
+>>> src = quickhouse.BigQuery("my-gcp-project")  # or credentials_file="key.json"
+>>> quickhouse.sync(src, dst, dest_table="t", source_table="my_dataset.my_table")
 
-For a tqdm progress bar instead of a print callback (``pip install etlhouse[progress]``):
+For a tqdm progress bar instead of a print callback (``pip install quickhouse[progress]``):
 
->>> with etlhouse.progress_bar() as on_progress:
-...     etlhouse.sync(src, dst, dest_table="t", source_table="t", on_progress=on_progress)
+>>> with quickhouse.progress_bar() as on_progress:
+...     quickhouse.sync(src, dst, dest_table="t", source_table="t", on_progress=on_progress)
 """
 
-from ._etlhouse import (
+from ._quickhouse import (
     BigQuery,
     ClickHouse,
     MySQL,

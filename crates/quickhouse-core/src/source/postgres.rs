@@ -40,10 +40,10 @@ fn load_extra_ca_certs(roots: &mut RootCertStore, path: &str) -> Result<()> {
 }
 
 fn tls_connector(ca_cert_file: Option<&str>) -> Result<MakeRustlsConnect> {
-    // Ignore the error: it just means some other crate in the process (e.g.
-    // reqwest) already installed a default crypto provider, which is fine.
-    let _ = rustls::crypto::ring::default_provider().install_default();
-
+    // The process-wide rustls CryptoProvider is installed once, centrally,
+    // in sync::run_transfer() — see its doc comment — so every source
+    // (including this one) can assume it's already selected by the time
+    // any connection is attempted.
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     if let Some(path) = ca_cert_file {
@@ -367,7 +367,7 @@ OCm3XK2CW4/x+Z55ntrAffyyonL3V3vHIz7fokiz5H+l
 
     fn write_temp_file(contents: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(
-            "etlhouse-test-{}-{}.pem",
+            "quickhouse-test-{}-{}.pem",
             std::process::id(),
             contents.len()
         ));

@@ -10,7 +10,7 @@ Run against the services in ``docker-compose.yml`` after building the module:
 
 from __future__ import annotations
 
-import etlhouse
+import quickhouse
 
 
 def _seed_table(pg_conn, table: str, rows: int, base_ts: str = "2024-01-01 00:00:00"):
@@ -39,7 +39,7 @@ def _seed_table(pg_conn, table: str, rows: int, base_ts: str = "2024-01-01 00:00
 
 def _drop_ch(ch_client, table: str):
     ch_client.command(f"DROP TABLE IF EXISTS `{table}`")
-    ch_client.command(f"DROP TABLE IF EXISTS `{table}_etlhouse_tmp`")
+    ch_client.command(f"DROP TABLE IF EXISTS `{table}_quickhouse_tmp`")
 
 
 def test_full_refresh_reconciles(pg_conn, ch_client, pg_source, ch_target, unique_name):
@@ -48,7 +48,7 @@ def test_full_refresh_reconciles(pg_conn, ch_client, pg_source, ch_target, uniqu
     _seed_table(pg_conn, table, n)
     _drop_ch(ch_client, table)
     try:
-        result = etlhouse.sync(
+        result = quickhouse.sync(
             pg_source,
             ch_target,
             dest_table=table,
@@ -84,7 +84,7 @@ def test_incremental_appends_and_is_idempotent(
     _drop_ch(ch_client, table)
     try:
         # First incremental run backfills everything (no prior watermark).
-        r1 = etlhouse.sync(
+        r1 = quickhouse.sync(
             pg_source,
             ch_target,
             dest_table=table,
@@ -108,7 +108,7 @@ def test_incremental_appends_and_is_idempotent(
                 for i in range(101, 151):
                     copy.write_row((i, f"row-{i}", i * 1.5, i, True, "2024-02-01 00:00:00"))
 
-        r2 = etlhouse.sync(
+        r2 = quickhouse.sync(
             pg_source,
             ch_target,
             dest_table=table,
@@ -122,7 +122,7 @@ def test_incremental_appends_and_is_idempotent(
         assert r2.rows_written == 50  # only the new rows
 
         # Re-running with no new data changes nothing.
-        r3 = etlhouse.sync(
+        r3 = quickhouse.sync(
             pg_source,
             ch_target,
             dest_table=table,
@@ -144,7 +144,7 @@ def test_column_mapping(pg_conn, ch_client, pg_source, ch_target, unique_name):
     _seed_table(pg_conn, table, 10)
     _drop_ch(ch_client, table)
     try:
-        etlhouse.sync(
+        quickhouse.sync(
             pg_source,
             ch_target,
             dest_table=table,

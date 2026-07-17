@@ -105,7 +105,7 @@ jobs:
     needs: [linux, macos, windows, sdist]
     environment:
       name: testpypi
-      url: https://test.pypi.org/p/etlhouse
+      url: https://test.pypi.org/p/quickhouse
     permissions:
       id-token: write # required for Trusted Publishing
     steps:
@@ -126,7 +126,7 @@ jobs:
     needs: publish-testpypi
     environment:
       name: pypi
-      url: https://pypi.org/p/etlhouse
+      url: https://pypi.org/p/quickhouse
     permissions:
       id-token: write # required for Trusted Publishing
     steps:

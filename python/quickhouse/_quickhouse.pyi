@@ -1,4 +1,4 @@
-"""Type stubs for the compiled ``etlhouse._etlhouse`` extension module."""
+"""Type stubs for the compiled ``quickhouse._quickhouse`` extension module."""
 
 from typing import Callable, Mapping, Optional, Sequence, Union
 
@@ -145,6 +145,7 @@ def sync(
     primary_key: Optional[Sequence[str]] = None,
     parallelism: int = 4,
     batch_rows: int = 100_000,
+    batch_bytes: int = 4_194_304,
     partition_column: Optional[str] = None,
     type_overrides: Optional[Mapping[str, str]] = None,
     rename: Optional[Mapping[str, str]] = None,

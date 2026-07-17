@@ -117,6 +117,7 @@ mod tests {
             primary_key: vec![],
             parallelism: 1,
             batch_rows: 1,
+            batch_bytes: 0,
             partition_column: None,
             type_overrides: HashMap::new(),
             rename: HashMap::new(),

@@ -1,4 +1,4 @@
-//! etlhouse-core — the Rust engine behind the `etlhouse` Python package.
+//! quickhouse-core — the Rust engine behind the `quickhouse` Python package.
 //!
 //! Streams large PostgreSQL, MySQL, or BigQuery tables into ClickHouse:
 //! native wire protocol (or, for BigQuery, the Storage Read API) -> Apache

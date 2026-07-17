@@ -59,25 +59,30 @@ impl ColBuilder {
         })
     }
 
-    fn append_from_row(&mut self, row: &Row, index: usize, type_id: u32) -> Result<()> {
-        match (self, type_id) {
+    /// Appends the value and returns its approximate size in bytes, used
+    /// only to decide when to flush a batch (not an exact memory accounting).
+    fn append_from_row(&mut self, row: &Row, index: usize, type_id: u32) -> Result<usize> {
+        let size = match (&mut *self, type_id) {
             (ColBuilder::Bool(b), t) if t == id::BOOLEAN => {
                 match row.column::<Option<bool>>(index).map_err(conv_err)? {
                     Some(v) => b.append_value(v),
                     None => b.append_null(),
                 }
+                1
             }
             (ColBuilder::I64(b), t) if t == id::INTEGER => {
                 match row.column::<Option<i64>>(index).map_err(conv_err)? {
                     Some(v) => b.append_value(v),
                     None => b.append_null(),
                 }
+                8
             }
             (ColBuilder::F64(b), t) if t == id::FLOAT => {
                 match row.column::<Option<f64>>(index).map_err(conv_err)? {
                     Some(v) => b.append_value(v),
                     None => b.append_null(),
                 }
+                8
             }
             // NUMERIC/BIGNUMERIC have no direct f64 decode in the crate;
             // they decode to a String (via BigDecimal) which we parse.
@@ -88,20 +93,38 @@ impl ColBuilder {
                             .parse()
                             .map_err(|e| EtlError::decode(format!("invalid BigQuery numeric '{s}': {e}")))?;
                         b.append_value(v);
+                        s.len()
                     }
-                    None => b.append_null(),
+                    None => {
+                        b.append_null();
+                        0
+                    }
                 }
             }
             (ColBuilder::Str(b), t) if t == id::STRING || t == id::JSON => {
                 match row.column::<Option<String>>(index).map_err(conv_err)? {
-                    Some(v) => b.append_value(&v),
-                    None => b.append_null(),
+                    Some(v) => {
+                        let n = v.len();
+                        b.append_value(&v);
+                        n
+                    }
+                    None => {
+                        b.append_null();
+                        0
+                    }
                 }
             }
             (ColBuilder::Bin(b), t) if t == id::BYTES => {
                 match row.column::<Option<Vec<u8>>>(index).map_err(conv_err)? {
-                    Some(v) => b.append_value(&v),
-                    None => b.append_null(),
+                    Some(v) => {
+                        let n = v.len();
+                        b.append_value(&v);
+                        n
+                    }
+                    None => {
+                        b.append_null();
+                        0
+                    }
                 }
             }
             (ColBuilder::Date(b), t) if t == id::DATE => {
@@ -112,12 +135,14 @@ impl ColBuilder {
                     }
                     None => b.append_null(),
                 }
+                4
             }
             (ColBuilder::Ts(b), t) if t == id::TIMESTAMP || t == id::DATETIME => {
                 match row.column::<Option<time::OffsetDateTime>>(index).map_err(conv_err)? {
                     Some(dt) => b.append_value((dt.unix_timestamp_nanos() / 1000) as i64),
                     None => b.append_null(),
                 }
+                8
             }
             (ColBuilder::Time(b), t) if t == id::TIME => {
                 match row.column::<Option<time::Time>>(index).map_err(conv_err)? {
@@ -130,14 +155,15 @@ impl ColBuilder {
                     }
                     None => b.append_null(),
                 }
+                8
             }
             (_, t) => {
                 return Err(EtlError::decode(format!(
                     "unexpected BigQuery type_id {t} for column index {index}"
                 )))
             }
-        }
-        Ok(())
+        };
+        Ok(size)
     }
 
     fn finish(&mut self) -> ArrayRef {
@@ -159,12 +185,18 @@ pub struct BigQueryBatcher {
     builders: Vec<ColBuilder>,
     type_ids: Vec<u32>,
     batch_rows: usize,
+    batch_bytes: usize,
     rows_in_batch: usize,
+    bytes_in_batch: usize,
     pub rows_total: u64,
 }
 
 impl BigQueryBatcher {
     pub fn new(columns: &[ColumnType], batch_rows: usize) -> Result<Self> {
+        Self::with_batch_bytes(columns, batch_rows, 0)
+    }
+
+    pub fn with_batch_bytes(columns: &[ColumnType], batch_rows: usize, batch_bytes: usize) -> Result<Self> {
         let fields: Vec<Field> = columns
             .iter()
             .map(|c| Field::new(&c.name, c.arrow.clone(), c.nullable))
@@ -178,7 +210,9 @@ impl BigQueryBatcher {
             builders,
             type_ids: columns.iter().map(|c| c.type_id).collect(),
             batch_rows,
+            batch_bytes,
             rows_in_batch: 0,
+            bytes_in_batch: 0,
             rows_total: 0,
         })
     }
@@ -187,14 +221,18 @@ impl BigQueryBatcher {
         self.schema.clone()
     }
 
-    /// Append one row; returns a flushed batch if `batch_rows` was reached.
+    /// Append one row; returns a flushed batch if `batch_rows`/`batch_bytes` was reached.
     pub fn append_row(&mut self, row: &Row) -> Result<Option<RecordBatch>> {
+        let mut row_bytes = 0usize;
         for (i, builder) in self.builders.iter_mut().enumerate() {
-            builder.append_from_row(row, i, self.type_ids[i])?;
+            row_bytes += builder.append_from_row(row, i, self.type_ids[i])?;
         }
         self.rows_in_batch += 1;
         self.rows_total += 1;
-        if self.rows_in_batch >= self.batch_rows {
+        self.bytes_in_batch += row_bytes;
+        if self.rows_in_batch >= self.batch_rows
+            || (self.batch_bytes > 0 && self.bytes_in_batch >= self.batch_bytes)
+        {
             Ok(Some(self.flush_batch()?))
         } else {
             Ok(None)
@@ -213,6 +251,7 @@ impl BigQueryBatcher {
     fn flush_batch(&mut self) -> Result<RecordBatch> {
         let cols: Vec<ArrayRef> = self.builders.iter_mut().map(|b| b.finish()).collect();
         self.rows_in_batch = 0;
+        self.bytes_in_batch = 0;
         RecordBatch::try_new(self.schema.clone(), cols).map_err(EtlError::from)
     }
 }

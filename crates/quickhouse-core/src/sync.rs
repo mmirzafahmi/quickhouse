@@ -42,7 +42,7 @@ struct Counters {
     bytes_written: AtomicU64,
 }
 
-const STAGING_SUFFIX: &str = "_etlhouse_tmp";
+const STAGING_SUFFIX: &str = "_quickhouse_tmp";
 
 struct SourceSetup {
     source_cols: Vec<ColumnType>,
@@ -57,6 +57,18 @@ pub async fn run_transfer(
     cfg: TransferConfig,
     progress: Option<ProgressCb>,
 ) -> Result<TransferResult> {
+    // Every source (Postgres, MySQL, BigQuery — directly or via reqwest/tonic's
+    // own rustls-based transport) eventually needs a process-wide rustls
+    // CryptoProvider selected. With both "ring" (this crate's explicit
+    // feature) and "aws-lc-rs" (pulled in transitively by some dependency)
+    // linked into the same binary, rustls refuses to guess and panics on
+    // first use instead — and since this call is idempotent (ignore the
+    // error; it just means some other crate got here first), doing it once
+    // here, before any source-specific connection code runs, covers every
+    // source uniformly instead of requiring each new source module to
+    // remember it individually.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     cfg.validate()?;
     let started = Instant::now();
 
@@ -156,7 +168,7 @@ pub async fn run_transfer(
     let target_table = prepare_target(&sink, &cfg, &plan.dest_columns).await?;
 
     tracing::info!(
-        "etlhouse: transferring into {} across {} partition(s), parallelism={}",
+        "quickhouse: transferring into {} across {} partition(s), parallelism={}",
         target_table,
         partitions.len(),
         cfg.parallelism
@@ -324,7 +336,7 @@ async fn run_transfer_bigquery(
     let target_table = prepare_target(&sink, &cfg, &plan.dest_columns).await?;
 
     tracing::info!(
-        "etlhouse: transferring into {} via BigQuery Storage Read API, max_stream_count={}",
+        "quickhouse: transferring into {} via BigQuery Storage Read API, max_stream_count={}",
         target_table,
         cfg.parallelism
     );
@@ -340,7 +352,7 @@ async fn run_transfer_bigquery(
         )
         .await?;
 
-    let mut batcher = BigQueryBatcher::new(&plan.dest_columns, cfg.batch_rows)?;
+    let mut batcher = BigQueryBatcher::with_batch_bytes(&plan.dest_columns, cfg.batch_rows, cfg.batch_bytes)?;
     let schema = batcher.schema();
     while let Some(row) = iter
         .next()
@@ -487,7 +499,7 @@ async fn transfer_partition_postgres(
     let stream = source.copy_stream(&client, &copy_sql).await?;
     futures::pin_mut!(stream);
 
-    let mut decoder = CopyDecoder::new(&plan.dest_columns, cfg.batch_rows)?;
+    let mut decoder = CopyDecoder::with_batch_bytes(&plan.dest_columns, cfg.batch_rows, cfg.batch_bytes)?;
     let schema = decoder.schema();
 
     while let Some(chunk) = stream.next().await {
@@ -542,7 +554,7 @@ async fn transfer_partition_mysql(
     );
     tracing::debug!("partition {}: {select_sql}", partition.label);
 
-    let mut batcher = MySqlBatcher::new(&plan.dest_columns, cfg.batch_rows)?;
+    let mut batcher = MySqlBatcher::with_batch_bytes(&plan.dest_columns, cfg.batch_rows, cfg.batch_bytes)?;
     let schema = batcher.schema();
 
     // Use the binary protocol (prepared statement) for actual row fetching,
@@ -828,7 +840,7 @@ fn build_watermark_filter(col: &str, last: Option<&str>, snapshot_max: Option<&s
 
 async fn read_last_watermark(sink: &ClickHouseSink, cfg: &TransferConfig) -> Result<Option<String>> {
     // The state table may not exist yet on the very first incremental run.
-    if !sink.table_exists("_etlhouse_state").await? {
+    if !sink.table_exists("_quickhouse_state").await? {
         return Ok(None);
     }
     let source_id = cfg
@@ -837,7 +849,7 @@ async fn read_last_watermark(sink: &ClickHouseSink, cfg: &TransferConfig) -> Res
         .or_else(|| cfg.source_query.clone())
         .unwrap_or_default();
     let sql = format!(
-        "SELECT last_watermark FROM {}.`_etlhouse_state` FINAL \
+        "SELECT last_watermark FROM {}.`_quickhouse_state` FINAL \
          WHERE source_table = '{}' AND dest_table = '{}' \
          ORDER BY run_ts DESC LIMIT 1",
         crate::ddl::quote_ident(sink.database()),
@@ -859,7 +871,7 @@ async fn persist_watermark(
         .or_else(|| cfg.source_query.clone())
         .unwrap_or_default();
     let sql = format!(
-        "INSERT INTO {}.`_etlhouse_state` (source_table, dest_table, last_watermark, rows) \
+        "INSERT INTO {}.`_quickhouse_state` (source_table, dest_table, last_watermark, rows) \
          VALUES ('{}', '{}', '{}', {})",
         crate::ddl::quote_ident(sink.database()),
         source_id.replace('\'', "''"),

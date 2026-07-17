@@ -1,4 +1,4 @@
-"""Unit tests for etlhouse.progress_bar — pure Python, no services required."""
+"""Unit tests for quickhouse.progress_bar — pure Python, no services required."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-import etlhouse
+import quickhouse
 
 
 def _progress(rows_written, rows_per_sec=0.0):
@@ -18,7 +18,7 @@ def _progress(rows_written, rows_per_sec=0.0):
 def test_progress_bar_tracks_deltas_and_renders_final_count():
     pytest.importorskip("tqdm")
     buf = io.StringIO()
-    with etlhouse.progress_bar(total=100, file=buf, mininterval=0, maxinterval=0) as on_progress:
+    with quickhouse.progress_bar(total=100, file=buf, mininterval=0, maxinterval=0) as on_progress:
         on_progress(_progress(10, 500.0))
         on_progress(_progress(30, 750.0))
         on_progress(_progress(30, 750.0))  # no new rows: must be a no-op, not double-counted
@@ -29,7 +29,7 @@ def test_progress_bar_closes_even_on_exception():
     pytest.importorskip("tqdm")
     buf = io.StringIO()
     with pytest.raises(ValueError, match="boom"):
-        with etlhouse.progress_bar(file=buf) as on_progress:
+        with quickhouse.progress_bar(file=buf) as on_progress:
             on_progress(_progress(5))
             raise ValueError("boom")
     # tqdm writes a newline/reset on close; reaching here without a hang/deadlock
@@ -39,6 +39,6 @@ def test_progress_bar_closes_even_on_exception():
 
 def test_progress_bar_missing_tqdm_gives_clear_error(monkeypatch):
     monkeypatch.setitem(sys.modules, "tqdm", None)
-    with pytest.raises(ImportError, match=r"etlhouse\[progress\]"):
-        with etlhouse.progress_bar():
+    with pytest.raises(ImportError, match=r"quickhouse\[progress\]"):
+        with quickhouse.progress_bar():
             pass

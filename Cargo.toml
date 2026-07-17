@@ -1,16 +1,16 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/etlhouse-core",
-    "crates/etlhouse-py",
+    "crates/quickhouse-core",
+    "crates/quickhouse-py",
 ]
 
 [workspace.package]
 version = "0.2.0"
 edition = "2021"
 license = "MIT"
-authors = ["etlhouse contributors"]
-repository = "https://github.com/mmirzafahmi/etl-house"
+authors = ["quickhouse contributors"]
+repository = "https://github.com/mmirzafahmi/quickhouse"
 rust-version = "1.75"
 
 [workspace.dependencies]
