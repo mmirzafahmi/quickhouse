@@ -73,7 +73,7 @@ pub struct ClickHouseConfig {
     pub database: String,
     pub user: String,
     pub password: String,
-    /// `"none" | "gzip"` — HTTP body compression for inserts.
+    /// `"none" | "gzip" | "zstd"` — HTTP body compression for inserts.
     pub compression: Compression,
 }
 
@@ -81,6 +81,7 @@ pub struct ClickHouseConfig {
 pub enum Compression {
     None,
     Gzip,
+    Zstd,
 }
 
 /// Full-refresh reloads everything; Incremental appends rows past a watermark.
@@ -118,13 +119,26 @@ pub struct TransferConfig {
 
     // ---- parallelism / batching ----
     pub parallelism: usize,
+    /// Per-batch granularity: flush a RecordBatch once it reaches this many
+    /// rows. Controls how big each individual insert is (a throughput/overhead
+    /// knob), NOT the overall memory ceiling — that's `max_memory_bytes`.
     pub batch_rows: usize,
-    /// Flush a RecordBatch once its accumulated (estimated) source bytes
-    /// reach this many, even if `batch_rows` hasn't been hit yet — caps peak
-    /// memory for wide-row tables, where row-count alone is a poor proxy for
-    /// actual bytes buffered. `0` disables the byte-based trigger (row count
-    /// alone decides, as before this option existed).
+    /// Per-batch granularity: also flush once a batch's accumulated (estimated)
+    /// source bytes reach this many, even if `batch_rows` hasn't been hit yet,
+    /// so a single batch of wide rows doesn't grow unbounded. `0` disables this
+    /// per-batch byte cap (row count alone decides batch size). This bounds one
+    /// *batch*; the total in-flight memory across all partitions and in-flight
+    /// inserts is bounded separately by `max_memory_bytes`.
     pub batch_bytes: usize,
+    /// Hard ceiling on total in-flight Arrow batch memory across the whole
+    /// transfer — every partition's decoded-but-not-yet-sent batches plus all
+    /// batches currently being uploaded. Enforced against each batch's real
+    /// `RecordBatch::get_array_memory_size()`, so it holds regardless of
+    /// `parallelism`, row width, or partition skew. When the ceiling is
+    /// reached, decoding blocks (backpressure) until in-flight inserts drain.
+    /// `0` disables the ceiling (unbounded — memory then scales with
+    /// parallelism and batch size, the pre-`max_memory_bytes` behavior).
+    pub max_memory_bytes: usize,
     /// Column used to split the table into parallel range partitions.
     /// Defaults to the first `key` column, else the sync falls back to a single stream.
     pub partition_column: Option<String>,
@@ -168,6 +182,14 @@ impl TransferConfig {
         }
         if self.batch_rows == 0 {
             return Err(EtlError::config("batch_rows must be >= 1"));
+        }
+        // A non-zero ceiling must at least admit a single batch's worth of
+        // rows-ish of memory; guard against pathologically tiny values that
+        // would stall every transfer. (0 = unbounded, always allowed.)
+        if self.max_memory_bytes != 0 && self.max_memory_bytes < 64 * 1024 {
+            return Err(EtlError::config(
+                "max_memory_bytes must be 0 (unbounded) or >= 65536",
+            ));
         }
         Ok(())
     }

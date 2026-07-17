@@ -97,3 +97,12 @@ def ch_target():
     return quickhouse.ClickHouse(
         CH_URL, database=CH_DB, user=CH_USER, password=CH_PASSWORD, compression="gzip"
     )
+
+
+@pytest.fixture
+def ch_target_zstd():
+    import quickhouse
+
+    return quickhouse.ClickHouse(
+        CH_URL, database=CH_DB, user=CH_USER, password=CH_PASSWORD, compression="zstd"
+    )

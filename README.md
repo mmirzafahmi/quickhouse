@@ -43,9 +43,11 @@ either way.
 | --- | --- |
 | Deserialization | PostgreSQL: binary `COPY` decoded straight into Arrow in Rust. MySQL: `mysql_async`'s typed binary-protocol rows appended straight into Arrow builders. BigQuery: the Storage Read API's wire format is already Arrow. Either way, no per-row Python objects. |
 | Parallelism | Postgres/MySQL: table split into key ranges, one connection + Tokio task per partition. BigQuery: `parallelism` is passed as a stream-count hint to BigQuery's own server-side parallel preparation (see the BigQuery note below). |
-| Memory | Batches flushed every `batch_rows` rows *or* `batch_bytes` (whichever hits first) and streamed to ClickHouse — RSS stays flat regardless of table size, and wide-row tables can't blow past the byte budget the way a rows-only cap would |
+| Pipelining | Decoding overlaps with uploading: each finished batch's insert is spawned as a background task, so a partition keeps reading/decoding while previous batches are still being compressed and sent, instead of stalling on each HTTP round-trip. |
+| Memory | A single hard ceiling, `max_memory_bytes`, bounds **total** in-flight batch memory (across every partition and every upload in flight), measured against each batch's real Arrow allocation. When the ceiling is reached, decoding blocks (backpressure) until uploads drain — so peak RSS stays bounded regardless of `parallelism`, row width, or partition skew. `batch_rows`/`batch_bytes` separately control how big each individual batch is. |
 | GIL | Entire transfer runs inside `Python::allow_threads`; the GIL is only touched for `on_progress` |
-| Insert | Arrow IPC stream ingested by ClickHouse's native `ArrowStream` format, gzip on the wire |
+| Insert | Arrow IPC stream ingested by ClickHouse's native `ArrowStream` format, streamed to the wire with zstd (default), gzip, or no compression — the compressed body is produced incrementally rather than buffered in full. |
+| Resilience | Each insert retries transient failures (dropped/reset connections, timeouts, HTTP 5xx/429) with exponential backoff — up to 4 attempts — so a single network blip over a long WAN transfer doesn't abort the whole run. Deterministic 4xx errors (bad SQL, auth) fail fast without retrying. Retry is at-least-once: a lost ack after a committed batch can duplicate that one batch — harmless in incremental mode (`ReplacingMergeTree` dedupes by key), possible dupes for one batch in full-refresh into a plain `MergeTree`. |
 
 ## Sync modes
 
@@ -140,8 +142,9 @@ cargo test -p quickhouse-core
 | `create_if_missing` | Auto-run generated `CREATE TABLE` when the destination is absent |
 | `engine`, `order_by`, `partition_by`, `primary_key` | DDL knobs (sensible defaults per mode) |
 | `parallelism` | Number of concurrent partition streams |
-| `batch_rows` | Max rows per Arrow batch / insert flush (memory vs round-trips) |
-| `batch_bytes` | Max estimated source bytes per batch before flushing, even under `batch_rows` — default 4 MiB; caps peak memory for wide-row tables. `0` disables (row count alone decides) |
+| `batch_rows` | Max rows in each Arrow batch / insert — a per-batch granularity knob (round-trips vs. per-insert overhead), **not** the memory ceiling |
+| `batch_bytes` | Also cap each individual batch at this many estimated source bytes, even under `batch_rows` — default 4 MiB; keeps a single wide-row batch from growing large. `0` disables (row count alone sizes the batch) |
+| `max_memory_bytes` | **The memory ceiling.** Hard cap on total in-flight Arrow batch memory across all partitions and all in-flight uploads, measured against each batch's real allocation. Decoding blocks (backpressure) when reached, so peak RSS stays bounded independent of `parallelism`/row width. Default 512 MiB; `0` = unbounded |
 | `partition_column` | Integer column to range-split on (defaults to first `key`) |
 | `type_overrides` | Per-column ClickHouse type (e.g. `{"qty": "Decimal(18, 3)"}`) |
 | `rename` | Source → destination column renames |

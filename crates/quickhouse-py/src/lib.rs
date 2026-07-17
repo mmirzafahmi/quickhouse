@@ -170,7 +170,7 @@ struct ClickHouse {
 #[pymethods]
 impl ClickHouse {
     #[new]
-    #[pyo3(signature = (url, *, database="default".to_string(), user="default".to_string(), password="".to_string(), compression="gzip".to_string()))]
+    #[pyo3(signature = (url, *, database="default".to_string(), user="default".to_string(), password="".to_string(), compression="zstd".to_string()))]
     fn new(
         url: String,
         database: String,
@@ -273,8 +273,9 @@ fn parse_compression(c: &str) -> PyResult<core::Compression> {
     match c.to_ascii_lowercase().as_str() {
         "none" | "off" | "" => Ok(core::Compression::None),
         "gzip" | "gz" => Ok(core::Compression::Gzip),
+        "zstd" | "zst" => Ok(core::Compression::Zstd),
         other => Err(PyRuntimeError::new_err(format!(
-            "invalid compression {other:?}; expected 'none' or 'gzip'"
+            "invalid compression {other:?}; expected 'none', 'gzip', or 'zstd'"
         ))),
     }
 }
@@ -299,6 +300,7 @@ fn parse_compression(c: &str) -> PyResult<core::Compression> {
     parallelism=4,
     batch_rows=100_000,
     batch_bytes=4_194_304,
+    max_memory_bytes=536_870_912,
     partition_column=None,
     type_overrides=None,
     rename=None,
@@ -325,6 +327,7 @@ fn sync(
     parallelism: usize,
     batch_rows: usize,
     batch_bytes: usize,
+    max_memory_bytes: usize,
     partition_column: Option<String>,
     type_overrides: Option<HashMap<String, String>>,
     rename: Option<HashMap<String, String>>,
@@ -356,6 +359,7 @@ fn sync(
         parallelism,
         batch_rows,
         batch_bytes,
+        max_memory_bytes,
         partition_column,
         type_overrides: type_overrides.unwrap_or_default(),
         rename: rename.unwrap_or_default(),

@@ -97,7 +97,10 @@ class ClickHouse:
     database, user, password:
         Target database and credentials.
     compression:
-        HTTP insert body compression: ``"gzip"`` (default) or ``"none"``.
+        HTTP insert body compression: ``"zstd"`` (default), ``"gzip"``, or
+        ``"none"``. zstd-fast is faster than gzip at a similar/better ratio;
+        use ``"none"`` on a fast local network where CPU, not bandwidth, is
+        the bottleneck.
     """
 
     def __init__(
@@ -107,7 +110,7 @@ class ClickHouse:
         database: str = "default",
         user: str = "default",
         password: str = "",
-        compression: str = "gzip",
+        compression: str = "zstd",
     ) -> None: ...
 
 class Progress:
@@ -146,6 +149,7 @@ def sync(
     parallelism: int = 4,
     batch_rows: int = 100_000,
     batch_bytes: int = 4_194_304,
+    max_memory_bytes: int = 536_870_912,
     partition_column: Optional[str] = None,
     type_overrides: Optional[Mapping[str, str]] = None,
     rename: Optional[Mapping[str, str]] = None,
@@ -160,6 +164,17 @@ def sync(
     Either ``source_table`` or ``source_query`` must be provided. For
     ``mode="incremental"``, ``watermark`` is required and only rows newer than
     the last recorded watermark are copied.
+
+    Memory vs. batch sizing:
+
+    - ``batch_rows`` / ``batch_bytes`` control how big each individual Arrow
+      batch (and thus each insert) is — a throughput/overhead granularity knob.
+    - ``max_memory_bytes`` is the hard ceiling on *total* in-flight batch
+      memory across all partitions and all uploads currently in flight,
+      measured against each batch's real Arrow allocation. Decoding overlaps
+      with concurrent uploads and blocks (backpressure) when this ceiling is
+      reached, so peak RSS stays bounded regardless of ``parallelism`` or row
+      width. Default 512 MiB; ``0`` disables the ceiling (unbounded).
     """
     ...
 

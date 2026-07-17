@@ -8,8 +8,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use arrow_array::RecordBatch;
+use arrow_schema::SchemaRef;
 use futures::StreamExt;
 use mysql_async::prelude::*;
+use tokio::task::JoinSet;
 
 use crate::config::{ClickHouseConfig, SourceConfig, SyncMode, TransferConfig, TransferResult};
 use crate::ddl;
@@ -17,6 +20,7 @@ use crate::decode::CopyDecoder;
 use crate::decode_bigquery::BigQueryBatcher;
 use crate::decode_mysql::MySqlBatcher;
 use crate::error::{EtlError, Result};
+use crate::memory::MemoryBudget;
 use crate::sink::ClickHouseSink;
 use crate::source::mysql::{quote_my, quote_my_table};
 use crate::source::{BigQuerySource, MySqlSource, PgSource, Partition, Source};
@@ -40,6 +44,70 @@ struct Counters {
     rows_read: AtomicU64,
     rows_written: AtomicU64,
     bytes_written: AtomicU64,
+}
+
+/// Shared handle for uploading finished batches. Cloned cheaply into each
+/// partition task (all fields are `Arc`/`Copy`), so every partition spawns
+/// sends against the *same* memory budget and counters.
+#[derive(Clone)]
+struct SendCtx {
+    sink: ClickHouseSink,
+    budget: MemoryBudget,
+    target_table: Arc<String>,
+    counters: Arc<Counters>,
+    progress: Option<ProgressCb>,
+    started: Instant,
+}
+
+impl SendCtx {
+    /// Reserve budget for `batch` — awaiting here is the backpressure point:
+    /// if the pipeline's memory ceiling is reached, the caller (decoder) stalls
+    /// until in-flight uploads drain — then spawn its upload as a background
+    /// task and return immediately so decoding can continue overlapping the
+    /// network round-trip. The reservation is held until the upload completes.
+    async fn spawn_upload(&self, sends: &mut JoinSet<Result<()>>, schema: SchemaRef, batch: RecordBatch) {
+        let reservation = self.budget.reserve(batch.get_array_memory_size()).await;
+        let ctx = self.clone();
+        sends.spawn(async move {
+            let _reservation = reservation; // released on task completion
+            let rows = batch.num_rows() as u64;
+            let bytes = ctx
+                .sink
+                .insert_batches(&ctx.target_table, schema, std::slice::from_ref(&batch))
+                .await?;
+            ctx.counters.rows_written.fetch_add(rows, Ordering::Relaxed);
+            ctx.counters.bytes_written.fetch_add(bytes, Ordering::Relaxed);
+            // Progress fires on *completion*, so rows_written reflects rows
+            // actually landed in ClickHouse, not merely decoded.
+            emit_progress(&ctx.counters, &ctx.progress, ctx.started);
+            Ok(())
+        });
+    }
+}
+
+/// Reap finished upload tasks, propagating the first error. With `block`,
+/// awaits every remaining task (call once the source stream is exhausted, so
+/// all uploads finish before a full-refresh swap / watermark persist); without
+/// it, only drains already-finished tasks to surface errors promptly and keep
+/// the `JoinSet` from accumulating completed handles.
+async fn reap(sends: &mut JoinSet<Result<()>>, block: bool) -> Result<()> {
+    if block {
+        while let Some(res) = sends.join_next().await {
+            join_result(res)?;
+        }
+    } else {
+        while let Some(res) = sends.try_join_next() {
+            join_result(res)?;
+        }
+    }
+    Ok(())
+}
+
+fn join_result(res: std::result::Result<Result<()>, tokio::task::JoinError>) -> Result<()> {
+    match res {
+        Ok(inner) => inner,
+        Err(e) => Err(EtlError::other(format!("upload task failed: {e}"))),
+    }
 }
 
 const STAGING_SUFFIX: &str = "_quickhouse_tmp";
@@ -179,16 +247,21 @@ pub async fn run_transfer(
     let cfg = Arc::new(cfg);
     let extra_filter = Arc::new(extra_filter);
     let target_table = Arc::new(target_table);
+    let ctx = SendCtx {
+        sink: sink.clone(),
+        budget: MemoryBudget::new(cfg.max_memory_bytes),
+        target_table: target_table.clone(),
+        counters: counters.clone(),
+        progress: progress.clone(),
+        started,
+    };
 
     let mut results = futures::stream::iter(partitions.into_iter().map(|part| {
         let source = source.clone();
-        let sink = sink.clone();
         let plan = plan.clone();
         let cfg = cfg.clone();
-        let counters = counters.clone();
-        let progress = progress.clone();
+        let ctx = ctx.clone();
         let extra_filter = extra_filter.clone();
-        let target_table = target_table.clone();
         let base_table = base_table.clone();
         let base_query = base_query.clone();
         async move {
@@ -196,34 +269,26 @@ pub async fn run_transfer(
                 Source::Postgres(s) => {
                     transfer_partition_postgres(
                         s,
-                        &sink,
                         &plan,
                         &cfg,
-                        &counters,
-                        &progress,
-                        &target_table,
+                        &ctx,
                         base_table.as_deref(),
                         base_query.as_deref(),
                         extra_filter.as_deref(),
                         part,
-                        started,
                     )
                     .await
                 }
                 Source::MySql(s) => {
                     transfer_partition_mysql(
                         s,
-                        &sink,
                         &plan,
                         &cfg,
-                        &counters,
-                        &progress,
-                        &target_table,
+                        &ctx,
                         base_table.as_deref(),
                         base_query.as_deref(),
                         extra_filter.as_deref(),
                         part,
-                        started,
                     )
                     .await
                 }
@@ -341,7 +406,16 @@ async fn run_transfer_bigquery(
         cfg.parallelism
     );
 
-    let counters = Counters::default();
+    let counters = Arc::new(Counters::default());
+    let ctx = SendCtx {
+        sink: sink.clone(),
+        budget: MemoryBudget::new(cfg.max_memory_bytes),
+        target_table: Arc::new(target_table),
+        counters: counters.clone(),
+        progress: progress.clone(),
+        started,
+    };
+
     let mut iter = source
         .read_table::<google_cloud_bigquery::storage::row::Row>(
             &client,
@@ -354,19 +428,21 @@ async fn run_transfer_bigquery(
 
     let mut batcher = BigQueryBatcher::with_batch_bytes(&plan.dest_columns, cfg.batch_rows, cfg.batch_bytes)?;
     let schema = batcher.schema();
+    let mut sends: JoinSet<Result<()>> = JoinSet::new();
     while let Some(row) = iter
         .next()
         .await
         .map_err(|e| EtlError::other(format!("bigquery row error: {e}")))?
     {
         if let Some(batch) = batcher.append_row(&row)? {
-            flush(&sink, &target_table, &schema, &batch, &counters).await?;
-            emit_progress(&counters, &progress, started);
+            ctx.spawn_upload(&mut sends, schema.clone(), batch).await;
+            reap(&mut sends, false).await?;
         }
     }
     if let Some(batch) = batcher.finish()? {
-        flush(&sink, &target_table, &schema, &batch, &counters).await?;
+        ctx.spawn_upload(&mut sends, schema.clone(), batch).await;
     }
+    reap(&mut sends, true).await?;
     counters
         .rows_read
         .fetch_add(batcher.rows_total, Ordering::Relaxed);
@@ -473,17 +549,13 @@ async fn setup_mysql(
 #[allow(clippy::too_many_arguments)]
 async fn transfer_partition_postgres(
     source: &PgSource,
-    sink: &ClickHouseSink,
     plan: &SelectPlan,
     cfg: &TransferConfig,
-    counters: &Counters,
-    progress: &Option<ProgressCb>,
-    target_table: &str,
+    ctx: &SendCtx,
     base_table: Option<&str>,
     base_query: Option<&str>,
     extra_filter: Option<&str>,
     partition: Partition,
-    started: Instant,
 ) -> Result<()> {
     tracing::info!("partition '{}' starting", partition.label);
     let client = source.connect().await?;
@@ -501,17 +573,15 @@ async fn transfer_partition_postgres(
 
     let mut decoder = CopyDecoder::with_batch_bytes(&plan.dest_columns, cfg.batch_rows, cfg.batch_bytes)?;
     let schema = decoder.schema();
+    let mut sends: JoinSet<Result<()>> = JoinSet::new();
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
         let batches = decoder.feed(&chunk)?;
         for batch in batches {
-            flush(sink, target_table, &schema, &batch, counters).await?;
-            emit_progress(counters, progress, started);
+            ctx.spawn_upload(&mut sends, schema.clone(), batch).await;
         }
-    }
-    if let Some(batch) = decoder.finish()? {
-        flush(sink, target_table, &schema, &batch, counters).await?;
+        reap(&mut sends, false).await?; // surface any upload error promptly
     }
     if !decoder.saw_trailer() {
         return Err(EtlError::decode(format!(
@@ -519,11 +589,15 @@ async fn transfer_partition_postgres(
             partition.label
         )));
     }
+    if let Some(batch) = decoder.finish()? {
+        ctx.spawn_upload(&mut sends, schema.clone(), batch).await;
+    }
+    reap(&mut sends, true).await?; // wait for all uploads before returning
 
-    counters
+    ctx.counters
         .rows_read
         .fetch_add(decoder.rows_total, Ordering::Relaxed);
-    emit_progress(counters, progress, started);
+    emit_progress(&ctx.counters, &ctx.progress, ctx.started);
     tracing::info!("partition '{}' complete: {} rows", partition.label, decoder.rows_total);
     Ok(())
 }
@@ -531,17 +605,13 @@ async fn transfer_partition_postgres(
 #[allow(clippy::too_many_arguments)]
 async fn transfer_partition_mysql(
     source: &MySqlSource,
-    sink: &ClickHouseSink,
     plan: &SelectPlan,
     cfg: &TransferConfig,
-    counters: &Counters,
-    progress: &Option<ProgressCb>,
-    target_table: &str,
+    ctx: &SendCtx,
     base_table: Option<&str>,
     base_query: Option<&str>,
     extra_filter: Option<&str>,
     partition: Partition,
-    started: Instant,
 ) -> Result<()> {
     tracing::info!("partition '{}' starting", partition.label);
     let mut conn = source.connect().await?;
@@ -556,6 +626,7 @@ async fn transfer_partition_mysql(
 
     let mut batcher = MySqlBatcher::with_batch_bytes(&plan.dest_columns, cfg.batch_rows, cfg.batch_bytes)?;
     let schema = batcher.schema();
+    let mut sends: JoinSet<Result<()>> = JoinSet::new();
 
     // Use the binary protocol (prepared statement) for actual row fetching,
     // not just for resolve_columns's schema probe: plain query_iter uses the
@@ -579,35 +650,20 @@ async fn transfer_partition_mysql(
     while let Some(row) = stream.next().await {
         let row = row.map_err(|e| EtlError::other(format!("mysql row error: {e}")))?;
         if let Some(batch) = batcher.append_row(row)? {
-            flush(sink, target_table, &schema, &batch, counters).await?;
-            emit_progress(counters, progress, started);
+            ctx.spawn_upload(&mut sends, schema.clone(), batch).await;
+            reap(&mut sends, false).await?; // surface any upload error promptly
         }
     }
     if let Some(batch) = batcher.finish()? {
-        flush(sink, target_table, &schema, &batch, counters).await?;
+        ctx.spawn_upload(&mut sends, schema.clone(), batch).await;
     }
+    reap(&mut sends, true).await?; // wait for all uploads before returning
 
-    counters
+    ctx.counters
         .rows_read
         .fetch_add(batcher.rows_total, Ordering::Relaxed);
-    emit_progress(counters, progress, started);
+    emit_progress(&ctx.counters, &ctx.progress, ctx.started);
     tracing::info!("partition '{}' complete: {} rows", partition.label, batcher.rows_total);
-    Ok(())
-}
-
-async fn flush(
-    sink: &ClickHouseSink,
-    table: &str,
-    schema: &arrow_schema::SchemaRef,
-    batch: &arrow_array::RecordBatch,
-    counters: &Counters,
-) -> Result<()> {
-    let rows = batch.num_rows() as u64;
-    let bytes = sink
-        .insert_batches(table, schema.clone(), std::slice::from_ref(batch))
-        .await?;
-    counters.rows_written.fetch_add(rows, Ordering::Relaxed);
-    counters.bytes_written.fetch_add(bytes, Ordering::Relaxed);
     Ok(())
 }
 

@@ -118,6 +118,7 @@ mod tests {
             parallelism: 1,
             batch_rows: 1,
             batch_bytes: 0,
+            max_memory_bytes: 0,
             partition_column: None,
             type_overrides: HashMap::new(),
             rename: HashMap::new(),

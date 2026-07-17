@@ -76,6 +76,43 @@ def test_full_refresh_reconciles(pg_conn, ch_client, pg_source, ch_target, uniqu
         _drop_ch(ch_client, table)
 
 
+def test_full_refresh_zstd_with_tight_memory_budget(
+    pg_conn, ch_client, pg_source, ch_target_zstd, unique_name
+):
+    """zstd compression (the new default codec) reconciles exactly, and a
+    deliberately tight memory ceiling at high parallelism still completes —
+    exercising the streaming-compressed upload path and the MemoryBudget
+    backpressure together."""
+    table = unique_name
+    n = 20000
+    _seed_table(pg_conn, table, n)
+    _drop_ch(ch_client, table)
+    try:
+        result = quickhouse.sync(
+            pg_source,
+            ch_target_zstd,
+            dest_table=table,
+            source_table=table,
+            mode="full",
+            key=["id"],
+            create_if_missing=True,
+            parallelism=8,
+            batch_rows=1000,
+            # 2 MiB ceiling forces backpressure across the 8 partitions.
+            max_memory_bytes=2 * 1024 * 1024,
+        )
+        assert result.rows_written == n
+
+        ch_count = ch_client.command(f"SELECT count() FROM `{table}`")
+        assert int(ch_count) == n
+
+        pg_sum = _pg_scalar(pg_conn, f'SELECT sum(amount) FROM "{table}"')
+        ch_sum = float(ch_client.command(f"SELECT sum(amount) FROM `{table}`"))
+        assert abs(pg_sum - ch_sum) < 1e-3
+    finally:
+        _drop_ch(ch_client, table)
+
+
 def test_incremental_appends_and_is_idempotent(
     pg_conn, ch_client, pg_source, ch_target, unique_name
 ):
