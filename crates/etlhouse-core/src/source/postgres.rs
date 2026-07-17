@@ -5,9 +5,10 @@
 //! used elsewhere in this crate). Whether TLS is actually negotiated is
 //! controlled the normal libpq way, via `sslmode` in the connection string
 //! (`disable` | `prefer` (default) | `require`); the connector here just
-//! makes TLS available when the server offers or requires it. Only
-//! publicly-trusted CA certificates are supported for now (via
-//! `webpki-roots`) — no custom CA bundles or client-cert (mTLS) auth yet.
+//! makes TLS available when the server offers or requires it. The public
+//! webpki-roots store is always trusted; pass `ca_cert_file` (a PEM file) to
+//! additionally trust a private CA — e.g. AWS RDS's regional bundle, whose
+//! certificates don't chain to any public root.
 
 use bytes::Bytes;
 use futures::Stream;
@@ -18,17 +19,40 @@ use tokio_postgres_rustls::MakeRustlsConnect;
 use crate::error::{EtlError, Result};
 use crate::types::{map_oid, oid, ColumnType};
 
-fn tls_connector() -> MakeRustlsConnect {
+fn load_extra_ca_certs(roots: &mut RootCertStore, path: &str) -> Result<()> {
+    let file = std::fs::File::open(path)
+        .map_err(|e| EtlError::config(format!("failed to open ca_cert_file '{path}': {e}")))?;
+    let mut reader = std::io::BufReader::new(file);
+    let certs = rustls_pemfile::certs(&mut reader)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| EtlError::config(format!("failed to parse ca_cert_file '{path}': {e}")))?;
+    if certs.is_empty() {
+        return Err(EtlError::config(format!(
+            "ca_cert_file '{path}' contained no PEM certificates"
+        )));
+    }
+    for cert in certs {
+        roots
+            .add(cert)
+            .map_err(|e| EtlError::config(format!("invalid CA certificate in '{path}': {e}")))?;
+    }
+    Ok(())
+}
+
+fn tls_connector(ca_cert_file: Option<&str>) -> Result<MakeRustlsConnect> {
     // Ignore the error: it just means some other crate in the process (e.g.
     // reqwest) already installed a default crypto provider, which is fine.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    if let Some(path) = ca_cert_file {
+        load_extra_ca_certs(&mut roots, path)?;
+    }
     let config = ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
-    MakeRustlsConnect::new(config)
+    Ok(MakeRustlsConnect::new(config))
 }
 
 /// A unit of parallel work: an optional `WHERE` predicate over the source.
@@ -42,19 +66,26 @@ pub struct Partition {
 pub struct PgSource {
     dsn: String,
     statement_timeout_secs: u64,
+    ca_cert_file: Option<String>,
 }
 
 impl PgSource {
-    pub fn new(dsn: impl Into<String>, statement_timeout_secs: u64) -> Self {
+    pub fn new(
+        dsn: impl Into<String>,
+        statement_timeout_secs: u64,
+        ca_cert_file: Option<String>,
+    ) -> Self {
         Self {
             dsn: dsn.into(),
             statement_timeout_secs,
+            ca_cert_file,
         }
     }
 
     /// Open a fresh connection. Each parallel COPY stream should use its own.
     pub async fn connect(&self) -> Result<Client> {
-        let (client, connection) = tokio_postgres::connect(&self.dsn, tls_connector()).await?;
+        let tls = tls_connector(self.ca_cert_file.as_deref())?;
+        let (client, connection) = tokio_postgres::connect(&self.dsn, tls).await?;
         // The connection future must be driven for the client to work.
         tokio::spawn(async move {
             if let Err(e) = connection.await {
@@ -99,7 +130,7 @@ impl PgSource {
             let nullable = !not_null.contains(&c.name().to_string());
             cols.push(ColumnType {
                 name: c.name().to_string(),
-                pg_oid,
+                type_id: pg_oid,
                 nullable,
                 arrow,
                 clickhouse_inner: ch_inner,
@@ -310,9 +341,67 @@ fn quote_pg_table(table: &str) -> String {
 mod tests {
     use super::*;
 
+    // Throwaway self-signed cert (openssl req -x509 -newkey rsa:2048 -nodes
+    // -days 3650 -subj '/CN=test-ca.example.com'), used only to exercise the
+    // PEM-parsing path in load_extra_ca_certs — not a real trust anchor.
+    const TEST_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIDHTCCAgWgAwIBAgIUMUDUzLaOof+PJdWnEkzqRiEc4I4wDQYJKoZIhvcNAQEL
+BQAwHjEcMBoGA1UEAwwTdGVzdC1jYS5leGFtcGxlLmNvbTAeFw0yNjA3MTYxNDQ0
+NTBaFw0zNjA3MTMxNDQ0NTBaMB4xHDAaBgNVBAMME3Rlc3QtY2EuZXhhbXBsZS5j
+b20wggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQDHvEJUDZZsBLPfK2dz
+u71v/f7jRPERouFTd4U4AChcCE34s3TrMN9sDe00wDByQ6Z7Jkn+kzi65FLgpgEa
+n1STX+GHMk3XgrSs6xBtIsLtfeNH4vZakPjJ8bg+IEVkZQXMM6yFjOvQZa0llgOf
+mVDHN7IUrDvc2C1Hw1cSN3rtihQ21sq6GaFgu4GlaXXpJTnJrBxKQlOfha6R2rWS
+cdAfa8synygQS2lQbPPF/tuaeONN+rd9GvHO8gv3z/rtH3kAUBfTCAHAjHjwTWGu
+WOYghU96KJ1crNsUu/XWnH1G9TkvFJYnZevLAsJqFx5Qg/kJirEzoIisqmQ6ex1X
+ZvkxAgMBAAGjUzBRMB0GA1UdDgQWBBSzPC1pmZm3vo7hzfrOApcZPjPOEjAfBgNV
+HSMEGDAWgBSzPC1pmZm3vo7hzfrOApcZPjPOEjAPBgNVHRMBAf8EBTADAQH/MA0G
+CSqGSIb3DQEBCwUAA4IBAQBsq9A4fn9aKXsczE82/BJvqiyzn8yu7f+UGuX/Rr4w
+5+N1WjI3HUBiZH/vowvqnmJ4fYEnfsAxH861+UUTTD2Vj0Ig+X/X+k+WnWQFOf6U
+23BDGBQHPjRvg7TrnTOj1n/AWmdZceeFlRHVr6hx3/Bmf/Zp1SCnJsIA+DhuDkLi
+eIK+iJw8OmcWlO/xI9krijg2p8/EZIkeKe4MlypXcp4wee0hyYZ2/RAzfa7REg45
+co6xgNpuI4l7lc+dGW08eWX9SWHmV0zVh4OmXQEnqFo1yOjEZV/xuTdMEkIA57ej
+OCm3XK2CW4/x+Z55ntrAffyyonL3V3vHIz7fokiz5H+l
+-----END CERTIFICATE-----
+";
+
+    fn write_temp_file(contents: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "etlhouse-test-{}-{}.pem",
+            std::process::id(),
+            contents.len()
+        ));
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    #[test]
+    fn load_extra_ca_certs_accepts_valid_pem() {
+        let path = write_temp_file(TEST_CERT_PEM);
+        let mut roots = RootCertStore::empty();
+        let before = roots.len();
+        load_extra_ca_certs(&mut roots, path.to_str().unwrap()).unwrap();
+        assert_eq!(roots.len(), before + 1);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn load_extra_ca_certs_rejects_garbage_file() {
+        let path = write_temp_file("this is not a PEM certificate\n");
+        let mut roots = RootCertStore::empty();
+        assert!(load_extra_ca_certs(&mut roots, path.to_str().unwrap()).is_err());
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn load_extra_ca_certs_rejects_missing_file() {
+        let mut roots = RootCertStore::empty();
+        assert!(load_extra_ca_certs(&mut roots, "/no/such/file.pem").is_err());
+    }
+
     #[test]
     fn copy_sql_with_table_and_filters() {
-        let src = PgSource::new("postgresql://x", 0);
+        let src = PgSource::new("postgresql://x", 0, None);
         let part = Partition {
             label: "r0".into(),
             predicate: Some("\"id\" >= 1 AND \"id\" <= 100".into()),

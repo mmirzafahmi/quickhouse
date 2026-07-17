@@ -10,6 +10,59 @@ pub struct PostgresConfig {
     pub dsn: String,
     /// Statement timeout hint (seconds) applied per connection; 0 = server default.
     pub statement_timeout_secs: u64,
+    /// Path to a PEM file with extra trusted CA certificate(s) (e.g. AWS RDS's
+    /// regional bundle), trusted in addition to the public webpki-roots store.
+    /// Needed whenever the server's certificate doesn't chain to a public CA.
+    pub ca_cert_file: Option<String>,
+}
+
+/// Where to read from, when the source is MySQL (e.g. AWS RDS for MySQL).
+#[derive(Debug, Clone)]
+pub struct MySqlConfig {
+    /// MySQL connection string, e.g. `mysql://user:pw@host:3306/db`.
+    pub dsn: String,
+    /// Statement timeout hint (seconds) applied per connection; 0 = server default.
+    pub statement_timeout_secs: u64,
+    /// Path to a PEM file with extra trusted CA certificate(s) (e.g. AWS RDS's
+    /// regional bundle), trusted in addition to the public webpki-roots store.
+    pub ca_cert_file: Option<String>,
+    /// Require TLS for the connection (MySQL has no `sslmode` DSN parameter
+    /// convention like libpq, so this is explicit).
+    pub require_tls: bool,
+}
+
+/// Where to read from, when the source is Google BigQuery.
+#[derive(Debug, Clone)]
+pub struct BigQueryConfig {
+    /// GCP project ID. If `None`, resolved from the credentials (both ADC and
+    /// service-account key files normally embed/resolve a project ID).
+    pub project_id: Option<String>,
+    /// Path to a service-account JSON key file. If `None`, falls back to
+    /// Application Default Credentials (`GOOGLE_APPLICATION_CREDENTIALS`,
+    /// `GOOGLE_APPLICATION_CREDENTIALS_JSON`, the metadata server, or the
+    /// gcloud CLI's well-known ADC file).
+    pub credentials_file: Option<String>,
+}
+
+/// Which database engine to read from.
+#[derive(Debug, Clone)]
+pub enum SourceConfig {
+    Postgres(PostgresConfig),
+    MySql(MySqlConfig),
+    BigQuery(BigQueryConfig),
+}
+
+impl SourceConfig {
+    /// A short label identifying the source, used to persist watermark state
+    /// under a source-qualified key (so the same table name in different
+    /// engines doesn't collide).
+    pub fn kind(&self) -> &'static str {
+        match self {
+            SourceConfig::Postgres(_) => "postgres",
+            SourceConfig::MySql(_) => "mysql",
+            SourceConfig::BigQuery(_) => "bigquery",
+        }
+    }
 }
 
 /// Where to write to.

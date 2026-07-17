@@ -1,6 +1,6 @@
 """Shared pytest fixtures.
 
-The integration tests need a live PostgreSQL and ClickHouse (see
+The integration tests need a live PostgreSQL, MySQL, and ClickHouse (see
 ``docker-compose.yml``). Connection details come from environment variables and
 default to the compose setup. If a service is unreachable the whole module is
 skipped rather than failed.
@@ -14,6 +14,12 @@ import uuid
 import pytest
 
 PG_DSN = os.environ.get("ETLHOUSE_PG_DSN", "postgresql://etl:etl@localhost:5432/etl")
+MYSQL_DSN = os.environ.get("ETLHOUSE_MYSQL_DSN", "mysql://etl:etl@localhost:3306/etl")
+MYSQL_HOST = os.environ.get("ETLHOUSE_MYSQL_HOST", "localhost")
+MYSQL_PORT = int(os.environ.get("ETLHOUSE_MYSQL_PORT", "3306"))
+MYSQL_USER = os.environ.get("ETLHOUSE_MYSQL_USER", "etl")
+MYSQL_PASSWORD = os.environ.get("ETLHOUSE_MYSQL_PASSWORD", "etl")
+MYSQL_DB = os.environ.get("ETLHOUSE_MYSQL_DB", "etl")
 CH_URL = os.environ.get("ETLHOUSE_CH_URL", "http://localhost:8123")
 CH_HOST = os.environ.get("ETLHOUSE_CH_HOST", "localhost")
 CH_PORT = int(os.environ.get("ETLHOUSE_CH_PORT", "8123"))
@@ -29,6 +35,24 @@ def pg_conn():
         conn = psycopg.connect(PG_DSN, autocommit=True)
     except Exception as e:  # noqa: BLE001
         pytest.skip(f"PostgreSQL unavailable at {PG_DSN}: {e}")
+    yield conn
+    conn.close()
+
+
+@pytest.fixture(scope="session")
+def mysql_conn():
+    pymysql = pytest.importorskip("pymysql")
+    try:
+        conn = pymysql.connect(
+            host=MYSQL_HOST,
+            port=MYSQL_PORT,
+            user=MYSQL_USER,
+            password=MYSQL_PASSWORD,
+            database=MYSQL_DB,
+            autocommit=True,
+        )
+    except Exception as e:  # noqa: BLE001
+        pytest.skip(f"MySQL unavailable at {MYSQL_HOST}:{MYSQL_PORT}: {e}")
     yield conn
     conn.close()
 
@@ -57,6 +81,13 @@ def pg_source():
     import etlhouse
 
     return etlhouse.Postgres(PG_DSN)
+
+
+@pytest.fixture
+def mysql_source():
+    import etlhouse
+
+    return etlhouse.MySQL(MYSQL_DSN)
 
 
 @pytest.fixture

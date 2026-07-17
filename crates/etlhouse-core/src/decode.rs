@@ -233,7 +233,7 @@ impl CopyDecoder {
         }
         Ok(Self {
             schema: Arc::new(Schema::new(fields)),
-            oids: columns.iter().map(|c| c.pg_oid).collect(),
+            oids: columns.iter().map(|c| c.type_id).collect(),
             builders,
             buf: Vec::with_capacity(1 << 16),
             header_done: false,
@@ -385,7 +385,7 @@ mod tests {
     fn col(name: &str, oid: u32, dt: DataType, nullable: bool) -> ColumnType {
         ColumnType {
             name: name.into(),
-            pg_oid: oid,
+            type_id: oid,
             nullable,
             arrow: dt,
             clickhouse_inner: "x".into(),

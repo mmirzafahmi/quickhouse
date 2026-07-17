@@ -115,7 +115,7 @@ mod tests {
     fn col(name: &str, ch: &str, nullable: bool) -> ColumnType {
         ColumnType {
             name: name.into(),
-            pg_oid: 0,
+            type_id: 0,
             nullable,
             arrow: DataType::Int32,
             clickhouse_inner: ch.into(),

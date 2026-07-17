@@ -4,13 +4,13 @@ build-backend = "maturin"
 
 [project]
 name = "etlhouse"
-version = "0.1.1"
-description = "Fast PostgreSQL -> ClickHouse ETL with a Rust engine (parallel, bounded-memory, Arrow-based)."
+version = "0.2.0"
+description = "Fast PostgreSQL/MySQL/BigQuery -> ClickHouse ETL with a Rust engine (parallel, bounded-memory, Arrow-based)."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
 authors = [{ name = "M Mirza Fahmi", email = "mr.sm1l3yz@gmail.com" }]
-keywords = ["etl", "postgresql", "clickhouse", "arrow", "rust", "data-engineering"]
+keywords = ["etl", "postgresql", "mysql", "bigquery", "clickhouse", "arrow", "rust", "data-engineering"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -28,7 +28,8 @@ Repository = "https://github.com/mmirzafahmi/etl-house"
 Issues = "https://github.com/mmirzafahmi/etl-house/issues"
 
 [project.optional-dependencies]
-test = ["pytest>=7", "psycopg[binary]>=3.1", "clickhouse-connect>=0.7"]
+progress = ["tqdm>=4.60"]
+test = ["pytest>=7", "psycopg[binary]>=3.1", "pymysql>=1.1", "clickhouse-connect>=0.7", "tqdm>=4.60"]
 
 [tool.maturin]
 # The compiled extension module lives at etlhouse._etlhouse; the pure-Python

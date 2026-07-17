@@ -7,6 +7,8 @@
 //! to the destination column type at insert time (e.g. `String` -> `UUID`,
 //! `Float64` -> `Decimal(...)`), which is why the Arrow type is left untouched.
 
+use std::collections::HashSet;
+
 use crate::config::TransferConfig;
 use crate::error::{EtlError, Result};
 use crate::types::ColumnType;
@@ -42,6 +44,21 @@ pub fn plan(source: &[ColumnType], cfg: &TransferConfig) -> Result<SelectPlan> {
         }
     }
 
+    // ClickHouse rejects a Nullable column in ORDER BY / PRIMARY KEY outright.
+    // Nullability is normally resolved from the source's NOT NULL constraints,
+    // but that resolution only works for a plain table (see
+    // PgSource::resolve_columns's `base_table` param); with `source_query`
+    // there's no table to check constraints against, so every column
+    // defaults to nullable. A business/dedup key should never be null
+    // regardless of how the schema was resolved, so force it here.
+    let key_columns: HashSet<&str> = cfg
+        .key
+        .iter()
+        .chain(cfg.order_by.iter())
+        .chain(cfg.primary_key.iter())
+        .map(|s| s.as_str())
+        .collect();
+
     let mut source_columns = Vec::with_capacity(included.len());
     let mut dest_columns = Vec::with_capacity(included.len());
     for c in included {
@@ -53,10 +70,11 @@ pub fn plan(source: &[ColumnType], cfg: &TransferConfig) -> Result<SelectPlan> {
             .or_else(|| cfg.type_overrides.get(&dest_name))
             .cloned()
             .unwrap_or_else(|| c.clickhouse_inner.clone());
+        let nullable = c.nullable && !key_columns.contains(dest_name.as_str());
         dest_columns.push(ColumnType {
             name: dest_name,
-            pg_oid: c.pg_oid,
-            nullable: c.nullable,
+            type_id: c.type_id,
+            nullable,
             arrow: c.arrow.clone(),
             clickhouse_inner: ch_inner,
         });
@@ -77,7 +95,7 @@ mod tests {
     fn c(name: &str) -> ColumnType {
         ColumnType {
             name: name.into(),
-            pg_oid: 23,
+            type_id: 23,
             nullable: true,
             arrow: DataType::Int32,
             clickhouse_inner: "Int32".into(),
@@ -126,5 +144,32 @@ mod tests {
         let mut cfg = cfg();
         cfg.include = vec!["nope".into()];
         assert!(plan(&src, &cfg).is_err());
+    }
+
+    /// With `source_query` (no base table), every column resolves as
+    /// nullable — but a `key` column must never end up `Nullable(...)` in the
+    /// generated DDL, since ClickHouse rejects nullable sort keys outright.
+    #[test]
+    fn key_column_forced_non_nullable() {
+        let src = vec![c("id"), c("name")]; // c() always resolves nullable: true
+        let mut cfg = cfg();
+        cfg.key = vec!["id".into()];
+        let p = plan(&src, &cfg).unwrap();
+        assert!(!p.dest_columns[0].nullable, "key column must not be nullable");
+        assert!(p.dest_columns[1].nullable, "non-key column keeps its resolved nullability");
+    }
+
+    /// order_by/primary_key are matched against the *destination* (post-rename)
+    /// name, since that's what actually ends up in the DDL's ORDER BY/PRIMARY KEY.
+    #[test]
+    fn order_by_and_primary_key_matched_after_rename() {
+        let src = vec![c("id"), c("amount")];
+        let mut cfg = cfg();
+        cfg.rename = HashMap::from([("id".to_string(), "pk".to_string())]);
+        cfg.order_by = vec!["pk".into()];
+        cfg.primary_key = vec!["pk".into()];
+        let p = plan(&src, &cfg).unwrap();
+        assert_eq!(p.dest_columns[0].name, "pk");
+        assert!(!p.dest_columns[0].nullable);
     }
 }

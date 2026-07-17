@@ -35,7 +35,10 @@ pub mod oid {
 #[derive(Debug, Clone)]
 pub struct ColumnType {
     pub name: String,
-    pub pg_oid: u32,
+    /// Source-engine type identifier: PostgreSQL OID, or a MySQL
+    /// `ColumnType` cast to `u32`. Only meaningful to that source's own
+    /// decoder; other sources ignore it.
+    pub type_id: u32,
     pub nullable: bool,
     pub arrow: DataType,
     /// ClickHouse type *without* the `Nullable(...)` wrapper.
@@ -94,6 +97,158 @@ pub fn is_supported(oid: u32) -> bool {
     map_oid(oid).is_some()
 }
 
+/// BigQuery `TableFieldType` <-> Arrow <-> ClickHouse type mapping.
+///
+/// Unlike Postgres/MySQL, BigQuery's own type system has no small integer
+/// code we can reuse for `ColumnType::type_id`, so we assign our own stable
+/// constants here (arbitrary, just needs to round-trip through `map_type`).
+pub mod bigquery {
+    use arrow_schema::DataType;
+    use google_cloud_bigquery::http::table::TableFieldType as BqType;
+
+    pub mod type_id {
+        pub const STRING: u32 = 1;
+        pub const BYTES: u32 = 2;
+        pub const INTEGER: u32 = 3;
+        pub const FLOAT: u32 = 4;
+        pub const BOOLEAN: u32 = 5;
+        pub const TIMESTAMP: u32 = 6;
+        pub const DATE: u32 = 7;
+        pub const TIME: u32 = 8;
+        pub const DATETIME: u32 = 9;
+        pub const NUMERIC: u32 = 10;
+        pub const BIGNUMERIC: u32 = 11;
+        pub const JSON: u32 = 12;
+    }
+
+    /// Map a BigQuery field type to (`type_id`, Arrow type, ClickHouse inner type).
+    ///
+    /// `NUMERIC`/`BIGNUMERIC`/`DECIMAL`/`BIGDECIMAL` map to `Float64` by
+    /// default (same override-via-`type_overrides` policy as the other
+    /// sources' arbitrary-precision numeric types). `RECORD`/`STRUCT` and
+    /// repeated (ARRAY) fields aren't supported in v1 — same scalar-only
+    /// scope as the Postgres/MySQL sources.
+    pub fn map_type(field_type: &BqType) -> Option<(u32, DataType, String)> {
+        use type_id as id;
+        let mapped = match field_type {
+            BqType::String | BqType::Json => (id::STRING, DataType::Utf8, "String".to_string()),
+            BqType::Bytes => (id::BYTES, DataType::Binary, "String".to_string()),
+            BqType::Integer | BqType::Int64 => (id::INTEGER, DataType::Int64, "Int64".to_string()),
+            BqType::Float | BqType::Float64 => (id::FLOAT, DataType::Float64, "Float64".to_string()),
+            BqType::Boolean | BqType::Bool => (id::BOOLEAN, DataType::Boolean, "Bool".to_string()),
+            BqType::Timestamp => (
+                id::TIMESTAMP,
+                DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())),
+                "DateTime64(6, 'UTC')".to_string(),
+            ),
+            BqType::Date => (id::DATE, DataType::Date32, "Date32".to_string()),
+            BqType::Time => (
+                id::TIME,
+                DataType::Time64(arrow_schema::TimeUnit::Microsecond),
+                "String".to_string(),
+            ),
+            BqType::Datetime => (
+                id::DATETIME,
+                DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
+                "DateTime64(6)".to_string(),
+            ),
+            BqType::Numeric => (id::NUMERIC, DataType::Float64, "Float64".to_string()),
+            BqType::Bignumeric | BqType::Decimal | BqType::Bigdecimal => {
+                (id::BIGNUMERIC, DataType::Float64, "Float64".to_string())
+            }
+            BqType::Record | BqType::Struct | BqType::Interval => return None,
+        };
+        Some(mapped)
+    }
+}
+
+/// MySQL `Column::column_type()` (`mysql_async::consts::ColumnType`) <-> Arrow
+/// <-> ClickHouse type mapping. Unlike PostgreSQL's binary COPY protocol,
+/// MySQL's wire protocol exposes nullability directly in column metadata
+/// (`ColumnFlags::NOT_NULL_FLAG`), so there's no separate catalog lookup
+/// needed the way there is for `PgSource::not_null_columns`.
+pub mod mysql {
+    use arrow_schema::DataType;
+    use mysql_async::consts::ColumnType as MyType;
+
+    /// Resolve a MySQL column type to (Arrow type, ClickHouse inner type).
+    ///
+    /// `is_unsigned` distinguishes e.g. `INT UNSIGNED` (fits `UInt32`) from
+    /// signed `INT`. `TINYINT(1)` is treated as MySQL's de facto boolean
+    /// convention (matching most MySQL client libraries); other TINYINT
+    /// widths map to `Int8`. `numeric`/`DECIMAL` maps to `Float64` by default,
+    /// same policy as the PostgreSQL source — override via `type_overrides`
+    /// for exact `Decimal(P, S)` semantics.
+    pub fn map_mysql_type(
+        col_type: MyType,
+        is_unsigned: bool,
+        is_tinyint1: bool,
+    ) -> Option<(DataType, String)> {
+        let mapped = match col_type {
+            MyType::MYSQL_TYPE_TINY if is_tinyint1 => (DataType::Boolean, "Bool".to_string()),
+            MyType::MYSQL_TYPE_TINY => {
+                if is_unsigned {
+                    (DataType::UInt8, "UInt8".to_string())
+                } else {
+                    (DataType::Int8, "Int8".to_string())
+                }
+            }
+            MyType::MYSQL_TYPE_SHORT | MyType::MYSQL_TYPE_YEAR => {
+                if is_unsigned {
+                    (DataType::UInt16, "UInt16".to_string())
+                } else {
+                    (DataType::Int16, "Int16".to_string())
+                }
+            }
+            MyType::MYSQL_TYPE_INT24 | MyType::MYSQL_TYPE_LONG => {
+                if is_unsigned {
+                    (DataType::UInt32, "UInt32".to_string())
+                } else {
+                    (DataType::Int32, "Int32".to_string())
+                }
+            }
+            MyType::MYSQL_TYPE_LONGLONG => {
+                if is_unsigned {
+                    (DataType::UInt64, "UInt64".to_string())
+                } else {
+                    (DataType::Int64, "Int64".to_string())
+                }
+            }
+            MyType::MYSQL_TYPE_FLOAT => (DataType::Float32, "Float32".to_string()),
+            MyType::MYSQL_TYPE_DOUBLE
+            | MyType::MYSQL_TYPE_DECIMAL
+            | MyType::MYSQL_TYPE_NEWDECIMAL => (DataType::Float64, "Float64".to_string()),
+            MyType::MYSQL_TYPE_VARCHAR
+            | MyType::MYSQL_TYPE_VAR_STRING
+            | MyType::MYSQL_TYPE_STRING
+            | MyType::MYSQL_TYPE_ENUM
+            | MyType::MYSQL_TYPE_SET
+            | MyType::MYSQL_TYPE_JSON => (DataType::Utf8, "String".to_string()),
+            MyType::MYSQL_TYPE_TINY_BLOB
+            | MyType::MYSQL_TYPE_MEDIUM_BLOB
+            | MyType::MYSQL_TYPE_LONG_BLOB
+            | MyType::MYSQL_TYPE_BLOB => (DataType::Binary, "String".to_string()),
+            MyType::MYSQL_TYPE_DATE | MyType::MYSQL_TYPE_NEWDATE => {
+                (DataType::Date32, "Date32".to_string())
+            }
+            MyType::MYSQL_TYPE_DATETIME
+            | MyType::MYSQL_TYPE_DATETIME2
+            | MyType::MYSQL_TYPE_TIMESTAMP
+            | MyType::MYSQL_TYPE_TIMESTAMP2 => (
+                DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
+                "DateTime64(6)".to_string(),
+            ),
+            MyType::MYSQL_TYPE_TIME | MyType::MYSQL_TYPE_TIME2 => (
+                DataType::Time64(arrow_schema::TimeUnit::Microsecond),
+                "String".to_string(),
+            ),
+            MyType::MYSQL_TYPE_BIT => (DataType::Binary, "String".to_string()),
+            _ => return None,
+        };
+        Some(mapped)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,7 +267,7 @@ mod tests {
     fn nullable_wrapping() {
         let c = ColumnType {
             name: "x".into(),
-            pg_oid: oid::INT4,
+            type_id: oid::INT4,
             nullable: true,
             arrow: DataType::Int32,
             clickhouse_inner: "Int32".into(),

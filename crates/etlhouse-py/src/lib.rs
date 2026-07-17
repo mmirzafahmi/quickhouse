@@ -5,7 +5,7 @@
 //! GIL is released for the duration and only re-acquired to fire `on_progress`.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 
 use etlhouse_core as core;
 use pyo3::exceptions::PyRuntimeError;
@@ -15,27 +15,144 @@ fn map_err(e: core::EtlError) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
 }
 
+static INIT_LOGGING: Once = Once::new();
+
+/// Print `etlhouse_core`'s step-by-step `tracing` logs to stderr the first
+/// time `sync()` runs. Defaults to INFO level for our own crate (connect,
+/// schema resolution, DDL, per-partition progress, watermark handling, swap)
+/// while staying quiet about noisy dependency internals (tokio/hyper/tonic/
+/// etc.); override with the `RUST_LOG` env var, e.g. `RUST_LOG=debug` for
+/// everything or `RUST_LOG=etlhouse_core=debug` for just this crate's SQL/DDL
+/// text. This is separate from `on_progress`/`progress_bar()`, which only
+/// fires during the actual row-ingestion loop.
+fn init_logging() {
+    INIT_LOGGING.call_once(|| {
+        use tracing_subscriber::EnvFilter;
+        let filter =
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("etlhouse_core=info"));
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_target(false)
+            .with_writer(std::io::stderr)
+            .try_init();
+    });
+}
+
 /// PostgreSQL source connection descriptor.
 #[pyclass]
 #[derive(Clone)]
 struct Postgres {
     dsn: String,
     statement_timeout_secs: u64,
+    ca_cert_file: Option<String>,
 }
 
 #[pymethods]
 impl Postgres {
     #[new]
-    #[pyo3(signature = (dsn, *, statement_timeout_secs=0))]
-    fn new(dsn: String, statement_timeout_secs: u64) -> Self {
+    #[pyo3(signature = (dsn, *, statement_timeout_secs=0, ca_cert_file=None))]
+    fn new(dsn: String, statement_timeout_secs: u64, ca_cert_file: Option<String>) -> Self {
         Postgres {
             dsn,
             statement_timeout_secs,
+            ca_cert_file,
         }
     }
 
     fn __repr__(&self) -> String {
         "Postgres(dsn=***)".to_string()
+    }
+}
+
+/// MySQL source connection descriptor (e.g. AWS RDS for MySQL).
+#[pyclass]
+#[derive(Clone)]
+struct MySQL {
+    dsn: String,
+    statement_timeout_secs: u64,
+    ca_cert_file: Option<String>,
+    require_tls: bool,
+}
+
+#[pymethods]
+impl MySQL {
+    #[new]
+    #[pyo3(signature = (dsn, *, statement_timeout_secs=0, ca_cert_file=None, require_tls=false))]
+    fn new(
+        dsn: String,
+        statement_timeout_secs: u64,
+        ca_cert_file: Option<String>,
+        require_tls: bool,
+    ) -> Self {
+        MySQL {
+            dsn,
+            statement_timeout_secs,
+            ca_cert_file,
+            require_tls,
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        "MySQL(dsn=***)".to_string()
+    }
+}
+
+/// Google BigQuery source connection descriptor.
+///
+/// Authenticates via a service-account JSON key file (`credentials_file`) if
+/// given, otherwise falls back to Application Default Credentials (ADC) —
+/// `GOOGLE_APPLICATION_CREDENTIALS`, `GOOGLE_APPLICATION_CREDENTIALS_JSON`,
+/// the GCE/GKE metadata server, or the `gcloud` CLI's well-known ADC file.
+#[pyclass]
+#[derive(Clone)]
+struct BigQuery {
+    project_id: Option<String>,
+    credentials_file: Option<String>,
+}
+
+#[pymethods]
+impl BigQuery {
+    #[new]
+    #[pyo3(signature = (project_id=None, *, credentials_file=None))]
+    fn new(project_id: Option<String>, credentials_file: Option<String>) -> Self {
+        BigQuery {
+            project_id,
+            credentials_file,
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!("BigQuery(project_id={:?})", self.project_id)
+    }
+}
+
+/// Accepts `Postgres`, `MySQL`, or `BigQuery` as `sync()`'s `source` argument.
+#[derive(FromPyObject)]
+enum AnySource {
+    Postgres(Postgres),
+    MySQL(MySQL),
+    BigQuery(BigQuery),
+}
+
+impl From<AnySource> for core::SourceConfig {
+    fn from(source: AnySource) -> Self {
+        match source {
+            AnySource::Postgres(p) => core::SourceConfig::Postgres(core::PostgresConfig {
+                dsn: p.dsn,
+                statement_timeout_secs: p.statement_timeout_secs,
+                ca_cert_file: p.ca_cert_file,
+            }),
+            AnySource::MySQL(m) => core::SourceConfig::MySql(core::MySqlConfig {
+                dsn: m.dsn,
+                statement_timeout_secs: m.statement_timeout_secs,
+                ca_cert_file: m.ca_cert_file,
+                require_tls: m.require_tls,
+            }),
+            AnySource::BigQuery(b) => core::SourceConfig::BigQuery(core::BigQueryConfig {
+                project_id: b.project_id,
+                credentials_file: b.credentials_file,
+            }),
+        }
     }
 }
 
@@ -191,7 +308,7 @@ fn parse_compression(c: &str) -> PyResult<core::Compression> {
 #[allow(clippy::too_many_arguments)]
 fn sync(
     py: Python<'_>,
-    source: Postgres,
+    source: AnySource,
     target: ClickHouse,
     dest_table: String,
     source_table: Option<String>,
@@ -213,10 +330,8 @@ fn sync(
     exclude: Option<Vec<String>>,
     on_progress: Option<PyObject>,
 ) -> PyResult<TransferResult> {
-    let pg = core::PostgresConfig {
-        dsn: source.dsn,
-        statement_timeout_secs: source.statement_timeout_secs,
-    };
+    init_logging();
+    let source_cfg: core::SourceConfig = source.into();
     let ch = core::ClickHouseConfig {
         url: target.url,
         database: target.database,
@@ -263,7 +378,7 @@ fn sync(
     // Run with the GIL released so Python threads keep moving and the callback
     // can re-acquire it without deadlocking.
     let result = py
-        .allow_threads(|| core::run_transfer_blocking(pg, ch, cfg, progress))
+        .allow_threads(|| core::run_transfer_blocking(source_cfg, ch, cfg, progress))
         .map_err(map_err)?;
 
     Ok(TransferResult {
@@ -284,6 +399,8 @@ fn version() -> &'static str {
 #[pymodule]
 fn _etlhouse(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Postgres>()?;
+    m.add_class::<MySQL>()?;
+    m.add_class::<BigQuery>()?;
     m.add_class::<ClickHouse>()?;
     m.add_class::<Progress>()?;
     m.add_class::<TransferResult>()?;
