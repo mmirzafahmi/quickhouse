@@ -137,7 +137,11 @@ pub async fn run_transfer(
     // remember it individually.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
+    let mut cfg = cfg;
     cfg.validate()?;
+    // Drop mode-irrelevant fields (e.g. a watermark passed with mode="full")
+    // so the config that runs matches what's effective — see normalize().
+    cfg.normalize();
     let started = Instant::now();
 
     let source_label = cfg
@@ -447,6 +451,7 @@ async fn run_transfer_bigquery(
         .rows_read
         .fetch_add(batcher.rows_total, Ordering::Relaxed);
     emit_progress(&counters, &progress, started);
+    warn_coerced_dates("bigquery read", batcher.invalid_dates_total);
     tracing::info!(
         "bigquery read complete: {} rows written",
         counters.rows_written.load(Ordering::Relaxed)
@@ -500,8 +505,16 @@ async fn setup_postgres(
         .resolve_columns(&control, &schema_probe, base_table)
         .await?;
 
-    let snapshot_max = if let Some(w) = watermark {
-        s.max_watermark(&control, base_table, base_query, w).await?
+    // Only needed for incremental mode (the value is discarded otherwise) —
+    // skip it in full-refresh so a watermark column left set alongside
+    // mode="full" can't add a spurious query or fail on an aggregate edge
+    // case (e.g. an empty table's MAX() being NULL) for a result nothing uses.
+    let snapshot_max = if cfg.mode == SyncMode::Incremental {
+        if let Some(w) = watermark {
+            s.max_watermark(&control, base_table, base_query, w).await?
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -531,9 +544,17 @@ async fn setup_mysql(
     };
     let source_cols = s.resolve_columns(&mut control, &schema_probe).await?;
 
-    let snapshot_max = if let Some(w) = watermark {
-        s.max_watermark(&mut control, base_table, base_query, w)
-            .await?
+    // Only needed for incremental mode (the value is discarded otherwise) —
+    // skip it in full-refresh so a watermark column left set alongside
+    // mode="full" can't add a spurious query or fail on an aggregate edge
+    // case (e.g. an empty table's MAX() being NULL) for a result nothing uses.
+    let snapshot_max = if cfg.mode == SyncMode::Incremental {
+        if let Some(w) = watermark {
+            s.max_watermark(&mut control, base_table, base_query, w)
+                .await?
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -599,6 +620,7 @@ async fn transfer_partition_postgres(
         .fetch_add(decoder.rows_total, Ordering::Relaxed);
     emit_progress(&ctx.counters, &ctx.progress, ctx.started);
     tracing::info!("partition '{}' complete: {} rows", partition.label, decoder.rows_total);
+    warn_coerced_dates(&format!("partition '{}'", partition.label), decoder.invalid_dates_total);
     Ok(())
 }
 
@@ -664,7 +686,22 @@ async fn transfer_partition_mysql(
         .fetch_add(batcher.rows_total, Ordering::Relaxed);
     emit_progress(&ctx.counters, &ctx.progress, ctx.started);
     tracing::info!("partition '{}' complete: {} rows", partition.label, batcher.rows_total);
+    warn_coerced_dates(&format!("partition '{}'", partition.label), batcher.invalid_dates_total);
     Ok(())
+}
+
+/// Warn (once per partition / read) when a decoder coerced date/datetime values
+/// to NULL — either zero-dates (`0000-00-00`) or valid dates outside ClickHouse's
+/// representable `[1900-01-01, 2299-12-31]` window (e.g. `9999-12-31` sentinels).
+/// Aggregated, not per-row, so a badly-legacy table can't flood the log.
+fn warn_coerced_dates(scope: &str, n: u64) {
+    if n > 0 {
+        tracing::warn!(
+            "{scope}: {n} unrepresentable or out-of-range date/datetime value(s) \
+             (zero-dates like '0000-00-00', or years outside ClickHouse's 1900–2299 \
+             window like '9999-12-31') coerced to NULL"
+        );
+    }
 }
 
 fn emit_progress(counters: &Counters, progress: &Option<ProgressCb>, started: Instant) {

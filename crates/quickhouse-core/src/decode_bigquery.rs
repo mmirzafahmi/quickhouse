@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use arrow_array::builder::{
     BinaryBuilder, BooleanBuilder, Date32Builder, Float64Builder, Int64Builder, StringBuilder,
-    Time64MicrosecondBuilder, TimestampMicrosecondBuilder,
+    TimestampMicrosecondBuilder,
 };
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
@@ -19,7 +19,7 @@ use google_cloud_bigquery::storage::row::Row;
 
 use crate::error::{EtlError, Result};
 use crate::types::bigquery::type_id as id;
-use crate::types::ColumnType;
+use crate::types::{ch_range, ColumnType};
 
 fn conv_err(e: impl std::fmt::Display) -> EtlError {
     EtlError::decode(format!("bigquery row decode error: {e}"))
@@ -33,7 +33,6 @@ enum ColBuilder {
     Bin(BinaryBuilder),
     Date(Date32Builder),
     Ts(TimestampMicrosecondBuilder),
-    Time(Time64MicrosecondBuilder),
 }
 
 impl ColBuilder {
@@ -48,9 +47,6 @@ impl ColBuilder {
             DataType::Timestamp(TimeUnit::Microsecond, _) => {
                 ColBuilder::Ts(TimestampMicrosecondBuilder::new())
             }
-            DataType::Time64(TimeUnit::Microsecond) => {
-                ColBuilder::Time(Time64MicrosecondBuilder::new())
-            }
             other => {
                 return Err(EtlError::decode(format!(
                     "no column builder for Arrow type {other:?}"
@@ -59,9 +55,14 @@ impl ColBuilder {
         })
     }
 
-    /// Appends the value and returns its approximate size in bytes, used
-    /// only to decide when to flush a batch (not an exact memory accounting).
-    fn append_from_row(&mut self, row: &Row, index: usize, type_id: u32) -> Result<usize> {
+    /// Appends the value and returns `(approx_size_bytes, coerced_to_null)`.
+    /// The size is used only to decide when to flush a batch (not exact memory
+    /// accounting); `coerced_to_null` is `true` for a valid date/datetime whose
+    /// year is outside ClickHouse's representable window ([`ch_range`]) and was
+    /// nulled rather than sent on to be rejected at insert time. BigQuery's DATE
+    /// range (0001..=9999) is far wider than ClickHouse's, so this is reachable.
+    fn append_from_row(&mut self, row: &Row, index: usize, type_id: u32) -> Result<(usize, bool)> {
+        let mut coerced_to_null = false;
         let size = match (&mut *self, type_id) {
             (ColBuilder::Bool(b), t) if t == id::BOOLEAN => {
                 match row.column::<Option<bool>>(index).map_err(conv_err)? {
@@ -129,9 +130,13 @@ impl ColBuilder {
             }
             (ColBuilder::Date(b), t) if t == id::DATE => {
                 match row.column::<Option<time::Date>>(index).map_err(conv_err)? {
-                    Some(d) => {
+                    Some(d) if ch_range::year_in_range(d.year()) => {
                         let epoch = time::macros::date!(1970 - 01 - 01);
                         b.append_value((d - epoch).whole_days() as i32);
+                    }
+                    Some(_) => {
+                        b.append_null();
+                        coerced_to_null = true;
                     }
                     None => b.append_null(),
                 }
@@ -139,23 +144,42 @@ impl ColBuilder {
             }
             (ColBuilder::Ts(b), t) if t == id::TIMESTAMP || t == id::DATETIME => {
                 match row.column::<Option<time::OffsetDateTime>>(index).map_err(conv_err)? {
-                    Some(dt) => b.append_value((dt.unix_timestamp_nanos() / 1000) as i64),
-                    None => b.append_null(),
-                }
-                8
-            }
-            (ColBuilder::Time(b), t) if t == id::TIME => {
-                match row.column::<Option<time::Time>>(index).map_err(conv_err)? {
-                    Some(v) => {
-                        let micros = v.hour() as i64 * 3_600_000_000
-                            + v.minute() as i64 * 60_000_000
-                            + v.second() as i64 * 1_000_000
-                            + v.microsecond() as i64;
-                        b.append_value(micros);
+                    Some(dt) if ch_range::year_in_range(dt.year()) => {
+                        b.append_value((dt.unix_timestamp_nanos() / 1000) as i64)
+                    }
+                    Some(_) => {
+                        b.append_null();
+                        coerced_to_null = true;
                     }
                     None => b.append_null(),
                 }
                 8
+            }
+            // TIME -> canonical "HH:MM:SS[.ffffff]" text into a String column.
+            // BigQuery TIME is a wall clock in [00:00:00, 24:00:00).
+            (ColBuilder::Str(b), t) if t == id::TIME => {
+                match row.column::<Option<time::Time>>(index).map_err(conv_err)? {
+                    Some(v) => {
+                        let s = if v.microsecond() > 0 {
+                            format!(
+                                "{:02}:{:02}:{:02}.{:06}",
+                                v.hour(),
+                                v.minute(),
+                                v.second(),
+                                v.microsecond()
+                            )
+                        } else {
+                            format!("{:02}:{:02}:{:02}", v.hour(), v.minute(), v.second())
+                        };
+                        let n = s.len();
+                        b.append_value(&s);
+                        n
+                    }
+                    None => {
+                        b.append_null();
+                        0
+                    }
+                }
             }
             (_, t) => {
                 return Err(EtlError::decode(format!(
@@ -163,7 +187,7 @@ impl ColBuilder {
                 )))
             }
         };
-        Ok(size)
+        Ok((size, coerced_to_null))
     }
 
     fn finish(&mut self) -> ArrayRef {
@@ -175,7 +199,6 @@ impl ColBuilder {
             ColBuilder::Bin(b) => Arc::new(b.finish()),
             ColBuilder::Date(b) => Arc::new(b.finish()),
             ColBuilder::Ts(b) => Arc::new(b.finish()),
-            ColBuilder::Time(b) => Arc::new(b.finish()),
         }
     }
 }
@@ -189,6 +212,9 @@ pub struct BigQueryBatcher {
     rows_in_batch: usize,
     bytes_in_batch: usize,
     pub rows_total: u64,
+    /// Count of valid dates/datetimes whose year fell outside ClickHouse's
+    /// representable window and were coerced to NULL (see `append_from_row`).
+    pub invalid_dates_total: u64,
 }
 
 impl BigQueryBatcher {
@@ -214,6 +240,7 @@ impl BigQueryBatcher {
             rows_in_batch: 0,
             bytes_in_batch: 0,
             rows_total: 0,
+            invalid_dates_total: 0,
         })
     }
 
@@ -225,7 +252,11 @@ impl BigQueryBatcher {
     pub fn append_row(&mut self, row: &Row) -> Result<Option<RecordBatch>> {
         let mut row_bytes = 0usize;
         for (i, builder) in self.builders.iter_mut().enumerate() {
-            row_bytes += builder.append_from_row(row, i, self.type_ids[i])?;
+            let (size, coerced) = builder.append_from_row(row, i, self.type_ids[i])?;
+            row_bytes += size;
+            if coerced {
+                self.invalid_dates_total += 1;
+            }
         }
         self.rows_in_batch += 1;
         self.rows_total += 1;

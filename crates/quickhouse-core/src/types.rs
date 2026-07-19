@@ -7,6 +7,39 @@
 
 use arrow_schema::DataType;
 
+/// ClickHouse's `Date32`/`DateTime64` representable window, `[1900-01-01,
+/// 2299-12-31]`. Any date/datetime outside this is rejected by ClickHouse's
+/// ArrowStream reader with `Code: 321 VALUE_IS_OUT_OF_RANGE_OF_DATA_TYPE`
+/// (confirmed against ClickHouse 24.8: `Date32` accepts days `[-25567, 120530]`),
+/// which aborts the whole transfer. Source engines allow far wider ranges
+/// (MySQL DATE `1000..=9999`, Postgres/BigQuery wider still), so every source's
+/// decoder coerces out-of-range values to NULL before they reach the insert.
+///
+/// The three helpers cover the two shapes decoders actually hold a value in: a
+/// calendar year (MySQL/BigQuery, which decode to date components) or a raw
+/// day/microsecond offset from the Unix epoch (Postgres binary COPY).
+pub mod ch_range {
+    pub const MIN_YEAR: i32 = 1900;
+    pub const MAX_YEAR: i32 = 2299;
+    /// Days from the Unix epoch to 1900-01-01 / 2299-12-31 (the Date32 bounds).
+    pub const MIN_DAYS: i32 = -25_567;
+    pub const MAX_DAYS: i32 = 120_530;
+    /// Microseconds from the Unix epoch to the first instant of 1900-01-01 and
+    /// the last microsecond of 2299-12-31 (the DateTime64 bounds).
+    pub const MIN_MICROS: i64 = MIN_DAYS as i64 * 86_400 * 1_000_000;
+    pub const MAX_MICROS: i64 = (MAX_DAYS as i64 + 1) * 86_400 * 1_000_000 - 1;
+
+    pub fn year_in_range(year: i32) -> bool {
+        (MIN_YEAR..=MAX_YEAR).contains(&year)
+    }
+    pub fn days_in_range(days: i32) -> bool {
+        (MIN_DAYS..=MAX_DAYS).contains(&days)
+    }
+    pub fn micros_in_range(micros: i64) -> bool {
+        (MIN_MICROS..=MAX_MICROS).contains(&micros)
+    }
+}
+
 /// Well-known PostgreSQL `pg_type.oid` values we decode natively.
 pub mod oid {
     pub const BOOL: u32 = 16;
@@ -86,7 +119,11 @@ pub fn map_oid(oid: u32) -> Option<(DataType, String)> {
             DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())),
             "DateTime64(6, 'UTC')".to_string(),
         ),
-        o::TIME => (DataType::Time64(arrow_schema::TimeUnit::Microsecond), "String".to_string()),
+        // TIME is transferred as text ("HH:MM:SS[.ffffff]") into a ClickHouse
+        // String column: ClickHouse has no time-of-day type, and an Arrow
+        // Time64 physical column does not round-trip into a String column
+        // (it lands as a bogus epoch-relative datetime). See the decoders.
+        o::TIME => (DataType::Utf8, "String".to_string()),
         _ => return None,
     };
     Some(mapped)
@@ -142,11 +179,9 @@ pub mod bigquery {
                 "DateTime64(6, 'UTC')".to_string(),
             ),
             BqType::Date => (id::DATE, DataType::Date32, "Date32".to_string()),
-            BqType::Time => (
-                id::TIME,
-                DataType::Time64(arrow_schema::TimeUnit::Microsecond),
-                "String".to_string(),
-            ),
+            // TIME -> text into a ClickHouse String column (see the Postgres
+            // TIME note above; ClickHouse has no time-of-day type).
+            BqType::Time => (id::TIME, DataType::Utf8, "String".to_string()),
             BqType::Datetime => (
                 id::DATETIME,
                 DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
@@ -238,10 +273,12 @@ pub mod mysql {
                 DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
                 "DateTime64(6)".to_string(),
             ),
-            MyType::MYSQL_TYPE_TIME | MyType::MYSQL_TYPE_TIME2 => (
-                DataType::Time64(arrow_schema::TimeUnit::Microsecond),
-                "String".to_string(),
-            ),
+            // TIME -> text into a ClickHouse String column. MySQL TIME can be
+            // negative and exceed 24h (range +/-838:59:59), which no time-of-day
+            // type can hold anyway; text preserves it losslessly. See decode_mysql.
+            MyType::MYSQL_TYPE_TIME | MyType::MYSQL_TYPE_TIME2 => {
+                (DataType::Utf8, "String".to_string())
+            }
             MyType::MYSQL_TYPE_BIT => (DataType::Binary, "String".to_string()),
             _ => return None,
         };
@@ -278,5 +315,27 @@ mod tests {
     #[test]
     fn unsupported_returns_none() {
         assert!(map_oid(999_999).is_none());
+    }
+
+    #[test]
+    fn ch_range_bounds_match_clickhouse_window() {
+        use super::ch_range;
+        // Year form (MySQL/BigQuery decoders).
+        assert!(!ch_range::year_in_range(1899));
+        assert!(ch_range::year_in_range(1900));
+        assert!(ch_range::year_in_range(2299));
+        assert!(!ch_range::year_in_range(2300));
+        assert!(!ch_range::year_in_range(1000)); // legacy MySQL min
+        assert!(!ch_range::year_in_range(9999)); // "never expires" sentinel
+        // Day form (Postgres Date32). Endpoints confirmed against CH 24.8.
+        assert!(ch_range::days_in_range(-25_567)); // 1900-01-01
+        assert!(ch_range::days_in_range(120_530)); // 2299-12-31
+        assert!(!ch_range::days_in_range(-25_568));
+        assert!(!ch_range::days_in_range(120_531));
+        // Micro form (Postgres DateTime64): first/last representable instants.
+        assert!(ch_range::micros_in_range(ch_range::MIN_MICROS));
+        assert!(ch_range::micros_in_range(ch_range::MAX_MICROS));
+        assert!(!ch_range::micros_in_range(ch_range::MIN_MICROS - 1));
+        assert!(!ch_range::micros_in_range(ch_range::MAX_MICROS + 1));
     }
 }

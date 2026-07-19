@@ -11,15 +11,15 @@ use std::sync::Arc;
 
 use arrow_array::builder::{
     BinaryBuilder, BooleanBuilder, Date32Builder, Float32Builder, Float64Builder, Int16Builder,
-    Int32Builder, Int64Builder, Int8Builder, StringBuilder, Time64MicrosecondBuilder,
-    TimestampMicrosecondBuilder, UInt16Builder, UInt32Builder, UInt64Builder, UInt8Builder,
+    Int32Builder, Int64Builder, Int8Builder, StringBuilder, TimestampMicrosecondBuilder,
+    UInt16Builder, UInt32Builder, UInt64Builder, UInt8Builder,
 };
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use mysql_async::{Row, Value};
 
 use crate::error::{EtlError, Result};
-use crate::types::ColumnType;
+use crate::types::{ch_range, ColumnType};
 
 enum ColBuilder {
     Bool(BooleanBuilder),
@@ -37,7 +37,6 @@ enum ColBuilder {
     Bin(BinaryBuilder),
     Date(Date32Builder),
     Ts(TimestampMicrosecondBuilder),
-    Time(Time64MicrosecondBuilder),
 }
 
 impl ColBuilder {
@@ -59,9 +58,6 @@ impl ColBuilder {
             DataType::Date32 => ColBuilder::Date(Date32Builder::new()),
             DataType::Timestamp(TimeUnit::Microsecond, _) => {
                 ColBuilder::Ts(TimestampMicrosecondBuilder::new())
-            }
-            DataType::Time64(TimeUnit::Microsecond) => {
-                ColBuilder::Time(Time64MicrosecondBuilder::new())
             }
             other => {
                 return Err(EtlError::decode(format!(
@@ -88,15 +84,29 @@ impl ColBuilder {
             ColBuilder::Bin(b) => b.append_null(),
             ColBuilder::Date(b) => b.append_null(),
             ColBuilder::Ts(b) => b.append_null(),
-            ColBuilder::Time(b) => b.append_null(),
         }
     }
 
-    fn append_value(&mut self, value: Value) -> Result<()> {
+    /// Appends `value`, returning `true` if it was an unrepresentable or
+    /// out-of-range MySQL date/datetime that got coerced to NULL instead of
+    /// erroring. Two distinct cases, both common in real legacy tables and both
+    /// fatal to a whole multi-million-row transfer if not handled:
+    ///   1. The classic `0000-00-00` zero-date (or a partial zero like
+    ///      `2024-00-15`) — MySQL allows these by default (no
+    ///      `NO_ZERO_DATE`/`NO_ZERO_IN_DATE` sql_mode) and they have no valid
+    ///      `chrono::NaiveDate` representation.
+    ///   2. A valid calendar date whose year falls outside ClickHouse's
+    ///      `Date32`/`DateTime64` window of `[1900-01-01, 2299-12-31]` — e.g.
+    ///      the ubiquitous `9999-12-31` "never expires" sentinel or a pre-1900
+    ///      date. ClickHouse's ArrowStream reader rejects these outright with
+    ///      `VALUE_IS_OUT_OF_RANGE_OF_DATA_TYPE`, so they must be filtered here
+    ///      rather than at insert time.
+    fn append_value(&mut self, value: Value) -> Result<bool> {
         if matches!(value, Value::NULL) {
             self.append_null();
-            return Ok(());
+            return Ok(false);
         }
+        let mut coerced_to_null = false;
         match (self, value) {
             (ColBuilder::Bool(b), Value::Int(i)) => b.append_value(i != 0),
             (ColBuilder::Bool(b), Value::UInt(u)) => b.append_value(u != 0),
@@ -135,12 +145,39 @@ impl ColBuilder {
             (ColBuilder::Str(b), Value::Bytes(v)) => {
                 b.append_value(String::from_utf8_lossy(&v).as_ref())
             }
+            // MySQL TIME (mapped to a ClickHouse String, not a time-of-day type):
+            // render the canonical `[-]HH:MM:SS[.ffffff]` text. Unlike a wall
+            // clock, TIME is a signed *duration* that can be negative and exceed
+            // 24h (up to +/-838:59:59), so hours accumulate `days*24 + hours`
+            // and can be three digits — text preserves all of that losslessly.
+            (ColBuilder::Str(b), Value::Time(is_neg, days, hours, minutes, seconds, micros)) => {
+                let total_hours = days as u64 * 24 + hours as u64;
+                let sign = if is_neg { "-" } else { "" };
+                let s = if micros > 0 {
+                    format!("{sign}{total_hours:02}:{minutes:02}:{seconds:02}.{micros:06}")
+                } else {
+                    format!("{sign}{total_hours:02}:{minutes:02}:{seconds:02}")
+                };
+                b.append_value(&s);
+            }
             (ColBuilder::Bin(b), Value::Bytes(v)) => b.append_value(&v),
+            // Coerce zero-dates (`0000-00-00`, `2024-00-15`) and dates whose
+            // year is outside ClickHouse's representable window to NULL rather
+            // than aborting the whole transfer — see `append_value`'s docs and
+            // `ch_year_in_range`. The `_` arm catches both: an unparseable date
+            // (`from_ymd_opt` -> None) and a valid-but-out-of-range one (guard
+            // fails).
             (ColBuilder::Date(b), Value::Date(year, month, day, ..)) => {
-                let date = chrono::NaiveDate::from_ymd_opt(year as i32, month as u32, day as u32)
-                    .ok_or_else(|| EtlError::decode("invalid MySQL date"))?;
-                let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-                b.append_value((date - epoch).num_days() as i32);
+                match chrono::NaiveDate::from_ymd_opt(year as i32, month as u32, day as u32) {
+                    Some(date) if ch_range::year_in_range(year as i32) => {
+                        let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+                        b.append_value((date - epoch).num_days() as i32);
+                    }
+                    _ => {
+                        b.append_null();
+                        coerced_to_null = true;
+                    }
+                }
             }
             (
                 ColBuilder::Ts(b),
@@ -149,17 +186,16 @@ impl ColBuilder {
                 let dt = chrono::NaiveDate::from_ymd_opt(year as i32, month as u32, day as u32)
                     .and_then(|d| {
                         d.and_hms_micro_opt(hour as u32, minute as u32, second as u32, micros)
-                    })
-                    .ok_or_else(|| EtlError::decode("invalid MySQL datetime"))?;
-                b.append_value(dt.and_utc().timestamp_micros());
-            }
-            (ColBuilder::Time(b), Value::Time(is_neg, days, hours, minutes, seconds, micros)) => {
-                let total_micros = ((days as i64 * 24 + hours as i64) * 3600
-                    + minutes as i64 * 60
-                    + seconds as i64)
-                    * 1_000_000
-                    + micros as i64;
-                b.append_value(if is_neg { -total_micros } else { total_micros });
+                    });
+                match dt {
+                    Some(dt) if ch_range::year_in_range(year as i32) => {
+                        b.append_value(dt.and_utc().timestamp_micros())
+                    }
+                    _ => {
+                        b.append_null();
+                        coerced_to_null = true;
+                    }
+                }
             }
             (_, value) => {
                 return Err(EtlError::decode(format!(
@@ -167,7 +203,7 @@ impl ColBuilder {
                 )))
             }
         }
-        Ok(())
+        Ok(coerced_to_null)
     }
 
     fn finish(&mut self) -> ArrayRef {
@@ -187,7 +223,6 @@ impl ColBuilder {
             ColBuilder::Bin(b) => Arc::new(b.finish()),
             ColBuilder::Date(b) => Arc::new(b.finish()),
             ColBuilder::Ts(b) => Arc::new(b.finish()),
-            ColBuilder::Time(b) => Arc::new(b.finish()),
         }
     }
 }
@@ -213,6 +248,9 @@ pub struct MySqlBatcher {
     rows_in_batch: usize,
     bytes_in_batch: usize,
     pub rows_total: u64,
+    /// Count of unrepresentable MySQL dates/datetimes (e.g. `0000-00-00`)
+    /// coerced to NULL across the whole stream — see `ColBuilder::append_value`.
+    pub invalid_dates_total: u64,
 }
 
 impl MySqlBatcher {
@@ -237,6 +275,7 @@ impl MySqlBatcher {
             rows_in_batch: 0,
             bytes_in_batch: 0,
             rows_total: 0,
+            invalid_dates_total: 0,
         })
     }
 
@@ -257,7 +296,9 @@ impl MySqlBatcher {
         for (i, builder) in self.builders.iter_mut().enumerate() {
             let value = row.as_ref(i).cloned().unwrap_or(Value::NULL);
             row_bytes += value_size(&value);
-            builder.append_value(value)?;
+            if builder.append_value(value)? {
+                self.invalid_dates_total += 1;
+            }
         }
         self.rows_in_batch += 1;
         self.rows_total += 1;
@@ -285,5 +326,65 @@ impl MySqlBatcher {
         self.rows_in_batch = 0;
         self.bytes_in_batch = 0;
         RecordBatch::try_new(self.schema.clone(), cols).map_err(EtlError::from)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::{Array, Date32Array, StringArray, TimestampMicrosecondArray};
+
+    #[test]
+    fn time_formatted_as_signed_text() {
+        // TIME maps to a String column: (is_neg, days, hours, minutes, seconds, micros).
+        let mut b = ColBuilder::new(&DataType::Utf8).unwrap();
+        assert!(!b.append_value(Value::Time(false, 0, 10, 30, 0, 0)).unwrap()); // 10:30:00
+        assert!(!b.append_value(Value::Time(true, 0, 5, 0, 0, 0)).unwrap()); // -05:00:00
+        assert!(!b.append_value(Value::Time(false, 34, 22, 59, 59, 0)).unwrap()); // 838:59:59
+        assert!(!b.append_value(Value::Time(false, 0, 1, 2, 3, 500_000)).unwrap()); // sub-second
+        assert!(!b.append_value(Value::NULL).unwrap());
+
+        let arr = b.finish();
+        let arr = arr.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(arr.value(0), "10:30:00");
+        assert_eq!(arr.value(1), "-05:00:00");
+        assert_eq!(arr.value(2), "838:59:59"); // 34*24 + 22 = 838 hours
+        assert_eq!(arr.value(3), "01:02:03.500000");
+        assert!(arr.is_null(4));
+    }
+
+    #[test]
+    fn date_builder_coerces_zero_and_out_of_range_to_null() {
+        let mut b = ColBuilder::new(&DataType::Date32).unwrap();
+        // (year, month, day, hour, min, sec, micros)
+        assert!(!b.append_value(Value::Date(2024, 5, 1, 0, 0, 0, 0)).unwrap()); // in range
+        assert!(b.append_value(Value::Date(0, 0, 0, 0, 0, 0, 0)).unwrap()); // zero-date
+        assert!(b.append_value(Value::Date(2024, 0, 15, 0, 0, 0, 0)).unwrap()); // partial-zero
+        assert!(b.append_value(Value::Date(9999, 12, 31, 0, 0, 0, 0)).unwrap()); // far future
+        assert!(b.append_value(Value::Date(1800, 6, 15, 0, 0, 0, 0)).unwrap()); // pre-1900
+        assert!(!b.append_value(Value::NULL).unwrap()); // NULL is not a coercion
+
+        let arr = b.finish();
+        let arr = arr.as_any().downcast_ref::<Date32Array>().unwrap();
+        assert_eq!(arr.len(), 6);
+        assert!(!arr.is_null(0), "valid in-range date must be kept");
+        for i in 1..=4 {
+            assert!(arr.is_null(i), "row {i} must be coerced to NULL");
+        }
+        assert!(arr.is_null(5), "explicit NULL stays NULL");
+    }
+
+    #[test]
+    fn ts_builder_coerces_out_of_range_datetimes_to_null() {
+        let mut b = ColBuilder::new(&DataType::Timestamp(TimeUnit::Microsecond, None)).unwrap();
+        assert!(!b.append_value(Value::Date(2024, 5, 1, 10, 0, 0, 0)).unwrap()); // in range
+        assert!(b.append_value(Value::Date(9999, 12, 31, 23, 59, 59, 0)).unwrap()); // far future
+        assert!(b.append_value(Value::Date(1899, 12, 31, 0, 0, 0, 0)).unwrap()); // pre-1900
+
+        let arr = b.finish();
+        let arr = arr.as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap();
+        assert!(!arr.is_null(0));
+        assert!(arr.is_null(1));
+        assert!(arr.is_null(2));
     }
 }

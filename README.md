@@ -1,21 +1,80 @@
 # quickhouse
 
-Fast **PostgreSQL/MySQL/BigQuery → ClickHouse** ETL with a **Rust engine**, driven from Python.
+Fast **PostgreSQL / MySQL / BigQuery → ClickHouse** ETL: a native **Rust engine**
+driven from a small, typed **Python** API.
 
-The hot path is native Rust: the source's native wire protocol → Apache Arrow →
-ClickHouse `FORMAT ArrowStream`, with parallel range-partitioned reads,
-bounded-memory streaming (backpressure), automatic DDL, and both full-refresh
-and incremental (watermark) sync modes. The Python layer is a thin, typed API.
+The hot path never materializes Python objects — each source's native wire
+protocol flows straight into Apache Arrow and out to ClickHouse's
+`FORMAT ArrowStream`, with parallel range-partitioned reads, bounded-memory
+streaming, automatic table creation, and both full-refresh and incremental
+(watermark) sync modes.
 
 ```python
 import quickhouse
 
 src = quickhouse.Postgres("postgresql://user:pw@localhost:5432/odoo")
-# or: src = quickhouse.MySQL("mysql://user:pw@localhost:3306/odoo")
-# or: src = quickhouse.BigQuery("my-gcp-project")  # source_table="dataset.table"
 dst = quickhouse.ClickHouse("http://localhost:8123", database="analytics")
 
-result = quickhouse.sync(
+result = quickhouse.sync(src, dst, dest_table="account_move_line",
+                         source_table="account_move_line", key=["id"])
+print(result)   # rows_read, rows_written, bytes_written, duration_secs, new_watermark
+```
+
+## Key features
+
+- **Three sources, one API.** PostgreSQL, MySQL, and Google BigQuery — swap the
+  source object, and everything else about `sync()` is identical.
+- **Fast by construction.** Source rows are decoded straight into Arrow in Rust
+  (no per-row Python), tables are split into key ranges read in parallel, and
+  decoding overlaps uploading — each finished batch's insert is spawned as a
+  background task while the next batch is still being decoded.
+- **Bounded memory.** A single hard ceiling, `max_memory_bytes`, caps *total*
+  in-flight batch memory across every partition and every upload, measured
+  against each batch's real Arrow allocation. When it's reached, decoding blocks
+  (backpressure) — so peak RSS stays flat regardless of `parallelism`, row
+  width, or partition skew.
+- **Streaming compressed inserts.** Arrow IPC ingested by ClickHouse's native
+  `ArrowStream`, compressed on the fly with zstd (default), gzip, or none — the
+  body is produced incrementally, never buffered in full.
+- **Atomic full refresh.** Loads into a staging table, then `EXCHANGE TABLES` to
+  swap it into place; a crash mid-run never leaves the destination partial.
+- **Idempotent incremental.** Tracks a watermark in an internal ClickHouse state
+  table, copies only new rows, and dedupes via `ReplacingMergeTree`. Re-running
+  with no new data is a no-op.
+- **Resilient.** Transient insert failures (dropped connections, timeouts, HTTP
+  5xx/429) retry with exponential backoff (up to 4 attempts); deterministic 4xx
+  errors (bad SQL, auth) fail fast. Messy legacy data — zero-dates, out-of-range
+  dates — is coerced rather than crashing the run.
+- **Automatic DDL.** Generates the ClickHouse `CREATE TABLE` from the source
+  schema, with per-column type overrides, renames, and include/exclude lists.
+- **GIL-free.** The whole transfer runs inside `Python::allow_threads`; the GIL
+  is only re-acquired to fire your `on_progress` callback.
+
+## Installation
+
+Prebuilt wheels — no Rust toolchain required:
+
+```bash
+pip install quickhouse
+pip install "quickhouse[progress]"   # + a ready-made tqdm progress bar
+```
+
+Python 3.9+ on Linux, macOS (Intel + Apple Silicon), and Windows (x86_64).
+
+Building from source (for development, or to run an unreleased version) needs the
+Rust toolchain and maturin — see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## How to use
+
+```python
+import quickhouse as qh
+
+src = qh.Postgres("postgresql://user:pw@localhost:5432/odoo")
+# or: src = qh.MySQL("mysql://user:pw@localhost:3306/odoo")
+# or: src = qh.BigQuery("my-gcp-project")   # source_table="dataset.table"
+dst = qh.ClickHouse("http://localhost:8123", database="analytics")
+
+result = qh.sync(
     src, dst,
     dest_table="account_move_line",
     source_table="account_move_line",
@@ -33,23 +92,20 @@ result = quickhouse.sync(
 print(result)   # rows_read, rows_written, bytes_written, duration_secs, new_watermark
 ```
 
-`source` accepts `quickhouse.Postgres(...)`, `quickhouse.MySQL(...)`, or
-`quickhouse.BigQuery(...)` — everything else about `sync()` is identical
-either way.
+### Choosing a source
 
-## Why it's fast
+`sync()`'s first argument accepts any of:
 
-| Concern | Approach |
-| --- | --- |
-| Deserialization | PostgreSQL: binary `COPY` decoded straight into Arrow in Rust. MySQL: `mysql_async`'s typed binary-protocol rows appended straight into Arrow builders. BigQuery: the Storage Read API's wire format is already Arrow. Either way, no per-row Python objects. |
-| Parallelism | Postgres/MySQL: table split into key ranges, one connection + Tokio task per partition. BigQuery: `parallelism` is passed as a stream-count hint to BigQuery's own server-side parallel preparation (see the BigQuery note below). |
-| Pipelining | Decoding overlaps with uploading: each finished batch's insert is spawned as a background task, so a partition keeps reading/decoding while previous batches are still being compressed and sent, instead of stalling on each HTTP round-trip. |
-| Memory | A single hard ceiling, `max_memory_bytes`, bounds **total** in-flight batch memory (across every partition and every upload in flight), measured against each batch's real Arrow allocation. When the ceiling is reached, decoding blocks (backpressure) until uploads drain — so peak RSS stays bounded regardless of `parallelism`, row width, or partition skew. `batch_rows`/`batch_bytes` separately control how big each individual batch is. |
-| GIL | Entire transfer runs inside `Python::allow_threads`; the GIL is only touched for `on_progress` |
-| Insert | Arrow IPC stream ingested by ClickHouse's native `ArrowStream` format, streamed to the wire with zstd (default), gzip, or no compression — the compressed body is produced incrementally rather than buffered in full. |
-| Resilience | Each insert retries transient failures (dropped/reset connections, timeouts, HTTP 5xx/429) with exponential backoff — up to 4 attempts — so a single network blip over a long WAN transfer doesn't abort the whole run. Deterministic 4xx errors (bad SQL, auth) fail fast without retrying. Retry is at-least-once: a lost ack after a committed batch can duplicate that one batch — harmless in incremental mode (`ReplacingMergeTree` dedupes by key), possible dupes for one batch in full-refresh into a plain `MergeTree`. |
+```python
+qh.Postgres("postgresql://user:pw@host:5432/db", statement_timeout_secs=0, ca_cert_file=None)
+qh.MySQL("mysql://user:pw@host:3306/db", require_tls=False, ca_cert_file=None)
+qh.BigQuery("my-gcp-project", credentials_file=None)   # None → Application Default Credentials
+```
 
-## Sync modes
+Read a whole table with `source_table=...`, or a custom `SELECT` with
+`source_query=...` (exactly one is required).
+
+### Sync modes
 
 - **`full`** — loads into a staging table, then `EXCHANGE TABLES` to swap it into
   place atomically. A crash mid-run never leaves the destination empty/partial.
@@ -58,93 +114,53 @@ either way.
   the current max up front for consistency), and dedupes via
   `ReplacingMergeTree(<watermark>)`. Re-running with no new data is a no-op.
 
-## Progress reporting
+### Progress reporting
 
-`on_progress` is a plain callback (see `sync()` parameters below), so you can
-wire up anything — a `print`, a logger, a custom UI. For a ready-made
-progress bar, `quickhouse.progress_bar()` wraps [tqdm](https://github.com/tqdm/tqdm)
-(`pip install quickhouse[progress]`):
+`on_progress` is a plain callback, so you can wire up anything — a `print`, a
+logger, a custom UI. For a ready-made bar, `qh.progress_bar()` wraps
+[tqdm](https://github.com/tqdm/tqdm) (`pip install "quickhouse[progress]"`):
 
 ```python
-with quickhouse.progress_bar() as on_progress:
-    quickhouse.sync(src, dst, dest_table="t", source_table="t", on_progress=on_progress)
+with qh.progress_bar() as on_progress:
+    qh.sync(src, dst, dest_table="t", source_table="t", on_progress=on_progress)
 ```
 
-Pass `total=<row count>` if you know it in advance (e.g. from a prior
-`COUNT(*)`) for a percentage/ETA bar instead of a running count; any other
-keyword arguments are passed straight through to `tqdm.tqdm`. The bar closes
-automatically on exit, including when `sync()` raises.
+Pass `total=<row count>` (e.g. from a prior `COUNT(*)`) for a percentage/ETA bar
+instead of a running count; other keyword arguments pass straight through to
+`tqdm.tqdm`. The bar closes automatically on exit, including when `sync()` raises.
 
-## Logging
+### Logging
 
 Every `sync()` call prints step-by-step progress to **stderr** via `tracing`:
-connecting to the source, resolving columns and partitions, watermark
-resolution (incremental mode), DDL/staging-table creation, per-partition read
-start/completion, the full-refresh table swap, watermark persistence, and a
-final summary (rows, duration, rows/sec). This is independent of, and
-complementary to, `on_progress`/`progress_bar()` above — the callback only
-fires during the actual row-ingestion loop (never during connect/DDL/swap),
-while the log lines cover the whole pipeline including setup and teardown.
+connecting, resolving columns/partitions, watermark resolution, DDL/staging
+creation, per-partition read start/completion, the full-refresh swap, watermark
+persistence, and a final summary (rows, duration, rows/sec). This complements
+`on_progress` (which only fires during the row-ingestion loop, never during
+connect/DDL/swap).
 
-Default level is `INFO` for `quickhouse_core` (dependency internals like
-tokio/hyper/tonic stay quiet). Override with the standard `RUST_LOG`
-environment variable, e.g.:
+Default level is `INFO` for `quickhouse_core` (dependency internals stay quiet).
+Override with the standard `RUST_LOG` environment variable:
 
 ```bash
 RUST_LOG=quickhouse_core=debug python my_script.py   # + actual SQL/DDL text
-RUST_LOG=debug python my_script.py                 # everything, incl. deps
+RUST_LOG=debug python my_script.py                   # everything, incl. deps
 ```
 
-## Prerequisites
-
-- **Rust** toolchain (1.75+): install from <https://rustup.rs>
-- **Python** 3.9+
-- **maturin**: `pip install maturin`
-
-## Build & install (local dev)
-
-```bash
-# From the repo root
-pip install maturin
-maturin develop --release        # compiles the Rust engine, installs into the active venv
-python -c "import quickhouse; print(quickhouse.version())"
-```
-
-Build a wheel to distribute:
-
-```bash
-maturin build --release          # produces target/wheels/quickhouse-*.whl
-```
-
-## Running the tests
-
-Integration tests need live services (skipped automatically if unavailable):
-
-```bash
-docker compose up -d             # PostgreSQL + MySQL + ClickHouse
-pip install -e '.[test]'
-maturin develop --release
-pytest -v
-
-# Rust unit tests (decoders, type map, DDL) need no services:
-cargo test -p quickhouse-core
-```
-
-## `sync()` parameters
+### `sync()` parameters
 
 | Parameter | Meaning |
 | --- | --- |
 | `source_table` / `source_query` | Read a whole table, or a custom `SELECT` (one is required) |
 | `dest_table` | Destination table in the ClickHouse database |
 | `mode` | `"full"` or `"incremental"` |
-| `watermark` | Monotonic column (e.g. `write_date`, `id`) — required for incremental |
+| `watermark` | Monotonic column (e.g. `write_date`, `id`) — required for incremental; ignored (cleared to `None`) in full mode |
 | `key` | Business key → ClickHouse `ORDER BY` and dedup key |
 | `create_if_missing` | Auto-run generated `CREATE TABLE` when the destination is absent |
 | `engine`, `order_by`, `partition_by`, `primary_key` | DDL knobs (sensible defaults per mode) |
 | `parallelism` | Number of concurrent partition streams |
-| `batch_rows` | Max rows in each Arrow batch / insert — a per-batch granularity knob (round-trips vs. per-insert overhead), **not** the memory ceiling |
-| `batch_bytes` | Also cap each individual batch at this many estimated source bytes, even under `batch_rows` — default 4 MiB; keeps a single wide-row batch from growing large. `0` disables (row count alone sizes the batch) |
-| `max_memory_bytes` | **The memory ceiling.** Hard cap on total in-flight Arrow batch memory across all partitions and all in-flight uploads, measured against each batch's real allocation. Decoding blocks (backpressure) when reached, so peak RSS stays bounded independent of `parallelism`/row width. Default 512 MiB; `0` = unbounded |
+| `batch_rows` | Max rows per Arrow batch / insert — a per-batch granularity knob, **not** the memory ceiling |
+| `batch_bytes` | Also cap each batch at this many estimated source bytes (default 4 MiB); `0` disables |
+| `max_memory_bytes` | **The memory ceiling.** Hard cap on total in-flight Arrow memory across all partitions and uploads; decoding blocks when reached. Default 512 MiB; `0` = unbounded |
 | `partition_column` | Integer column to range-split on (defaults to first `key`) |
 | `type_overrides` | Per-column ClickHouse type (e.g. `{"qty": "Decimal(18, 3)"}`) |
 | `rename` | Source → destination column renames |
@@ -153,21 +169,28 @@ cargo test -p quickhouse-core
 
 ## Type mapping
 
+Nullable source columns become `Nullable(T)`. Arbitrary-precision numeric types
+(`numeric`/`DECIMAL`/`NUMERIC`/`BIGNUMERIC`, marked \*) map to `Float64` by
+default — precision isn't recoverable from the type alone; override to a
+`Decimal(P, S)` via `type_overrides` and ClickHouse converts on insert. `TIME`
+values are transferred as canonical `[-]HH:MM:SS[.ffffff]` **text** into a
+`String` column (ClickHouse has no time-of-day type; text preserves MySQL's
+negative / >24h durations losslessly). Dates outside ClickHouse's
+`[1900-01-01, 2299-12-31]` window — and MySQL zero-dates like `0000-00-00` — are
+coerced to `NULL` (with a per-partition warning) rather than aborting the run.
+
 ### PostgreSQL
 
 | PostgreSQL | Arrow | ClickHouse |
 | --- | --- | --- |
 | `int2/4/8` | `Int16/32/64` | `Int16/32/64` |
-| `float4/8`, `numeric`* | `Float32/64` | `Float32/64` |
+| `float4/8`, `numeric`\* | `Float32/64` | `Float32/64` |
 | `bool` | `Boolean` | `Bool` |
 | `text/varchar/json/jsonb` | `Utf8` | `String` |
 | `uuid` | `Utf8` | `UUID` |
 | `date` | `Date32` | `Date32` |
+| `time` | `Utf8` | `String` |
 | `timestamp[tz]` | `Timestamp(µs)` | `DateTime64(6[, tz])` |
-
-Nullable PostgreSQL columns become `Nullable(T)`. `numeric` maps to `Float64`
-by default (arbitrary precision is unknown from the type OID); override to a
-`Decimal(P, S)` via `type_overrides` and ClickHouse will convert on insert.
 
 ### MySQL
 
@@ -176,18 +199,17 @@ by default (arbitrary precision is unknown from the type OID); override to a
 | `TINYINT(1)` | `Boolean` | `Bool` |
 | `TINYINT` / `SMALLINT` / `INT` / `BIGINT` (± `UNSIGNED`) | `Int8..64` / `UInt8..64` | matching `Int*`/`UInt*` |
 | `FLOAT` | `Float32` | `Float32` |
-| `DOUBLE`, `DECIMAL`/`NUMERIC`* | `Float64` | `Float64` |
+| `DOUBLE`, `DECIMAL`/`NUMERIC`\* | `Float64` | `Float64` |
 | `VARCHAR/TEXT/ENUM/SET/JSON` | `Utf8` | `String` |
 | `BLOB` family, `BIT` | `Binary` | `String` |
 | `DATE` | `Date32` | `Date32` |
+| `TIME` | `Utf8` | `String` |
 | `DATETIME`/`TIMESTAMP` | `Timestamp(µs)` | `DateTime64(6)` |
 
-`TINYINT(1)` is treated as MySQL's de facto boolean convention (matching most
-MySQL client libraries); other `TINYINT` widths map to `Int8`/`UInt8`. Column
-nullability comes directly from MySQL's wire-protocol column metadata
-(`NOT_NULL_FLAG`) — unlike PostgreSQL, this works even for `source_query`
-(no separate catalog lookup needed). `DECIMAL`/`NUMERIC` maps to `Float64` by
-default, same override policy as PostgreSQL's `numeric`.
+`TINYINT(1)` follows MySQL's de facto boolean convention (matching most client
+libraries); other `TINYINT` widths map to `Int8`/`UInt8`. Column nullability
+comes directly from MySQL's wire-protocol metadata (`NOT_NULL_FLAG`), so it works
+even for `source_query`.
 
 ### BigQuery
 
@@ -196,92 +218,40 @@ default, same override policy as PostgreSQL's `numeric`.
 | `BOOLEAN`/`BOOL` | `Boolean` | `Bool` |
 | `INTEGER`/`INT64` | `Int64` | `Int64` |
 | `FLOAT`/`FLOAT64` | `Float64` | `Float64` |
-| `NUMERIC`/`BIGNUMERIC`/`DECIMAL`* | `Float64` | `Float64` |
+| `NUMERIC`/`BIGNUMERIC`/`DECIMAL`\* | `Float64` | `Float64` |
 | `STRING`, `JSON` | `Utf8` | `String` |
 | `BYTES` | `Binary` | `String` |
 | `DATE` | `Date32` | `Date32` |
-| `TIME` | `Time64(µs)` | `String` |
+| `TIME` | `Utf8` | `String` |
 | `TIMESTAMP` | `Timestamp(µs, UTC)` | `DateTime64(6, 'UTC')` |
 | `DATETIME` | `Timestamp(µs)` | `DateTime64(6)` |
 
-`NUMERIC`/`BIGNUMERIC` map to `Float64` by default (same override policy as
-the other sources' arbitrary-precision types). `RECORD`/`STRUCT` and
-repeated (`ARRAY`) fields aren't supported in v1 — same scalar-only scope as
-the Postgres/MySQL sources.
-
-## Project layout
-
-```
-crates/quickhouse-core/   # pure-Rust engine (unit-testable, no Python)
-  src/source/postgres.rs   # PostgreSQL: binary COPY, schema/partition queries
-  src/source/mysql.rs      # MySQL: streaming SELECT, schema/partition queries
-  src/source/bigquery.rs   # BigQuery: auth, schema resolution, Storage Read API
-  src/decode.rs            # PostgreSQL COPY wire format -> Arrow
-  src/decode_mysql.rs       # MySQL typed rows -> Arrow
-  src/decode_bigquery.rs    # BigQuery typed rows -> Arrow
-  src/types.rs              # per-source type -> Arrow -> ClickHouse mapping
-  src/sync.rs               # orchestration; dispatches on the `Source` enum
-crates/quickhouse-py/     # PyO3 bindings (cdylib -> quickhouse._quickhouse)
-python/quickhouse/        # typed Python surface (__init__.py, .pyi stubs)
-tests/                  # pytest integration tests
-docker-compose.yml      # local PostgreSQL + MySQL + ClickHouse
-```
+`RECORD`/`STRUCT` and repeated (`ARRAY`) fields aren't supported in v1 — same
+scalar-only scope as the Postgres/MySQL sources.
 
 ## Limitations / roadmap (v1)
 
-- TLS uses rustls, trusting the public CA roots (`webpki-roots`) plus,
-  optionally, an extra CA file via `ca_cert_file=...` on either `Postgres` or
-  `MySQL` — needed for providers like AWS RDS whose certificates chain to a
-  private regional CA rather than a public one. For PostgreSQL, whether TLS is
-  used follows the normal libpq `sslmode` query parameter on the DSN
-  (`disable` | `prefer` (default) | `require`); MySQL has no such DSN
-  convention, so use `MySQL(..., require_tls=True)` explicitly. Client-certificate
-  (mTLS) auth isn't supported for either source yet.
-- Array and `time` types have limited support; extend `types.rs` + `decode.rs`
-  (Postgres) / `decode_mysql.rs` (MySQL) / `decode_bigquery.rs` (BigQuery).
-- **BigQuery parallelism**: `parallelism` is passed to BigQuery as a
-  stream-count hint (server-side parallel preparation), but rows are
-  currently consumed on a single connection rather than fanned out across
-  concurrent local tasks like Postgres/MySQL. Multi-statement BigQuery
-  *script* jobs aren't supported for `source_query` (only single `SELECT`
-  statements) — the destination-table resolution needed for the Storage Read
-  API doesn't follow child jobs.
+- TLS uses rustls, trusting the public CA roots plus, optionally, an extra CA
+  file via `ca_cert_file=...` on `Postgres`/`MySQL` (needed for providers like
+  AWS RDS with a private regional CA). PostgreSQL follows the libpq `sslmode` DSN
+  parameter (`disable` | `prefer` (default) | `require`); MySQL has no such
+  convention, so use `MySQL(..., require_tls=True)`. Client-certificate (mTLS)
+  auth isn't supported yet.
+- Array and composite (`RECORD`/`STRUCT`) types aren't supported; extend
+  `types.rs` + the relevant `decode*.rs`.
+- **BigQuery parallelism**: `parallelism` is passed as a stream-count hint
+  (server-side parallel preparation), but rows are consumed on a single
+  connection rather than fanned out across concurrent local tasks. Only single
+  `SELECT` statements are supported for `source_query` (not multi-statement
+  scripts).
 - No CLI yet — a config-driven CLI over the same engine is planned.
 - Logical-replication CDC and arbitrary transform callbacks are future work.
 
-## Releasing
+## Contributing
 
-CI (`.github/workflows/release.yml`) builds wheels for Linux (manylinux x86_64),
-macOS (Intel + Apple Silicon), and Windows (x86_64) plus an sdist, then publishes
-via **PyPI Trusted Publishing** (OIDC — no API tokens stored anywhere).
-
-**One-time setup:**
-
-1. In the GitHub repo settings, create two **Environments**: `testpypi` and `pypi`
-   (Settings → Environments). On `pypi`, add yourself as a **required reviewer** —
-   this gives you a manual approval gate before the irreversible real-PyPI publish.
-2. On [test.pypi.org](https://test.pypi.org) and [pypi.org](https://pypi.org),
-   add a **Trusted Publisher** for the `quickhouse` project (Account settings →
-   Publishing), pointing at this repo, workflow file `release.yml`, and the
-   matching environment name (`testpypi` / `pypi`). Since the project doesn't
-   exist yet on either index, use each site's "publish a new project" /
-   pending-publisher flow.
-
-**Cutting a release:**
-
-```bash
-# bump the version in Cargo.toml and pyproject.toml, commit, then:
-git tag v0.1.0
-git push origin v0.1.0
-```
-
-Pushing the tag triggers the workflow: it builds all wheels, publishes to
-TestPyPI automatically, then waits for your approval on the `pypi` environment
-before publishing the real release. Verify the TestPyPI install first:
-
-```bash
-pip install --index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/ quickhouse
-```
+Bug reports, source/type-mapping additions, and PRs are welcome. Build steps,
+the test workflow, project layout, and the release process live in
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 

@@ -76,6 +76,91 @@ def test_full_refresh_reconciles(pg_conn, ch_client, pg_source, ch_target, uniqu
         _drop_ch(ch_client, table)
 
 
+def test_full_refresh_coerces_out_of_range_dates_to_null(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """Regression test: a valid PostgreSQL date/timestamp whose year is outside
+    ClickHouse's Date32/DateTime64 window ([1900-01-01, 2299-12-31]) used to
+    abort the whole transfer at insert time (VALUE_IS_OUT_OF_RANGE_OF_DATA_TYPE).
+    PostgreSQL's date range is far wider than ClickHouse's, so this is reachable
+    with ordinary data; out-of-range values must coerce to NULL and complete."""
+    table = unique_name
+    with pg_conn.cursor() as cur:
+        cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+        cur.execute(
+            f"""
+            CREATE TABLE "{table}" (
+                id          bigint PRIMARY KEY,
+                event_date  date,
+                event_at    timestamp
+            )
+            """
+        )
+        with cur.copy(f'COPY "{table}" (id, event_date, event_at) FROM STDIN') as copy:
+            copy.write_row((1, "2024-05-01", "2024-05-01 10:00:00"))  # in range
+            copy.write_row((2, "3000-01-01", "3000-01-01 00:00:00"))  # far future
+            copy.write_row((3, "1000-01-01", "1000-01-01 00:00:00"))  # far past
+    _drop_ch(ch_client, table)
+    try:
+        result = quickhouse.sync(
+            pg_source,
+            ch_target,
+            dest_table=table,
+            source_table=table,
+            mode="full",
+            key=["id"],
+            create_if_missing=True,
+        )
+        assert result.rows_written == 3
+
+        null_dates = ch_client.command(f"SELECT countIf(event_date IS NULL) FROM `{table}`")
+        assert int(null_dates) == 2
+        null_ts = ch_client.command(f"SELECT countIf(event_at IS NULL) FROM `{table}`")
+        assert int(null_ts) == 2
+
+        valid = ch_client.command(f"SELECT event_date FROM `{table}` WHERE id = 1")
+        assert str(valid) == "2024-05-01"
+    finally:
+        _drop_ch(ch_client, table)
+
+
+def test_time_column_stored_as_text(pg_conn, ch_client, pg_source, ch_target, unique_name):
+    """PostgreSQL TIME maps to a ClickHouse String and round-trips as canonical
+    HH:MM:SS[.ffffff] text. Previously the column carried an Arrow Time64
+    physical type into a String destination, which stored a bogus value."""
+    table = unique_name
+    with pg_conn.cursor() as cur:
+        cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+        cur.execute(f'CREATE TABLE "{table}" (id bigint PRIMARY KEY, t time, t2 time)')
+        with cur.copy(f'COPY "{table}" (id, t, t2) FROM STDIN') as copy:
+            copy.write_row((1, "10:30:00", "23:59:59.123456"))
+            copy.write_row((2, "00:00:00", None))
+    _drop_ch(ch_client, table)
+    try:
+        result = quickhouse.sync(
+            pg_source,
+            ch_target,
+            dest_table=table,
+            source_table=table,
+            mode="full",
+            key=["id"],
+            create_if_missing=True,
+        )
+        assert result.rows_written == 2
+
+        col_type = ch_client.command(
+            f"SELECT type FROM system.columns "
+            f"WHERE database = currentDatabase() AND table = '{table}' AND name = 't'"
+        )
+        assert "String" in col_type
+
+        assert str(ch_client.command(f"SELECT t FROM `{table}` WHERE id = 1")) == "10:30:00"
+        assert str(ch_client.command(f"SELECT t2 FROM `{table}` WHERE id = 1")) == "23:59:59.123456"
+        assert int(ch_client.command(f"SELECT countIf(t2 IS NULL) FROM `{table}`")) == 1
+    finally:
+        _drop_ch(ch_client, table)
+
+
 def test_full_refresh_zstd_with_tight_memory_budget(
     pg_conn, ch_client, pg_source, ch_target_zstd, unique_name
 ):

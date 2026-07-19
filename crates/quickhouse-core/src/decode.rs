@@ -15,14 +15,13 @@ use std::sync::Arc;
 
 use arrow_array::builder::{
     BinaryBuilder, BooleanBuilder, Date32Builder, Float32Builder, Float64Builder, Int16Builder,
-    Int32Builder, Int64Builder, StringBuilder, Time64MicrosecondBuilder,
-    TimestampMicrosecondBuilder, UInt32Builder,
+    Int32Builder, Int64Builder, StringBuilder, TimestampMicrosecondBuilder, UInt32Builder,
 };
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 
 use crate::error::{EtlError, Result};
-use crate::types::{oid, ColumnType};
+use crate::types::{ch_range, oid, ColumnType};
 
 const SIGNATURE: &[u8; 11] = b"PGCOPY\n\xff\r\n\0";
 /// Days between 1970-01-01 (Arrow epoch) and 2000-01-01 (PostgreSQL epoch).
@@ -45,7 +44,6 @@ enum ColBuilder {
     Bin(BinaryBuilder),
     Date(Date32Builder),
     Ts(TimestampMicrosecondBuilder, Option<Arc<str>>),
-    Time(Time64MicrosecondBuilder),
 }
 
 impl ColBuilder {
@@ -63,9 +61,6 @@ impl ColBuilder {
             DataType::Date32 => ColBuilder::Date(Date32Builder::new()),
             DataType::Timestamp(TimeUnit::Microsecond, tz) => {
                 ColBuilder::Ts(TimestampMicrosecondBuilder::new(), tz.clone())
-            }
-            DataType::Time64(TimeUnit::Microsecond) => {
-                ColBuilder::Time(Time64MicrosecondBuilder::new())
             }
             other => {
                 return Err(EtlError::decode(format!(
@@ -88,12 +83,18 @@ impl ColBuilder {
             ColBuilder::Bin(b) => b.append_null(),
             ColBuilder::Date(b) => b.append_null(),
             ColBuilder::Ts(b, _) => b.append_null(),
-            ColBuilder::Time(b) => b.append_null(),
         }
     }
 
     /// Decode a non-NULL field's raw binary bytes for the given PostgreSQL OID.
-    fn append_value(&mut self, pg_oid: u32, buf: &[u8]) -> Result<()> {
+    ///
+    /// Returns `true` if the value was a valid date/datetime whose year is
+    /// outside ClickHouse's representable window ([`ch_range`]) and so was
+    /// coerced to NULL rather than sent on to be rejected at insert time (which
+    /// would abort the whole transfer). PostgreSQL's DATE/TIMESTAMP range is far
+    /// wider than ClickHouse's, so this is reachable with ordinary data.
+    fn append_value(&mut self, pg_oid: u32, buf: &[u8]) -> Result<bool> {
+        let mut coerced_to_null = false;
         match self {
             ColBuilder::Bool(b) => b.append_value(buf.first().map(|&x| x != 0).unwrap_or(false)),
             ColBuilder::I16(b) => b.append_value(read_i16(buf)?),
@@ -111,22 +112,44 @@ impl ColBuilder {
                 b.append_value(v);
             }
             ColBuilder::Str(b) => {
-                // jsonb wire format prefixes a 1-byte version header.
-                let bytes = if pg_oid == oid::JSONB && !buf.is_empty() {
-                    &buf[1..]
+                if pg_oid == oid::TIME {
+                    // TIME arrives as an i64 of microseconds since midnight and
+                    // maps to a ClickHouse String (no time-of-day type); render
+                    // it as canonical "HH:MM:SS[.ffffff]" text.
+                    b.append_value(format_pg_time(read_i64(buf)?));
                 } else {
-                    buf
-                };
-                let s = std::str::from_utf8(bytes)
-                    .map_err(|e| EtlError::decode(format!("invalid utf8: {e}")))?;
-                b.append_value(s);
+                    // jsonb wire format prefixes a 1-byte version header.
+                    let bytes = if pg_oid == oid::JSONB && !buf.is_empty() {
+                        &buf[1..]
+                    } else {
+                        buf
+                    };
+                    let s = std::str::from_utf8(bytes)
+                        .map_err(|e| EtlError::decode(format!("invalid utf8: {e}")))?;
+                    b.append_value(s);
+                }
             }
             ColBuilder::Bin(b) => b.append_value(buf),
-            ColBuilder::Date(b) => b.append_value(read_i32(buf)? + PG_EPOCH_DAYS),
-            ColBuilder::Ts(b, _) => b.append_value(read_i64(buf)? + PG_EPOCH_MICROS),
-            ColBuilder::Time(b) => b.append_value(read_i64(buf)?),
+            ColBuilder::Date(b) => {
+                let days = read_i32(buf)?.saturating_add(PG_EPOCH_DAYS);
+                if ch_range::days_in_range(days) {
+                    b.append_value(days);
+                } else {
+                    b.append_null();
+                    coerced_to_null = true;
+                }
+            }
+            ColBuilder::Ts(b, _) => {
+                let micros = read_i64(buf)?.saturating_add(PG_EPOCH_MICROS);
+                if ch_range::micros_in_range(micros) {
+                    b.append_value(micros);
+                } else {
+                    b.append_null();
+                    coerced_to_null = true;
+                }
+            }
         }
-        Ok(())
+        Ok(coerced_to_null)
     }
 
     fn finish(&mut self) -> ArrayRef {
@@ -148,8 +171,23 @@ impl ColBuilder {
                     None => Arc::new(arr),
                 }
             }
-            ColBuilder::Time(b) => Arc::new(b.finish()),
         }
+    }
+}
+
+/// Format a PostgreSQL `time` value (microseconds since midnight, always in
+/// `[0, 24h)`) as canonical `HH:MM:SS[.ffffff]` text for a ClickHouse String
+/// column. The fractional part is emitted only when non-zero, matching how
+/// PostgreSQL and MySQL render TIME.
+fn format_pg_time(micros: i64) -> String {
+    let micros = micros.max(0);
+    let sub = micros % 1_000_000;
+    let total_secs = micros / 1_000_000;
+    let (h, m, s) = (total_secs / 3600, (total_secs % 3600) / 60, total_secs % 60);
+    if sub > 0 {
+        format!("{h:02}:{m:02}:{s:02}.{sub:06}")
+    } else {
+        format!("{h:02}:{m:02}:{s:02}")
     }
 }
 
@@ -221,6 +259,9 @@ pub struct CopyDecoder {
     batch_bytes: usize,
     /// Total rows decoded across the whole stream.
     pub rows_total: u64,
+    /// Count of valid dates/datetimes whose year fell outside ClickHouse's
+    /// representable window and were coerced to NULL (see `ColBuilder::append_value`).
+    pub invalid_dates_total: u64,
 }
 
 impl CopyDecoder {
@@ -249,6 +290,7 @@ impl CopyDecoder {
             batch_rows,
             batch_bytes,
             rows_total: 0,
+            invalid_dates_total: 0,
         })
     }
 
@@ -380,7 +422,9 @@ impl CopyDecoder {
                 None => self.builders[i].append_null(),
                 Some((s, e)) => {
                     let oid = self.oids[i];
-                    self.builders[i].append_value(oid, &self.buf[*s..*e])?;
+                    if self.builders[i].append_value(oid, &self.buf[*s..*e])? {
+                        self.invalid_dates_total += 1;
+                    }
                 }
             }
         }

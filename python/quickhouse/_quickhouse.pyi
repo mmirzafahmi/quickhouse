@@ -163,7 +163,9 @@ def sync(
     descriptor; everything else about the call is identical either way.
     Either ``source_table`` or ``source_query`` must be provided. For
     ``mode="incremental"``, ``watermark`` is required and only rows newer than
-    the last recorded watermark are copied.
+    the last recorded watermark are copied. In ``mode="full"`` the watermark is
+    unused and ignored (cleared to ``None``), and the returned ``new_watermark``
+    is ``None``.
 
     Memory vs. batch sizing:
 

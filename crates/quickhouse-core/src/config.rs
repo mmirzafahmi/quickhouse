@@ -165,6 +165,18 @@ impl TransferConfig {
         }
     }
 
+    /// Clear fields that a given mode doesn't use, so the effective config
+    /// matches what actually runs. In full-refresh mode the watermark is
+    /// meaningless — there's no "since last run" filter and the generated DDL
+    /// uses a plain `MergeTree` (not `ReplacingMergeTree(<watermark>)`) — so a
+    /// watermark passed alongside `mode="full"` is dropped here, and the
+    /// returned `new_watermark` is `None`.
+    pub fn normalize(&mut self) {
+        if self.mode == SyncMode::Full {
+            self.watermark = None;
+        }
+    }
+
     pub fn validate(&self) -> crate::error::Result<()> {
         use crate::error::EtlError;
         if self.source_table.is_none() && self.source_query.is_none() {
@@ -203,4 +215,48 @@ pub struct TransferResult {
     pub bytes_written: u64,
     pub duration_secs: f64,
     pub new_watermark: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(mode: SyncMode, watermark: Option<&str>) -> TransferConfig {
+        TransferConfig {
+            source_table: Some("t".into()),
+            source_query: None,
+            dest_table: "t".into(),
+            mode,
+            watermark: watermark.map(str::to_string),
+            key: vec!["id".into()],
+            create_if_missing: true,
+            engine: None,
+            order_by: vec![],
+            partition_by: None,
+            primary_key: vec![],
+            parallelism: 1,
+            batch_rows: 1000,
+            batch_bytes: 0,
+            max_memory_bytes: 0,
+            partition_column: None,
+            type_overrides: HashMap::new(),
+            rename: HashMap::new(),
+            include: vec![],
+            exclude: vec![],
+        }
+    }
+
+    #[test]
+    fn normalize_clears_watermark_in_full_mode() {
+        let mut c = cfg(SyncMode::Full, Some("write_date"));
+        c.normalize();
+        assert_eq!(c.watermark, None, "watermark is unused in full mode");
+    }
+
+    #[test]
+    fn normalize_keeps_watermark_in_incremental_mode() {
+        let mut c = cfg(SyncMode::Incremental, Some("write_date"));
+        c.normalize();
+        assert_eq!(c.watermark.as_deref(), Some("write_date"));
+    }
 }

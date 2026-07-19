@@ -231,8 +231,13 @@ impl MySqlSource {
                 t = quote_my_table(from_table.expect("table required"))
             )
         };
-        conn.query_first(sql)
+        // MAX() over an empty table (or an all-NULL column) returns one row
+        // whose value is SQL NULL — must be requested as `Option<String>`,
+        // not `String`, or mysql_common panics converting NULL to a bare
+        // String instead of returning `None` (see FromRow documentation).
+        conn.query_first::<Option<String>, _>(sql)
             .await
+            .map(|row| row.flatten())
             .map_err(|e| EtlError::other(format!("mysql error: {e}")))
     }
 }
