@@ -13,6 +13,8 @@ Run against the services in ``docker-compose.yml`` after building the module:
 
 from __future__ import annotations
 
+import pytest
+
 import quickhouse
 
 
@@ -285,6 +287,36 @@ def test_time_column_stored_as_text(
         assert vals[2] == "-05:00:00"
         assert vals[3] == "838:59:59"  # 34d 22h -> 838 accumulated hours
         assert vals[4] is None
+    finally:
+        _drop_ch(ch_client, table)
+
+
+def test_incremental_missing_watermark_column_errors_clearly(
+    mysql_conn, ch_client, mysql_source, ch_target, unique_name
+):
+    """A watermark column absent from the source must fail with a clear config
+    error naming the available columns — not the cryptic driver error the
+    MAX(watermark) probe raised before (MySQL 1054 'Unknown column ... in
+    field list'). Common trigger: one watermark reused across a batch of tables
+    where this one lacks it."""
+    table = unique_name
+    with mysql_conn.cursor() as cur:
+        cur.execute(f"DROP TABLE IF EXISTS `{table}`")
+        cur.execute(f"CREATE TABLE `{table}` (id BIGINT PRIMARY KEY, name TEXT)")
+        cur.execute(f"INSERT INTO `{table}` (id, name) VALUES (1, 'a')")
+    _drop_ch(ch_client, table)
+    try:
+        with pytest.raises(RuntimeError, match=r"watermark column 'created_date' not found"):
+            quickhouse.sync(
+                mysql_source,
+                ch_target,
+                dest_table=table,
+                source_table=table,
+                mode="incremental",
+                watermark="created_date",  # not a column of this table
+                key=["id"],
+                create_if_missing=True,
+            )
     finally:
         _drop_ch(ch_client, table)
 

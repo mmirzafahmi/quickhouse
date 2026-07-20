@@ -385,6 +385,7 @@ async fn run_transfer_bigquery(
 
     let (row_restriction, new_watermark) = if cfg.mode == SyncMode::Incremental {
         let watermark = cfg.watermark.as_ref().unwrap();
+        ensure_watermark_column(watermark, &source_cols)?;
         let last = read_last_watermark(&sink, &cfg).await?;
         let table_sql = crate::source::bigquery::table_sql(&table_ref);
         let snapshot_max = source
@@ -511,6 +512,7 @@ async fn setup_postgres(
     // case (e.g. an empty table's MAX() being NULL) for a result nothing uses.
     let snapshot_max = if cfg.mode == SyncMode::Incremental {
         if let Some(w) = watermark {
+            ensure_watermark_column(w, &source_cols)?;
             s.max_watermark(&control, base_table, base_query, w).await?
         } else {
             None
@@ -550,6 +552,7 @@ async fn setup_mysql(
     // case (e.g. an empty table's MAX() being NULL) for a result nothing uses.
     let snapshot_max = if cfg.mode == SyncMode::Incremental {
         if let Some(w) = watermark {
+            ensure_watermark_column(w, &source_cols)?;
             s.max_watermark(&mut control, base_table, base_query, w)
                 .await?
         } else {
@@ -702,6 +705,26 @@ fn warn_coerced_dates(scope: &str, n: u64) {
              window like '9999-12-31') coerced to NULL"
         );
     }
+}
+
+/// Fail early (before any query touches it) if the incremental `watermark`
+/// column isn't among the resolved source columns. Without this, the watermark
+/// only surfaces deep in the setup as a cryptic driver error — e.g. MySQL 1054
+/// `Unknown column '<w>' in 'field list'` from the `MAX(<w>)` probe — that
+/// doesn't say the problem is the `watermark` argument. Common trigger: one
+/// `watermark=...` reused across a batch of tables where one table lacks it.
+fn ensure_watermark_column(watermark: &str, source_cols: &[ColumnType]) -> Result<()> {
+    if source_cols.iter().any(|c| c.name == watermark) {
+        return Ok(());
+    }
+    let available = source_cols
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(EtlError::config(format!(
+        "watermark column '{watermark}' not found in source; available columns: {available}"
+    )))
 }
 
 fn emit_progress(counters: &Counters, progress: &Option<ProgressCb>, started: Instant) {
@@ -973,4 +996,36 @@ async fn persist_watermark(
         rows,
     );
     sink.execute(&sql).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_schema::DataType;
+
+    fn col(name: &str) -> ColumnType {
+        ColumnType {
+            name: name.into(),
+            type_id: 0,
+            nullable: true,
+            arrow: DataType::Int64,
+            clickhouse_inner: "Int64".into(),
+        }
+    }
+
+    #[test]
+    fn watermark_column_present_ok() {
+        let cols = vec![col("id"), col("write_date")];
+        assert!(ensure_watermark_column("write_date", &cols).is_ok());
+    }
+
+    #[test]
+    fn watermark_column_missing_errors_and_lists_available() {
+        let cols = vec![col("id"), col("name")];
+        let msg = ensure_watermark_column("created_date", &cols)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("created_date"), "names the missing column: {msg}");
+        assert!(msg.contains("id") && msg.contains("name"), "lists available: {msg}");
+    }
 }
