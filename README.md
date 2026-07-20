@@ -12,11 +12,11 @@ streaming, automatic table creation, and both full-refresh and incremental
 ```python
 import quickhouse
 
-src = quickhouse.Postgres("postgresql://user:pw@localhost:5432/odoo")
+src = quickhouse.Postgres("postgresql://user:pw@localhost:5432/shop")
 dst = quickhouse.ClickHouse("http://localhost:8123", database="analytics")
 
-result = quickhouse.sync(src, dst, dest_table="account_move_line",
-                         source_table="account_move_line", key=["id"])
+result = quickhouse.sync(src, dst, dest_table="orders",
+                         source_table="orders", key=["id"])
 print(result)   # rows_read, rows_written, bytes_written, duration_secs, new_watermark
 ```
 
@@ -69,22 +69,22 @@ Rust toolchain and maturin — see [CONTRIBUTING.md](CONTRIBUTING.md).
 ```python
 import quickhouse as qh
 
-src = qh.Postgres("postgresql://user:pw@localhost:5432/odoo")
-# or: src = qh.MySQL("mysql://user:pw@localhost:3306/odoo")
+src = qh.Postgres("postgresql://user:pw@localhost:5432/shop")
+# or: src = qh.MySQL("mysql://user:pw@localhost:3306/shop")
 # or: src = qh.BigQuery("my-gcp-project")   # source_table="dataset.table"
 dst = qh.ClickHouse("http://localhost:8123", database="analytics")
 
 result = qh.sync(
     src, dst,
-    dest_table="account_move_line",
-    source_table="account_move_line",
+    dest_table="orders",
+    source_table="orders",
     mode="incremental",           # or "full"
-    watermark="write_date",       # required for incremental
+    watermark="updated_at",       # required for incremental
     key=["id"],                   # ORDER BY / dedup key
     create_if_missing=True,       # auto-generate the ClickHouse table
     parallelism=8,
     batch_rows=100_000,
-    exclude=["display_name"],
+    exclude=["internal_notes"],
     rename={"amount": "amt"},
     type_overrides={"amt": "Decimal(18, 2)"},
     on_progress=lambda p: print(f"{p.rows_written:,} rows @ {p.rows_per_sec:,.0f}/s"),
@@ -146,6 +146,25 @@ RUST_LOG=quickhouse_core=debug python my_script.py   # + actual SQL/DDL text
 RUST_LOG=debug python my_script.py                   # everything, incl. deps
 ```
 
+### Errors
+
+Every failure raises a plain Python `RuntimeError` whose message is built to be
+actionable on its own, without needing to scroll back through stderr logs:
+
+- **Every error names the table it happened to** — `sync()` is often called in
+  a loop over many tables (see the quickstart), so the message is always
+  prefixed with `"<source> -> <dest_table>: ..."`.
+- **Bad config or a data-shape problem says exactly what's wrong**, e.g. an
+  incremental `watermark` column that doesn't exist in the source names the
+  columns that do; a source column type with no ClickHouse mapping (an array,
+  a geometry type, BigQuery `RECORD`) names the real engine, the real type, and
+  suggests a fix — `exclude=[...]` the column, or cast it in a `source_query`.
+- **A message starting with "internal error"** means the failure couldn't have
+  been caused by your data or config — please file an issue with the message.
+- Everything else (connection failures, a rejected `INSERT`, etc.) surfaces the
+  underlying database's own error text — e.g. Postgres's SQLSTATE code and
+  message, or ClickHouse's exception code — rather than a generic wrapper.
+
 ### `sync()` parameters
 
 | Parameter | Meaning |
@@ -153,7 +172,7 @@ RUST_LOG=debug python my_script.py                   # everything, incl. deps
 | `source_table` / `source_query` | Read a whole table, or a custom `SELECT` (one is required) |
 | `dest_table` | Destination table in the ClickHouse database |
 | `mode` | `"full"` or `"incremental"` |
-| `watermark` | Monotonic column (e.g. `write_date`, `id`) — required for incremental; ignored (cleared to `None`) in full mode |
+| `watermark` | Monotonic column (e.g. `updated_at`, `id`) — required for incremental; ignored (cleared to `None`) in full mode |
 | `key` | Business key → ClickHouse `ORDER BY` and dedup key |
 | `create_if_missing` | Auto-run generated `CREATE TABLE` when the destination is absent |
 | `engine`, `order_by`, `partition_by`, `primary_key` | DDL knobs (sensible defaults per mode) |

@@ -235,8 +235,12 @@ fn columns_from_schema(schema: &TableSchema) -> Result<Vec<ColumnType>> {
     let mut cols = Vec::with_capacity(schema.fields.len());
     for f in &schema.fields {
         let (type_id, arrow, ch_inner) = map_type(&f.data_type).ok_or_else(|| EtlError::UnsupportedType {
-            oid: 0,
-            context: f.name.clone(),
+            engine: "BigQuery",
+            column: f.name.clone(),
+            // TableFieldType's Debug repr is its variant name (e.g. "Record",
+            // "Struct"), not a placeholder — every unsupported BigQuery type
+            // (RECORD/STRUCT, repeated/ARRAY fields) is one of these.
+            type_name: format!("{:?}", f.data_type),
         })?;
         let nullable = !matches!(f.mode, Some(TableFieldMode::Required));
         cols.push(ColumnType {

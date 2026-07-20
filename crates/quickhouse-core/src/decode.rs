@@ -63,7 +63,10 @@ impl ColBuilder {
                 ColBuilder::Ts(TimestampMicrosecondBuilder::new(), tz.clone())
             }
             other => {
-                return Err(EtlError::decode(format!(
+                // Reachable only if types.rs maps some OID to an Arrow type
+                // this decoder doesn't implement a builder for — a mapping/
+                // decoder mismatch, not anything a source column can trigger.
+                return Err(EtlError::internal(format!(
                     "no column builder for Arrow type {other:?}"
                 )))
             }
@@ -191,27 +194,35 @@ fn format_pg_time(micros: i64) -> String {
     }
 }
 
+// These "short" checks fail only if a field's declared wire length doesn't
+// match what its resolved column type requires — i.e. the schema resolved by
+// `resolve_columns` disagrees with what COPY is actually streaming (e.g. the
+// table's schema changed between the two). Not something malformed source
+// *data* can trigger on its own, so these are framed as internal errors.
 fn read_i16(buf: &[u8]) -> Result<i16> {
     buf.get(0..2)
         .map(|b| i16::from_be_bytes([b[0], b[1]]))
-        .ok_or_else(|| EtlError::decode("short int2"))
+        .ok_or_else(|| EtlError::internal(format!("expected a 2-byte int2 field, got {} byte(s)", buf.len())))
 }
 fn read_i32(buf: &[u8]) -> Result<i32> {
     buf.get(0..4)
         .map(|b| i32::from_be_bytes([b[0], b[1], b[2], b[3]]))
-        .ok_or_else(|| EtlError::decode("short int4"))
+        .ok_or_else(|| EtlError::internal(format!("expected a 4-byte int4 field, got {} byte(s)", buf.len())))
 }
 fn read_i64(buf: &[u8]) -> Result<i64> {
     buf.get(0..8)
         .map(|b| i64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
-        .ok_or_else(|| EtlError::decode("short int8"))
+        .ok_or_else(|| EtlError::internal(format!("expected an 8-byte int8 field, got {} byte(s)", buf.len())))
 }
 
 /// Decode PostgreSQL's `numeric` binary form to `f64` (approximate; exact
 /// arbitrary precision is intentionally out of scope for v1).
 fn decode_numeric(buf: &[u8]) -> Result<f64> {
     if buf.len() < 8 {
-        return Err(EtlError::decode("short numeric header"));
+        return Err(EtlError::internal(format!(
+            "truncated numeric header: expected at least 8 bytes, got {}",
+            buf.len()
+        )));
     }
     let ndigits = i16::from_be_bytes([buf[0], buf[1]]) as usize;
     let weight = i16::from_be_bytes([buf[2], buf[3]]) as i32;
@@ -221,7 +232,11 @@ fn decode_numeric(buf: &[u8]) -> Result<f64> {
         return Ok(f64::NAN);
     }
     if buf.len() < 8 + ndigits * 2 {
-        return Err(EtlError::decode("short numeric digits"));
+        return Err(EtlError::internal(format!(
+            "truncated numeric digits: expected {} more byte(s), got {}",
+            8 + ndigits * 2,
+            buf.len()
+        )));
     }
     let mut value = 0f64;
     for i in 0..ndigits {
@@ -368,7 +383,12 @@ impl CopyDecoder {
             return Ok(None);
         }
         if &buf[0..11] != SIGNATURE {
-            return Err(EtlError::decode("bad COPY signature"));
+            // The stream doesn't start with PGCOPY's fixed magic bytes — only
+            // possible if something other than `COPY ... (FORMAT binary)` fed
+            // this decoder, not from any content a source table could hold.
+            return Err(EtlError::internal(
+                "COPY stream did not start with the expected PGCOPY binary signature",
+            ));
         }
         let ext_len = read_i32(&buf[15..19])? as usize;
         let total = 19 + ext_len;
@@ -389,8 +409,11 @@ impl CopyDecoder {
             return Ok(Parsed::End);
         }
         if field_count as usize != self.oids.len() {
-            return Err(EtlError::decode(format!(
-                "field count {field_count} != schema columns {}",
+            // The row's field count disagrees with the resolved schema's
+            // column count — a decoder/schema mismatch, not something bad
+            // source data alone can cause.
+            return Err(EtlError::internal(format!(
+                "row has {field_count} field(s) but the resolved schema has {} column(s)",
                 self.oids.len()
             )));
         }
@@ -422,7 +445,10 @@ impl CopyDecoder {
                 None => self.builders[i].append_null(),
                 Some((s, e)) => {
                     let oid = self.oids[i];
-                    if self.builders[i].append_value(oid, &self.buf[*s..*e])? {
+                    let coerced = self.builders[i]
+                        .append_value(oid, &self.buf[*s..*e])
+                        .map_err(|err| err.context(format!("column '{}'", self.schema.field(i).name())))?;
+                    if coerced {
                         self.invalid_dates_total += 1;
                     }
                 }

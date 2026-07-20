@@ -99,8 +99,12 @@ impl MySqlSource {
             let is_tinyint1 = col_type == MyType::MYSQL_TYPE_TINY && c.column_length() == 1;
             let (arrow, ch_inner) = map_mysql_type(col_type, is_unsigned, is_tinyint1)
                 .ok_or_else(|| EtlError::UnsupportedType {
-                    oid: col_type as u8 as u32,
-                    context: c.name_str().to_string(),
+                    engine: "MySQL",
+                    column: c.name_str().to_string(),
+                    // ColumnType's Debug repr is its wire-protocol constant
+                    // name (e.g. "MYSQL_TYPE_GEOMETRY") — human-readable,
+                    // unlike the raw numeric code used previously.
+                    type_name: format!("{col_type:?}"),
                 })?;
             let nullable = !c.flags().contains(ColumnFlags::NOT_NULL_FLAG);
             cols.push(ColumnType {

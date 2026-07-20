@@ -7,12 +7,12 @@ Python surface over the compiled extension.
 Example
 -------
 >>> import quickhouse
->>> src = quickhouse.Postgres("postgresql://user:pw@localhost:5432/odoo")
+>>> src = quickhouse.Postgres("postgresql://user:pw@localhost:5432/shop")
 >>> dst = quickhouse.ClickHouse("http://localhost:8123", database="analytics")
 >>> result = quickhouse.sync(
-...     src, dst, dest_table="account_move_line",
-...     source_table="account_move_line",
-...     mode="incremental", watermark="write_date", key=["id"],
+...     src, dst, dest_table="orders",
+...     source_table="orders",
+...     mode="incremental", watermark="updated_at", key=["id"],
 ...     create_if_missing=True, parallelism=8,
 ...     on_progress=lambda p: print(f"{p.rows_written:,} rows @ {p.rows_per_sec:,.0f}/s"),
 ... )

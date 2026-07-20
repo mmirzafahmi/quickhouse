@@ -123,9 +123,14 @@ impl PgSource {
         let mut cols = Vec::with_capacity(stmt.columns().len());
         for c in stmt.columns() {
             let pg_oid = c.type_().oid();
+            // `c.type_().name()` is already resolved by tokio_postgres's own
+            // pg_type catalog lookup during `prepare()` — a real name like
+            // "point"/"interval"/"_int4", not just a numeric oid — even for
+            // types this crate doesn't otherwise recognize.
             let (arrow, ch_inner) = map_oid(pg_oid).ok_or_else(|| EtlError::UnsupportedType {
-                oid: pg_oid,
-                context: c.name().to_string(),
+                engine: "PostgreSQL",
+                column: c.name().to_string(),
+                type_name: c.type_().name().to_string(),
             })?;
             let nullable = !not_null.contains(&c.name().to_string());
             cols.push(ColumnType {
@@ -408,12 +413,12 @@ OCm3XK2CW4/x+Z55ntrAffyyonL3V3vHIz7fokiz5H+l
         };
         let sql = src.copy_sql(
             &["id".to_string(), "name".to_string()],
-            Some("public.account_move_line"),
+            Some("public.orders"),
             None,
             &part,
-            Some("\"write_date\" > '2024-01-01'"),
+            Some("\"updated_at\" > '2024-01-01'"),
         );
-        assert!(sql.starts_with("COPY (SELECT \"id\", \"name\" FROM \"public\".\"account_move_line\""));
+        assert!(sql.starts_with("COPY (SELECT \"id\", \"name\" FROM \"public\".\"orders\""));
         assert!(sql.contains("WHERE"));
         assert!(sql.ends_with("TO STDOUT (FORMAT binary)"));
     }

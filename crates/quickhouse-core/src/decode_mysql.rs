@@ -60,7 +60,9 @@ impl ColBuilder {
                 ColBuilder::Ts(TimestampMicrosecondBuilder::new())
             }
             other => {
-                return Err(EtlError::decode(format!(
+                // Reachable only if types.rs maps some MySQL column type to an
+                // Arrow type this decoder doesn't implement a builder for.
+                return Err(EtlError::internal(format!(
                     "no column builder for Arrow type {other:?}"
                 )))
             }
@@ -198,7 +200,11 @@ impl ColBuilder {
                 }
             }
             (_, value) => {
-                return Err(EtlError::decode(format!(
+                // The binary protocol (always used for row fetching — see
+                // transfer_partition_mysql) hands back a value shape that
+                // doesn't match what this column's resolved type expects —
+                // a types.rs mapping/decoder mismatch, not bad source data.
+                return Err(EtlError::internal(format!(
                     "unexpected MySQL value {value:?} for this column's builder"
                 )))
             }
@@ -287,8 +293,10 @@ impl MySqlBatcher {
     pub fn append_row(&mut self, row: Row) -> Result<Option<RecordBatch>> {
         let n = row.len();
         if n != self.builders.len() {
-            return Err(EtlError::decode(format!(
-                "row has {n} columns, expected {}",
+            // The result set's own shape disagrees with the resolved schema's
+            // column count — a decoder/schema mismatch, not bad source data.
+            return Err(EtlError::internal(format!(
+                "row has {n} column(s) but the resolved schema has {} column(s)",
                 self.builders.len()
             )));
         }
@@ -296,7 +304,10 @@ impl MySqlBatcher {
         for (i, builder) in self.builders.iter_mut().enumerate() {
             let value = row.as_ref(i).cloned().unwrap_or(Value::NULL);
             row_bytes += value_size(&value);
-            if builder.append_value(value)? {
+            let coerced = builder
+                .append_value(value)
+                .map_err(|e| e.context(format!("column '{}'", self.schema.field(i).name())))?;
+            if coerced {
                 self.invalid_dates_total += 1;
             }
         }

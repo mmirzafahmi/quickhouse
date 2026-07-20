@@ -21,8 +21,13 @@ use crate::error::{EtlError, Result};
 use crate::types::bigquery::type_id as id;
 use crate::types::{ch_range, ColumnType};
 
+/// A column's value didn't convert to the Rust type its resolved Arrow column
+/// expects — only reachable if the schema resolved from BigQuery's table
+/// metadata disagrees with what the Storage Read API actually sends for that
+/// column, a mapping/decoder mismatch rather than a value a source row itself
+/// could hold.
 fn conv_err(e: impl std::fmt::Display) -> EtlError {
-    EtlError::decode(format!("bigquery row decode error: {e}"))
+    EtlError::internal(format!("bigquery row decode error: {e}"))
 }
 
 enum ColBuilder {
@@ -48,7 +53,9 @@ impl ColBuilder {
                 ColBuilder::Ts(TimestampMicrosecondBuilder::new())
             }
             other => {
-                return Err(EtlError::decode(format!(
+                // Reachable only if types.rs maps some BigQuery field type to
+                // an Arrow type this decoder doesn't implement a builder for.
+                return Err(EtlError::internal(format!(
                     "no column builder for Arrow type {other:?}"
                 )))
             }
@@ -182,7 +189,10 @@ impl ColBuilder {
                 }
             }
             (_, t) => {
-                return Err(EtlError::decode(format!(
+                // The resolved type_id disagrees with this column's builder —
+                // a types.rs mapping/decoder mismatch, not anything a BigQuery
+                // row's actual value could cause.
+                return Err(EtlError::internal(format!(
                     "unexpected BigQuery type_id {t} for column index {index}"
                 )))
             }
@@ -252,7 +262,9 @@ impl BigQueryBatcher {
     pub fn append_row(&mut self, row: &Row) -> Result<Option<RecordBatch>> {
         let mut row_bytes = 0usize;
         for (i, builder) in self.builders.iter_mut().enumerate() {
-            let (size, coerced) = builder.append_from_row(row, i, self.type_ids[i])?;
+            let (size, coerced) = builder
+                .append_from_row(row, i, self.type_ids[i])
+                .map_err(|e| e.context(format!("column '{}'", self.schema.field(i).name())))?;
             row_bytes += size;
             if coerced {
                 self.invalid_dates_total += 1;

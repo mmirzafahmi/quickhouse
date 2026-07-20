@@ -119,7 +119,32 @@ struct SourceSetup {
 }
 
 /// Run one table transfer end to end.
+///
+/// Thin wrapper around [`run_transfer_impl`] that prefixes any error it
+/// returns with "which table" — e.g. `"orders -> analytics.orders: ..."` —
+/// so a script syncing many tables in a loop (a common pattern; see the
+/// README) can tell which one failed straight from the exception text, not
+/// just from scrolling back through stderr logs.
 pub async fn run_transfer(
+    source_cfg: SourceConfig,
+    ch: ClickHouseConfig,
+    cfg: TransferConfig,
+    progress: Option<ProgressCb>,
+) -> Result<TransferResult> {
+    let table_context = format!(
+        "{} -> {}",
+        cfg.source_table
+            .as_deref()
+            .or(cfg.source_query.as_deref())
+            .unwrap_or(""),
+        cfg.dest_table
+    );
+    run_transfer_impl(source_cfg, ch, cfg, progress)
+        .await
+        .map_err(|e| e.context(table_context))
+}
+
+async fn run_transfer_impl(
     source_cfg: SourceConfig,
     ch: ClickHouseConfig,
     cfg: TransferConfig,
