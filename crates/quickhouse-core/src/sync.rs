@@ -14,18 +14,19 @@ use futures::StreamExt;
 use mysql_async::prelude::*;
 use tokio::task::JoinSet;
 
-use crate::config::{ClickHouseConfig, SourceConfig, SyncMode, TransferConfig, TransferResult};
-use crate::ddl;
+use crate::config::{DestinationConfig, SourceConfig, SyncMode, TransferConfig, TransferResult};
 use crate::decode::CopyDecoder;
 use crate::decode_bigquery::BigQueryBatcher;
 use crate::decode_mysql::MySqlBatcher;
 use crate::error::{EtlError, Result};
 use crate::memory::MemoryBudget;
-use crate::sink::ClickHouseSink;
+use crate::sink::Sink;
 use crate::source::mysql::{quote_my, quote_my_table};
 use crate::source::{BigQuerySource, MySqlSource, PgSource, Partition, Source};
 use crate::transform::{self, SelectPlan};
+use crate::types::bigquery::arrow_to_bigquery_type;
 use crate::types::ColumnType;
+use google_cloud_bigquery::http::table::TableFieldType;
 
 /// Live progress snapshot passed to the optional callback.
 #[derive(Debug, Clone, Copy)]
@@ -51,7 +52,7 @@ struct Counters {
 /// sends against the *same* memory budget and counters.
 #[derive(Clone)]
 struct SendCtx {
-    sink: ClickHouseSink,
+    sink: Sink,
     budget: MemoryBudget,
     target_table: Arc<String>,
     counters: Arc<Counters>,
@@ -127,7 +128,7 @@ struct SourceSetup {
 /// just from scrolling back through stderr logs.
 pub async fn run_transfer(
     source_cfg: SourceConfig,
-    ch: ClickHouseConfig,
+    dest: DestinationConfig,
     cfg: TransferConfig,
     progress: Option<ProgressCb>,
 ) -> Result<TransferResult> {
@@ -139,14 +140,14 @@ pub async fn run_transfer(
             .unwrap_or(""),
         cfg.dest_table
     );
-    run_transfer_impl(source_cfg, ch, cfg, progress)
+    run_transfer_impl(source_cfg, dest, cfg, progress)
         .await
         .map_err(|e| e.context(table_context))
 }
 
 async fn run_transfer_impl(
     source_cfg: SourceConfig,
-    ch: ClickHouseConfig,
+    dest: DestinationConfig,
     cfg: TransferConfig,
     progress: Option<ProgressCb>,
 ) -> Result<TransferResult> {
@@ -190,7 +191,7 @@ async fn run_transfer_impl(
     // which was built for connection-oriented sources.
     if let SourceConfig::BigQuery(bq) = &source_cfg {
         let source = BigQuerySource::new(bq.project_id.clone(), bq.credentials_file.clone());
-        let sink = ClickHouseSink::new(ch)?;
+        let sink = Sink::new(dest).await?;
         return run_transfer_bigquery(&source, sink, cfg, progress, started).await;
     }
 
@@ -208,7 +209,7 @@ async fn run_transfer_impl(
         )),
         SourceConfig::BigQuery(_) => unreachable!("handled via early return above"),
     });
-    let sink = ClickHouseSink::new(ch)?;
+    let sink = Sink::new(dest).await?;
 
     let base_table = cfg.source_table.clone();
     let base_query = cfg.source_query.clone();
@@ -244,7 +245,7 @@ async fn run_transfer_impl(
     // --- Incremental: read last watermark, build the "since last run" filter. ---
     let (extra_filter, new_watermark) = if cfg.mode == SyncMode::Incremental {
         let watermark = cfg.watermark.as_ref().unwrap();
-        let last = read_last_watermark(&sink, &cfg).await?;
+        let last = sink.read_last_watermark(&cfg).await?;
         tracing::info!(
             "incremental watermark on '{}': last synced={:?}, current source max={:?}",
             watermark,
@@ -252,8 +253,12 @@ async fn run_transfer_impl(
             snapshot_max
         );
         let filter = match source.as_ref() {
-            Source::Postgres(_) => build_watermark_filter_pg(watermark, last.as_deref(), snapshot_max.as_deref()),
-            Source::MySql(_) => build_watermark_filter_mysql(watermark, last.as_deref(), snapshot_max.as_deref()),
+            Source::Postgres(_) => {
+                build_watermark_filter_pg(watermark, last.as_deref(), snapshot_max.as_deref(), cfg.lookback_seconds)
+            }
+            Source::MySql(_) => {
+                build_watermark_filter_mysql(watermark, last.as_deref(), snapshot_max.as_deref(), cfg.lookback_seconds)
+            }
             Source::BigQuery(_) => unreachable!("BigQuery is handled via the early return in run_transfer"),
         };
         (filter, snapshot_max)
@@ -338,22 +343,29 @@ async fn run_transfer_impl(
     // --- Full refresh: atomically swap staging into place. ---
     if cfg.mode == SyncMode::Full {
         tracing::info!("swapping staging table into '{}'", cfg.dest_table);
-        sink.exchange_tables(&cfg.dest_table, &staging_name(&cfg.dest_table))
+        sink.atomic_swap(&cfg.dest_table, &staging_name(&cfg.dest_table))
             .await?;
         sink.drop_table(&staging_name(&cfg.dest_table)).await?;
     }
 
-    // --- Incremental: persist the new watermark. ---
+    // --- Incremental: merge staged rows into the destination (destinations
+    // with no engine-level dedup), then persist the new watermark. ---
     if cfg.mode == SyncMode::Incremental {
-        if let Some(w) = &new_watermark {
-            tracing::info!("persisting new watermark: {w}");
-            persist_watermark(
-                &sink,
-                &cfg,
-                w,
-                counters.rows_written.load(Ordering::Relaxed),
+        if sink.requires_staging_for_incremental() {
+            tracing::info!("merging staged incremental rows into '{}'", cfg.dest_table);
+            sink.merge_into(
+                &cfg.dest_table,
+                &staging_name(&cfg.dest_table),
+                &cfg.key,
+                &plan.dest_columns,
             )
             .await?;
+            sink.drop_table(&staging_name(&cfg.dest_table)).await?;
+        }
+        if let Some(w) = &new_watermark {
+            tracing::info!("persisting new watermark: {w}");
+            sink.persist_watermark(&cfg, w, counters.rows_written.load(Ordering::Relaxed))
+                .await?;
         }
     }
 
@@ -379,7 +391,7 @@ async fn run_transfer_impl(
 /// `max_stream_count` hint for server-side parallel preparation.
 async fn run_transfer_bigquery(
     source: &BigQuerySource,
-    sink: ClickHouseSink,
+    sink: Sink,
     cfg: TransferConfig,
     progress: Option<ProgressCb>,
     started: Instant,
@@ -411,7 +423,8 @@ async fn run_transfer_bigquery(
     let (row_restriction, new_watermark) = if cfg.mode == SyncMode::Incremental {
         let watermark = cfg.watermark.as_ref().unwrap();
         ensure_watermark_column(watermark, &source_cols)?;
-        let last = read_last_watermark(&sink, &cfg).await?;
+        ensure_lookback_compatible(watermark, cfg.lookback_seconds, &source_cols)?;
+        let last = sink.read_last_watermark(&cfg).await?;
         let table_sql = crate::source::bigquery::table_sql(&table_ref);
         let snapshot_max = source
             .max_watermark(&client, &project_id, &table_sql, watermark)
@@ -422,7 +435,13 @@ async fn run_transfer_bigquery(
             last,
             snapshot_max
         );
-        let filter = build_watermark_filter_bigquery(watermark, last.as_deref(), snapshot_max.as_deref());
+        let filter = build_watermark_filter_bigquery(
+            watermark,
+            last.as_deref(),
+            snapshot_max.as_deref(),
+            cfg.lookback_seconds,
+            &source_cols,
+        );
         (filter, snapshot_max)
     } else {
         (None, None)
@@ -485,14 +504,26 @@ async fn run_transfer_bigquery(
 
     if cfg.mode == SyncMode::Full {
         tracing::info!("swapping staging table into '{}'", cfg.dest_table);
-        sink.exchange_tables(&cfg.dest_table, &staging_name(&cfg.dest_table))
+        sink.atomic_swap(&cfg.dest_table, &staging_name(&cfg.dest_table))
             .await?;
         sink.drop_table(&staging_name(&cfg.dest_table)).await?;
     }
     if cfg.mode == SyncMode::Incremental {
+        if sink.requires_staging_for_incremental() {
+            tracing::info!("merging staged incremental rows into '{}'", cfg.dest_table);
+            sink.merge_into(
+                &cfg.dest_table,
+                &staging_name(&cfg.dest_table),
+                &cfg.key,
+                &plan.dest_columns,
+            )
+            .await?;
+            sink.drop_table(&staging_name(&cfg.dest_table)).await?;
+        }
         if let Some(w) = &new_watermark {
             tracing::info!("persisting new watermark: {w}");
-            persist_watermark(&sink, &cfg, w, counters.rows_written.load(Ordering::Relaxed)).await?;
+            sink.persist_watermark(&cfg, w, counters.rows_written.load(Ordering::Relaxed))
+                .await?;
         }
     }
 
@@ -538,6 +569,7 @@ async fn setup_postgres(
     let snapshot_max = if cfg.mode == SyncMode::Incremental {
         if let Some(w) = watermark {
             ensure_watermark_column(w, &source_cols)?;
+            ensure_lookback_compatible(w, cfg.lookback_seconds, &source_cols)?;
             s.max_watermark(&control, base_table, base_query, w).await?
         } else {
             None
@@ -578,6 +610,7 @@ async fn setup_mysql(
     let snapshot_max = if cfg.mode == SyncMode::Incremental {
         if let Some(w) = watermark {
             ensure_watermark_column(w, &source_cols)?;
+            ensure_lookback_compatible(w, cfg.lookback_seconds, &source_cols)?;
             s.max_watermark(&mut control, base_table, base_query, w)
                 .await?
         } else {
@@ -752,6 +785,33 @@ fn ensure_watermark_column(watermark: &str, source_cols: &[ColumnType]) -> Resul
     )))
 }
 
+/// Fail early (before any query touches it) if `lookback_seconds` is set but
+/// the watermark column isn't a date/timestamp type. The lookback lower
+/// bound is expressed as SQL date arithmetic (`... - INTERVAL n SECOND`),
+/// which only makes sense for a temporal column; `TransferConfig::validate()`
+/// can't catch this itself since it only sees config, not resolved source
+/// columns. Reuses [`crate::types::may_coerce_to_null`]'s Date32/Timestamp
+/// check as the "is this temporal" predicate — same two types this crate
+/// already treats as its one temporal family.
+fn ensure_lookback_compatible(watermark: &str, lookback_seconds: u64, source_cols: &[ColumnType]) -> Result<()> {
+    if lookback_seconds == 0 {
+        return Ok(());
+    }
+    let col = source_cols
+        .iter()
+        .find(|c| c.name == watermark)
+        .expect("ensure_watermark_column already validated the watermark column exists");
+    if crate::types::may_coerce_to_null(&col.arrow) {
+        Ok(())
+    } else {
+        Err(EtlError::config(format!(
+            "lookback_seconds requires the watermark column '{watermark}' to be a date or \
+             timestamp type (resolved as {:?})",
+            col.arrow
+        )))
+    }
+}
+
 fn emit_progress(counters: &Counters, progress: &Option<ProgressCb>, started: Instant) {
     if let Some(cb) = progress {
         let elapsed = started.elapsed().as_secs_f64();
@@ -773,26 +833,20 @@ fn emit_progress(counters: &Counters, progress: &Option<ProgressCb>, started: In
 
 /// Create/verify the destination table and return the table to write rows into.
 /// For full refresh this is a fresh staging table; for incremental it's the
-/// destination table itself.
+/// destination table itself. Destination-agnostic: `sink.create_table` builds
+/// whichever native DDL/schema the concrete destination needs.
 async fn prepare_target(
-    sink: &ClickHouseSink,
+    sink: &Sink,
     cfg: &TransferConfig,
     dest_columns: &[ColumnType],
 ) -> Result<String> {
     match cfg.mode {
         SyncMode::Full => {
-            // Destination must exist for EXCHANGE; create it empty if allowed.
+            // Destination must exist for the atomic swap; create it empty if allowed.
             if !sink.table_exists(&cfg.dest_table).await? {
                 if cfg.create_if_missing {
-                    let sql = ddl::create_table(
-                        sink.database(),
-                        &cfg.dest_table,
-                        dest_columns,
-                        cfg,
-                    )?;
                     tracing::info!("destination table '{}' does not exist; creating it", cfg.dest_table);
-                    tracing::debug!("DDL: {sql}");
-                    sink.execute(&sql).await?;
+                    sink.create_table(&cfg.dest_table, dest_columns, cfg).await?;
                 } else {
                     return Err(EtlError::config(format!(
                         "destination table {} does not exist and create_if_missing=false",
@@ -806,23 +860,28 @@ async fn prepare_target(
             let staging = staging_name(&cfg.dest_table);
             tracing::info!("creating staging table '{staging}'");
             sink.drop_table(&staging).await?;
-            let sql = ddl::create_table(sink.database(), &staging, dest_columns, cfg)?;
-            tracing::debug!("DDL: {sql}");
-            sink.execute(&sql).await?;
+            sink.create_table(&staging, dest_columns, cfg).await?;
             Ok(staging)
         }
         SyncMode::Incremental => {
+            // Checked first, before any network I/O: MERGE has nothing to
+            // match rows on without a key — this destination has no
+            // engine-level dedup the way ClickHouse's ReplacingMergeTree
+            // does, so a key is mandatory here even though it's optional
+            // everywhere else. A pure config check, so it fails fast and
+            // cheaply rather than after establishing a connection.
+            if sink.requires_staging_for_incremental() && cfg.key.is_empty() {
+                return Err(EtlError::config(
+                    "key is required for incremental mode with this destination (used as the \
+                     MERGE match key; this destination has no engine-level dedup, unlike \
+                     ClickHouse's ReplacingMergeTree)",
+                ));
+            }
+
             if !sink.table_exists(&cfg.dest_table).await? {
                 if cfg.create_if_missing {
-                    let sql = ddl::create_table(
-                        sink.database(),
-                        &cfg.dest_table,
-                        dest_columns,
-                        cfg,
-                    )?;
                     tracing::info!("destination table '{}' does not exist; creating it", cfg.dest_table);
-                    tracing::debug!("DDL: {sql}");
-                    sink.execute(&sql).await?;
+                    sink.create_table(&cfg.dest_table, dest_columns, cfg).await?;
                 } else {
                     return Err(EtlError::config(format!(
                         "destination table {} does not exist and create_if_missing=false",
@@ -832,8 +891,17 @@ async fn prepare_target(
             } else {
                 tracing::debug!("destination table '{}' already exists", cfg.dest_table);
             }
-            sink.execute(&ddl::create_state_table(sink.database())).await?;
-            Ok(cfg.dest_table.clone())
+            sink.ensure_state_table().await?;
+
+            if sink.requires_staging_for_incremental() {
+                let staging = staging_name(&cfg.dest_table);
+                tracing::info!("creating staging table '{staging}' for incremental merge");
+                sink.drop_table(&staging).await?;
+                sink.create_table(&staging, dest_columns, cfg).await?;
+                Ok(staging)
+            } else {
+                Ok(cfg.dest_table.clone())
+            }
         }
     }
 }
@@ -942,32 +1010,101 @@ fn build_watermark_filter_pg(
     watermark: &str,
     last: Option<&str>,
     snapshot_max: Option<&str>,
+    lookback_seconds: u64,
 ) -> Option<String> {
     let col = format!("\"{}\"", watermark.replace('"', "\"\""));
-    build_watermark_filter(&col, last, snapshot_max)
+    let lower = last.map(|l| lookback_lower_bound_pg(l, lookback_seconds));
+    build_watermark_filter(&col, lower, snapshot_max)
 }
 
 fn build_watermark_filter_mysql(
     watermark: &str,
     last: Option<&str>,
     snapshot_max: Option<&str>,
+    lookback_seconds: u64,
 ) -> Option<String> {
-    build_watermark_filter(&quote_my(watermark), last, snapshot_max)
+    let lower = last.map(|l| lookback_lower_bound_mysql(l, lookback_seconds));
+    build_watermark_filter(&quote_my(watermark), lower, snapshot_max)
 }
 
 /// BigQuery Standard SQL uses the same backtick identifier quoting as MySQL.
+/// `source_cols` resolves the watermark column's BigQuery type
+/// (DATE/DATETIME/TIMESTAMP each need their own `_SUB` function and typed
+/// literal — BigQuery won't implicitly compare across them); only looked up
+/// when `lookback_seconds > 0` (`ensure_lookback_compatible` has already run
+/// by the time this is called, so the lookup is guaranteed to succeed).
 fn build_watermark_filter_bigquery(
     watermark: &str,
     last: Option<&str>,
     snapshot_max: Option<&str>,
+    lookback_seconds: u64,
+    source_cols: &[ColumnType],
 ) -> Option<String> {
-    build_watermark_filter(&quote_my(watermark), last, snapshot_max)
+    let lower = last.map(|l| {
+        let bq_type = if lookback_seconds > 0 {
+            source_cols
+                .iter()
+                .find(|c| c.name == watermark)
+                .and_then(|c| arrow_to_bigquery_type(&c.arrow))
+        } else {
+            None
+        };
+        lookback_lower_bound_bigquery(l, lookback_seconds, bq_type)
+    });
+    build_watermark_filter(&quote_my(watermark), lower, snapshot_max)
 }
 
-fn build_watermark_filter(col: &str, last: Option<&str>, snapshot_max: Option<&str>) -> Option<String> {
+/// Widen `last`'s lower bound by `lookback_seconds` using Postgres's own
+/// cast-and-subtract syntax — a same-engine round trip (the tracked watermark
+/// string is parsed by the same engine that produced it via `CAST(MAX(col)
+/// AS ...)`, not guessed at in Rust). `lookback_seconds == 0` returns the
+/// plain quoted literal, byte-identical to the pre-lookback filter.
+fn lookback_lower_bound_pg(last: &str, lookback_seconds: u64) -> String {
+    let l = last.replace('\'', "''");
+    if lookback_seconds == 0 {
+        return format!("'{l}'");
+    }
+    format!("('{l}'::timestamp - interval '{lookback_seconds} seconds')")
+}
+
+fn lookback_lower_bound_mysql(last: &str, lookback_seconds: u64) -> String {
+    let l = last.replace('\'', "''");
+    if lookback_seconds == 0 {
+        return format!("'{l}'");
+    }
+    format!("(CAST('{l}' AS DATETIME) - INTERVAL {lookback_seconds} SECOND)")
+}
+
+/// `DATE_SUB` has no sub-day granularity, so a sub-day `lookback_seconds`
+/// against a `DATE` watermark rounds *up* to whole days via `div_ceil` —
+/// documented behavior, not silently wrong (a 1-hour lookback on a DATE
+/// column re-includes the whole prior day, not nothing).
+fn lookback_lower_bound_bigquery(last: &str, lookback_seconds: u64, bq_type: Option<TableFieldType>) -> String {
+    let l = last.replace('\'', "''");
+    if lookback_seconds == 0 {
+        return format!("'{l}'");
+    }
+    match bq_type.expect("ensure_lookback_compatible already validated a temporal watermark type") {
+        TableFieldType::Date => {
+            format!("DATE_SUB(DATE '{l}', INTERVAL {} DAY)", lookback_seconds.div_ceil(86400))
+        }
+        TableFieldType::Datetime => {
+            format!("DATETIME_SUB(DATETIME '{l}', INTERVAL {lookback_seconds} SECOND)")
+        }
+        TableFieldType::Timestamp => {
+            format!("TIMESTAMP_SUB(TIMESTAMP '{l}', INTERVAL {lookback_seconds} SECOND)")
+        }
+        other => unreachable!(
+            "ensure_lookback_compatible only allows Date32/Timestamp Arrow types, which map to \
+             BigQuery Date/Datetime/Timestamp — got {other:?}"
+        ),
+    }
+}
+
+fn build_watermark_filter(col: &str, lower_bound: Option<String>, snapshot_max: Option<&str>) -> Option<String> {
     let mut clauses = Vec::new();
-    if let Some(l) = last {
-        clauses.push(format!("{col} > '{}'", l.replace('\'', "''")));
+    if let Some(lb) = lower_bound {
+        clauses.push(format!("{col} > {lb}"));
     }
     if let Some(m) = snapshot_max {
         clauses.push(format!("{col} <= '{}'", m.replace('\'', "''")));
@@ -979,61 +1116,21 @@ fn build_watermark_filter(col: &str, last: Option<&str>, snapshot_max: Option<&s
     }
 }
 
-async fn read_last_watermark(sink: &ClickHouseSink, cfg: &TransferConfig) -> Result<Option<String>> {
-    // The state table may not exist yet on the very first incremental run.
-    if !sink.table_exists("_quickhouse_state").await? {
-        return Ok(None);
-    }
-    let source_id = cfg
-        .source_table
-        .clone()
-        .or_else(|| cfg.source_query.clone())
-        .unwrap_or_default();
-    let sql = format!(
-        "SELECT last_watermark FROM {}.`_quickhouse_state` FINAL \
-         WHERE source_table = '{}' AND dest_table = '{}' \
-         ORDER BY run_ts DESC LIMIT 1",
-        crate::ddl::quote_ident(sink.database()),
-        source_id.replace('\'', "''"),
-        cfg.dest_table.replace('\'', "''"),
-    );
-    sink.query_scalar(&sql).await
-}
-
-async fn persist_watermark(
-    sink: &ClickHouseSink,
-    cfg: &TransferConfig,
-    watermark: &str,
-    rows: u64,
-) -> Result<()> {
-    let source_id = cfg
-        .source_table
-        .clone()
-        .or_else(|| cfg.source_query.clone())
-        .unwrap_or_default();
-    let sql = format!(
-        "INSERT INTO {}.`_quickhouse_state` (source_table, dest_table, last_watermark, rows) \
-         VALUES ('{}', '{}', '{}', {})",
-        crate::ddl::quote_ident(sink.database()),
-        source_id.replace('\'', "''"),
-        cfg.dest_table.replace('\'', "''"),
-        watermark.replace('\'', "''"),
-        rows,
-    );
-    sink.execute(&sql).await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use arrow_schema::DataType;
 
     fn col(name: &str) -> ColumnType {
+        col_typed(name, DataType::Int64)
+    }
+
+    fn col_typed(name: &str, arrow: DataType) -> ColumnType {
         ColumnType {
             name: name.into(),
             type_id: 0,
             nullable: true,
-            arrow: DataType::Int64,
+            arrow,
             clickhouse_inner: "Int64".into(),
         }
     }
@@ -1052,5 +1149,111 @@ mod tests {
             .to_string();
         assert!(msg.contains("created_date"), "names the missing column: {msg}");
         assert!(msg.contains("id") && msg.contains("name"), "lists available: {msg}");
+    }
+
+    #[test]
+    fn lookback_disabled_is_a_noop_regardless_of_watermark_type() {
+        let cols = vec![col("id")]; // Int64 — not temporal
+        assert!(ensure_lookback_compatible("id", 0, &cols).is_ok());
+    }
+
+    #[test]
+    fn lookback_accepts_date32_and_timestamp_watermarks() {
+        let cols = vec![
+            col_typed("d", DataType::Date32),
+            col_typed(
+                "ts",
+                DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
+            ),
+        ];
+        assert!(ensure_lookback_compatible("d", 60, &cols).is_ok());
+        assert!(ensure_lookback_compatible("ts", 60, &cols).is_ok());
+    }
+
+    #[test]
+    fn lookback_rejects_non_temporal_watermark() {
+        let cols = vec![col("id")];
+        let msg = ensure_lookback_compatible("id", 60, &cols)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("lookback_seconds"), "got: {msg}");
+        assert!(msg.contains("id"), "got: {msg}");
+    }
+
+    #[test]
+    fn watermark_filter_unchanged_when_lookback_disabled() {
+        // Regression guard: lookback_seconds=0 must produce byte-identical
+        // SQL to the pre-lookback filter.
+        assert_eq!(
+            build_watermark_filter_pg("write_date", Some("2024-01-01"), Some("2024-06-01"), 0),
+            Some("\"write_date\" > '2024-01-01' AND \"write_date\" <= '2024-06-01'".to_string())
+        );
+        assert_eq!(
+            build_watermark_filter_mysql("write_date", Some("2024-01-01"), Some("2024-06-01"), 0),
+            Some("`write_date` > '2024-01-01' AND `write_date` <= '2024-06-01'".to_string())
+        );
+        let cols = vec![col_typed("write_date", DataType::Date32)];
+        assert_eq!(
+            build_watermark_filter_bigquery("write_date", Some("2024-01-01"), Some("2024-06-01"), 0, &cols),
+            Some("`write_date` > '2024-01-01' AND `write_date` <= '2024-06-01'".to_string())
+        );
+    }
+
+    #[test]
+    fn watermark_filter_pg_widens_lower_bound_with_lookback() {
+        let f = build_watermark_filter_pg("write_date", Some("2024-06-10"), Some("2024-06-15"), 3600).unwrap();
+        assert!(
+            f.contains("'2024-06-10'::timestamp - interval '3600 seconds'"),
+            "got: {f}"
+        );
+        assert!(f.contains("<= '2024-06-15'"), "upper bound stays exact: {f}");
+    }
+
+    #[test]
+    fn watermark_filter_mysql_widens_lower_bound_with_lookback() {
+        let f = build_watermark_filter_mysql("write_date", Some("2024-06-10 00:00:00"), None, 3600).unwrap();
+        assert!(
+            f.contains("CAST('2024-06-10 00:00:00' AS DATETIME) - INTERVAL 3600 SECOND"),
+            "got: {f}"
+        );
+    }
+
+    #[test]
+    fn watermark_filter_bigquery_dispatches_by_resolved_type() {
+        let date_cols = vec![col_typed("d", DataType::Date32)];
+        let f = build_watermark_filter_bigquery("d", Some("2024-06-10"), None, 3600, &date_cols).unwrap();
+        assert!(f.contains("DATE_SUB(DATE '2024-06-10', INTERVAL 1 DAY)"), "got: {f}");
+
+        let datetime_cols = vec![col_typed(
+            "dt",
+            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
+        )];
+        let f = build_watermark_filter_bigquery("dt", Some("2024-06-10 00:00:00"), None, 3600, &datetime_cols)
+            .unwrap();
+        assert!(
+            f.contains("DATETIME_SUB(DATETIME '2024-06-10 00:00:00', INTERVAL 3600 SECOND)"),
+            "got: {f}"
+        );
+
+        let ts_cols = vec![col_typed(
+            "ts",
+            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())),
+        )];
+        let f = build_watermark_filter_bigquery("ts", Some("2024-06-10 00:00:00"), None, 3600, &ts_cols).unwrap();
+        assert!(
+            f.contains("TIMESTAMP_SUB(TIMESTAMP '2024-06-10 00:00:00', INTERVAL 3600 SECOND)"),
+            "got: {f}"
+        );
+    }
+
+    #[test]
+    fn lookback_bigquery_date_rounds_up_to_whole_days() {
+        // 1 hour of lookback against a DATE-typed watermark can't be expressed
+        // in sub-day granularity, so it rounds up to 1 whole day rather than
+        // silently rounding down to 0 (which would disable lookback entirely).
+        let f = lookback_lower_bound_bigquery("2024-06-10", 3600, Some(TableFieldType::Date));
+        assert_eq!(f, "DATE_SUB(DATE '2024-06-10', INTERVAL 1 DAY)");
+        let f = lookback_lower_bound_bigquery("2024-06-10", 86400 * 2, Some(TableFieldType::Date));
+        assert_eq!(f, "DATE_SUB(DATE '2024-06-10', INTERVAL 2 DAY)");
     }
 }

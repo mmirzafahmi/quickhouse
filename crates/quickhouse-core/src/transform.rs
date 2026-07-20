@@ -11,7 +11,7 @@ use std::collections::HashSet;
 
 use crate::config::TransferConfig;
 use crate::error::{EtlError, Result};
-use crate::types::ColumnType;
+use crate::types::{may_coerce_to_null, ColumnType};
 
 pub struct SelectPlan {
     /// Source column names to read, in order (drives the COPY SELECT list).
@@ -70,7 +70,35 @@ pub fn plan(source: &[ColumnType], cfg: &TransferConfig) -> Result<SelectPlan> {
             .or_else(|| cfg.type_overrides.get(&dest_name))
             .cloned()
             .unwrap_or_else(|| c.clickhouse_inner.clone());
-        let nullable = c.nullable && !key_columns.contains(dest_name.as_str());
+        let is_key = key_columns.contains(dest_name.as_str());
+        // ClickHouse's ReplacingMergeTree also rejects a Nullable version
+        // column outright (`Code: 169 BAD_TYPE_OF_FIELD`), same restriction
+        // as ORDER BY/PRIMARY KEY above, just for a different column — the
+        // watermark, when it's the effective engine's version column.
+        // Matched against the *source* name (not `dest_name`): the DDL's
+        // `ReplacingMergeTree(<watermark>)` clause already assumes the
+        // watermark column's name is unchanged by `rename` (a pre-existing
+        // characteristic of `ddl::create_table`, not something this touches).
+        let is_version_column =
+            cfg.watermark.as_deref() == Some(c.name.as_str()) && cfg.effective_engine() == "ReplacingMergeTree";
+        let force_non_nullable = is_key || is_version_column;
+        // Date32/Timestamp columns are otherwise forced nullable regardless
+        // of the source's own NOT NULL constraint: their decoders coerce
+        // unrepresentable values (zero-dates, out-of-ch_range years) to NULL
+        // unconditionally, and a NOT NULL Arrow field containing a coerced
+        // NULL fails downstream with a schema-consistency error instead of
+        // transferring cleanly — see `types::may_coerce_to_null`'s docs.
+        // `force_non_nullable` still wins over this: a key or version column
+        // that's also a coercible date type and actually hits a zero-date
+        // will still fail — an inherent conflict between two hard
+        // constraints, not something papered over here (both combinations
+        // are expected to be rare: a business/dedup key or watermark column
+        // with legacy zero-date values).
+        let nullable = if force_non_nullable {
+            false
+        } else {
+            c.nullable || may_coerce_to_null(&c.arrow)
+        };
         dest_columns.push(ColumnType {
             name: dest_name,
             type_id: c.type_id,
@@ -102,6 +130,16 @@ mod tests {
         }
     }
 
+    fn typed_col(name: &str, arrow: DataType, nullable: bool) -> ColumnType {
+        ColumnType {
+            name: name.into(),
+            type_id: 0,
+            nullable,
+            arrow,
+            clickhouse_inner: "irrelevant".into(),
+        }
+    }
+
     fn cfg() -> TransferConfig {
         TransferConfig {
             source_table: Some("t".into()),
@@ -109,6 +147,7 @@ mod tests {
             dest_table: "t".into(),
             mode: crate::config::SyncMode::Full,
             watermark: None,
+            lookback_seconds: 0,
             key: vec![],
             create_if_missing: true,
             engine: None,
@@ -159,6 +198,104 @@ mod tests {
         let p = plan(&src, &cfg).unwrap();
         assert!(!p.dest_columns[0].nullable, "key column must not be nullable");
         assert!(p.dest_columns[1].nullable, "non-key column keeps its resolved nullability");
+    }
+
+    /// Regression test for bug report 06: a NOT NULL MySQL DATE/DATETIME
+    /// column resolves as `nullable: false` from the source's own
+    /// constraint, but decode_mysql.rs coerces legacy zero-dates and
+    /// out-of-ch_range years to NULL unconditionally — an Arrow field
+    /// declared non-nullable that then receives a coerced NULL fails
+    /// downstream with a schema-consistency error. Date32/Timestamp columns
+    /// must be forced nullable regardless of the resolved source
+    /// nullability, so that coercion (already tested at the decoder level in
+    /// decode_mysql.rs/decode.rs/decode_bigquery.rs) can't produce an
+    /// inconsistent batch.
+    #[test]
+    fn not_null_date_and_timestamp_columns_forced_nullable() {
+        let src = vec![
+            typed_col("id", DataType::Int64, false),
+            typed_col("created_date", DataType::Date32, false), // NOT NULL in the source
+            typed_col(
+                "updated_at",
+                DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
+                false, // NOT NULL in the source
+            ),
+            typed_col("name", DataType::Utf8, false), // NOT NULL, but not a coercible type
+        ];
+        let p = plan(&src, &cfg()).unwrap();
+        assert!(!p.dest_columns[0].nullable, "plain NOT NULL Int64 column is untouched");
+        assert!(
+            p.dest_columns[1].nullable,
+            "NOT NULL DATE column must be forced nullable (zero-date coercion target)"
+        );
+        assert!(
+            p.dest_columns[2].nullable,
+            "NOT NULL DATETIME/TIMESTAMP column must be forced nullable (out-of-range coercion target)"
+        );
+        assert!(
+            !p.dest_columns[3].nullable,
+            "NOT NULL text column has no coercion path, so stays non-nullable"
+        );
+    }
+
+    /// The `key` (or order_by/primary_key) non-nullable rule wins over the
+    /// date/timestamp forced-nullable rule — ClickHouse rejects a nullable
+    /// sort key outright, a harder constraint than the coercion concern.
+    #[test]
+    fn key_column_wins_over_date_forced_nullable() {
+        let src = vec![typed_col("event_date", DataType::Date32, false)];
+        let mut cfg = cfg();
+        cfg.key = vec!["event_date".into()];
+        let p = plan(&src, &cfg).unwrap();
+        assert!(!p.dest_columns[0].nullable, "key column must stay non-nullable even for a date type");
+    }
+
+    /// Regression test: forcing the watermark column nullable (as a
+    /// Date/Timestamp type normally would be) broke incremental syncs
+    /// outright when the effective engine is `ReplacingMergeTree` — its
+    /// version column must not be `Nullable(...)` either
+    /// (`Code: 169 BAD_TYPE_OF_FIELD`), the same class of constraint as a
+    /// sort key, just for a different column. Caught by the existing
+    /// integration test suite (`test_incremental_appends_and_is_idempotent`)
+    /// failing against a live ClickHouse before this was added.
+    #[test]
+    fn watermark_column_forced_non_nullable_when_replacing_merge_tree() {
+        let src = vec![
+            typed_col("id", DataType::Int64, false),
+            typed_col(
+                "write_date",
+                DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
+                false,
+            ),
+        ];
+        let mut cfg = cfg();
+        cfg.mode = crate::config::SyncMode::Incremental;
+        cfg.watermark = Some("write_date".into());
+        // engine left None -> effective_engine() defaults to ReplacingMergeTree for Incremental.
+        let p = plan(&src, &cfg).unwrap();
+        assert!(
+            !p.dest_columns[1].nullable,
+            "watermark column used as the ReplacingMergeTree version column must stay non-nullable"
+        );
+    }
+
+    /// The same watermark column is NOT forced non-nullable when the
+    /// effective engine isn't ReplacingMergeTree (e.g. an explicit
+    /// `engine="MergeTree"` override) — nothing structurally requires it
+    /// there, so the ordinary coercion-target nullable rule still applies.
+    #[test]
+    fn watermark_column_not_forced_when_engine_is_not_replacing_merge_tree() {
+        let src = vec![typed_col(
+            "write_date",
+            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
+            false,
+        )];
+        let mut cfg = cfg();
+        cfg.mode = crate::config::SyncMode::Incremental;
+        cfg.watermark = Some("write_date".into());
+        cfg.engine = Some("MergeTree".into());
+        let p = plan(&src, &cfg).unwrap();
+        assert!(p.dest_columns[0].nullable, "no ReplacingMergeTree version-column constraint applies here");
     }
 
     /// order_by/primary_key are matched against the *destination* (post-rename)

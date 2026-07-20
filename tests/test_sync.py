@@ -10,6 +10,8 @@ Run against the services in ``docker-compose.yml`` after building the module:
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+
 import quickhouse
 
 
@@ -257,6 +259,93 @@ def test_incremental_appends_and_is_idempotent(
 
         total = ch_client.command(f"SELECT count() FROM `{table}` FINAL")
         assert int(total) == 150
+    finally:
+        _drop_ch(ch_client, table)
+
+
+def test_incremental_lookback_reprocesses_row_whose_watermark_moved_forward(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """lookback_seconds widens the tracked watermark's lower bound so a run
+    re-includes a trailing window of already-synced rows -- the mechanism
+    that makes a "resync the last N days" pattern safe. Simulates a row
+    whose write_date moves forward (a late edit) but stays behind the
+    previous run's high-water mark, so a plain incremental rerun's
+    `write_date > last` filter never sees it; lookback_seconds must catch it,
+    and ReplacingMergeTree/FINAL must upsert it rather than duplicate it."""
+    table = unique_name
+    base = datetime(2024, 1, 1)
+    with pg_conn.cursor() as cur:
+        cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+        cur.execute(
+            f"""
+            CREATE TABLE "{table}" (
+                id          bigint PRIMARY KEY,
+                amount      double precision,
+                write_date  timestamp NOT NULL
+            )
+            """
+        )
+        with cur.copy(f'COPY "{table}" (id, amount, write_date) FROM STDIN') as copy:
+            for i in range(1, 101):
+                copy.write_row((i, i * 1.5, base + timedelta(seconds=i)))
+    _drop_ch(ch_client, table)
+    try:
+        r1 = quickhouse.sync(
+            pg_source,
+            ch_target,
+            dest_table=table,
+            source_table=table,
+            mode="incremental",
+            watermark="write_date",
+            key=["id"],
+            create_if_missing=True,
+            engine="ReplacingMergeTree",
+            order_by=["id"],
+        )
+        assert r1.rows_written == 100
+
+        # id=1's write_date moves forward (1s -> 60s) but stays well behind
+        # the persisted high-water mark (100s, from id=100).
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                f'UPDATE "{table}" SET amount = 99999.0, write_date = %s WHERE id = 1',
+                (base + timedelta(seconds=60),),
+            )
+
+        r2 = quickhouse.sync(
+            pg_source,
+            ch_target,
+            dest_table=table,
+            source_table=table,
+            mode="incremental",
+            watermark="write_date",
+            key=["id"],
+        )
+        assert r2.rows_written == 0, "without lookback the moved-forward-but-still-behind row is invisible"
+        stale = ch_client.command(f"SELECT amount FROM `{table}` FINAL WHERE id = 1")
+        assert float(stale) == 1.5, "the update hasn't propagated yet"
+
+        r3 = quickhouse.sync(
+            pg_source,
+            ch_target,
+            dest_table=table,
+            source_table=table,
+            mode="incremental",
+            watermark="write_date",
+            lookback_seconds=45,
+            key=["id"],
+        )
+        # Lower bound becomes (last=100s) - 45s = 55s: re-reads ids 56..100
+        # (45 rows, write_date 56s..100s) plus id=1 (now at 60s) = 46 rows.
+        assert r3.rows_written == 46
+
+        total = ch_client.command(f"SELECT count() FROM `{table}` FINAL")
+        assert int(total) == 100, "upserted, not duplicated"
+        updated = ch_client.command(f"SELECT amount FROM `{table}` FINAL WHERE id = 1")
+        assert float(updated) == 99999.0
+        unaffected = ch_client.command(f"SELECT amount FROM `{table}` FINAL WHERE id = 60")
+        assert float(unaffected) == 90.0
     finally:
         _drop_ch(ch_client, table)
 

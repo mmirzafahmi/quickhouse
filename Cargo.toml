@@ -6,7 +6,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.4"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
 authors = ["quickhouse contributors"]
@@ -42,6 +42,9 @@ mysql_async = { version = "0.34", default-features = false, features = ["default
 google-cloud-bigquery = { version = "0.15", default-features = false, features = ["auth", "rustls-tls"] }
 google-cloud-googleapis = { version = "0.16", features = ["bigquery"] }
 time = { version = "0.3", features = ["macros"] }
+# Only used to encode Binary columns as BigQuery's BYTES JSON representation
+# (base64 text) for the insertAll destination path.
+base64 = "0.22"
 
 # Faster release builds for the shipped wheel.
 [profile.release]

@@ -32,6 +32,7 @@ mysql_async.workspace = true
 google-cloud-bigquery.workspace = true
 google-cloud-googleapis.workspace = true
 time.workspace = true
+base64.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true

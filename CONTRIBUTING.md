@@ -18,7 +18,7 @@ quickhouse is a Rust engine with a thin Python binding:
   stubs, the `progress_bar()` helper).
 
 The data path is: source's native wire protocol → Apache Arrow `RecordBatch` →
-ClickHouse `FORMAT ArrowStream`.
+the destination's own native ingestion path.
 
 ### Project layout
 
@@ -30,12 +30,14 @@ crates/quickhouse-core/    # pure-Rust engine (unit-testable, no Python)
   src/decode.rs            # PostgreSQL COPY wire format -> Arrow
   src/decode_mysql.rs      # MySQL typed rows -> Arrow
   src/decode_bigquery.rs   # BigQuery typed rows -> Arrow
-  src/types.rs             # per-source type -> Arrow -> ClickHouse mapping
+  src/types.rs             # per-source/destination type <-> Arrow mapping
   src/memory.rs            # MemoryBudget: total in-flight memory ceiling
+  src/sink/mod.rs          # `Sink` enum (dispatches to whichever destination), shared retry/backoff
   src/sink/clickhouse.rs   # ClickHouse HTTP sink (streaming compressed inserts, retry)
-  src/config.rs            # TransferConfig and friends
-  src/ddl.rs               # CREATE TABLE generation
-  src/sync.rs              # orchestration; dispatches on the `Source` enum
+  src/sink/bigquery.rs     # BigQuery sink (structured DDL, insertAll writes, copy-job swap)
+  src/config.rs            # TransferConfig, SourceConfig/DestinationConfig, and friends
+  src/ddl.rs               # ClickHouse CREATE TABLE generation (BigQuery's own DDL lives in sink/bigquery.rs)
+  src/sync.rs              # orchestration; dispatches on the `Source`/`Sink` enums
 crates/quickhouse-py/      # PyO3 bindings (cdylib -> quickhouse._quickhouse)
 python/quickhouse/         # typed Python surface (__init__.py, .pyi stubs)
 tests/                     # pytest integration tests
@@ -112,24 +114,38 @@ pytest -v                              # integration tests green (if services ar
 
 ## Common changes
 
-**Add a type mapping.** Map the source type in `src/types.rs` (`map_oid` for
-Postgres, `mysql::map_mysql_type`, or `bigquery::map_type`) to an Arrow
-`DataType` + ClickHouse type string, then handle that Arrow type in the matching
-decoder's `ColBuilder` (`src/decode.rs` / `src/decode_mysql.rs` /
+**Add a type mapping.** For a *source*: map the type in `src/types.rs`
+(`map_oid` for Postgres, `mysql::map_mysql_type`, or `bigquery::map_type`) to an
+Arrow `DataType` + ClickHouse type string, then handle that Arrow type in the
+matching decoder's `ColBuilder` (`src/decode.rs` / `src/decode_mysql.rs` /
 `src/decode_bigquery.rs`). Prefer coercing messy/out-of-range source values to
 `NULL` (see how zero-dates and out-of-ClickHouse-range dates are handled) over
-aborting a whole transfer.
+aborting a whole transfer. For the BigQuery *destination*: map the Arrow type in
+`types.rs`'s `bigquery::arrow_to_bigquery_type` and handle it in
+`sink/bigquery.rs`'s `array_value_to_json`.
 
 **Add a `sync()` option.** Add the field to `TransferConfig` in
 `src/config.rs` (with validation in `validate()` if needed), thread it through
 `src/sync.rs`, then expose it as a keyword argument in
 `crates/quickhouse-py/src/lib.rs` and document it in `python/quickhouse/*.pyi`
-and the README's parameter table.
+and the README's parameter table. If the field means something different per
+destination (like `partition_by`/`order_by` already do), document that split
+in the field's doc comment and the README's "Choosing a destination" table.
 
 **Add a source.** This is the largest change: add a module under `src/source/`,
 a decoder, type mappings in `types.rs`, a variant to the `Source`/`SourceConfig`
 enums, dispatch in `src/sync.rs`, and a `#[pyclass]` in the Python bindings.
 Opening an issue to discuss the shape first is a good idea.
+
+**Add a destination.** Add a module under `src/sink/`, implementing at least
+`table_exists`, `create_table`, `insert_batches`, `atomic_swap`, `drop_table`,
+`ensure_state_table`, `read_last_watermark`, and `persist_watermark` (see
+`sink/bigquery.rs` for a from-scratch example, or `sink/clickhouse.rs` for the
+original), a variant on the `Sink`/`DestinationConfig` enums (`sink/mod.rs` /
+`config.rs`) with delegating methods, and a `#[pyclass]` (or an extension to an
+existing one, like `BigQuery` doubling as both source and target) in the
+Python bindings. Reuse the shared `SendError`/backoff retry helpers in
+`sink/mod.rs` rather than re-implementing them.
 
 ## Releasing (maintainers)
 

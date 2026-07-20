@@ -148,6 +148,69 @@ def test_full_refresh_coerces_zero_dates_to_null(
         _drop_ch(ch_client, table)
 
 
+def test_full_refresh_not_null_zero_dates_promote_column_to_nullable(
+    mysql_conn, ch_client, mysql_source, ch_target, unique_name
+):
+    """Regression test for bug report 06: a NOT NULL MySQL DATE/DATETIME
+    column resolves as non-nullable from the source's own constraint, but a
+    legacy zero-date in it still gets coerced to NULL at decode time (same as
+    the nullable case above). Previously this produced a *second*, more
+    confusing failure than the original bug: 'arrow error: Invalid argument
+    error: Column ... is declared as non-nullable but contains null values',
+    since the NOT NULL destination column didn't accept the coerced NULL.
+    The destination column must be auto-promoted to Nullable so the coercion
+    that already works for nullable columns works here too."""
+    table = unique_name
+    with mysql_conn.cursor() as cur:
+        cur.execute(f"DROP TABLE IF EXISTS `{table}`")
+        cur.execute(
+            f"""
+            CREATE TABLE `{table}` (
+                id            BIGINT PRIMARY KEY,
+                created_date  DATETIME NOT NULL
+            )
+            """
+        )
+        cur.execute("SELECT @@SESSION.sql_mode")
+        (orig_mode,) = cur.fetchone()
+        try:
+            cur.execute("SET SESSION sql_mode = ''")
+            cur.executemany(
+                f"INSERT INTO `{table}` (id, created_date) VALUES (%s, %s)",
+                [
+                    (1, "2024-05-01 10:00:00"),  # valid
+                    (2, "0000-00-00 00:00:00"),  # zero-date, despite NOT NULL
+                ],
+            )
+        finally:
+            cur.execute("SET SESSION sql_mode = %s", (orig_mode,))
+    _drop_ch(ch_client, table)
+    try:
+        result = quickhouse.sync(
+            mysql_source,
+            ch_target,
+            dest_table=table,
+            source_table=table,
+            mode="full",
+            key=["id"],
+            create_if_missing=True,
+        )
+        assert result.rows_written == 2
+
+        col_type = ch_client.command(
+            f"SELECT type FROM system.columns "
+            f"WHERE database = currentDatabase() AND table = '{table}' AND name = 'created_date'"
+        )
+        assert "Nullable" in col_type, f"NOT NULL source column must be promoted to Nullable: {col_type}"
+
+        null_count = ch_client.command(f"SELECT countIf(created_date IS NULL) FROM `{table}`")
+        assert int(null_count) == 1
+        valid = ch_client.command(f"SELECT created_date FROM `{table}` WHERE id = 1")
+        assert str(valid) == "2024-05-01 10:00:00.000000"
+    finally:
+        _drop_ch(ch_client, table)
+
+
 def test_full_refresh_coerces_out_of_range_dates_to_null(
     mysql_conn, ch_client, mysql_source, ch_target, unique_name
 ):

@@ -40,6 +40,25 @@ pub mod ch_range {
     }
 }
 
+/// Whether `arrow` is a type whose decoders may coerce an otherwise-valid
+/// value to NULL — currently `Date32`/`Timestamp` only (zero-dates and
+/// out-of-`ch_range` years; see each decoder's `ColBuilder::append_value`).
+///
+/// A destination column of one of these types must be resolved as nullable
+/// regardless of the source's own `NOT NULL` constraint. Without this, a
+/// `NOT NULL` MySQL `DATE`/`DATETIME` column containing a legacy zero-date
+/// (a common pattern — MySQL allows `0000-00-00` in `NOT NULL` columns by
+/// default) decodes fine, coerces to NULL, and then fails downstream with an
+/// Arrow schema-consistency error ("column is declared as non-nullable but
+/// contains null values") instead of transferring cleanly — trading the
+/// original hard decode error for an equally-fatal one, just later and more
+/// confusing. Forcing nullability here closes that gap at its single source
+/// of truth: `transform::plan` feeds both the Arrow schema construction (via
+/// each decoder's `Field::new(.., nullable)`) and the destination DDL.
+pub fn may_coerce_to_null(arrow: &DataType) -> bool {
+    matches!(arrow, DataType::Date32 | DataType::Timestamp(_, _))
+}
+
 /// Well-known PostgreSQL `pg_type.oid` values we decode natively.
 pub mod oid {
     pub const BOOL: u32 = 16;
@@ -140,7 +159,7 @@ pub fn is_supported(oid: u32) -> bool {
 /// code we can reuse for `ColumnType::type_id`, so we assign our own stable
 /// constants here (arbitrary, just needs to round-trip through `map_type`).
 pub mod bigquery {
-    use arrow_schema::DataType;
+    use arrow_schema::{DataType, TimeUnit};
     use google_cloud_bigquery::http::table::TableFieldType as BqType;
 
     pub mod type_id {
@@ -194,6 +213,41 @@ pub mod bigquery {
             BqType::Record | BqType::Struct | BqType::Interval => return None,
         };
         Some(mapped)
+    }
+
+    /// Map an Arrow type (as produced by any source's decoder) to a BigQuery
+    /// column type, for generating a destination `TableSchema`. The inverse
+    /// of [`map_type`], but must cover every Arrow type any source ever
+    /// produces — not just the subset BigQuery-as-source uses — since any
+    /// source can now feed a BigQuery destination.
+    ///
+    /// Two known limitations, deliberately left as documented caveats rather
+    /// than solved (matching this crate's existing policy for arbitrary-
+    /// precision numerics, e.g. `numeric` -> `Float64`): BigQuery's
+    /// `INTEGER` is signed 64-bit, so a source `UInt64` column with values
+    /// above `i64::MAX` would overflow on insert. BigQuery's
+    /// DATE/DATETIME/TIMESTAMP range (0001-01-01..=9999-12-31) is far wider
+    /// than Arrow's, so — unlike the ClickHouse destination's `ch_range` —
+    /// no range coercion is needed here.
+    pub fn arrow_to_bigquery_type(arrow: &DataType) -> Option<BqType> {
+        match arrow {
+            DataType::Boolean => Some(BqType::Boolean),
+            DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64 => Some(BqType::Integer),
+            DataType::Float32 | DataType::Float64 => Some(BqType::Float),
+            DataType::Utf8 => Some(BqType::String),
+            DataType::Binary => Some(BqType::Bytes),
+            DataType::Date32 => Some(BqType::Date),
+            DataType::Timestamp(TimeUnit::Microsecond, None) => Some(BqType::Datetime),
+            DataType::Timestamp(TimeUnit::Microsecond, Some(_)) => Some(BqType::Timestamp),
+            _ => None,
+        }
     }
 }
 
@@ -291,6 +345,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn may_coerce_to_null_covers_date_and_timestamp_only() {
+        assert!(may_coerce_to_null(&DataType::Date32));
+        assert!(may_coerce_to_null(&DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None)));
+        assert!(may_coerce_to_null(&DataType::Timestamp(
+            arrow_schema::TimeUnit::Microsecond,
+            Some("UTC".into())
+        )));
+        // TIME is text (Utf8) in this project — never coerced, so not covered.
+        assert!(!may_coerce_to_null(&DataType::Utf8));
+        assert!(!may_coerce_to_null(&DataType::Int64));
+        assert!(!may_coerce_to_null(&DataType::Boolean));
+    }
+
+    #[test]
     fn maps_common_scalars() {
         assert_eq!(map_oid(oid::INT4).unwrap().1, "Int32");
         assert_eq!(map_oid(oid::INT8).unwrap().1, "Int64");
@@ -337,5 +405,42 @@ mod tests {
         assert!(ch_range::micros_in_range(ch_range::MAX_MICROS));
         assert!(!ch_range::micros_in_range(ch_range::MIN_MICROS - 1));
         assert!(!ch_range::micros_in_range(ch_range::MAX_MICROS + 1));
+    }
+
+    #[test]
+    fn arrow_to_bigquery_type_covers_every_arrow_type_a_source_produces() {
+        use super::bigquery::arrow_to_bigquery_type as a2b;
+        use arrow_schema::TimeUnit;
+        use google_cloud_bigquery::http::table::TableFieldType as BqType;
+
+        assert_eq!(a2b(&DataType::Boolean), Some(BqType::Boolean));
+        for int in [
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+            DataType::UInt8,
+            DataType::UInt16,
+            DataType::UInt32,
+            DataType::UInt64,
+        ] {
+            assert_eq!(a2b(&int), Some(BqType::Integer), "{int:?}");
+        }
+        assert_eq!(a2b(&DataType::Float32), Some(BqType::Float));
+        assert_eq!(a2b(&DataType::Float64), Some(BqType::Float));
+        assert_eq!(a2b(&DataType::Utf8), Some(BqType::String));
+        assert_eq!(a2b(&DataType::Binary), Some(BqType::Bytes));
+        assert_eq!(a2b(&DataType::Date32), Some(BqType::Date));
+        assert_eq!(
+            a2b(&DataType::Timestamp(TimeUnit::Microsecond, None)),
+            Some(BqType::Datetime)
+        );
+        assert_eq!(
+            a2b(&DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))),
+            Some(BqType::Timestamp)
+        );
+        // Not produced by any current decoder (all three sources map TIME to
+        // Utf8 text, not Arrow Time64) — confirms there's no silent gap.
+        assert_eq!(a2b(&DataType::Time64(TimeUnit::Microsecond)), None);
     }
 }

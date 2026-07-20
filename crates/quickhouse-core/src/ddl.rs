@@ -129,6 +129,7 @@ mod tests {
             dest_table: "t".into(),
             mode,
             watermark: Some("write_date".into()),
+            lookback_seconds: 0,
             key: vec!["id".into()],
             create_if_missing: true,
             engine: None,

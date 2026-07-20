@@ -10,35 +10,10 @@ use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use reqwest::Client;
 
-use crate::config::{ClickHouseConfig, Compression};
+use crate::config::{ClickHouseConfig, Compression, TransferConfig};
 use crate::error::{EtlError, Result};
-
-/// Max total attempts for one insert (1 initial + retries).
-const MAX_INSERT_ATTEMPTS: u32 = 4;
-/// Base backoff; attempt N waits `BASE * 2^(N-1)` (0.25s, 0.5s, 1s, ...).
-const BACKOFF_BASE_MS: u64 = 250;
-
-/// Exponential backoff for retry attempt `attempt` (1-based).
-fn backoff_delay(attempt: u32) -> std::time::Duration {
-    let mult = 1u64 << (attempt.saturating_sub(1)).min(6); // cap the shift
-    std::time::Duration::from_millis(BACKOFF_BASE_MS.saturating_mul(mult))
-}
-
-/// Outcome of a single insert attempt, telling the caller whether to retry.
-enum SendError {
-    /// Retryable (dropped connection, timeout, 5xx/429).
-    Transient(EtlError),
-    /// Deterministic (4xx: bad SQL, auth) — do not retry.
-    Permanent(EtlError),
-}
-
-impl std::fmt::Display for SendError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SendError::Transient(e) | SendError::Permanent(e) => write!(f, "{e}"),
-        }
-    }
-}
+use crate::sink::{backoff_delay, SendError, MAX_INSERT_ATTEMPTS};
+use crate::types::ColumnType;
 
 #[derive(Clone)]
 pub struct ClickHouseSink {
@@ -94,6 +69,61 @@ impl ClickHouseSink {
             ident(table)
         );
         Ok(self.query_scalar(&sql).await?.as_deref() == Some("1"))
+    }
+
+    /// Generate and run this destination's own `CREATE TABLE` DDL for `table`.
+    pub async fn create_table(&self, table: &str, columns: &[ColumnType], cfg: &TransferConfig) -> Result<()> {
+        let sql = crate::ddl::create_table(&self.cfg.database, table, columns, cfg)?;
+        tracing::debug!("DDL: {sql}");
+        self.execute(&sql).await
+    }
+
+    /// Create the internal `_quickhouse_state` watermark-tracking table if it
+    /// doesn't exist yet (`CREATE TABLE IF NOT EXISTS`, so no prior existence
+    /// check is needed here, unlike BigQuery's sink).
+    pub async fn ensure_state_table(&self) -> Result<()> {
+        self.execute(&crate::ddl::create_state_table(&self.cfg.database)).await
+    }
+
+    /// Read the last persisted watermark for this `(source, dest_table)` pair.
+    pub async fn read_last_watermark(&self, cfg: &TransferConfig) -> Result<Option<String>> {
+        // The state table may not exist yet on the very first incremental run.
+        if !self.table_exists("_quickhouse_state").await? {
+            return Ok(None);
+        }
+        let source_id = cfg
+            .source_table
+            .clone()
+            .or_else(|| cfg.source_query.clone())
+            .unwrap_or_default();
+        let sql = format!(
+            "SELECT last_watermark FROM {}.`_quickhouse_state` FINAL \
+             WHERE source_table = '{}' AND dest_table = '{}' \
+             ORDER BY run_ts DESC LIMIT 1",
+            crate::ddl::quote_ident(&self.cfg.database),
+            source_id.replace('\'', "''"),
+            cfg.dest_table.replace('\'', "''"),
+        );
+        self.query_scalar(&sql).await
+    }
+
+    /// Persist a new watermark after a successful incremental run.
+    pub async fn persist_watermark(&self, cfg: &TransferConfig, watermark: &str, rows: u64) -> Result<()> {
+        let source_id = cfg
+            .source_table
+            .clone()
+            .or_else(|| cfg.source_query.clone())
+            .unwrap_or_default();
+        let sql = format!(
+            "INSERT INTO {}.`_quickhouse_state` (source_table, dest_table, last_watermark, rows) \
+             VALUES ('{}', '{}', '{}', {})",
+            crate::ddl::quote_ident(&self.cfg.database),
+            source_id.replace('\'', "''"),
+            cfg.dest_table.replace('\'', "''"),
+            watermark.replace('\'', "''"),
+            rows,
+        );
+        self.execute(&sql).await
     }
 
     /// Insert a group of Arrow batches into `table` via `FORMAT ArrowStream`.

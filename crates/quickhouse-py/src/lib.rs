@@ -1,8 +1,20 @@
 //! PyO3 bindings for quickhouse-core.
 //!
-//! Exposes `Postgres`, `ClickHouse`, `sync(...)`, and the result/progress types.
-//! The transfer runs on a Tokio runtime inside `Python::allow_threads`, so the
-//! GIL is released for the duration and only re-acquired to fire `on_progress`.
+//! Exposes `Postgres`, `MySQL`, `BigQuery`, `ClickHouse`, `sync(...)`, and the
+//! result/progress types. `BigQuery` doubles as either a source or a
+//! destination for `sync()` (see its doc comment); `ClickHouse` is
+//! destination-only. The transfer runs on a Tokio runtime inside
+//! `Python::allow_threads`, so the GIL is released for the duration and only
+//! re-acquired to fire `on_progress`.
+//!
+//! `#![allow(clippy::useless_conversion)]`: the `#[pyfunction]` macro's own
+//! generated wrapper around `sync()`'s `PyResult` return type trips this lint
+//! once a second fallible `?` conversion (`target.into_config()?`, alongside
+//! the pre-existing `parse_mode(&mode)?`) is present in the function body —
+//! the warning's span lands in macro-generated code no local `#[allow]` on
+//! the visible function/statement can reach; confirmed not a real redundant
+//! conversion in this file's own code.
+#![allow(clippy::useless_conversion)]
 
 use std::collections::HashMap;
 use std::sync::{Arc, Once};
@@ -97,32 +109,39 @@ impl MySQL {
     }
 }
 
-/// Google BigQuery source connection descriptor.
+/// Google BigQuery connection descriptor — usable as either a `source` or a
+/// `target` for `sync()`.
 ///
 /// Authenticates via a service-account JSON key file (`credentials_file`) if
 /// given, otherwise falls back to Application Default Credentials (ADC) —
 /// `GOOGLE_APPLICATION_CREDENTIALS`, `GOOGLE_APPLICATION_CREDENTIALS_JSON`,
 /// the GCE/GKE metadata server, or the `gcloud` CLI's well-known ADC file.
+///
+/// `dataset_id` is only required when this is plugged in as `target=`
+/// (BigQuery's equivalent of ClickHouse's `database`) — as a `source=` it's
+/// unused, since `source_table`/`source_query` already carry the dataset.
 #[pyclass]
 #[derive(Clone)]
 struct BigQuery {
     project_id: Option<String>,
     credentials_file: Option<String>,
+    dataset_id: Option<String>,
 }
 
 #[pymethods]
 impl BigQuery {
     #[new]
-    #[pyo3(signature = (project_id=None, *, credentials_file=None))]
-    fn new(project_id: Option<String>, credentials_file: Option<String>) -> Self {
+    #[pyo3(signature = (project_id=None, *, credentials_file=None, dataset_id=None))]
+    fn new(project_id: Option<String>, credentials_file: Option<String>, dataset_id: Option<String>) -> Self {
         BigQuery {
             project_id,
             credentials_file,
+            dataset_id,
         }
     }
 
     fn __repr__(&self) -> String {
-        format!("BigQuery(project_id={:?})", self.project_id)
+        format!("BigQuery(project_id={:?}, dataset_id={:?})", self.project_id, self.dataset_id)
     }
 }
 
@@ -151,6 +170,7 @@ impl From<AnySource> for core::SourceConfig {
             AnySource::BigQuery(b) => core::SourceConfig::BigQuery(core::BigQueryConfig {
                 project_id: b.project_id,
                 credentials_file: b.credentials_file,
+                // dataset_id is a target-only field (see BigQuery's doc comment) — ignored here.
             }),
         }
     }
@@ -189,6 +209,43 @@ impl ClickHouse {
 
     fn __repr__(&self) -> String {
         format!("ClickHouse(url={:?}, database={:?})", self.url, self.database)
+    }
+}
+
+/// Accepts `ClickHouse` or `BigQuery` as `sync()`'s `target` argument.
+#[derive(FromPyObject)]
+enum AnyDestination {
+    ClickHouse(ClickHouse),
+    BigQuery(BigQuery),
+}
+
+impl AnyDestination {
+    /// Fallible unlike `AnySource`'s plain `From` — a BigQuery target without
+    /// `dataset_id` is a config error we can catch here, before ever
+    /// touching the network.
+    fn into_config(self) -> PyResult<core::DestinationConfig> {
+        match self {
+            AnyDestination::ClickHouse(c) => Ok(core::DestinationConfig::ClickHouse(core::ClickHouseConfig {
+                url: c.url,
+                database: c.database,
+                user: c.user,
+                password: c.password,
+                compression: parse_compression(&c.compression)?,
+            })),
+            AnyDestination::BigQuery(b) => {
+                let dataset_id = b.dataset_id.ok_or_else(|| {
+                    PyRuntimeError::new_err(
+                        "BigQuery(...) used as a sync() target requires dataset_id, \
+                         e.g. quickhouse.BigQuery(\"my-project\", dataset_id=\"analytics\")",
+                    )
+                })?;
+                Ok(core::DestinationConfig::BigQuery(core::BigQueryDestConfig {
+                    project_id: b.project_id,
+                    credentials_file: b.credentials_file,
+                    dataset_id,
+                }))
+            }
+        }
     }
 }
 
@@ -280,7 +337,7 @@ fn parse_compression(c: &str) -> PyResult<core::Compression> {
     }
 }
 
-/// Transfer one table from PostgreSQL to ClickHouse.
+/// Transfer one table from PostgreSQL, MySQL, or BigQuery into ClickHouse or BigQuery.
 #[pyfunction]
 #[pyo3(signature = (
     source,
@@ -291,6 +348,7 @@ fn parse_compression(c: &str) -> PyResult<core::Compression> {
     source_query=None,
     mode="full".to_string(),
     watermark=None,
+    lookback_seconds=0,
     key=None,
     create_if_missing=true,
     engine=None,
@@ -312,12 +370,13 @@ fn parse_compression(c: &str) -> PyResult<core::Compression> {
 fn sync(
     py: Python<'_>,
     source: AnySource,
-    target: ClickHouse,
+    target: AnyDestination,
     dest_table: String,
     source_table: Option<String>,
     source_query: Option<String>,
     mode: String,
     watermark: Option<String>,
+    lookback_seconds: u64,
     key: Option<Vec<String>>,
     create_if_missing: bool,
     engine: Option<String>,
@@ -337,19 +396,14 @@ fn sync(
 ) -> PyResult<TransferResult> {
     init_logging();
     let source_cfg: core::SourceConfig = source.into();
-    let ch = core::ClickHouseConfig {
-        url: target.url,
-        database: target.database,
-        user: target.user,
-        password: target.password,
-        compression: parse_compression(&target.compression)?,
-    };
+    let dest_cfg = target.into_config()?;
     let cfg = core::TransferConfig {
         source_table,
         source_query,
         dest_table,
         mode: parse_mode(&mode)?,
         watermark,
+        lookback_seconds,
         key: key.unwrap_or_default(),
         create_if_missing,
         engine,
@@ -385,7 +439,7 @@ fn sync(
     // Run with the GIL released so Python threads keep moving and the callback
     // can re-acquire it without deadlocking.
     let result = py
-        .allow_threads(|| core::run_transfer_blocking(source_cfg, ch, cfg, progress))
+        .allow_threads(|| core::run_transfer_blocking(source_cfg, dest_cfg, cfg, progress))
         .map_err(map_err)?;
 
     Ok(TransferResult {

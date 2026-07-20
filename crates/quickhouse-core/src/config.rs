@@ -84,6 +84,42 @@ pub enum Compression {
     Zstd,
 }
 
+/// Where to write to, when the destination is Google BigQuery.
+#[derive(Debug, Clone)]
+pub struct BigQueryDestConfig {
+    /// GCP project ID. If `None`, resolved from the credentials (both ADC and
+    /// service-account key files normally embed/resolve a project ID).
+    pub project_id: Option<String>,
+    /// Path to a service-account JSON key file. If `None`, falls back to
+    /// Application Default Credentials (`GOOGLE_APPLICATION_CREDENTIALS`,
+    /// `GOOGLE_APPLICATION_CREDENTIALS_JSON`, the metadata server, or the
+    /// gcloud CLI's well-known ADC file).
+    pub credentials_file: Option<String>,
+    /// Destination dataset (BigQuery's equivalent of ClickHouse's `database`).
+    /// `dest_table` names a bare table within it.
+    pub dataset_id: String,
+}
+
+/// Which destination engine to write to. Mirrors [`SourceConfig`]. `sync.rs`
+/// builds the matching [`crate::sink::Sink`] from this and dispatches DDL,
+/// inserts, atomic full-refresh swap, and incremental watermark state through
+/// it uniformly regardless of which destination is chosen.
+#[derive(Debug, Clone)]
+pub enum DestinationConfig {
+    ClickHouse(ClickHouseConfig),
+    BigQuery(BigQueryDestConfig),
+}
+
+impl DestinationConfig {
+    /// A short label identifying the destination, used in log lines.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            DestinationConfig::ClickHouse(_) => "clickhouse",
+            DestinationConfig::BigQuery(_) => "bigquery",
+        }
+    }
+}
+
 /// Full-refresh reloads everything; Incremental appends rows past a watermark.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncMode {
@@ -98,22 +134,45 @@ pub struct TransferConfig {
     pub source_table: Option<String>,
     /// Custom SELECT to read from instead of a whole table.
     pub source_query: Option<String>,
-    /// Destination table name (in the ClickHouse `database`).
+    /// Destination table name (a bare name within the ClickHouse `database` or
+    /// BigQuery `dataset_id`).
     pub dest_table: String,
 
     pub mode: SyncMode,
 
     /// Column used for the incremental high-water mark (required for Incremental).
     pub watermark: Option<String>,
-    /// Business/dedup key -> ClickHouse ORDER BY when we generate DDL.
+    /// Widen the tracked watermark's lower bound by this many seconds before
+    /// filtering, so a run re-includes a trailing window of already-synced
+    /// rows (catches late-arriving/edited rows that don't monotonically bump
+    /// the watermark). `0` disables this (default; byte-identical to the
+    /// pre-lookback filter). Requires `key` or `order_by` to be set (relies
+    /// on the destination's upsert/dedup to replace the overlap rather than
+    /// duplicate them) and a `watermark` column that resolves to a date or
+    /// timestamp type.
+    pub lookback_seconds: u64,
+    /// Business/dedup key. ClickHouse: contributes to `ORDER BY` when no
+    /// explicit `order_by` is given. BigQuery: contributes to `Clustering`
+    /// alongside `order_by` (see its docs) — BigQuery has no dedicated key
+    /// concept.
     pub key: Vec<String>,
 
     // ---- DDL / auto-create ----
     pub create_if_missing: bool,
-    /// ClickHouse engine, e.g. `MergeTree` or `ReplacingMergeTree`.
+    /// ClickHouse engine, e.g. `MergeTree` or `ReplacingMergeTree`. Ignored
+    /// for a BigQuery destination (no engine concept there).
     /// When `None`, chosen by mode (Full -> MergeTree, Incremental -> ReplacingMergeTree).
     pub engine: Option<String>,
+    /// ClickHouse: `ORDER BY` columns for generated DDL (falls back to `key`
+    /// if empty). BigQuery: combined with `key` into `Clustering.fields` (at
+    /// most 4 columns total — a clear config error if more are given, not a
+    /// silent truncation).
     pub order_by: Vec<String>,
+    /// ClickHouse: a `PARTITION BY` SQL expression (e.g. `toYYYYMM(date)`).
+    /// BigQuery: must instead be a bare `DATE`/`TIMESTAMP`/`DATETIME` column
+    /// name (BigQuery's time partitioning takes a column, not an expression)
+    /// — mapped to `TimePartitioning`; a clear error if the name doesn't
+    /// resolve to one of those types.
     pub partition_by: Option<String>,
     pub primary_key: Vec<String>,
 
@@ -144,7 +203,9 @@ pub struct TransferConfig {
     pub partition_column: Option<String>,
 
     // ---- transforms ----
-    /// Per-column ClickHouse type overrides (column name -> CH type string).
+    /// Per-column destination type overrides (column name -> the
+    /// destination's own type name, e.g. ClickHouse `"Decimal(18, 2)"` or
+    /// BigQuery `"NUMERIC"`/`"BIGNUMERIC"`).
     pub type_overrides: HashMap<String, String>,
     /// Source column -> destination column renames.
     pub rename: HashMap<String, String>,
@@ -189,6 +250,17 @@ impl TransferConfig {
                 "watermark column is required for incremental mode",
             ));
         }
+        if self.lookback_seconds > 0 && self.mode != SyncMode::Incremental {
+            return Err(EtlError::config(
+                "lookback_seconds only applies to incremental mode",
+            ));
+        }
+        if self.lookback_seconds > 0 && self.key.is_empty() && self.order_by.is_empty() {
+            return Err(EtlError::config(
+                "lookback_seconds requires key or order_by (otherwise the re-synced \
+                 overlap window produces duplicate rows instead of an upsert)",
+            ));
+        }
         if self.parallelism == 0 {
             return Err(EtlError::config("parallelism must be >= 1"));
         }
@@ -228,6 +300,7 @@ mod tests {
             dest_table: "t".into(),
             mode,
             watermark: watermark.map(str::to_string),
+            lookback_seconds: 0,
             key: vec!["id".into()],
             create_if_missing: true,
             engine: None,
@@ -258,5 +331,41 @@ mod tests {
         let mut c = cfg(SyncMode::Incremental, Some("write_date"));
         c.normalize();
         assert_eq!(c.watermark.as_deref(), Some("write_date"));
+    }
+
+    #[test]
+    fn validate_rejects_lookback_in_full_mode() {
+        let mut c = cfg(SyncMode::Full, None);
+        c.lookback_seconds = 60;
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("lookback_seconds"), "got: {err}");
+        assert!(err.contains("incremental"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_lookback_without_key_or_order_by() {
+        let mut c = cfg(SyncMode::Incremental, Some("write_date"));
+        c.key = vec![];
+        c.order_by = vec![];
+        c.lookback_seconds = 60;
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("lookback_seconds"), "got: {err}");
+        assert!(err.contains("key or order_by"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_accepts_lookback_with_order_by_but_no_key() {
+        let mut c = cfg(SyncMode::Incremental, Some("write_date"));
+        c.key = vec![];
+        c.order_by = vec!["id".into()];
+        c.lookback_seconds = 60;
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_lookback_with_key_in_incremental_mode() {
+        let mut c = cfg(SyncMode::Incremental, Some("write_date"));
+        c.lookback_seconds = 60;
+        assert!(c.validate().is_ok());
     }
 }
