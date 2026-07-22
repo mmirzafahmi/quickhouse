@@ -120,28 +120,41 @@ impl MySQL {
 /// `dataset_id` is only required when this is plugged in as `target=`
 /// (BigQuery's equivalent of ClickHouse's `database`) — as a `source=` it's
 /// unused, since `source_table`/`source_query` already carry the dataset.
+///
+/// `write_method` (`"insert_all"` (default) or `"storage_write"`) selects how
+/// rows are written when this is a `target=`; ignored as a `source=`.
 #[pyclass]
 #[derive(Clone)]
 struct BigQuery {
     project_id: Option<String>,
     credentials_file: Option<String>,
     dataset_id: Option<String>,
+    write_method: String,
 }
 
 #[pymethods]
 impl BigQuery {
     #[new]
-    #[pyo3(signature = (project_id=None, *, credentials_file=None, dataset_id=None))]
-    fn new(project_id: Option<String>, credentials_file: Option<String>, dataset_id: Option<String>) -> Self {
+    #[pyo3(signature = (project_id=None, *, credentials_file=None, dataset_id=None, write_method="insert_all".to_string()))]
+    fn new(
+        project_id: Option<String>,
+        credentials_file: Option<String>,
+        dataset_id: Option<String>,
+        write_method: String,
+    ) -> Self {
         BigQuery {
             project_id,
             credentials_file,
             dataset_id,
+            write_method,
         }
     }
 
     fn __repr__(&self) -> String {
-        format!("BigQuery(project_id={:?}, dataset_id={:?})", self.project_id, self.dataset_id)
+        format!(
+            "BigQuery(project_id={:?}, dataset_id={:?}, write_method={:?})",
+            self.project_id, self.dataset_id, self.write_method
+        )
     }
 }
 
@@ -243,6 +256,7 @@ impl AnyDestination {
                     project_id: b.project_id,
                     credentials_file: b.credentials_file,
                     dataset_id,
+                    write_method: parse_bq_write_method(&b.write_method)?,
                 }))
             }
         }
@@ -333,6 +347,16 @@ fn parse_compression(c: &str) -> PyResult<core::Compression> {
         "zstd" | "zst" => Ok(core::Compression::Zstd),
         other => Err(PyRuntimeError::new_err(format!(
             "invalid compression {other:?}; expected 'none', 'gzip', or 'zstd'"
+        ))),
+    }
+}
+
+fn parse_bq_write_method(m: &str) -> PyResult<core::BigQueryWriteMethod> {
+    match m.to_ascii_lowercase().as_str() {
+        "insert_all" | "insertall" | "insert" => Ok(core::BigQueryWriteMethod::InsertAll),
+        "storage_write" | "storagewrite" | "storage" => Ok(core::BigQueryWriteMethod::StorageWrite),
+        other => Err(PyRuntimeError::new_err(format!(
+            "invalid write_method {other:?}; expected 'insert_all' or 'storage_write'"
         ))),
     }
 }

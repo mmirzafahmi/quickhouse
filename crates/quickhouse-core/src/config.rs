@@ -84,6 +84,20 @@ pub enum Compression {
     Zstd,
 }
 
+/// How to write rows into BigQuery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BigQueryWriteMethod {
+    /// `tabledata.insertAll` — a plain JSON POST over the REST API. The
+    /// default: proven, no extra dependencies, but the older/lower-throughput
+    /// path (and it bills, unlike the free Storage Write API).
+    #[default]
+    InsertAll,
+    /// The BigQuery Storage Write API (gRPC, protobuf) — modern, free, and
+    /// higher-throughput. Opt-in: rows are encoded to protobuf and appended to
+    /// the table's `_default` stream. See `sink::bigquery_proto`.
+    StorageWrite,
+}
+
 /// Where to write to, when the destination is Google BigQuery.
 #[derive(Debug, Clone)]
 pub struct BigQueryDestConfig {
@@ -98,6 +112,9 @@ pub struct BigQueryDestConfig {
     /// Destination dataset (BigQuery's equivalent of ClickHouse's `database`).
     /// `dest_table` names a bare table within it.
     pub dataset_id: String,
+    /// How rows are written into BigQuery (default `InsertAll`). Only meaningful
+    /// when BigQuery is the destination; ignored when it's the source.
+    pub write_method: BigQueryWriteMethod,
 }
 
 /// Which destination engine to write to. Mirrors [`SourceConfig`]. `sync.rs`

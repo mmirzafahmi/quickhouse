@@ -5,6 +5,7 @@
 //! never needs to know which concrete destination it's talking to.
 
 pub mod bigquery;
+mod bigquery_proto;
 pub mod clickhouse;
 
 pub use bigquery::BigQuerySink;

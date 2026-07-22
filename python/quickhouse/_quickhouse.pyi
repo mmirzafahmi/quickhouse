@@ -75,6 +75,13 @@ class BigQuery:
         ``database``) — **required** when this is used as ``target=``;
         unused as a ``source=`` (``source_table``/``source_query`` already
         carry the dataset there).
+    write_method:
+        How rows are written when this is a ``target=`` (ignored as a
+        ``source=``). ``"insert_all"`` (default) uses ``tabledata.insertAll``
+        (JSON over REST — proven, but billed and lower-throughput).
+        ``"storage_write"`` uses the BigQuery Storage Write API (gRPC +
+        protobuf — free and higher-throughput). Both share the same atomic
+        swap / MERGE flow; only the row-insert transport differs.
 
     Notes
     -----
@@ -85,16 +92,15 @@ class BigQuery:
     the parallel work server-side rather than via multiple local
     connections, unlike the Postgres/MySQL sources).
 
-    As a destination: writes use the ``tabledata.insertAll`` streaming-insert
-    API (JSON rows over REST); the full-refresh atomic swap uses a
-    ``WRITE_TRUNCATE`` copy job (BigQuery has no `EXCHANGE TABLES`
-    equivalent). ``partition_by`` must be a bare ``DATE``/``DATETIME``/
-    ``TIMESTAMP`` column name (not a SQL expression like ClickHouse's);
-    ``order_by``/``key`` become clustering columns (at most 4 total).
-    Incremental mode has no engine-level dedup here (unlike ClickHouse's
-    `ReplacingMergeTree`), so it upserts via a ``MERGE`` statement matched on
-    ``key`` instead — making ``key`` **required** for incremental syncs into
-    BigQuery specifically.
+    As a destination: rows are written via ``write_method`` (see above); the
+    full-refresh atomic swap uses a ``WRITE_TRUNCATE`` copy job (BigQuery has
+    no `EXCHANGE TABLES` equivalent). ``partition_by`` must be a bare
+    ``DATE``/``DATETIME``/``TIMESTAMP`` column name (not a SQL expression like
+    ClickHouse's); ``order_by``/``key`` become clustering columns (at most 4
+    total). Incremental mode has no engine-level dedup here (unlike
+    ClickHouse's `ReplacingMergeTree`), so it upserts via a ``MERGE``
+    statement matched on ``key`` instead — making ``key`` **required** for
+    incremental syncs into BigQuery specifically.
     """
 
     def __init__(
@@ -103,6 +109,7 @@ class BigQuery:
         *,
         credentials_file: Optional[str] = None,
         dataset_id: Optional[str] = None,
+        write_method: str = "insert_all",
     ) -> None: ...
 
 class ClickHouse:

@@ -43,10 +43,14 @@ use google_cloud_bigquery::http::table::{
 };
 use google_cloud_bigquery::http::tabledata::insert_all::{InsertAllRequest, Row as InsertRow};
 use google_cloud_bigquery::query::row::Row as QueryRow;
+use google_cloud_bigquery::storage_write::stream::default::DefaultStream;
+use google_cloud_bigquery::storage_write::AppendRowsRequestBuilder;
+use prost_types::DescriptorProto;
 use serde_json::Value;
 
-use crate::config::{BigQueryDestConfig, TransferConfig};
+use crate::config::{BigQueryDestConfig, BigQueryWriteMethod, TransferConfig};
 use crate::error::{EtlError, Result};
+use crate::sink::bigquery_proto::{build_proto_descriptor, encode_row, resolve_fields};
 use crate::sink::{backoff_delay, SendError, MAX_INSERT_ATTEMPTS};
 use crate::types::bigquery::arrow_to_bigquery_type;
 use crate::types::ColumnType;
@@ -56,6 +60,11 @@ use crate::types::ColumnType;
 /// guard — conservative but simple for v1).
 const INSERT_ALL_MAX_ROWS_PER_REQUEST: usize = 5_000;
 
+/// The Storage Write API `AppendRows` request has a ~10MB limit. Protobuf rows
+/// are far more compact than insertAll's JSON, so this row cap leaves ample
+/// headroom for typical rows (byte size isn't pre-computed, same as insertAll).
+const STORAGE_WRITE_MAX_ROWS_PER_APPEND: usize = 5_000;
+
 const STATE_TABLE: &str = "_quickhouse_state";
 
 #[derive(Clone)]
@@ -63,6 +72,7 @@ pub struct BigQuerySink {
     client: Client,
     project_id: String,
     dataset_id: String,
+    write_method: BigQueryWriteMethod,
 }
 
 impl BigQuerySink {
@@ -97,6 +107,7 @@ impl BigQuerySink {
             client,
             project_id,
             dataset_id: cfg.dataset_id,
+            write_method: cfg.write_method,
         })
     }
 
@@ -127,11 +138,20 @@ impl BigQuerySink {
         Ok(())
     }
 
+    /// Insert Arrow batches, dispatching on the configured write method:
+    /// `insertAll` (default) or the Storage Write API (opt-in). Both share the
+    /// transient-failure retry/backoff policy of the ClickHouse sink.
+    pub async fn insert_batches(&self, table: &str, schema: SchemaRef, batches: &[RecordBatch]) -> Result<u64> {
+        match self.write_method {
+            BigQueryWriteMethod::InsertAll => self.insert_batches_insert_all(table, batches).await,
+            BigQueryWriteMethod::StorageWrite => self.insert_batches_storage_write(table, schema, batches).await,
+        }
+    }
+
     /// Insert Arrow batches via `tabledata.insertAll`, chunked to stay under
-    /// its per-request row limit, with the same transient-failure retry/
-    /// backoff policy as the ClickHouse sink. Returns an approximate
-    /// JSON-payload-bytes-sent count (an accounting detail, not exact).
-    pub async fn insert_batches(&self, table: &str, _schema: SchemaRef, batches: &[RecordBatch]) -> Result<u64> {
+    /// its per-request row limit. Returns an approximate JSON-payload-bytes-sent
+    /// count (an accounting detail, not exact).
+    async fn insert_batches_insert_all(&self, table: &str, batches: &[RecordBatch]) -> Result<u64> {
         if batches.iter().all(|b| b.num_rows() == 0) {
             return Ok(0);
         }
@@ -209,6 +229,115 @@ impl BigQuerySink {
                     errors.len(),
                     self.dataset_id
                 ))));
+            }
+        }
+        Ok(())
+    }
+
+    /// Insert Arrow batches via the BigQuery Storage Write API (opt-in). Each
+    /// row is protobuf-encoded (see [`super::bigquery_proto`]) and appended to
+    /// the table's `_default` stream — at-least-once, matching insertAll's
+    /// semantics; idempotency for incremental syncs comes from the staging +
+    /// MERGE flow, and for full-refresh from writing to staging then swapping.
+    /// Returns the total encoded protobuf bytes sent.
+    async fn insert_batches_storage_write(&self, table: &str, schema: SchemaRef, batches: &[RecordBatch]) -> Result<u64> {
+        if batches.iter().all(|b| b.num_rows() == 0) {
+            return Ok(0);
+        }
+        let fields = resolve_fields(&schema)?;
+        let descriptor = build_proto_descriptor(&fields)?;
+        // `_default` is a persistent server-side stream; this fetches its
+        // handle (a lightweight GetWriteStream), created once per call.
+        let resource = format!("projects/{}/datasets/{}/tables/{table}", self.project_id, self.dataset_id);
+        let stream = self
+            .client
+            .default_storage_writer()
+            .create_write_stream(&resource)
+            .await
+            .map_err(|e| EtlError::other(format!("bigquery storage-write: open stream for {resource}: {e}")))?;
+
+        let mut total_bytes = 0u64;
+        for batch in batches {
+            let mut start = 0usize;
+            while start < batch.num_rows() {
+                let end = (start + STORAGE_WRITE_MAX_ROWS_PER_APPEND).min(batch.num_rows());
+                let mut serialized = Vec::with_capacity(end - start);
+                for r in start..end {
+                    let mut buf = Vec::new();
+                    encode_row(batch, r, &fields, &mut buf)?;
+                    total_bytes += buf.len() as u64;
+                    serialized.push(buf);
+                }
+
+                let mut attempt = 0u32;
+                loop {
+                    attempt += 1;
+                    // Clone per attempt: retries are rare, and the builder
+                    // consumes the row bytes.
+                    match self.try_append(&stream, &descriptor, serialized.clone(), table).await {
+                        Ok(()) => break,
+                        Err(SendError::Permanent(e)) => return Err(e),
+                        Err(SendError::Transient(e)) => {
+                            if attempt >= MAX_INSERT_ATTEMPTS {
+                                return Err(EtlError::other(format!(
+                                    "bigquery storage-write append into {}.{table} failed after {attempt} attempts: {e}",
+                                    self.dataset_id
+                                )));
+                            }
+                            let delay = backoff_delay(attempt);
+                            tracing::warn!(
+                                "bigquery storage-write append into {}.{table} attempt {attempt} failed ({e}); retrying in {:?}",
+                                self.dataset_id,
+                                delay
+                            );
+                            tokio::time::sleep(delay).await;
+                        }
+                    }
+                }
+                start = end;
+            }
+        }
+        Ok(total_bytes)
+    }
+
+    /// One `AppendRows` attempt: append the chunk and drain the response
+    /// stream, surfacing both transport failures and in-band append/row errors
+    /// classified for retry (transient) vs. immediate failure (permanent).
+    async fn try_append(
+        &self,
+        stream: &DefaultStream,
+        descriptor: &DescriptorProto,
+        rows: Vec<Vec<u8>>,
+        table: &str,
+    ) -> std::result::Result<(), SendError> {
+        let builder = AppendRowsRequestBuilder::new(descriptor.clone(), rows);
+        let mut resp = stream
+            .append_rows(vec![builder])
+            .await
+            .map_err(|s| classify_status(&s, "bigquery storage-write append"))?;
+        while let Some(msg) = resp
+            .message()
+            .await
+            .map_err(|s| classify_status(&s, "bigquery storage-write stream"))?
+        {
+            if !msg.row_errors.is_empty() {
+                let detail = msg
+                    .row_errors
+                    .iter()
+                    .map(|e| format!("row {}: {}", e.index, e.message))
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                return Err(SendError::Permanent(EtlError::other(format!(
+                    "bigquery storage-write rejected {} row(s) into {}.{table}: {detail}",
+                    msg.row_errors.len(),
+                    self.dataset_id
+                ))));
+            }
+            if let Some(response) = msg.response {
+                use google_cloud_googleapis::cloud::bigquery::storage::v1::append_rows_response::Response;
+                if let Response::Error(status) = response {
+                    return Err(classify_rpc_status(&status, table, &self.dataset_id));
+                }
             }
         }
         Ok(())
@@ -459,6 +588,38 @@ fn classify_bq_error(e: BqError, context: &str) -> SendError {
     }
 }
 
+/// Classify a gRPC transport `Status` (from `append_rows`/stream draining):
+/// unavailable/internal/aborted/exhausted/deadline are transient (retry),
+/// everything else (e.g. `INVALID_ARGUMENT`, auth) is deterministic.
+fn classify_status(status: &google_cloud_gax::grpc::Status, context: &str) -> SendError {
+    use google_cloud_gax::grpc::Code;
+    let err = EtlError::other(format!("{context}: {} ({:?})", status.message(), status.code()));
+    match status.code() {
+        Code::Unavailable
+        | Code::Internal
+        | Code::Aborted
+        | Code::DeadlineExceeded
+        | Code::ResourceExhausted => SendError::Transient(err),
+        _ => SendError::Permanent(err),
+    }
+}
+
+/// Classify an in-band `google.rpc.Status` returned inside an
+/// `AppendRowsResponse` (a per-append error, distinct from a transport
+/// failure). Codes are `google.rpc.Code` integers: INTERNAL(13),
+/// UNAVAILABLE(14), ABORTED(10), RESOURCE_EXHAUSTED(8), DEADLINE_EXCEEDED(4)
+/// are transient; everything else (e.g. INVALID_ARGUMENT(3)) is deterministic.
+fn classify_rpc_status(status: &google_cloud_googleapis::rpc::Status, table: &str, dataset: &str) -> SendError {
+    let err = EtlError::other(format!(
+        "bigquery storage-write append error into {dataset}.{table}: code {} {}",
+        status.code, status.message
+    ));
+    match status.code {
+        13 | 14 | 10 | 8 | 4 => SendError::Transient(err),
+        _ => SendError::Permanent(err),
+    }
+}
+
 /// A job ID unique enough in practice (nanosecond timestamp + a sanitized
 /// table name), matching this crate's own test-suite convention of deriving
 /// job IDs from a timestamp. Job IDs may only contain letters/digits/`_`/`-`.
@@ -691,7 +852,9 @@ fn date32_to_iso(days: i32) -> String {
 /// `has_tz` distinguishes BigQuery `DATETIME` (naive, no suffix) from
 /// `TIMESTAMP` (UTC instant, trailing `Z`) — matching `arrow_to_bigquery_type`'s
 /// `Timestamp(µs, None) -> Datetime` / `Timestamp(µs, Some(_)) -> Timestamp` split.
-fn timestamp_micros_to_iso(micros: i64, has_tz: bool) -> Result<String> {
+/// `pub(crate)` so the Storage Write proto encoder (`bigquery_proto`) reuses the
+/// same civil-string format for `DATETIME` columns.
+pub(crate) fn timestamp_micros_to_iso(micros: i64, has_tz: bool) -> Result<String> {
     let secs = micros.div_euclid(1_000_000);
     let nanos = (micros.rem_euclid(1_000_000) * 1000) as u32;
     let dt = chrono::DateTime::from_timestamp(secs, nanos)

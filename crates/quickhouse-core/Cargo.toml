@@ -31,8 +31,11 @@ rustls-pemfile.workspace = true
 mysql_async.workspace = true
 google-cloud-bigquery.workspace = true
 google-cloud-googleapis.workspace = true
+google-cloud-gax.workspace = true
 time.workspace = true
 base64.workspace = true
+prost.workspace = true
+prost-types.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true

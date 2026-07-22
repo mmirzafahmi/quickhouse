@@ -41,10 +41,18 @@ mysql_async = { version = "0.34", default-features = false, features = ["default
 # that entirely, matching the rest of this workspace's pure-rustls stack.
 google-cloud-bigquery = { version = "0.15", default-features = false, features = ["auth", "rustls-tls"] }
 google-cloud-googleapis = { version = "0.16", features = ["bigquery"] }
+# gRPC transport types (Status/Code) for the Storage Write API error handling.
+google-cloud-gax = "0.19"
 time = { version = "0.3", features = ["macros"] }
 # Only used to encode Binary columns as BigQuery's BYTES JSON representation
 # (base64 text) for the insertAll destination path.
 base64 = "0.22"
+# For the opt-in BigQuery Storage Write API path: prost-types provides the
+# runtime protobuf `DescriptorProto`/`FieldDescriptorProto` we build from the
+# Arrow schema; prost is used in tests to decode our hand-encoded rows and
+# verify the wire format. Pinned to the versions the bigquery crate resolves.
+prost = "0.13"
+prost-types = "0.13"
 
 # Faster release builds for the shipped wheel.
 [profile.release]

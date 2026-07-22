@@ -24,8 +24,9 @@ pub mod transform;
 pub mod types;
 
 pub use config::{
-    BigQueryConfig, BigQueryDestConfig, ClickHouseConfig, Compression, DestinationConfig,
-    MySqlConfig, PostgresConfig, SourceConfig, SyncMode, TransferConfig, TransferResult,
+    BigQueryConfig, BigQueryDestConfig, BigQueryWriteMethod, ClickHouseConfig, Compression,
+    DestinationConfig, MySqlConfig, PostgresConfig, SourceConfig, SyncMode, TransferConfig,
+    TransferResult,
 };
 pub use error::{EtlError, Result};
 pub use sync::{run_transfer, Progress, ProgressCb};
