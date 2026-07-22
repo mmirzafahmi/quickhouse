@@ -343,7 +343,7 @@ async fn run_transfer_impl(
     // --- Full refresh: atomically swap staging into place. ---
     if cfg.mode == SyncMode::Full {
         tracing::info!("swapping staging table into '{}'", cfg.dest_table);
-        sink.atomic_swap(&cfg.dest_table, &staging_name(&cfg.dest_table))
+        sink.atomic_swap(&cfg.dest_table, &staging_name(&cfg.dest_table), &plan.dest_columns)
             .await?;
         sink.drop_table(&staging_name(&cfg.dest_table)).await?;
     }
@@ -504,7 +504,7 @@ async fn run_transfer_bigquery(
 
     if cfg.mode == SyncMode::Full {
         tracing::info!("swapping staging table into '{}'", cfg.dest_table);
-        sink.atomic_swap(&cfg.dest_table, &staging_name(&cfg.dest_table))
+        sink.atomic_swap(&cfg.dest_table, &staging_name(&cfg.dest_table), &plan.dest_columns)
             .await?;
         sink.drop_table(&staging_name(&cfg.dest_table)).await?;
     }

@@ -110,7 +110,11 @@ derived from the source.
 ### Full vs. incremental
 
 **Full** reloads the whole table into a staging table, then swaps it into place
-atomically — a crash mid-run never leaves the destination partial.
+atomically — a crash mid-run never leaves the destination partial. For a
+BigQuery destination that swap runs as a query (a billed scan of the staged
+data), not a free copy job — BigQuery's copy jobs can silently skip rows still
+sitting in a table's streaming buffer, so a real query is what keeps this
+correct rather than just fast.
 
 **Incremental** tracks a high-water mark (the `watermark` column) in a small
 state table in the destination and copies only newer rows. Updated rows are

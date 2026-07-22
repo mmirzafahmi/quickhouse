@@ -101,12 +101,13 @@ impl Sink {
     }
 
     /// Atomically replace `dest`'s contents with `staging`'s (both must
-    /// exist): ClickHouse's `EXCHANGE TABLES`, BigQuery's `WRITE_TRUNCATE`
-    /// copy job.
-    pub async fn atomic_swap(&self, dest: &str, staging: &str) -> Result<()> {
+    /// exist): ClickHouse's `EXCHANGE TABLES`, or BigQuery's `TRUNCATE` +
+    /// `INSERT ... SELECT` transaction (needs `columns` to build the
+    /// `INSERT`/`SELECT` column list; ClickHouse's swap needs no column list).
+    pub async fn atomic_swap(&self, dest: &str, staging: &str, columns: &[ColumnType]) -> Result<()> {
         match self {
             Sink::ClickHouse(s) => s.exchange_tables(dest, staging).await,
-            Sink::BigQuery(s) => s.atomic_swap(dest, staging).await,
+            Sink::BigQuery(s) => s.atomic_swap(dest, staging, columns).await,
         }
     }
 

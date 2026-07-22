@@ -1,23 +1,27 @@
 //! BigQuery sink: auth, structured DDL (no SQL-string templating, unlike
-//! ClickHouse — see `build_table`), and writes via the `tabledata.insertAll`
-//! streaming-insert API.
-//!
-//! Three ways exist to write into BigQuery; this is deliberately the
-//! simplest one that needs zero new dependencies. The Storage Write API is
-//! the modern, free, highest-throughput path, but requires hand-building a
-//! dynamic protobuf encoder (no crate support for arbitrary runtime schemas)
-//! — a large, separate undertaking, left as a documented future enhancement
-//! (see the README). Load jobs are cheap and BigQuery's own recommended bulk
-//! path, but this crate only supports them via a GCS `source_uris` staging
-//! file, which would add a hard Cloud Storage dependency and a bucket
-//! requirement just for this destination. `insertAll` needs neither: it's a
-//! plain JSON POST over the REST API this crate already wraps.
+//! ClickHouse — see `build_table`), and writes via either `tabledata.insertAll`
+//! (default) or the Storage Write API (opt-in, `write_method="storage_write"`
+//! — see `bigquery_proto` for the runtime protobuf descriptor/encoder).
+//! Load jobs were also considered, BigQuery's own recommended bulk path, but
+//! this crate only supports them via a GCS `source_uris` staging file, which
+//! would add a hard Cloud Storage dependency and a bucket requirement just
+//! for this destination.
 //!
 //! The atomic full-refresh swap (ClickHouse's `EXCHANGE TABLES`) has no
-//! single-statement BigQuery equivalent; the nearest is a COPY job with
-//! `WRITE_TRUNCATE`, which — like `EXCHANGE TABLES` — is atomic and (unlike
-//! `CREATE OR REPLACE TABLE ... AS SELECT`) doesn't re-read/bill for
-//! rewriting every row through a query.
+//! single-statement BigQuery equivalent. The obvious-looking option — a COPY
+//! job with `WRITE_TRUNCATE` — is actually **wrong**: BigQuery copy jobs never
+//! include rows still sitting in a table's streaming buffer (true for both
+//! `insertAll` and the Storage Write API), so a copy run immediately after
+//! writing `staging` can silently produce an empty `dest` while `sync()`
+//! still reports success. Instead, `atomic_swap` runs `TRUNCATE TABLE dest` +
+//! `INSERT INTO dest SELECT ... FROM staging` inside an explicit
+//! multi-statement transaction (`build_swap_sql`) — a DML/DDL query job,
+//! which (unlike a copy job) correctly reads all of `staging`'s rows whether
+//! buffered or not, while `TRUNCATE` (unlike `CREATE OR REPLACE TABLE ... AS
+//! SELECT`) preserves `dest`'s existing partitioning/clustering. This bills
+//! for reading `staging` once per full refresh — the same cost the
+//! incremental `MERGE` path already accepts — in exchange for actually being
+//! correct.
 
 use std::time::Duration;
 
@@ -34,8 +38,7 @@ use google_cloud_bigquery::http::error::Error as BqError;
 use google_cloud_bigquery::http::job::get::GetJobRequest;
 use google_cloud_bigquery::http::job::query::QueryRequest;
 use google_cloud_bigquery::http::job::{
-    CreateDisposition, Job, JobConfiguration, JobConfigurationQuery, JobConfigurationSourceTable,
-    JobConfigurationTableCopy, JobReference, JobState, JobType, OperationType, WriteDisposition,
+    Job, JobConfiguration, JobConfigurationQuery, JobReference, JobState, JobType,
 };
 use google_cloud_bigquery::http::table::{
     Clustering, Table, TableFieldMode, TableFieldSchema, TableFieldType, TableReference, TableSchema,
@@ -344,9 +347,13 @@ impl BigQuerySink {
     }
 
     /// Atomically replace `dest`'s contents with `staging`'s via a
-    /// `WRITE_TRUNCATE` copy job (see the module docs for why this, not
-    /// `CREATE OR REPLACE TABLE ... AS SELECT`).
-    pub async fn atomic_swap(&self, dest: &str, staging: &str) -> Result<()> {
+    /// `TRUNCATE TABLE` + `INSERT ... SELECT` wrapped in an explicit
+    /// multi-statement transaction — see the module docs for why this, not a
+    /// `WRITE_TRUNCATE` copy job (which silently drops rows still in
+    /// `staging`'s streaming buffer) or `CREATE OR REPLACE TABLE ... AS
+    /// SELECT` (which would drop `dest`'s partitioning/clustering).
+    pub async fn atomic_swap(&self, dest: &str, staging: &str, columns: &[ColumnType]) -> Result<()> {
+        let query = build_swap_sql(&self.project_id, &self.dataset_id, dest, staging, columns);
         let job = Job {
             job_reference: JobReference {
                 project_id: self.project_id.clone(),
@@ -354,20 +361,9 @@ impl BigQuerySink {
                 location: None,
             },
             configuration: JobConfiguration {
-                job: JobType::Copy(JobConfigurationTableCopy {
-                    source_table: JobConfigurationSourceTable::SourceTable(TableReference {
-                        project_id: self.project_id.clone(),
-                        dataset_id: self.dataset_id.clone(),
-                        table_id: staging.to_string(),
-                    }),
-                    destination_table: TableReference {
-                        project_id: self.project_id.clone(),
-                        dataset_id: self.dataset_id.clone(),
-                        table_id: dest.to_string(),
-                    },
-                    create_disposition: Some(CreateDisposition::CreateIfNeeded),
-                    write_disposition: Some(WriteDisposition::WriteTruncate),
-                    operation_type: Some(OperationType::Copy),
+                job: JobType::Query(JobConfigurationQuery {
+                    query,
+                    use_legacy_sql: Some(false),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -379,7 +375,7 @@ impl BigQuerySink {
             .job()
             .create(&job)
             .await
-            .map_err(|e| EtlError::other(format!("bigquery copy job error: {e}")))?;
+            .map_err(|e| EtlError::other(format!("bigquery swap job error: {e}")))?;
         self.poll_job_until_done(created).await?;
         Ok(())
     }
@@ -639,6 +635,28 @@ fn unique_job_id(prefix: &str, table: &str) -> String {
 /// `sync.rs`'s `build_watermark_filter_bigquery`, for consistency).
 fn escape_sql_string(s: &str) -> String {
     s.replace('\'', "''")
+}
+
+/// Build the `TRUNCATE` + `INSERT ... SELECT` transaction that atomically
+/// replaces `dest`'s contents with `staging`'s — see `BigQuerySink::
+/// atomic_swap`'s docs for why this, not a copy job. `TRUNCATE TABLE` is DDL
+/// that preserves `dest`'s schema/partitioning/clustering (unlike `CREATE OR
+/// REPLACE`) and is free (no bytes scanned); only the `INSERT ... SELECT`
+/// bills, for reading `staging` once. Wrapping both in an explicit
+/// transaction keeps the swap atomic: if the `INSERT` fails, `TRUNCATE`
+/// rolls back too and `dest` is left untouched. A free function (not a
+/// `&self` method) so it's unit-testable without a real authenticated
+/// client, mirroring `build_merge_sql`/`build_table`.
+fn build_swap_sql(project_id: &str, dataset_id: &str, dest: &str, staging: &str, columns: &[ColumnType]) -> String {
+    let dest_ref = format!("`{project_id}`.`{dataset_id}`.`{dest}`");
+    let staging_ref = format!("`{project_id}`.`{dataset_id}`.`{staging}`");
+    let col_list = columns.iter().map(|c| format!("`{}`", c.name)).collect::<Vec<_>>().join(", ");
+    format!(
+        "BEGIN TRANSACTION; \
+         TRUNCATE TABLE {dest_ref}; \
+         INSERT INTO {dest_ref} ({col_list}) SELECT {col_list} FROM {staging_ref}; \
+         COMMIT TRANSACTION;"
+    )
 }
 
 /// Build the `MERGE` statement that upserts `staging`'s rows into `dest`,
@@ -990,6 +1008,41 @@ mod tests {
         let tp = t.time_partitioning.unwrap();
         assert_eq!(tp.field.as_deref(), Some("event_date"));
         assert_eq!(tp.partition_type, TimePartitionType::Day);
+    }
+
+    #[test]
+    fn build_swap_sql_wraps_truncate_and_insert_select_in_a_transaction() {
+        let cols = vec![
+            col("id", DataType::Int64, false),
+            col("name", DataType::Utf8, true),
+            col("amount", DataType::Float64, true),
+        ];
+        let sql = build_swap_sql("proj", "ds", "orders", "orders_quickhouse_tmp", &cols);
+
+        assert!(sql.starts_with("BEGIN TRANSACTION;"), "{sql}");
+        assert!(sql.trim_end().ends_with("COMMIT TRANSACTION;"), "{sql}");
+        assert!(sql.contains("TRUNCATE TABLE `proj`.`ds`.`orders`;"), "{sql}");
+        assert!(
+            sql.contains(
+                "INSERT INTO `proj`.`ds`.`orders` (`id`, `name`, `amount`) \
+                 SELECT `id`, `name`, `amount` FROM `proj`.`ds`.`orders_quickhouse_tmp`;"
+            ),
+            "{sql}"
+        );
+        // TRUNCATE must run before the INSERT, and both inside the transaction.
+        let truncate_pos = sql.find("TRUNCATE TABLE").unwrap();
+        let insert_pos = sql.find("INSERT INTO").unwrap();
+        let commit_pos = sql.find("COMMIT TRANSACTION").unwrap();
+        assert!(truncate_pos < insert_pos && insert_pos < commit_pos, "wrong statement order: {sql}");
+    }
+
+    #[test]
+    fn build_swap_sql_includes_every_column_not_just_a_key_subset() {
+        // Unlike build_merge_sql there's no key/non-key split — every column
+        // is both truncated away and re-inserted.
+        let cols = vec![col("a", DataType::Int64, false), col("b", DataType::Utf8, true)];
+        let sql = build_swap_sql("p", "d", "dest", "staging", &cols);
+        assert!(sql.contains("(`a`, `b`) SELECT `a`, `b` FROM"), "{sql}");
     }
 
     #[test]
