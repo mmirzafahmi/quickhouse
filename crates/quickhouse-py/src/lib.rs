@@ -189,7 +189,65 @@ impl From<AnySource> for core::SourceConfig {
     }
 }
 
-/// ClickHouse destination connection descriptor.
+/// Optional S3 (or S3-compatible, e.g. MinIO) data-lake archive attached to a
+/// `ClickHouse` destination via its `archive=` parameter — every batch synced
+/// into ClickHouse is also written as Parquet, one file per parallel
+/// partition, to `s3://{bucket}/{prefix}/{dest_table}/dt=<date>/run=<id>/
+/// part-<partition>.parquet`. A secondary, best-effort-free backup/historical
+/// side channel; omitting `archive` entirely disables it and has zero effect
+/// on the ClickHouse write path.
+///
+/// `region`/`access_key_id`/`secret_access_key` default to the standard AWS
+/// credential chain (env vars, IAM role) when omitted — set them explicitly
+/// to override, or to point at an S3-compatible service via `endpoint`
+/// (plain HTTP is allowed automatically whenever `endpoint` is set; real AWS
+/// S3 always uses HTTPS).
+#[pyclass]
+#[derive(Clone)]
+struct S3Archive {
+    bucket: String,
+    prefix: String,
+    region: Option<String>,
+    access_key_id: Option<String>,
+    secret_access_key: Option<String>,
+    endpoint: Option<String>,
+    compression: String,
+}
+
+#[pymethods]
+impl S3Archive {
+    #[new]
+    #[pyo3(signature = (bucket, *, prefix="".to_string(), region=None, access_key_id=None, secret_access_key=None, endpoint=None, compression="zstd".to_string()))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        bucket: String,
+        prefix: String,
+        region: Option<String>,
+        access_key_id: Option<String>,
+        secret_access_key: Option<String>,
+        endpoint: Option<String>,
+        compression: String,
+    ) -> Self {
+        S3Archive {
+            bucket,
+            prefix,
+            region,
+            access_key_id,
+            secret_access_key,
+            endpoint,
+            compression,
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "S3Archive(bucket={:?}, prefix={:?}, endpoint={:?})",
+            self.bucket, self.prefix, self.endpoint
+        )
+    }
+}
+
+/// Where to write to.
 #[pyclass]
 #[derive(Clone)]
 struct ClickHouse {
@@ -198,18 +256,21 @@ struct ClickHouse {
     user: String,
     password: String,
     compression: String,
+    archive: Option<S3Archive>,
 }
 
 #[pymethods]
 impl ClickHouse {
     #[new]
-    #[pyo3(signature = (url, *, database="default".to_string(), user="default".to_string(), password="".to_string(), compression="zstd".to_string()))]
+    #[pyo3(signature = (url, *, database="default".to_string(), user="default".to_string(), password="".to_string(), compression="zstd".to_string(), archive=None))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         url: String,
         database: String,
         user: String,
         password: String,
         compression: String,
+        archive: Option<S3Archive>,
     ) -> Self {
         ClickHouse {
             url,
@@ -217,6 +278,7 @@ impl ClickHouse {
             user,
             password,
             compression,
+            archive,
         }
     }
 
@@ -238,13 +300,35 @@ impl AnyDestination {
     /// touching the network.
     fn into_config(self) -> PyResult<core::DestinationConfig> {
         match self {
-            AnyDestination::ClickHouse(c) => Ok(core::DestinationConfig::ClickHouse(core::ClickHouseConfig {
-                url: c.url,
-                database: c.database,
-                user: c.user,
-                password: c.password,
-                compression: parse_compression(&c.compression)?,
-            })),
+            AnyDestination::ClickHouse(c) => {
+                let s3_archive = match c.archive {
+                    Some(a) => {
+                        if a.bucket.is_empty() {
+                            return Err(PyRuntimeError::new_err(
+                                "S3Archive(...) requires a non-empty bucket",
+                            ));
+                        }
+                        Some(core::S3ArchiveConfig {
+                            bucket: a.bucket,
+                            prefix: a.prefix,
+                            region: a.region,
+                            access_key_id: a.access_key_id,
+                            secret_access_key: a.secret_access_key,
+                            endpoint: a.endpoint,
+                            compression: parse_parquet_compression(&a.compression)?,
+                        })
+                    }
+                    None => None,
+                };
+                Ok(core::DestinationConfig::ClickHouse(core::ClickHouseConfig {
+                    url: c.url,
+                    database: c.database,
+                    user: c.user,
+                    password: c.password,
+                    compression: parse_compression(&c.compression)?,
+                    s3_archive,
+                }))
+            }
             AnyDestination::BigQuery(b) => {
                 let dataset_id = b.dataset_id.ok_or_else(|| {
                     PyRuntimeError::new_err(
@@ -357,6 +441,17 @@ fn parse_bq_write_method(m: &str) -> PyResult<core::BigQueryWriteMethod> {
         "storage_write" | "storagewrite" | "storage" => Ok(core::BigQueryWriteMethod::StorageWrite),
         other => Err(PyRuntimeError::new_err(format!(
             "invalid write_method {other:?}; expected 'insert_all' or 'storage_write'"
+        ))),
+    }
+}
+
+fn parse_parquet_compression(c: &str) -> PyResult<core::ParquetCompression> {
+    match c.to_ascii_lowercase().as_str() {
+        "zstd" | "zst" => Ok(core::ParquetCompression::Zstd),
+        "snappy" | "snap" => Ok(core::ParquetCompression::Snappy),
+        "none" | "uncompressed" | "off" => Ok(core::ParquetCompression::Uncompressed),
+        other => Err(PyRuntimeError::new_err(format!(
+            "invalid archive compression {other:?}; expected 'zstd', 'snappy', or 'uncompressed'"
         ))),
     }
 }
@@ -487,6 +582,7 @@ fn _quickhouse(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<MySQL>()?;
     m.add_class::<BigQuery>()?;
     m.add_class::<ClickHouse>()?;
+    m.add_class::<S3Archive>()?;
     m.add_class::<Progress>()?;
     m.add_class::<TransferResult>()?;
     m.add_function(wrap_pyfunction!(sync, m)?)?;

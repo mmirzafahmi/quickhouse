@@ -50,3 +50,22 @@ services:
       interval: 3s
       timeout: 3s
       retries: 20
+
+  # S3-compatible store for the optional S3 data-lake archive
+  # (ClickHouse(..., archive=S3Archive(...))) — fully local, no AWS account
+  # needed. API on 9010 (mapped away from ClickHouse's native-protocol 9000),
+  # web console on 9011.
+  minio:
+    image: minio/minio:latest
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    ports:
+      - "9010:9000"
+      - "9011:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 3s
+      timeout: 3s
+      retries: 20

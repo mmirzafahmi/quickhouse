@@ -75,6 +75,12 @@ pub struct ClickHouseConfig {
     pub password: String,
     /// `"none" | "gzip" | "zstd"` — HTTP body compression for inserts.
     pub compression: Compression,
+    /// Optional: also archive every synced batch as Parquet into S3 (or an
+    /// S3-compatible store like MinIO) — a secondary, best-effort-free data
+    /// lake for backup/historical analysis, independent of ClickHouse's own
+    /// retention. `None` (default) disables this entirely; the ClickHouse
+    /// write path is unaffected either way.
+    pub s3_archive: Option<S3ArchiveConfig>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +88,38 @@ pub enum Compression {
     None,
     Gzip,
     Zstd,
+}
+
+/// Parquet's own internal (column/page) compression for archived files —
+/// distinct from `Compression` above, which is ClickHouse's HTTP transport
+/// compression and has no bearing on the archive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ParquetCompression {
+    #[default]
+    Zstd,
+    Snappy,
+    Uncompressed,
+}
+
+/// Optional S3 (or S3-compatible) data-lake archive for a ClickHouse
+/// destination. Every batch synced into ClickHouse is also written as
+/// Parquet to `s3://{bucket}/{prefix}/{dest_table}/dt=<date>/run=<id>/
+/// part-<partition>.parquet` — one streamed file per parallel partition,
+/// never fully buffered in memory (see `crate::archive`).
+#[derive(Debug, Clone)]
+pub struct S3ArchiveConfig {
+    pub bucket: String,
+    /// Key prefix within the bucket; empty string writes at the bucket root.
+    pub prefix: String,
+    /// `None` resolves the standard AWS credential chain (env vars, IAM
+    /// role) via `AmazonS3Builder::from_env()` — set explicitly to override.
+    pub region: Option<String>,
+    pub access_key_id: Option<String>,
+    pub secret_access_key: Option<String>,
+    /// Custom endpoint for S3-compatible services (e.g. MinIO). When set,
+    /// plain HTTP is allowed automatically (real AWS S3 always uses HTTPS).
+    pub endpoint: Option<String>,
+    pub compression: ParquetCompression,
 }
 
 /// How to write rows into BigQuery.

@@ -12,6 +12,7 @@ venv/
 dist/
 build/
 .pytest_cache/
+benchmarks/
 
 # maturin build artifacts
 python/etlhouse/*.so

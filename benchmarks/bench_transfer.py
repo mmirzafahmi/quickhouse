@@ -1,7 +1,7 @@
 """Benchmark: transfer N rows from PostgreSQL to ClickHouse and report throughput.
 
 Seeds a table server-side via generate_series (avoids slow client-side row-by-row
-inserts, which would dominate the measurement), then runs etlhouse.sync at a few
+inserts, which would dominate the measurement), then runs quickhouse.sync at a few
 parallelism levels, reporting rows/sec, MB/sec, and peak RSS.
 
 Usage:
@@ -18,17 +18,16 @@ import time
 
 import psycopg
 
-import etlhouse
+import quickhouse
 
-PG_DSN = os.environ.get("ETLHOUSE_PG_DSN", "postgresql://etl:etl@localhost:5432/etl")
-CH_URL = os.environ.get("ETLHOUSE_CH_URL", "http://localhost:8123")
+PG_DSN = os.environ.get("QUICKHOUSE_PG_DSN", "postgresql://etl:etl@localhost:5432/etl")
+CH_URL = os.environ.get("QUICKHOUSE_CH_URL", "http://localhost:8123")
 TABLE = "bench_transfer"
 
 
-# 20 columns mirroring the real account_move_line shape (bakefore-data Odoo
-# fixtures): a mix of bigint FKs (some nullable), floats, text, bool, and
-# timestamps, so the benchmark reflects the actual production column mix
-# rather than a handful of synthetic types.
+# 20 columns modeled on a typical accounting ledger line (a mix of bigint FKs,
+# some nullable, floats, text, bool, and timestamps), so the benchmark reflects
+# a realistic wide production column mix rather than a handful of synthetic types.
 def seed(conn: psycopg.Connection, rows: int) -> float:
     t0 = time.time()
     with conn.cursor() as cur:
@@ -144,7 +143,7 @@ def run_one(src, dst, rows: int, parallelism: int, batch_rows: int) -> None:
         )
 
     with RssSampler() as rss:
-        result = etlhouse.sync(
+        result = quickhouse.sync(
             src,
             dst,
             dest_table=dest_table,
@@ -180,8 +179,8 @@ def main():
     seed_secs = seed(conn, args.rows)
     print(f"Seeded in {seed_secs:.1f}s\n")
 
-    src = etlhouse.Postgres(PG_DSN)
-    dst = etlhouse.ClickHouse(CH_URL, database="default")
+    src = quickhouse.Postgres(PG_DSN)
+    dst = quickhouse.ClickHouse(CH_URL, database="default")
 
     print(f"{'':1}{'RESULTS':-<70}")
     for p in [int(x) for x in args.parallelism.split(",")]:

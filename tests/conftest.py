@@ -26,6 +26,9 @@ CH_PORT = int(os.environ.get("QUICKHOUSE_CH_PORT", "8123"))
 CH_DB = os.environ.get("QUICKHOUSE_CH_DB", "default")
 CH_USER = os.environ.get("QUICKHOUSE_CH_USER", "default")
 CH_PASSWORD = os.environ.get("QUICKHOUSE_CH_PASSWORD", "")
+MINIO_ENDPOINT = os.environ.get("QUICKHOUSE_MINIO_ENDPOINT", "http://localhost:9010")
+MINIO_ACCESS_KEY = os.environ.get("QUICKHOUSE_MINIO_ACCESS_KEY", "minioadmin")
+MINIO_SECRET_KEY = os.environ.get("QUICKHOUSE_MINIO_SECRET_KEY", "minioadmin")
 
 
 @pytest.fixture(scope="session")
@@ -74,6 +77,13 @@ def ch_client():
 @pytest.fixture
 def unique_name():
     return f"t_{uuid.uuid4().hex[:12]}"
+
+
+@pytest.fixture
+def unique_bucket_name():
+    # S3/MinIO bucket names are stricter than table names: lowercase,
+    # hyphens only (no underscores), 3-63 chars.
+    return f"bucket-{uuid.uuid4().hex[:12]}"
 
 
 @pytest.fixture

@@ -112,6 +112,56 @@ class BigQuery:
         write_method: str = "insert_all",
     ) -> None: ...
 
+class S3Archive:
+    """Optional S3 (or S3-compatible, e.g. MinIO) data-lake archive attached
+    to a :class:`ClickHouse` destination via its ``archive=`` parameter.
+
+    Every batch synced into ClickHouse is also written as Parquet — one
+    streamed file per parallel partition, never fully buffered in memory —
+    to ``s3://{bucket}/{prefix}/{dest_table}/dt=<date>/run=<id>/
+    part-<partition>.parquet``. A secondary, best-effort-free backup/
+    historical side channel: omitting ``archive`` entirely disables this and
+    has zero effect on the ClickHouse write path. A persistent S3 failure
+    fails the whole ``sync()`` call (matching how the ClickHouse insert path
+    itself already behaves), so the archive never silently falls behind.
+
+    Parameters
+    ----------
+    bucket:
+        Target S3 bucket (required).
+    prefix:
+        Key prefix within the bucket; empty (default) writes at the bucket
+        root.
+    region, access_key_id, secret_access_key:
+        Left as ``None`` (default), these resolve the standard AWS
+        credential chain (env vars, IAM role). Set explicitly to override.
+    endpoint:
+        Custom endpoint for an S3-compatible service (e.g.
+        ``"http://localhost:9000"`` for MinIO). Plain HTTP is allowed
+        automatically whenever this is set; real AWS S3 always uses HTTPS.
+    compression:
+        Parquet's own internal compression: ``"zstd"`` (default),
+        ``"snappy"``, or ``"uncompressed"`` — distinct from ClickHouse's own
+        HTTP transport compression, which is unaffected.
+
+    Note
+    ----
+    S3 storage and request costs are billed by AWS as usual (free on a
+    self-hosted MinIO).
+    """
+
+    def __init__(
+        self,
+        bucket: str,
+        *,
+        prefix: str = "",
+        region: Optional[str] = None,
+        access_key_id: Optional[str] = None,
+        secret_access_key: Optional[str] = None,
+        endpoint: Optional[str] = None,
+        compression: str = "zstd",
+    ) -> None: ...
+
 class ClickHouse:
     """ClickHouse destination connection descriptor.
 
@@ -126,6 +176,10 @@ class ClickHouse:
         ``"none"``. zstd-fast is faster than gzip at a similar/better ratio;
         use ``"none"`` on a fast local network where CPU, not bandwidth, is
         the bottleneck.
+    archive:
+        Optional :class:`S3Archive` — also write every synced batch as
+        Parquet to S3 for backup/historical analysis. ``None`` (default)
+        disables this entirely.
     """
 
     def __init__(
@@ -136,6 +190,7 @@ class ClickHouse:
         user: str = "default",
         password: str = "",
         compression: str = "zstd",
+        archive: Optional[S3Archive] = None,
     ) -> None: ...
 
 class Progress:

@@ -10,6 +10,7 @@
 //! The public entry point is [`sync::run_transfer`] (async) or
 //! [`run_transfer_blocking`] for callers without an async runtime.
 
+mod archive;
 pub mod config;
 mod decimal;
 pub mod ddl;
@@ -26,8 +27,8 @@ pub mod types;
 
 pub use config::{
     BigQueryConfig, BigQueryDestConfig, BigQueryWriteMethod, ClickHouseConfig, Compression,
-    DestinationConfig, MySqlConfig, PostgresConfig, SourceConfig, SyncMode, TransferConfig,
-    TransferResult,
+    DestinationConfig, MySqlConfig, ParquetCompression, PostgresConfig, S3ArchiveConfig,
+    SourceConfig, SyncMode, TransferConfig, TransferResult,
 };
 pub use error::{EtlError, Result};
 pub use sync::{run_transfer, Progress, ProgressCb};
