@@ -232,6 +232,7 @@ def sync(
     batch_bytes: int = 4_194_304,
     max_memory_bytes: int = 536_870_912,
     partition_column: Optional[str] = None,
+    read_max_rows_per_sec: Optional[int] = None,
     type_overrides: Optional[Mapping[str, str]] = None,
     rename: Optional[Mapping[str, str]] = None,
     include: Optional[Sequence[str]] = None,
@@ -291,6 +292,38 @@ def sync(
       with concurrent uploads and blocks (backpressure) when this ceiling is
       reached, so peak RSS stays bounded regardless of ``parallelism`` or row
       width. Default 512 MiB; ``0`` disables the ceiling (unbounded).
+
+    Being gentle to a small source database:
+
+    - ``read_max_rows_per_sec`` caps how many source rows are pulled per
+      second, summed across *all* parallel partitions (a global limiter, not
+      per-connection). After each batch is read the reader pauses to hold the
+      aggregate rate at this ceiling; because ``COPY``/streaming results only
+      produce as fast as the client consumes, that pause pushes back on the
+      server-side scan itself, so the source does proportionally less work —
+      not just quickhouse. ``None`` (default) reads as fast as possible.
+      Applies to PostgreSQL and MySQL sources; ignored for a BigQuery source
+      (its read path is a separately-metered managed API). For the lightest
+      possible footprint on a small instance, combine a modest
+      ``read_max_rows_per_sec`` with ``parallelism=1`` (one connection, one
+      scan), ``mode="incremental"`` (reads only new rows, not the whole
+      table), and a ``statement_timeout_secs`` on the ``Postgres``/``MySQL``
+      connection. The Postgres connection also reports itself as
+      ``application_name = 'quickhouse'`` so the export is visible (and
+      killable) in ``pg_stat_activity``.
+
+    Datetime/timezone handling:
+
+    - MySQL ``DATETIME``/``TIMESTAMP`` map to a UTC-aware timestamp — BigQuery
+      ``TIMESTAMP``, ClickHouse ``DateTime64(6, 'UTC')`` — reading the
+      wall-clock value as UTC (the same instant the legacy pandas/``to_gbq``
+      path stored, and what an existing BigQuery ``TIMESTAMP`` column expects).
+      To land a column as a naive BigQuery ``DATETIME`` (or ClickHouse
+      ``DateTime64(6)``) instead, opt out per-column with
+      ``type_overrides={"col": "DATETIME"}``; this flips the actual wire
+      encoding, not just the declared destination type, so it works on the
+      Storage Write path too. PostgreSQL keeps the distinction from the source
+      type: ``timestamptz`` → UTC-aware, ``timestamp`` → naive.
     """
     ...
 

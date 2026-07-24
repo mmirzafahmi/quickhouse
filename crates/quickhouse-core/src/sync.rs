@@ -5,8 +5,8 @@
 //! source-agnostic.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
@@ -54,6 +54,60 @@ struct Counters {
     bytes_written: AtomicU64,
 }
 
+/// Global source-read rate limiter, shared across every parallel partition so
+/// the ceiling is an *aggregate* rows/sec (not per-connection). Uses a
+/// virtual-scheduling (GCRA-style) clock: each `acquire(n)` reserves `n / rate`
+/// seconds of read time by pushing a shared `next_available` instant forward,
+/// and the caller sleeps until its reserved slot. Because reads are gated
+/// *after* each batch, and `COPY TO STDOUT` (and MySQL's streaming result) only
+/// produce as fast as the client consumes, pausing here applies TCP
+/// backpressure that slows the server-side scan itself — the whole point of the
+/// knob. No burst credit accumulates while idle (`next_available` is clamped
+/// forward to `now`, never left in the past), which is the safe choice for
+/// "be gentle to the source".
+struct ReadThrottle {
+    rate_per_sec: f64,
+    next_available: Mutex<Instant>,
+}
+
+impl ReadThrottle {
+    fn new(rows_per_sec: u64) -> Self {
+        Self {
+            rate_per_sec: rows_per_sec as f64,
+            next_available: Mutex::new(Instant::now()),
+        }
+    }
+
+    /// Reserve capacity for `rows` just-read rows and return how long the
+    /// caller must wait before pulling more. Pure of any `.await` (so the
+    /// `std::sync::Mutex` is never held across a suspension point, and the math
+    /// is unit-testable without sleeping); `acquire` wraps it with the sleep.
+    fn reserve(&self, rows: u64) -> Duration {
+        // A zero rate can't happen via the public API (`validate` rejects
+        // `Some(0)` before any throttle is built), but guard anyway so a Rust
+        // caller constructing `TransferConfig` directly gets a safe no-op
+        // instead of an `inf` `Duration` panic (`rows / 0.0`) in the read loop.
+        // `rate_per_sec` is a `u64 as f64`, so it's always finite and >= 0.
+        if rows == 0 || self.rate_per_sec <= 0.0 {
+            return Duration::ZERO;
+        }
+        let mut next = self.next_available.lock().unwrap();
+        let now = Instant::now();
+        // Idle time grants no credit: never start earlier than `now`.
+        let start = (*next).max(now);
+        let cost = Duration::from_secs_f64(rows as f64 / self.rate_per_sec);
+        *next = start + cost;
+        start.saturating_duration_since(now)
+    }
+
+    async fn acquire(&self, rows: u64) {
+        let wait = self.reserve(rows);
+        if !wait.is_zero() {
+            tokio::time::sleep(wait).await;
+        }
+    }
+}
+
 /// Shared handle for uploading finished batches. Cloned cheaply into each
 /// partition task (all fields are `Arc`/`Copy`), so every partition spawns
 /// sends against the *same* memory budget and counters.
@@ -69,6 +123,9 @@ struct SendCtx {
     /// `None` otherwise (including always for BigQuery). See
     /// `ArchiveRunInfo::writer_for`.
     archive: Option<Arc<ArchiveRunInfo>>,
+    /// `Some` when `read_max_rows_per_sec` is set: a single limiter shared by
+    /// all partition tasks, so the cap is an aggregate across the whole read.
+    throttle: Option<Arc<ReadThrottle>>,
 }
 
 impl SendCtx {
@@ -354,6 +411,11 @@ async fn run_transfer_impl(
 
         // --- Fan out partitions with bounded concurrency. ---
         let counters = Arc::new(Counters::default());
+        // One limiter shared across every partition, so `read_max_rows_per_sec`
+        // caps the *aggregate* read rate regardless of `parallelism`.
+        let throttle = cfg
+            .read_max_rows_per_sec
+            .map(|r| Arc::new(ReadThrottle::new(r)));
         let cfg = Arc::new(cfg);
         let extra_filter = Arc::new(extra_filter);
         let target_table = Arc::new(target_table);
@@ -365,6 +427,7 @@ async fn run_transfer_impl(
             progress: progress.clone(),
             started,
             archive: archive_info.clone(),
+            throttle,
         };
 
         let mut results = futures::stream::iter(partitions.into_iter().map(|part| {
@@ -549,6 +612,10 @@ async fn run_transfer_bigquery(
             progress: progress.clone(),
             started,
             archive: archive_info,
+            // read_max_rows_per_sec is a Postgres/MySQL knob; the BigQuery
+            // Storage Read API is a separately-metered managed service, so this
+            // path never throttles.
+            throttle: None,
         };
 
         let mut iter = source
@@ -767,10 +834,16 @@ async fn transfer_partition_postgres(
         let chunk = chunk?;
         let batches = decoder.feed(&chunk)?;
         for batch in batches {
+            let rows = batch.num_rows() as u64;
             if let Some(w) = archive_writer.as_mut() {
                 w.write(&batch).await?;
             }
             ctx.spawn_upload(&mut sends, schema.clone(), batch).await;
+            // Pace the read: pausing before pulling the next chunk applies TCP
+            // backpressure to the COPY stream, slowing the server-side scan.
+            if let Some(t) = &ctx.throttle {
+                t.acquire(rows).await;
+            }
         }
         reap(&mut sends, false).await?; // surface any upload error promptly
     }
@@ -853,11 +926,17 @@ async fn transfer_partition_mysql(
     while let Some(row) = stream.next().await {
         let row = row.map_err(|e| EtlError::other(format!("mysql row error: {e}")))?;
         if let Some(batch) = batcher.append_row(row)? {
+            let rows = batch.num_rows() as u64;
             if let Some(w) = archive_writer.as_mut() {
                 w.write(&batch).await?;
             }
             ctx.spawn_upload(&mut sends, schema.clone(), batch).await;
             reap(&mut sends, false).await?; // surface any upload error promptly
+            // Pace the read: pausing before fetching more rows applies
+            // backpressure to the streaming result set, slowing the scan.
+            if let Some(t) = &ctx.throttle {
+                t.acquire(rows).await;
+            }
         }
     }
     if let Some(batch) = batcher.finish()? {
@@ -1372,6 +1451,59 @@ mod tests {
         // clock-resolution-dependent flaky test; the naming logic is what
         // matters and is deterministic given distinct run_ids.)
         assert_ne!(staging_name("orders", "1"), staging_name("orders", "2"));
+    }
+
+    #[test]
+    fn throttle_reserve_zero_is_immediate() {
+        let t = ReadThrottle::new(1000);
+        assert!(t.reserve(0).is_zero());
+    }
+
+    #[test]
+    fn throttle_zero_rate_is_safe_noop_not_panic() {
+        // `validate` prevents this via the public API, but a direct Rust
+        // caller must not trip an `inf` Duration panic (rows / 0.0).
+        let t = ReadThrottle::new(0);
+        assert!(t.reserve(1_000_000).is_zero());
+    }
+
+    #[test]
+    fn throttle_first_reserve_does_not_wait() {
+        // The limiter starts unfilled: the first read is never delayed
+        // (`next_available` begins at construction time, already in the past by
+        // the time we reserve, so `start` clamps to `now` and the wait is 0).
+        let t = ReadThrottle::new(1000);
+        assert!(t.reserve(500).is_zero());
+    }
+
+    #[test]
+    fn throttle_paces_subsequent_reads_by_rate() {
+        // At 1000 rows/s, reserving 1000 rows pushes the schedule ~1s forward,
+        // so the very next reservation must wait close to a full second. Bounds
+        // are wide (>0.5s, <1s) so only genuine pacing — not scheduling jitter
+        // in the microseconds between two calls — can satisfy them.
+        let t = ReadThrottle::new(1000);
+        assert!(t.reserve(1000).is_zero());
+        let wait = t.reserve(1000);
+        assert!(
+            wait > Duration::from_millis(500) && wait < Duration::from_secs(1),
+            "expected ~1s pacing wait, got {wait:?}"
+        );
+    }
+
+    #[test]
+    fn throttle_is_shared_across_handles() {
+        // Two clones of the same Arc share one schedule, so the cap is an
+        // aggregate across all partitions rather than per-connection: after one
+        // handle consumes a full second of budget, the other must wait.
+        let t = Arc::new(ReadThrottle::new(1000));
+        let t2 = t.clone();
+        assert!(t.reserve(1000).is_zero());
+        let wait = t2.reserve(1000);
+        assert!(
+            wait > Duration::from_millis(500),
+            "a second handle should be paced by the first's reservation, got {wait:?}"
+        );
     }
 
     fn col(name: &str) -> ColumnType {

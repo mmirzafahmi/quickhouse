@@ -40,6 +40,16 @@ print(result)   # rows_read, rows_written, bytes_written, duration_secs, new_wat
   legacy quirks like MySQL zero-dates or out-of-range timestamps are coerced to
   `NULL` with a warning instead of aborting the run.
 
+- **It's gentle on a small production database.** Set `read_max_rows_per_sec`
+  and quickhouse paces the read to that aggregate rate across all partitions;
+  because `COPY`/streaming results only produce as fast as the client consumes,
+  the source scan itself backs off — you're throttling the database's work, not
+  just your own. Combine it with `parallelism=1` (one connection), incremental
+  mode (only new rows), and a `statement_timeout_secs`, point it at a read
+  replica, and a bulk export stops competing with your app. The Postgres
+  connection also shows up as `application_name = 'quickhouse'` in
+  `pg_stat_activity`, so a DBA can see and kill it.
+
 - **There's nothing to stand up.** `pip install quickhouse` and you're done —
   no JVM, no Spark cluster, no separate service. It's an ordinary Python
   dependency that runs wherever your jobs already run: cron, Airflow, Dagster,
@@ -186,6 +196,7 @@ errors are surfaced verbatim rather than wrapped in something generic.
 | `parallelism` | Concurrent read streams |
 | `batch_rows` / `batch_bytes` | Per-batch size knobs (rows, or estimated bytes) |
 | `max_memory_bytes` | Hard ceiling on total in-flight memory; decoding blocks when hit (default 512 MiB, `0` = unbounded) |
+| `read_max_rows_per_sec` | Cap the aggregate source read rate to be gentle on a small DB; `None` = unlimited (default). Postgres/MySQL only |
 | `type_overrides` | Force a destination column type, e.g. `{"qty": "Decimal(18, 3)"}` |
 | `rename`, `include`, `exclude` | Column renames and allow/deny lists |
 | `on_progress` | Progress callback |
@@ -208,6 +219,13 @@ knowing:
   front, rather than silently falling back to `Float64`.
 - **`TIME`** columns transfer as canonical text into a `String` column
   (ClickHouse has no time-of-day type).
+- **MySQL `DATETIME`/`TIMESTAMP`** map to a UTC-aware timestamp (BigQuery
+  `TIMESTAMP`, ClickHouse `DateTime64(6, 'UTC')`) — the wall-clock value is read
+  as UTC, matching how a `TIMESTAMP` column expects it. To land a column as a
+  naive BigQuery `DATETIME` instead, opt out per-column with
+  `type_overrides={"col": "DATETIME"}` — that flips the actual encoding, not
+  just the declared type. (PostgreSQL keeps the distinction natively:
+  `timestamptz` → UTC-aware, `timestamp` → naive.)
 - **Out-of-range dates** (and MySQL zero-dates like `0000-00-00`) coerce to
   `NULL` with a warning rather than failing the transfer.
 - **Nullable** source columns stay nullable in the destination.

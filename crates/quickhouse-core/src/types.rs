@@ -335,12 +335,29 @@ pub mod mysql {
             MyType::MYSQL_TYPE_DATE | MyType::MYSQL_TYPE_NEWDATE => {
                 (DataType::Date32, "Date32".to_string())
             }
+            // MySQL DATETIME/TIMESTAMP default to a tz-aware UTC mapping
+            // (Arrow `Some("UTC")` -> BigQuery `TIMESTAMP` / ClickHouse
+            // `DateTime64(6, 'UTC')`), NOT the tz-naive arm. Rationale: the
+            // decoder already interprets the wall-clock value as UTC
+            // (`dt.and_utc().timestamp_micros()`, decode_mysql.rs) and MySQL
+            // has no wire type that would ever reach a tz-aware arm otherwise,
+            // so a MySQL datetime could previously only ever land as BigQuery
+            // DATETIME — making it impossible to sync into an existing BigQuery
+            // `TIMESTAMP` column (fails the staging->dest MERGE with "Value of
+            // type DATETIME cannot be assigned to <col>, which has type
+            // TIMESTAMP"). This matches the legacy pandas->to_gbq semantics
+            // (naive wall-clock stored into BQ TIMESTAMP as UTC — same instant)
+            // and the Postgres `TIMESTAMPTZ` mapping. A column that genuinely
+            // wants naive (BigQuery DATETIME / `DateTime64(6)`) opts out
+            // per-column via `type_overrides={col: "DATETIME"}` — see
+            // `transform::datetime_override_tz`, which flips the Arrow tz flag
+            // (and thus the Storage Write proto encoding), not just the DDL.
             MyType::MYSQL_TYPE_DATETIME
             | MyType::MYSQL_TYPE_DATETIME2
             | MyType::MYSQL_TYPE_TIMESTAMP
             | MyType::MYSQL_TYPE_TIMESTAMP2 => (
-                DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
-                "DateTime64(6)".to_string(),
+                DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())),
+                "DateTime64(6, 'UTC')".to_string(),
             ),
             // TIME -> text into a ClickHouse String column. MySQL TIME can be
             // negative and exceed 24h (range +/-838:59:59), which no time-of-day
@@ -387,6 +404,30 @@ mod tests {
         assert_eq!(map_oid(oid::BOOL).unwrap().1, "Bool");
         assert_eq!(map_oid(oid::TIMESTAMP).unwrap().1, "DateTime64(6)");
         assert!(map_oid(oid::TIMESTAMPTZ).unwrap().1.contains("UTC"));
+    }
+
+    /// MySQL DATETIME/TIMESTAMP default to a tz-aware UTC mapping so they can
+    /// land in a BigQuery `TIMESTAMP` column (see the map arm's comment). The
+    /// decoder computes the same UTC epoch micros regardless of this flag, so
+    /// this only changes the destination type, not the stored instant.
+    #[test]
+    fn mysql_datetime_defaults_to_utc_aware() {
+        use super::mysql::map_mysql_type;
+        use mysql_async::consts::ColumnType as MyType;
+        for ty in [
+            MyType::MYSQL_TYPE_DATETIME,
+            MyType::MYSQL_TYPE_DATETIME2,
+            MyType::MYSQL_TYPE_TIMESTAMP,
+            MyType::MYSQL_TYPE_TIMESTAMP2,
+        ] {
+            let (arrow, ch) = map_mysql_type(ty, false, false).unwrap();
+            assert_eq!(
+                arrow,
+                DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())),
+                "{ty:?} must map to a tz-aware (UTC) Arrow timestamp"
+            );
+            assert_eq!(ch, "DateTime64(6, 'UTC')", "{ty:?} ClickHouse type");
+        }
     }
 
     #[test]

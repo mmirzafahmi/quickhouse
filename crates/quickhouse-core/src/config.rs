@@ -256,6 +256,17 @@ pub struct TransferConfig {
     /// Column used to split the table into parallel range partitions.
     /// Defaults to the first `key` column, else the sync falls back to a single stream.
     pub partition_column: Option<String>,
+    /// Optional cap on how many source rows are pulled **per second**, summed
+    /// across all parallel partitions (a global limiter, not per-connection).
+    /// Deliberately paces the read so a small/production database isn't
+    /// hammered by a bulk export: after each batch is read, the reader sleeps
+    /// long enough to hold the aggregate rate at this ceiling, which — because
+    /// `COPY TO STDOUT` streams only as fast as the client consumes — makes the
+    /// server-side scan itself back off (TCP backpressure), not just the
+    /// client. `None` (default) reads as fast as possible. Applies to the
+    /// PostgreSQL and MySQL sources; ignored for a BigQuery source (its read
+    /// path is a managed, separately-metered API).
+    pub read_max_rows_per_sec: Option<u64>,
 
     // ---- transforms ----
     /// Per-column destination type overrides (column name -> the
@@ -330,6 +341,11 @@ impl TransferConfig {
                 "max_memory_bytes must be 0 (unbounded) or >= 65536",
             ));
         }
+        if self.read_max_rows_per_sec == Some(0) {
+            return Err(EtlError::config(
+                "read_max_rows_per_sec must be None (unlimited) or >= 1",
+            ));
+        }
         Ok(())
     }
 }
@@ -367,6 +383,7 @@ mod tests {
             batch_bytes: 0,
             max_memory_bytes: 0,
             partition_column: None,
+            read_max_rows_per_sec: None,
             type_overrides: HashMap::new(),
             rename: HashMap::new(),
             include: vec![],
@@ -421,6 +438,23 @@ mod tests {
     fn validate_accepts_lookback_with_key_in_incremental_mode() {
         let mut c = cfg(SyncMode::Incremental, Some("write_date"));
         c.lookback_seconds = 60;
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_zero_read_rate() {
+        let mut c = cfg(SyncMode::Full, None);
+        c.read_max_rows_per_sec = Some(0);
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("read_max_rows_per_sec"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_accepts_none_or_positive_read_rate() {
+        let mut c = cfg(SyncMode::Full, None);
+        c.read_max_rows_per_sec = None;
+        assert!(c.validate().is_ok());
+        c.read_max_rows_per_sec = Some(10_000);
         assert!(c.validate().is_ok());
     }
 }

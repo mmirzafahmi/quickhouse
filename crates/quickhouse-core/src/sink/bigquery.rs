@@ -945,6 +945,7 @@ mod tests {
             batch_bytes: 0,
             max_memory_bytes: 0,
             partition_column: None,
+            read_max_rows_per_sec: None,
             type_overrides: HashMap::new(),
             rename: HashMap::new(),
             include: vec![],

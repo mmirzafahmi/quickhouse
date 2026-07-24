@@ -13,14 +13,59 @@
 //! `decimal.rs`.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use arrow_array::types::{validate_decimal_precision_and_scale, Decimal128Type};
-use arrow_schema::DataType;
+use arrow_schema::{DataType, TimeUnit};
 
 use crate::config::TransferConfig;
 use crate::decimal::parse_decimal_override;
 use crate::error::{EtlError, Result};
 use crate::types::{may_coerce_to_null, ColumnType};
+
+/// Classify a destination datetime type name into the Arrow timezone it
+/// implies: `Some(Some(tz))` = tz-aware (BigQuery `TIMESTAMP` / ClickHouse
+/// `DateTime64(P, 'tz')`), `Some(None)` = naive (BigQuery `DATETIME` /
+/// ClickHouse `DateTime64(P)`), and `None` = not a datetime type at all (so
+/// the source Arrow type is left untouched).
+///
+/// This is what makes a `type_overrides` entry flip a datetime column's
+/// *encoding*, not just its DDL string. MySQL datetimes now default to
+/// tz-aware UTC (see `types::map_mysql_type`), so `type_overrides={col:
+/// "DATETIME"}` is the per-column opt-out back to naive — and because the Arrow
+/// tz flag drives the BigQuery Storage Write proto encoding (Int64 micros vs
+/// civil string) and the destination column type, flipping it here fixes the
+/// whole chain, which a DDL-only relabel could not (it would leave a
+/// TIMESTAMP-encoded payload aimed at a DATETIME column, or vice-versa).
+///
+/// Recognizes BigQuery names (`TIMESTAMP`/`DATETIME`) and ClickHouse names
+/// (`DateTime`/`DateTime64(...)`), case-insensitively.
+fn datetime_override_tz(dest_type: &str) -> Option<Option<Arc<str>>> {
+    let trimmed = dest_type.trim();
+    let upper = trimmed.to_ascii_uppercase();
+    // BigQuery scalar names are exact.
+    if upper == "TIMESTAMP" {
+        return Some(Some(Arc::from("UTC")));
+    }
+    if upper == "DATETIME" {
+        return Some(None);
+    }
+    // ClickHouse `DateTime` / `DateTime64(P[, 'tz']])`: tz-aware iff a quoted
+    // timezone argument is present.
+    if upper.starts_with("DATETIME") {
+        return Some(extract_quoted_tz(trimmed));
+    }
+    None
+}
+
+/// Extract a single-quoted timezone argument (e.g. `UTC` from
+/// `DateTime64(6, 'UTC')`), or `None` when the type carries no timezone.
+fn extract_quoted_tz(s: &str) -> Option<Arc<str>> {
+    let start = s.find('\'')?;
+    let rest = &s[start + 1..];
+    let end = rest.find('\'')?;
+    Some(Arc::from(&rest[..end]))
+}
 
 #[derive(Debug)]
 pub struct SelectPlan {
@@ -133,6 +178,20 @@ pub fn plan(source: &[ColumnType], cfg: &TransferConfig) -> Result<SelectPlan> {
                 }
                 None => c.arrow.clone(),
             }
+        } else if matches!(c.arrow, DataType::Timestamp(_, _)) {
+            // A datetime column's tz-awareness follows its (possibly
+            // overridden) destination type — this is the per-column opt-out
+            // that lets `type_overrides={col: "DATETIME"}` render a
+            // (UTC-by-default) MySQL datetime as a naive BigQuery DATETIME, and
+            // the reverse. With no override, `ch_inner` is the source's own
+            // default mapping string, so this reproduces the source tz exactly
+            // (no behavior change). A non-datetime override (e.g. "String")
+            // returns `None` and leaves the Arrow timestamp untouched, matching
+            // the pre-existing DDL-only-relabel behavior for such overrides.
+            match datetime_override_tz(&ch_inner) {
+                Some(tz) => DataType::Timestamp(TimeUnit::Microsecond, tz),
+                None => c.arrow.clone(),
+            }
         } else {
             c.arrow.clone()
         };
@@ -219,6 +278,7 @@ mod tests {
             batch_bytes: 0,
             max_memory_bytes: 0,
             partition_column: None,
+            read_max_rows_per_sec: None,
             type_overrides: HashMap::new(),
             rename: HashMap::new(),
             include: vec![],
@@ -426,5 +486,81 @@ mod tests {
         let err = plan(&src, &cfg).unwrap_err().to_string();
         assert!(err.contains("amount"), "must name the column: {err}");
         assert!(err.contains("Decimal256"), "must mention the Decimal256 follow-up: {err}");
+    }
+
+    fn ts(tz: Option<&str>) -> DataType {
+        DataType::Timestamp(TimeUnit::Microsecond, tz.map(Arc::from))
+    }
+
+    /// The classifier that drives the per-column datetime opt-out: BigQuery and
+    /// ClickHouse type names, tz-aware vs naive, and non-datetime strings.
+    #[test]
+    fn datetime_override_tz_classifies_type_names() {
+        // tz-aware
+        assert_eq!(datetime_override_tz("TIMESTAMP"), Some(Some(Arc::from("UTC"))));
+        assert_eq!(datetime_override_tz("timestamp"), Some(Some(Arc::from("UTC"))));
+        assert_eq!(datetime_override_tz("DateTime64(6, 'UTC')"), Some(Some(Arc::from("UTC"))));
+        assert_eq!(datetime_override_tz("DateTime('Asia/Jakarta')"), Some(Some(Arc::from("Asia/Jakarta"))));
+        // naive
+        assert_eq!(datetime_override_tz("DATETIME"), Some(None));
+        assert_eq!(datetime_override_tz("DateTime64(6)"), Some(None));
+        assert_eq!(datetime_override_tz("DateTime"), Some(None));
+        // not a datetime type at all -> leave the Arrow type alone
+        assert_eq!(datetime_override_tz("String"), None);
+        assert_eq!(datetime_override_tz("Int64"), None);
+        assert_eq!(datetime_override_tz("Decimal(18, 2)"), None);
+    }
+
+    /// A `type_overrides={col: "DATETIME"}` on a (UTC-by-default) MySQL-style
+    /// timestamp column flips its Arrow tz to naive — the per-column opt-out
+    /// that makes it land as a BigQuery DATETIME. This drives the Storage Write
+    /// proto encoding, not just the DDL string, so it's the only thing that
+    /// actually works (a DDL-only relabel would leave a mismatched payload).
+    #[test]
+    fn datetime_override_flips_utc_timestamp_to_naive() {
+        let src = vec![typed_col("event_at", ts(Some("UTC")), true)];
+        let mut cfg = cfg();
+        cfg.type_overrides = HashMap::from([("event_at".to_string(), "DATETIME".to_string())]);
+        let p = plan(&src, &cfg).unwrap();
+        assert_eq!(p.dest_columns[0].arrow, ts(None), "override must flip tz-aware -> naive");
+        assert_eq!(p.dest_columns[0].clickhouse_inner, "DATETIME");
+    }
+
+    /// The reverse: an override to `TIMESTAMP` promotes a naive timestamp
+    /// column to tz-aware UTC (BigQuery TIMESTAMP).
+    #[test]
+    fn datetime_override_promotes_naive_timestamp_to_utc() {
+        let src = vec![typed_col("event_at", ts(None), true)];
+        let mut cfg = cfg();
+        cfg.type_overrides = HashMap::from([("event_at".to_string(), "TIMESTAMP".to_string())]);
+        let p = plan(&src, &cfg).unwrap();
+        assert_eq!(p.dest_columns[0].arrow, ts(Some("UTC")), "override must flip naive -> tz-aware UTC");
+    }
+
+    /// With no override, a timestamp column keeps its source tz exactly — the
+    /// classifier reproduces the default from the source's own `clickhouse_inner`
+    /// mapping string, so this is a no-op for existing behavior.
+    #[test]
+    fn timestamp_without_override_keeps_source_tz() {
+        let mut utc_col = typed_col("a", ts(Some("UTC")), true);
+        utc_col.clickhouse_inner = "DateTime64(6, 'UTC')".into();
+        let mut naive_col = typed_col("b", ts(None), true);
+        naive_col.clickhouse_inner = "DateTime64(6)".into();
+        let p = plan(&[utc_col, naive_col], &cfg()).unwrap();
+        assert_eq!(p.dest_columns[0].arrow, ts(Some("UTC")), "UTC source stays UTC");
+        assert_eq!(p.dest_columns[1].arrow, ts(None), "naive source stays naive");
+    }
+
+    /// A non-datetime override (e.g. storing a timestamp as text) leaves the
+    /// Arrow timestamp untouched — preserving the pre-existing DDL-only-relabel
+    /// behavior for such overrides (ClickHouse coerces at insert time).
+    #[test]
+    fn non_datetime_override_leaves_timestamp_arrow_untouched() {
+        let src = vec![typed_col("event_at", ts(Some("UTC")), true)];
+        let mut cfg = cfg();
+        cfg.type_overrides = HashMap::from([("event_at".to_string(), "String".to_string())]);
+        let p = plan(&src, &cfg).unwrap();
+        assert_eq!(p.dest_columns[0].arrow, ts(Some("UTC")), "arrow type unchanged by a non-datetime override");
+        assert_eq!(p.dest_columns[0].clickhouse_inner, "String", "DDL string still honored");
     }
 }

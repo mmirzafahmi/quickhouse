@@ -92,14 +92,22 @@ impl PgSource {
                 tracing::warn!("postgres connection error: {e}");
             }
         });
+        // Session setup, run as one round-trip. `application_name` makes this
+        // export visible (and killable) in `pg_stat_activity` — exactly what a
+        // DBA wants when watching load from a bulk read. When a statement
+        // timeout is configured we also cap `idle_in_transaction_session_timeout`
+        // at the same value: defense-in-depth so a stalled connection can never
+        // sit inside an open transaction holding an MVCC snapshot (which would
+        // block vacuum and bloat the source). The bulk COPY itself runs in
+        // autocommit, so statement_timeout is the primary guard; this covers the
+        // edge/future transactional paths.
+        let mut setup = String::from("SET application_name = 'quickhouse'");
         if self.statement_timeout_secs > 0 {
-            client
-                .batch_execute(&format!(
-                    "SET statement_timeout = {}",
-                    self.statement_timeout_secs * 1000
-                ))
-                .await?;
+            let ms = self.statement_timeout_secs * 1000;
+            setup.push_str(&format!("; SET statement_timeout = {ms}"));
+            setup.push_str(&format!("; SET idle_in_transaction_session_timeout = {ms}"));
         }
+        client.batch_execute(&setup).await?;
         Ok(client)
     }
 
@@ -132,7 +140,7 @@ impl PgSource {
                 column: c.name().to_string(),
                 type_name: c.type_().name().to_string(),
             })?;
-            let nullable = !not_null.contains(&c.name().to_string());
+            let nullable = !not_null.contains(c.name());
             cols.push(ColumnType {
                 name: c.name().to_string(),
                 type_id: pg_oid,
