@@ -21,14 +21,15 @@
 //! which goes as raw protobuf `bytes` here rather than base64 text.
 
 use arrow_array::{
-    Array, BinaryArray, BooleanArray, Date32Array, Float32Array, Float64Array, Int16Array,
-    Int32Array, Int64Array, Int8Array, RecordBatch, StringArray, TimestampMicrosecondArray,
-    UInt16Array, UInt32Array, UInt64Array, UInt8Array,
+    Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
+    Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray,
+    TimestampMicrosecondArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
 };
 use arrow_schema::{DataType, Schema, TimeUnit};
 use prost_types::field_descriptor_proto::{Label, Type as ProtoType};
 use prost_types::{DescriptorProto, FieldDescriptorProto};
 
+use crate::decimal::decimal128_to_string;
 use crate::error::{EtlError, Result};
 use crate::sink::bigquery::timestamp_micros_to_iso;
 
@@ -91,6 +92,11 @@ fn proto_type_for(dt: &DataType) -> Result<ProtoType> {
         // BigQuery DATETIME: written as a canonical civil string — the
         // unambiguously accepted representation (see the plan's DATETIME note).
         DataType::Timestamp(TimeUnit::Microsecond, None) => ProtoType::String,
+        // BigQuery NUMERIC: sent as exact decimal TEXT in a proto `string`
+        // field — endianness-free and accepted for NUMERIC; BigQuery parses it
+        // into the column. (Only reachable when plan() promoted a NUMERIC
+        // override to Decimal128 for a BigQuery dest.)
+        DataType::Decimal128(_, _) => ProtoType::String,
         other => {
             return Err(EtlError::internal(format!(
                 "no BigQuery Storage Write proto mapping for Arrow type {other:?}"
@@ -161,6 +167,11 @@ pub(crate) fn encode_row(batch: &RecordBatch, row: usize, fields: &[FieldEnc], b
                 let micros = downcast::<TimestampMicrosecondArray>(col)?.value(row);
                 let s = timestamp_micros_to_iso(micros, false)?;
                 write_len(buf, fe.number, s.as_bytes());
+            }
+            // BigQuery NUMERIC as exact decimal text (see proto_type_for).
+            DataType::Decimal128(_, scale) => {
+                let v = downcast::<Decimal128Array>(col)?.value(row);
+                write_len(buf, fe.number, decimal128_to_string(v, *scale).as_bytes());
             }
             other => {
                 return Err(EtlError::internal(format!(

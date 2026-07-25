@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use arrow_array::RecordBatch;
-use arrow_schema::SchemaRef;
+use arrow_schema::{DataType, SchemaRef};
 use chrono::Utc;
 use futures::StreamExt;
 use mysql_async::prelude::*;
@@ -28,8 +28,8 @@ use crate::error::{EtlError, Result};
 use crate::memory::MemoryBudget;
 use crate::sink::Sink;
 use crate::source::mysql::{quote_my, quote_my_table};
-use crate::source::postgres::quote_pg_table;
-use crate::source::{BigQuerySource, MySqlSource, PgSource, Partition, Source};
+use crate::source::postgres::{quote_pg, quote_pg_table};
+use crate::source::{BigQuerySource, Keyset, MySqlSource, PgSource, Partition, Source};
 use crate::transform::{self, SelectPlan};
 use crate::types::bigquery::arrow_to_bigquery_type;
 use crate::types::ColumnType;
@@ -247,9 +247,37 @@ pub async fn run_transfer(
             .unwrap_or(""),
         cfg.dest_table
     );
-    run_transfer_impl(source_cfg, dest, cfg, progress)
-        .await
-        .map_err(|e| e.context(table_context))
+    let max_attempts = cfg.retry_max_attempts.max(1);
+    if max_attempts <= 1 {
+        // Fast path: byte-identical to the pre-retry behavior — one call, one
+        // context wrap, no clones.
+        return run_transfer_impl(source_cfg, dest, cfg, progress)
+            .await
+            .map_err(|e| e.context(table_context));
+    }
+    // Retry the WHOLE transfer on a transient source error. Each attempt runs
+    // from a clean slate (fresh per-run staging; the watermark advances only on
+    // success), so a full refresh stays atomic and an incremental run re-reads
+    // the same window rather than skipping rows. Sink/write blips are retried
+    // separately at the insert layer, so those never re-read the source here.
+    let mut attempt = 1u32;
+    loop {
+        let result =
+            run_transfer_impl(source_cfg.clone(), dest.clone(), cfg.clone(), progress.clone()).await;
+        match result {
+            Ok(r) => return Ok(r),
+            Err(e) if attempt < max_attempts && e.is_transient_source() => {
+                let delay = crate::sink::backoff_delay(attempt);
+                tracing::warn!(
+                    "{table_context}: attempt {attempt}/{max_attempts} failed with a transient \
+                     source error ({e}); retrying the whole transfer in {delay:?}"
+                );
+                tokio::time::sleep(delay).await;
+                attempt += 1;
+            }
+            Err(e) => return Err(e.context(table_context)),
+        }
+    }
 }
 
 async fn run_transfer_impl(
@@ -333,6 +361,16 @@ async fn run_transfer_impl(
     });
     let sink = Sink::new(dest).await?;
 
+    // Keyset resumable reads (MVP) commit per chunk straight into the
+    // destination, which only works where incremental inserts directly (no
+    // staging + swap/merge) — i.e. ClickHouse.
+    if cfg.chunk_rows.is_some() && sink.requires_staging_for_incremental() {
+        return Err(EtlError::config(
+            "chunk_rows (keyset resumable reads) is only supported for a ClickHouse destination \
+             in this version",
+        ));
+    }
+
     let base_table = cfg.source_table.clone();
     let base_query = cfg.source_query.clone();
     let watermark = cfg.watermark.clone();
@@ -361,35 +399,60 @@ async fn run_transfer_impl(
         partitions.len()
     );
 
-    let plan: SelectPlan = transform::plan(&source_cols, &cfg)?;
+    let plan: SelectPlan = transform::plan(&source_cols, &cfg, sink.dest_kind())?;
     let plan = Arc::new(plan);
 
-    // --- Incremental: read last watermark, build the "since last run" filter. ---
-    let (extra_filter, new_watermark) = if cfg.mode == SyncMode::Incremental {
+    // --- Incremental: read watermark state, build the "since last run" filter,
+    // and (for chunked reads) the keyset resume plan. ---
+    let (extra_filter, new_watermark, chunk_plan) = if cfg.mode == SyncMode::Incremental {
         let watermark = cfg.watermark.as_ref().unwrap();
-        let last = sink.read_last_watermark(&cfg).await?;
-        // First run only (no persisted cursor): apply the configured seed so a
-        // fresh table can skip a doomed whole-table pull. Self-retires once a
-        // real watermark is persisted (`last` is then Some).
-        let last = last.or_else(|| seed_value(&cfg.seed_watermark, snapshot_max.as_deref()));
+        // The committed cursor from the last fully-successful run (None first run).
+        let committed = sink.read_last_watermark(&cfg).await?;
+        // An in-progress chunk-resume marker (frozen upper + last durable
+        // cursor), only for chunked reads and only if a prior run was cut short.
+        let resume = if cfg.chunk_rows.is_some() {
+            sink.read_chunk_state(&cfg).await?
+        } else {
+            None
+        };
+        let (pinned_upper, start_cursor) = match &resume {
+            Some((c, u)) => (Some(u.clone()), Some(c.clone())),
+            None => (None, None),
+        };
+        // Resume freezes the upper bound to the interrupted run's snapshot so it
+        // reads the same window; a fresh run uses the live source MAX. (For a
+        // non-chunked run `pinned_upper` is always None, so this == snapshot_max
+        // and behavior is unchanged.)
+        let effective_upper = pinned_upper.or_else(|| snapshot_max.clone());
+        // First run only: seed the lower bound.
+        let last = committed
+            .clone()
+            .or_else(|| seed_value(&cfg.seed_watermark, effective_upper.as_deref()));
         tracing::info!(
-            "incremental watermark on '{}': last synced={:?}, current source max={:?}",
+            "incremental watermark on '{}': committed={:?}, upper={:?}, resuming={}",
             watermark,
-            last,
-            snapshot_max
+            committed,
+            effective_upper,
+            resume.is_some()
         );
         let filter = match source.as_ref() {
-            Source::Postgres(_) => {
-                build_watermark_filter_pg(watermark, last.as_deref(), snapshot_max.as_deref(), cfg.lookback_seconds)
-            }
-            Source::MySql(_) => {
-                build_watermark_filter_mysql(watermark, last.as_deref(), snapshot_max.as_deref(), cfg.lookback_seconds)
-            }
+            Source::Postgres(_) => build_watermark_filter_pg(
+                watermark, last.as_deref(), effective_upper.as_deref(), cfg.lookback_seconds,
+            ),
+            Source::MySql(_) => build_watermark_filter_mysql(
+                watermark, last.as_deref(), effective_upper.as_deref(), cfg.lookback_seconds,
+            ),
             Source::BigQuery(_) => unreachable!("BigQuery is handled via the early return in run_transfer"),
         };
-        (filter, snapshot_max)
+        let chunk_plan = match cfg.chunk_rows {
+            Some(limit) => Some(build_chunk_plan(
+                &cfg, &plan, &source_cols, limit, committed, effective_upper.clone(), start_cursor,
+            )?),
+            None => None,
+        };
+        (filter, effective_upper, chunk_plan)
     } else {
-        (None, None)
+        (None, None, None)
     };
 
     // --- Ensure destination / staging tables exist. ---
@@ -422,6 +485,7 @@ async fn run_transfer_impl(
             .map(|r| Arc::new(ReadThrottle::new(r)));
         let cfg = Arc::new(cfg);
         let extra_filter = Arc::new(extra_filter);
+        let chunk_plan = Arc::new(chunk_plan);
         let target_table = Arc::new(target_table);
         let ctx = SendCtx {
             sink: sink.clone(),
@@ -440,6 +504,7 @@ async fn run_transfer_impl(
             let cfg = cfg.clone();
             let ctx = ctx.clone();
             let extra_filter = extra_filter.clone();
+            let chunk_plan = chunk_plan.clone();
             let base_table = base_table.clone();
             let base_query = base_query.clone();
             async move {
@@ -454,6 +519,7 @@ async fn run_transfer_impl(
                             base_query.as_deref(),
                             extra_filter.as_deref(),
                             part,
+                            chunk_plan.as_ref().as_ref(),
                         )
                         .await
                     }
@@ -467,6 +533,7 @@ async fn run_transfer_impl(
                             base_query.as_deref(),
                             extra_filter.as_deref(),
                             part,
+                            chunk_plan.as_ref().as_ref(),
                         )
                         .await
                     }
@@ -548,6 +615,21 @@ async fn run_transfer_bigquery(
     archive_info: Option<Arc<ArchiveRunInfo>>,
     staging: String,
 ) -> Result<TransferResult> {
+    // column_transforms are injected into the SQL SELECT built for the
+    // Postgres/MySQL COPY path; the BigQuery Storage Read API reads bare
+    // columns with no SELECT to inject into, so it can't honor them. Reject
+    // loudly rather than silently ignoring the transform.
+    if !cfg.column_transforms.is_empty() {
+        return Err(EtlError::config(
+            "column_transforms is not supported for a BigQuery source — express the \
+             transform in a source_query instead",
+        ));
+    }
+    if cfg.chunk_rows.is_some() {
+        return Err(EtlError::config(
+            "chunk_rows (keyset resumable reads) is not supported for a BigQuery source",
+        ));
+    }
     let (client, project_id) = source.connect().await?;
     tracing::info!("authenticated with bigquery, project_id={project_id}");
 
@@ -570,7 +652,7 @@ async fn run_transfer_bigquery(
     };
     tracing::info!("resolved {} source column(s)", source_cols.len());
 
-    let plan: SelectPlan = transform::plan(&source_cols, &cfg)?;
+    let plan: SelectPlan = transform::plan(&source_cols, &cfg, sink.dest_kind())?;
 
     let (row_restriction, new_watermark) = if cfg.mode == SyncMode::Incremental {
         let watermark = cfg.watermark.as_ref().unwrap();
@@ -816,6 +898,233 @@ async fn setup_mysql(
     })
 }
 
+/// Resolved plan for a keyset-chunked resumable read (see
+/// `TransferConfig::chunk_rows`). Built once per run in `run_transfer_impl`.
+#[derive(Debug, Clone)]
+struct ChunkPlan {
+    /// Rows per chunk (`LIMIT`).
+    limit: usize,
+    /// The keyset ordering column (source name) — unique, NOT NULL, integer.
+    keyset_col: String,
+    /// Its index in `plan.source_columns` (== the decoded batch column index).
+    keyset_idx: usize,
+    /// The last fully-committed watermark (stays put across chunks; written as
+    /// the per-chunk row's `last_watermark` so a concurrent read sees it).
+    committed: Option<String>,
+    /// The frozen upper bound this run reads up to (`chunk_upper`), so a resume
+    /// re-reads the same window.
+    effective_upper: Option<String>,
+    /// The cursor to resume past (`None` = start from the beginning).
+    start_cursor: Option<String>,
+}
+
+/// Validate and resolve the keyset plan for a chunked read. Enforces the
+/// correctness contract: the keyset column must be selected, an integer type,
+/// NOT NULL (a NULL key is silently skipped by `> cursor`), and not
+/// value-transformed (the cursor is compared against the raw column in SQL, so
+/// the decoded value must be the raw column value).
+fn build_chunk_plan(
+    cfg: &TransferConfig,
+    plan: &SelectPlan,
+    source_cols: &[ColumnType],
+    limit: usize,
+    committed: Option<String>,
+    effective_upper: Option<String>,
+    start_cursor: Option<String>,
+) -> Result<ChunkPlan> {
+    let keyset_col = cfg
+        .keyset_column()
+        .ok_or_else(|| EtlError::config("chunk_rows requires a keyset ordering column"))?;
+    let keyset_idx = plan
+        .source_columns
+        .iter()
+        .position(|c| c == &keyset_col)
+        .ok_or_else(|| {
+            EtlError::config(format!(
+                "keyset column '{keyset_col}' must be selected (it was excluded from the transfer)"
+            ))
+        })?;
+    if cfg.column_transforms.contains_key(&keyset_col) {
+        return Err(EtlError::config(format!(
+            "keyset column '{keyset_col}' cannot be in column_transforms — chunked reads order \
+             and resume on the raw column value, not a transformed one"
+        )));
+    }
+    let col = source_cols.iter().find(|c| c.name == keyset_col).ok_or_else(|| {
+        EtlError::config(format!("keyset column '{keyset_col}' not found in source"))
+    })?;
+    if !matches!(
+        col.arrow,
+        DataType::Int16 | DataType::Int32 | DataType::Int64 | DataType::UInt32
+    ) {
+        return Err(EtlError::config(format!(
+            "keyset column '{keyset_col}' must be an integer type for chunk_rows resumable reads \
+             (found {:?}); pick a unique integer key",
+            col.arrow
+        )));
+    }
+    if col.nullable {
+        return Err(EtlError::config(format!(
+            "keyset column '{keyset_col}' must be NOT NULL for chunk_rows (a NULL key is silently \
+             skipped by the cursor). With source_query, nullability can't be verified — use \
+             source_table with a NOT NULL, unique integer key"
+        )));
+    }
+    Ok(ChunkPlan { limit, keyset_col, keyset_idx, committed, effective_upper, start_cursor })
+}
+
+/// Read the keyset column's value at the LAST row of `batch` (rows arrive in
+/// ascending key order, so this is the chunk's max). `None` if the batch is
+/// empty or that cell is NULL (a data-loss guard — a NULL key can't advance the
+/// cursor). Supports the integer widths `build_chunk_plan` admits.
+fn last_int_key(batch: &RecordBatch, idx: usize) -> Result<Option<i128>> {
+    use arrow_array::{Int16Array, Int32Array, Int64Array, UInt32Array};
+    let n = batch.num_rows();
+    if n == 0 {
+        return Ok(None);
+    }
+    let col = batch.column(idx);
+    if col.is_null(n - 1) {
+        return Ok(None);
+    }
+    let row = n - 1;
+    let v: i128 = if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
+        a.value(row) as i128
+    } else if let Some(a) = col.as_any().downcast_ref::<Int32Array>() {
+        a.value(row) as i128
+    } else if let Some(a) = col.as_any().downcast_ref::<Int16Array>() {
+        a.value(row) as i128
+    } else if let Some(a) = col.as_any().downcast_ref::<UInt32Array>() {
+        a.value(row) as i128
+    } else {
+        return Err(EtlError::internal(
+            "keyset column is not a supported integer array (build_chunk_plan gate should prevent this)",
+        ));
+    };
+    Ok(Some(v))
+}
+
+/// Keyset-chunked resumable read for a Postgres source: a loop of bounded
+/// `COPY (... WHERE key > cursor ORDER BY key LIMIT N) TO STDOUT` chunks, each
+/// made durable (`reap(block=true)`) and its cursor persisted before advancing.
+/// A crash resumes from the last persisted cursor within the frozen window.
+#[allow(clippy::too_many_arguments)]
+async fn transfer_keyset_postgres(
+    source: &PgSource,
+    plan: &SelectPlan,
+    cfg: &TransferConfig,
+    ctx: &SendCtx,
+    base_table: Option<&str>,
+    base_query: Option<&str>,
+    extra_filter: Option<&str>,
+    chunk: &ChunkPlan,
+) -> Result<()> {
+    let client = source.connect().await?;
+    let col_quoted = quote_pg(&chunk.keyset_col);
+    let mut cursor = chunk.start_cursor.clone();
+    let partition = Partition { label: "keyset".into(), predicate: None };
+    let schema = CopyDecoder::with_batch_bytes(&plan.dest_columns, cfg.batch_rows, cfg.batch_bytes)?.schema();
+    let mut archive_writer = match &ctx.archive {
+        Some(info) => Some(info.writer_for("keyset", schema.clone())?),
+        None => None,
+    };
+    tracing::info!(
+        "keyset chunked read starting on '{}' (chunk_rows={}, resume_cursor={:?})",
+        chunk.keyset_col, chunk.limit, cursor
+    );
+
+    loop {
+        let keyset = Keyset { col_quoted: col_quoted.clone(), cursor: cursor.clone(), limit: chunk.limit };
+        let copy_sql = source.copy_sql(
+            &plan.source_columns,
+            &plan.source_select_exprs,
+            base_table,
+            base_query,
+            &partition,
+            extra_filter,
+            Some(keyset),
+        );
+        tracing::debug!("keyset chunk: {copy_sql}");
+        let stream = source.copy_stream(&client, &copy_sql).await?;
+        futures::pin_mut!(stream);
+        let mut decoder = CopyDecoder::with_batch_bytes(&plan.dest_columns, cfg.batch_rows, cfg.batch_bytes)?;
+        let mut sends: JoinSet<Result<()>> = JoinSet::new();
+        let mut cursor_candidate: Option<i128> = None;
+
+        while let Some(bytes) = stream.next().await {
+            let bytes = bytes?;
+            for batch in decoder.feed(&bytes)? {
+                let rows = batch.num_rows() as u64;
+                if let Some(k) = last_int_key(&batch, chunk.keyset_idx)? {
+                    cursor_candidate = Some(cursor_candidate.map_or(k, |c| c.max(k)));
+                }
+                if let Some(w) = archive_writer.as_mut() {
+                    w.write(&batch).await?;
+                }
+                ctx.spawn_upload(&mut sends, schema.clone(), batch).await;
+                if let Some(t) = &ctx.throttle {
+                    t.acquire(rows).await;
+                }
+            }
+            reap(&mut sends, false).await?;
+        }
+        if !decoder.saw_trailer() {
+            return Err(EtlError::decode("keyset COPY chunk ended without a trailer".to_string()));
+        }
+        if let Some(batch) = decoder.finish()? {
+            if let Some(k) = last_int_key(&batch, chunk.keyset_idx)? {
+                cursor_candidate = Some(cursor_candidate.map_or(k, |c| c.max(k)));
+            }
+            if let Some(w) = archive_writer.as_mut() {
+                w.write(&batch).await?;
+            }
+            ctx.spawn_upload(&mut sends, schema.clone(), batch).await;
+        }
+        // Force this chunk's rows durable in the destination BEFORE advancing
+        // the cursor — the invariant that makes a crash resumable.
+        reap(&mut sends, true).await?;
+
+        let rows_this_chunk = decoder.rows_total;
+        ctx.counters.rows_read.fetch_add(rows_this_chunk, Ordering::Relaxed);
+        warn_coerced_dates("keyset read", decoder.invalid_dates_total);
+        warn_coerced_decimals("keyset read", decoder.invalid_decimals_total);
+
+        if rows_this_chunk == 0 {
+            break; // empty read — nothing (more) to sync
+        }
+        // Data-loss guard: rows were read but no key could be extracted (a NULL
+        // key slipped through despite the NOT NULL gate) — refuse to advance.
+        let next = cursor_candidate.ok_or_else(|| {
+            EtlError::other(format!(
+                "keyset column '{}' produced no usable value in a non-empty chunk (NULL key?); \
+                 refusing to advance the cursor to avoid skipping rows",
+                chunk.keyset_col
+            ))
+        })?;
+        let cur = next.to_string();
+        ctx.sink
+            .persist_chunk_cursor(
+                cfg,
+                chunk.committed.as_deref(),
+                &cur,
+                chunk.effective_upper.as_deref().unwrap_or(""),
+                ctx.counters.rows_written.load(Ordering::Relaxed),
+            )
+            .await?;
+        cursor = Some(cur);
+        emit_progress(&ctx.counters, &ctx.progress, ctx.started);
+
+        if (rows_this_chunk as usize) < chunk.limit {
+            break; // short chunk — the window is exhausted
+        }
+    }
+    if let Some(w) = archive_writer.take() {
+        w.close().await?;
+    }
+    tracing::info!("keyset chunked read complete: {} rows read", ctx.counters.rows_read.load(Ordering::Relaxed));
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn transfer_partition_postgres(
     source: &PgSource,
@@ -826,15 +1135,21 @@ async fn transfer_partition_postgres(
     base_query: Option<&str>,
     extra_filter: Option<&str>,
     partition: Partition,
+    chunk: Option<&ChunkPlan>,
 ) -> Result<()> {
+    if let Some(cp) = chunk {
+        return transfer_keyset_postgres(source, plan, cfg, ctx, base_table, base_query, extra_filter, cp).await;
+    }
     tracing::info!("partition '{}' starting", partition.label);
     let client = source.connect().await?;
     let copy_sql = source.copy_sql(
         &plan.source_columns,
+        &plan.source_select_exprs,
         base_table,
         base_query,
         &partition,
         extra_filter,
+        None,
     );
     tracing::debug!("partition {}: {copy_sql}", partition.label);
 
@@ -893,6 +1208,133 @@ async fn transfer_partition_postgres(
     Ok(())
 }
 
+/// Keyset-chunked resumable read for a MySQL source — the MySQL analogue of
+/// [`transfer_keyset_postgres`]: bounded `SELECT ... WHERE key > cursor
+/// ORDER BY key LIMIT N` chunks via the binary protocol, each made durable
+/// before its cursor is persisted.
+#[allow(clippy::too_many_arguments)]
+async fn transfer_keyset_mysql(
+    source: &MySqlSource,
+    plan: &SelectPlan,
+    cfg: &TransferConfig,
+    ctx: &SendCtx,
+    base_table: Option<&str>,
+    base_query: Option<&str>,
+    extra_filter: Option<&str>,
+    chunk: &ChunkPlan,
+) -> Result<()> {
+    let mut conn = source.connect().await?;
+    let col_quoted = quote_my(&chunk.keyset_col);
+    let mut cursor = chunk.start_cursor.clone();
+    let partition = Partition { label: "keyset".into(), predicate: None };
+    let schema = MySqlBatcher::with_batch_bytes(&plan.dest_columns, cfg.batch_rows, cfg.batch_bytes)?.schema();
+    let mut archive_writer = match &ctx.archive {
+        Some(info) => Some(info.writer_for("keyset", schema.clone())?),
+        None => None,
+    };
+    tracing::info!(
+        "keyset chunked read starting on '{}' (chunk_rows={}, resume_cursor={:?})",
+        chunk.keyset_col, chunk.limit, cursor
+    );
+
+    loop {
+        let keyset = Keyset { col_quoted: col_quoted.clone(), cursor: cursor.clone(), limit: chunk.limit };
+        let select_sql = source.select_sql(
+            &plan.source_columns,
+            &plan.source_select_exprs,
+            base_table,
+            base_query,
+            &partition,
+            extra_filter,
+            Some(keyset),
+        );
+        tracing::debug!("keyset chunk: {select_sql}");
+        let mut batcher = MySqlBatcher::with_batch_bytes(&plan.dest_columns, cfg.batch_rows, cfg.batch_bytes)?;
+        let mut sends: JoinSet<Result<()>> = JoinSet::new();
+        let mut cursor_candidate: Option<i128> = None;
+
+        let stmt = conn
+            .prep(select_sql)
+            .await
+            .map_err(|e| EtlError::from(e).context("preparing mysql keyset statement"))?;
+        let mut result = conn
+            .exec_iter(stmt, ())
+            .await
+            .map_err(|e| EtlError::from(e).context("executing mysql keyset query"))?;
+        let stream = result
+            .stream::<mysql_async::Row>()
+            .await
+            .map_err(|e| EtlError::from(e).context("streaming mysql keyset result"))?
+            .ok_or_else(|| EtlError::other("mysql keyset query returned no result set"))?;
+        futures::pin_mut!(stream);
+
+        while let Some(row) = stream.next().await {
+            let row = row.map_err(|e| EtlError::from(e).context("reading mysql row"))?;
+            if let Some(batch) = batcher.append_row(row)? {
+                let rows = batch.num_rows() as u64;
+                if let Some(k) = last_int_key(&batch, chunk.keyset_idx)? {
+                    cursor_candidate = Some(cursor_candidate.map_or(k, |c| c.max(k)));
+                }
+                if let Some(w) = archive_writer.as_mut() {
+                    w.write(&batch).await?;
+                }
+                ctx.spawn_upload(&mut sends, schema.clone(), batch).await;
+                reap(&mut sends, false).await?;
+                if let Some(t) = &ctx.throttle {
+                    t.acquire(rows).await;
+                }
+            }
+        }
+        if let Some(batch) = batcher.finish()? {
+            if let Some(k) = last_int_key(&batch, chunk.keyset_idx)? {
+                cursor_candidate = Some(cursor_candidate.map_or(k, |c| c.max(k)));
+            }
+            if let Some(w) = archive_writer.as_mut() {
+                w.write(&batch).await?;
+            }
+            ctx.spawn_upload(&mut sends, schema.clone(), batch).await;
+        }
+        reap(&mut sends, true).await?;
+
+        let rows_this_chunk = batcher.rows_total;
+        ctx.counters.rows_read.fetch_add(rows_this_chunk, Ordering::Relaxed);
+        warn_coerced_dates("keyset read", batcher.invalid_dates_total);
+        warn_coerced_decimals("keyset read", batcher.invalid_decimals_total);
+
+        if rows_this_chunk == 0 {
+            break;
+        }
+        let next = cursor_candidate.ok_or_else(|| {
+            EtlError::other(format!(
+                "keyset column '{}' produced no usable value in a non-empty chunk (NULL key?); \
+                 refusing to advance the cursor to avoid skipping rows",
+                chunk.keyset_col
+            ))
+        })?;
+        let cur = next.to_string();
+        ctx.sink
+            .persist_chunk_cursor(
+                cfg,
+                chunk.committed.as_deref(),
+                &cur,
+                chunk.effective_upper.as_deref().unwrap_or(""),
+                ctx.counters.rows_written.load(Ordering::Relaxed),
+            )
+            .await?;
+        cursor = Some(cur);
+        emit_progress(&ctx.counters, &ctx.progress, ctx.started);
+
+        if (rows_this_chunk as usize) < chunk.limit {
+            break;
+        }
+    }
+    if let Some(w) = archive_writer.take() {
+        w.close().await?;
+    }
+    tracing::info!("keyset chunked read complete: {} rows read", ctx.counters.rows_read.load(Ordering::Relaxed));
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn transfer_partition_mysql(
     source: &MySqlSource,
@@ -903,15 +1345,21 @@ async fn transfer_partition_mysql(
     base_query: Option<&str>,
     extra_filter: Option<&str>,
     partition: Partition,
+    chunk: Option<&ChunkPlan>,
 ) -> Result<()> {
+    if let Some(cp) = chunk {
+        return transfer_keyset_mysql(source, plan, cfg, ctx, base_table, base_query, extra_filter, cp).await;
+    }
     tracing::info!("partition '{}' starting", partition.label);
     let mut conn = source.connect().await?;
     let select_sql = source.select_sql(
         &plan.source_columns,
+        &plan.source_select_exprs,
         base_table,
         base_query,
         &partition,
         extra_filter,
+        None,
     );
     tracing::debug!("partition {}: {select_sql}", partition.label);
 
@@ -930,20 +1378,20 @@ async fn transfer_partition_mysql(
     let stmt = conn
         .prep(select_sql)
         .await
-        .map_err(|e| EtlError::other(format!("mysql prepare error: {e}")))?;
+        .map_err(|e| EtlError::from(e).context("preparing mysql statement"))?;
     let mut result = conn
         .exec_iter(stmt, ())
         .await
-        .map_err(|e| EtlError::other(format!("mysql query error: {e}")))?;
+        .map_err(|e| EtlError::from(e).context("executing mysql query"))?;
     let stream = result
         .stream::<mysql_async::Row>()
         .await
-        .map_err(|e| EtlError::other(format!("mysql stream error: {e}")))?
+        .map_err(|e| EtlError::from(e).context("streaming mysql result"))?
         .ok_or_else(|| EtlError::other("mysql query returned no result set"))?;
     futures::pin_mut!(stream);
 
     while let Some(row) = stream.next().await {
-        let row = row.map_err(|e| EtlError::other(format!("mysql row error: {e}")))?;
+        let row = row.map_err(|e| EtlError::from(e).context("reading mysql row"))?;
         if let Some(batch) = batcher.append_row(row)? {
             let rows = batch.num_rows() as u64;
             if let Some(w) = archive_writer.as_mut() {
@@ -1098,6 +1546,18 @@ async fn prepare_target(
                 }
             } else {
                 tracing::debug!("destination table '{}' already exists", cfg.dest_table);
+                // Full-refresh only needs to evolve a dest whose swap names its
+                // columns (BigQuery INSERT...SELECT). ClickHouse's swap recreates
+                // the table from staging, so drift is absorbed transparently.
+                if cfg.evolve_schema && sink.full_refresh_references_dest_columns() {
+                    let added = sink.add_missing_columns(&cfg.dest_table, dest_columns, cfg).await?;
+                    if !added.is_empty() {
+                        tracing::info!(
+                            "evolve_schema: added {} column(s) to '{}': {}",
+                            added.len(), cfg.dest_table, added.join(", ")
+                        );
+                    }
+                }
             }
             // Fresh, per-run-unique staging table. The unique name (see
             // `staging_name`) is why we can create it without first dropping a
@@ -1135,6 +1595,18 @@ async fn prepare_target(
                 }
             } else {
                 tracing::debug!("destination table '{}' already exists", cfg.dest_table);
+                // Incremental always evolves: ClickHouse inserts straight into
+                // the dest, and BigQuery's MERGE references its columns — a new
+                // source column would hard-error on either without this.
+                if cfg.evolve_schema {
+                    let added = sink.add_missing_columns(&cfg.dest_table, dest_columns, cfg).await?;
+                    if !added.is_empty() {
+                        tracing::info!(
+                            "evolve_schema: added {} column(s) to '{}': {}",
+                            added.len(), cfg.dest_table, added.join(", ")
+                        );
+                    }
+                }
             }
             sink.ensure_state_table().await?;
 
@@ -1159,6 +1631,12 @@ async fn compute_partitions_pg(
         label: "all".into(),
         predicate: None,
     }];
+
+    // Chunked resumable reads drive a single keyset stream (the chunk loop is
+    // the parallelism) — never range-fan-out.
+    if cfg.chunk_rows.is_some() {
+        return Ok(single);
+    }
 
     // Only base tables (not custom queries) support cheap range partitioning.
     let table = match &cfg.source_table {
@@ -1204,6 +1682,10 @@ async fn compute_partitions_mysql(
         label: "all".into(),
         predicate: None,
     }];
+
+    if cfg.chunk_rows.is_some() {
+        return Ok(single);
+    }
 
     let table = match &cfg.source_table {
         Some(t) if cfg.source_query.is_none() => t,
@@ -1728,5 +2210,68 @@ mod tests {
         assert_eq!(f, "DATE_SUB(DATE '2024-06-10', INTERVAL 1 DAY)");
         let f = lookback_lower_bound_bigquery("2024-06-10", 86400 * 2, Some(TableFieldType::Date));
         assert_eq!(f, "DATE_SUB(DATE '2024-06-10', INTERVAL 2 DAY)");
+    }
+
+    fn int64_batch(name: &str, vals: &[Option<i64>]) -> RecordBatch {
+        use arrow_array::Int64Array;
+        use arrow_schema::{Field, Schema};
+        let arr = Int64Array::from(vals.to_vec());
+        let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Int64, true)]));
+        RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap()
+    }
+
+    #[test]
+    fn last_int_key_reads_last_row_or_none() {
+        // Ascending order -> last row is the chunk max cursor.
+        let b = int64_batch("id", &[Some(1), Some(5), Some(9)]);
+        assert_eq!(last_int_key(&b, 0).unwrap(), Some(9));
+        // Empty batch -> None (no cursor to advance).
+        let b = int64_batch("id", &[]);
+        assert_eq!(last_int_key(&b, 0).unwrap(), None);
+        // NULL last key -> None (data-loss guard: caller refuses to advance).
+        let b = int64_batch("id", &[Some(1), None]);
+        assert_eq!(last_int_key(&b, 0).unwrap(), None);
+    }
+
+    /// Minimal cfg + plan + source_cols for build_chunk_plan gate tests.
+    fn chunk_inputs(keyset: &str, arrow: DataType, nullable: bool) -> (TransferConfig, SelectPlan, Vec<ColumnType>) {
+        let mut cfg = crate::config::default_test_config();
+        cfg.mode = SyncMode::Incremental;
+        cfg.watermark = Some("wm".into());
+        cfg.key = vec![keyset.to_string()];
+        cfg.chunk_rows = Some(1000);
+        let src = vec![
+            ColumnType { name: keyset.into(), type_id: 0, nullable, arrow: arrow.clone(), clickhouse_inner: "x".into(), arbitrary_precision_decimal: false },
+            col_typed("wm", DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into()))),
+        ];
+        let plan = SelectPlan {
+            source_columns: vec![keyset.to_string(), "wm".to_string()],
+            source_select_exprs: vec![None, None],
+            dest_columns: src.clone(),
+        };
+        (cfg, plan, src)
+    }
+
+    #[test]
+    fn build_chunk_plan_accepts_unique_integer_notnull_key() {
+        let (cfg, plan, src) = chunk_inputs("id", DataType::Int64, false);
+        let cp = build_chunk_plan(&cfg, &plan, &src, 1000, None, Some("100".into()), None).unwrap();
+        assert_eq!(cp.keyset_col, "id");
+        assert_eq!(cp.keyset_idx, 0);
+        assert_eq!(cp.limit, 1000);
+    }
+
+    #[test]
+    fn build_chunk_plan_rejects_nullable_non_integer_and_transformed_keys() {
+        // Nullable key (NULLs silently skipped) -> reject.
+        let (cfg, plan, src) = chunk_inputs("id", DataType::Int64, true);
+        assert!(build_chunk_plan(&cfg, &plan, &src, 1000, None, None, None).unwrap_err().to_string().contains("NOT NULL"));
+        // Non-integer key -> reject.
+        let (cfg, plan, src) = chunk_inputs("id", DataType::Utf8, false);
+        assert!(build_chunk_plan(&cfg, &plan, &src, 1000, None, None, None).unwrap_err().to_string().contains("integer"));
+        // Transformed key (decoded value != raw column) -> reject.
+        let (mut cfg, plan, src) = chunk_inputs("id", DataType::Int64, false);
+        cfg.column_transforms = std::collections::HashMap::from([("id".to_string(), "id + 1".to_string())]);
+        assert!(build_chunk_plan(&cfg, &plan, &src, 1000, None, None, None).unwrap_err().to_string().contains("column_transforms"));
     }
 }

@@ -30,6 +30,41 @@ pub(crate) fn parse_decimal_override(s: &str) -> Option<(u8, i8)> {
     Some((precision, scale))
 }
 
+/// Render an Arrow `Decimal128` mantissa `value` at the given `scale` as its
+/// canonical plain-decimal text (e.g. `12345` @ scale 2 -> `"123.45"`), for
+/// delivering an exact BigQuery `NUMERIC` over both write paths (Storage Write
+/// proto `string`, and insertAll JSON string). No exponent, no thousands
+/// separators — the form BigQuery parses into NUMERIC. `scale <= 0` appends
+/// zeros (or is a plain integer at scale 0). Uses `unsigned_abs()` so
+/// `i128::MIN` can't overflow (unreachable anyway: `P <= 38` bounds
+/// `|value| < 10^38 < i128::MAX`).
+pub(crate) fn decimal128_to_string(value: i128, scale: i8) -> String {
+    let negative = value < 0;
+    let digits = value.unsigned_abs().to_string();
+    let body = if scale <= 0 {
+        if scale == 0 {
+            digits
+        } else {
+            let mut d = digits;
+            d.push_str(&"0".repeat((-(scale as i32)) as usize));
+            d
+        }
+    } else {
+        let scale = scale as usize;
+        if digits.len() > scale {
+            let point = digits.len() - scale;
+            format!("{}.{}", &digits[..point], &digits[point..])
+        } else {
+            format!("0.{}{}", "0".repeat(scale - digits.len()), digits)
+        }
+    };
+    if negative {
+        format!("-{body}")
+    } else {
+        body
+    }
+}
+
 /// Rescale a non-negative base-10 mantissa from `from_scale` to `to_scale`
 /// (either may be negative — Postgres's own native encoding scale is a
 /// multiple of 4 and can be negative for large whole numbers), rounding
@@ -133,6 +168,21 @@ pub(crate) enum Coercion {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decimal128_to_string_renders_canonical_numeric_text() {
+        assert_eq!(decimal128_to_string(12345, 2), "123.45");
+        assert_eq!(decimal128_to_string(-12345, 2), "-123.45");
+        // Fewer integer digits than the scale -> leading "0." with padding.
+        assert_eq!(decimal128_to_string(5, 3), "0.005");
+        assert_eq!(decimal128_to_string(-5, 3), "-0.005");
+        // Scale 0 -> plain integer; negative scale -> trailing zeros.
+        assert_eq!(decimal128_to_string(42, 0), "42");
+        assert_eq!(decimal128_to_string(42, -2), "4200");
+        assert_eq!(decimal128_to_string(0, 9), "0.000000000");
+        // A full NUMERIC(38,9)-scale value round-trips exactly (no f64 loss).
+        assert_eq!(decimal128_to_string(32_899_999_999, 9), "32.899999999");
+    }
 
     #[test]
     fn rescale_identity_when_scales_match() {

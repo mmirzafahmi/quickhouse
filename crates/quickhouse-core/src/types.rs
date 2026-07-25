@@ -261,6 +261,11 @@ pub mod bigquery {
             DataType::Date32 => Some(BqType::Date),
             DataType::Timestamp(TimeUnit::Microsecond, None) => Some(BqType::Datetime),
             DataType::Timestamp(TimeUnit::Microsecond, Some(_)) => Some(BqType::Timestamp),
+            // An exact-decimal column (from a promoted NUMERIC override) maps
+            // to BigQuery NUMERIC — for the DDL round-trip when the override is
+            // keyed by source name + a rename, and so partition_by validation
+            // correctly rejects a NUMERIC column as non-temporal.
+            DataType::Decimal128(_, _) => Some(BqType::Numeric),
             _ => None,
         }
     }
@@ -287,6 +292,7 @@ pub mod mysql {
         col_type: MyType,
         is_unsigned: bool,
         is_tinyint1: bool,
+        is_binary: bool,
     ) -> Option<(DataType, String)> {
         let mapped = match col_type {
             MyType::MYSQL_TYPE_TINY if is_tinyint1 => (DataType::Boolean, "Bool".to_string()),
@@ -328,10 +334,22 @@ pub mod mysql {
             | MyType::MYSQL_TYPE_ENUM
             | MyType::MYSQL_TYPE_SET
             | MyType::MYSQL_TYPE_JSON => (DataType::Utf8, "String".to_string()),
+            // The BLOB-family wire codes are shared by real binary BLOB and the
+            // TEXT/MEDIUMTEXT/LONGTEXT types — the ONLY distinguisher is the
+            // charset (binary collation 63 => BLOB, anything else => TEXT),
+            // which the caller passes as `is_binary`. A TEXT column MUST map to
+            // Utf8 (BigQuery STRING); mapping it to Binary/BYTES fails a MERGE
+            // into a STRING column ("Value of type BYTES cannot be assigned").
             MyType::MYSQL_TYPE_TINY_BLOB
             | MyType::MYSQL_TYPE_MEDIUM_BLOB
             | MyType::MYSQL_TYPE_LONG_BLOB
-            | MyType::MYSQL_TYPE_BLOB => (DataType::Binary, "String".to_string()),
+            | MyType::MYSQL_TYPE_BLOB => {
+                if is_binary {
+                    (DataType::Binary, "String".to_string())
+                } else {
+                    (DataType::Utf8, "String".to_string())
+                }
+            }
             MyType::MYSQL_TYPE_DATE | MyType::MYSQL_TYPE_NEWDATE => {
                 (DataType::Date32, "Date32".to_string())
             }
@@ -420,13 +438,33 @@ mod tests {
             MyType::MYSQL_TYPE_TIMESTAMP,
             MyType::MYSQL_TYPE_TIMESTAMP2,
         ] {
-            let (arrow, ch) = map_mysql_type(ty, false, false).unwrap();
+            let (arrow, ch) = map_mysql_type(ty, false, false, false).unwrap();
             assert_eq!(
                 arrow,
                 DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())),
                 "{ty:?} must map to a tz-aware (UTC) Arrow timestamp"
             );
             assert_eq!(ch, "DateTime64(6, 'UTC')", "{ty:?} ClickHouse type");
+        }
+    }
+
+    /// BLOB-family wire codes are shared by real BLOB and TEXT; only the charset
+    /// (`is_binary`, collation 63) distinguishes them. TEXT must be Utf8 (BQ
+    /// STRING); real BLOB stays Binary (BQ BYTES).
+    #[test]
+    fn mysql_blob_codes_split_on_binary_charset() {
+        use super::mysql::map_mysql_type;
+        use mysql_async::consts::ColumnType as MyType;
+        for ty in [
+            MyType::MYSQL_TYPE_TINY_BLOB,
+            MyType::MYSQL_TYPE_MEDIUM_BLOB,
+            MyType::MYSQL_TYPE_LONG_BLOB,
+            MyType::MYSQL_TYPE_BLOB,
+        ] {
+            // Non-binary charset => TEXT => Utf8/STRING.
+            assert_eq!(map_mysql_type(ty, false, false, false).unwrap().0, DataType::Utf8, "{ty:?} TEXT");
+            // Binary charset => real BLOB => Binary/BYTES.
+            assert_eq!(map_mysql_type(ty, false, false, true).unwrap().0, DataType::Binary, "{ty:?} BLOB");
         }
     }
 

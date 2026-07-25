@@ -16,6 +16,7 @@ use mysql_async::prelude::*;
 use mysql_async::{Conn, Opts, OptsBuilder, SslOpts, Value};
 
 use crate::error::{EtlError, Result};
+use crate::source::Keyset;
 use crate::types::{mysql::map_mysql_type, ColumnType};
 
 use super::Partition;
@@ -73,14 +74,14 @@ impl MySqlSource {
         let opts = build_opts(&self.dsn, self.ca_cert_file.as_deref(), self.require_tls)?;
         let mut conn = Conn::new(opts)
             .await
-            .map_err(|e| EtlError::other(format!("mysql connect error: {e}")))?;
+            .map_err(|e| EtlError::from(e).context("connecting to mysql"))?;
         if self.statement_timeout_secs > 0 {
             conn.query_drop(format!(
                 "SET SESSION MAX_EXECUTION_TIME = {}",
                 self.statement_timeout_secs * 1000
             ))
             .await
-            .map_err(|e| EtlError::other(format!("mysql error: {e}")))?;
+            .map_err(|e| EtlError::from(e).context("setting mysql session timeout"))?;
         }
         Ok(conn)
     }
@@ -90,14 +91,19 @@ impl MySqlSource {
         let stmt = conn
             .prep(select_sql)
             .await
-            .map_err(|e| EtlError::other(format!("mysql prepare error: {e}")))?;
+            .map_err(|e| EtlError::from(e).context("resolving mysql columns"))?;
 
         let mut cols = Vec::with_capacity(stmt.columns().len());
         for c in stmt.columns() {
             let col_type = c.column_type();
             let is_unsigned = c.flags().contains(ColumnFlags::UNSIGNED_FLAG);
             let is_tinyint1 = col_type == MyType::MYSQL_TYPE_TINY && c.column_length() == 1;
-            let (arrow, ch_inner) = map_mysql_type(col_type, is_unsigned, is_tinyint1)
+            // Collation id 63 is `binary` — the only way to tell a real BLOB
+            // from a TEXT column, which share the same wire type code. Without
+            // this, TEXT columns map to BYTES and fail a MERGE into a BigQuery
+            // STRING column.
+            let is_binary = c.character_set() == 63;
+            let (arrow, ch_inner) = map_mysql_type(col_type, is_unsigned, is_tinyint1, is_binary)
                 .ok_or_else(|| EtlError::UnsupportedType {
                     engine: "MySQL",
                     column: c.name_str().to_string(),
@@ -163,7 +169,7 @@ impl MySqlSource {
         let row: Option<(Option<Value>, Option<Value>)> = conn
             .query_first(sql)
             .await
-            .map_err(|e| EtlError::other(format!("mysql error: {e}")))?;
+            .map_err(|e| EtlError::from(e).context("computing mysql partition bounds"))?;
         let as_i128 = |v: Value| match v {
             Value::Int(i) => Some(i as i128),
             Value::UInt(u) => Some(u as i128),
@@ -187,35 +193,53 @@ impl MySqlSource {
         Ok(parts)
     }
 
-    /// Build the `SELECT ...` SQL for one partition.
+    /// Build the `SELECT ...` SQL for one partition. See `PgSource::copy_sql`
+    /// for the `select_exprs` (per-column transform) and `keyset` (chunked
+    /// resumable read) semantics — identical here. Byte-identical to the plain
+    /// query when `select_exprs` is all-`None` and `keyset` is `None`.
+    #[allow(clippy::too_many_arguments)]
     pub fn select_sql(
         &self,
         columns: &[String],
+        select_exprs: &[Option<String>],
         from_table: Option<&str>,
         base_query: Option<&str>,
         partition: &Partition,
         extra_filter: Option<&str>,
+        keyset: Option<Keyset>,
     ) -> String {
         let col_list = columns
             .iter()
-            .map(|c| quote_my(c))
+            .enumerate()
+            .map(|(i, c)| match select_exprs.get(i).and_then(|e| e.as_ref()) {
+                Some(expr) => format!("{expr} AS {}", quote_my(c)),
+                None => quote_my(c),
+            })
             .collect::<Vec<_>>()
             .join(", ");
 
-        if let Some(q) = base_query {
-            let mut sql = format!("SELECT {col_list} FROM ({q}) AS _src");
-            if let Some(f) = combine_filters(&partition.predicate, extra_filter) {
-                sql.push_str(&format!(" WHERE {f}"));
-            }
-            sql
+        let cursor_pred = keyset
+            .as_ref()
+            .and_then(|k| k.cursor.as_ref().map(|cur| format!("{} > {}", k.col_quoted, cur)));
+        let extra_owned = extra_filter.map(str::to_string);
+        let extra_and_cursor = combine_filters(&extra_owned, cursor_pred.as_deref());
+        let filters = combine_filters(&partition.predicate, extra_and_cursor.as_deref());
+        let order_limit = keyset
+            .as_ref()
+            .map(|k| format!(" ORDER BY {} ASC LIMIT {}", k.col_quoted, k.limit))
+            .unwrap_or_default();
+
+        let mut sql = if let Some(q) = base_query {
+            format!("SELECT {col_list} FROM ({q}) AS _src")
         } else {
             let table = from_table.expect("table or query required");
-            let mut sql = format!("SELECT {col_list} FROM {}", quote_my_table(table));
-            if let Some(f) = combine_filters(&partition.predicate, extra_filter) {
-                sql.push_str(&format!(" WHERE {f}"));
-            }
-            sql
+            format!("SELECT {col_list} FROM {}", quote_my_table(table))
+        };
+        if let Some(f) = filters {
+            sql.push_str(&format!(" WHERE {f}"));
         }
+        sql.push_str(&order_limit);
+        sql
     }
 
     /// Read the current max watermark value as text (for incremental sync).
@@ -245,7 +269,7 @@ impl MySqlSource {
         conn.query_first::<Option<String>, _>(sql)
             .await
             .map(|row| row.flatten())
-            .map_err(|e| EtlError::other(format!("mysql error: {e}")))
+            .map_err(|e| EtlError::from(e).context("reading mysql max watermark"))
     }
 }
 
@@ -288,14 +312,18 @@ mod tests {
         };
         let sql = src.select_sql(
             &["id".to_string(), "name".to_string()],
+            &[None, None],
             Some("mydb.orders"),
             None,
             &part,
             Some("`updated_at` > '2024-01-01'"),
+            None,
         );
         assert!(sql.starts_with("SELECT `id`, `name` FROM `mydb`.`orders`"));
         assert!(sql.contains("WHERE"));
         assert!(sql.contains("AND"));
+        assert!(!sql.contains(" AS "));
+        assert!(!sql.contains("ORDER BY"));
     }
 
     #[test]
@@ -307,12 +335,32 @@ mod tests {
         };
         let sql = src.select_sql(
             &["a".to_string()],
+            &[None],
             None,
             Some("SELECT a FROM t"),
             &part,
             None,
+            None,
         );
         assert_eq!(sql, "SELECT `a` FROM (SELECT a FROM t) AS _src");
+    }
+
+    #[test]
+    fn select_sql_transform_and_keyset() {
+        let src = MySqlSource::new("mysql://x", 0, None, false);
+        let part = Partition { label: "all".into(), predicate: None };
+        let sql = src.select_sql(
+            &["id".to_string(), "amt".to_string()],
+            &[None, Some("ROUND(`amt`, 9)".to_string())],
+            Some("t"),
+            None,
+            &part,
+            None,
+            Some(Keyset { col_quoted: "`id`".into(), cursor: Some("42".into()), limit: 500 }),
+        );
+        assert!(sql.contains("ROUND(`amt`, 9) AS `amt`"), "{sql}");
+        assert!(sql.contains("`id` > 42"), "{sql}");
+        assert!(sql.ends_with("ORDER BY `id` ASC LIMIT 500"), "{sql}");
     }
 
     #[test]

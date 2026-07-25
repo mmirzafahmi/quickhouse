@@ -26,9 +26,9 @@
 use std::time::Duration;
 
 use arrow_array::{
-    Array, BinaryArray, BooleanArray, Date32Array, Float32Array, Float64Array, Int16Array,
-    Int32Array, Int64Array, Int8Array, RecordBatch, StringArray, TimestampMicrosecondArray,
-    UInt16Array, UInt32Array, UInt64Array, UInt8Array,
+    Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
+    Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray,
+    TimestampMicrosecondArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
 };
 use arrow_schema::{DataType, SchemaRef, TimeUnit};
 use base64::Engine;
@@ -434,6 +434,37 @@ impl BigQuerySink {
         }
     }
 
+    /// Add each missing column as `Nullable` via a schema PATCH. Fetches the
+    /// live table, mutates its schema in place, and patches it back — so
+    /// partitioning, clustering, and the `etag` (optimistic-concurrency
+    /// If-Match) all carry through untouched. Returns the names added.
+    /// Case-insensitive column matching (BigQuery names are). ADD-only.
+    pub async fn add_missing_columns(
+        &self,
+        table: &str,
+        columns: &[ColumnType],
+        cfg: &TransferConfig,
+    ) -> Result<Vec<String>> {
+        let mut t = self
+            .client
+            .table()
+            .get(&self.project_id, &self.dataset_id, table)
+            .await
+            .map_err(|e| EtlError::other(format!("bigquery table get (evolve) error: {e}")))?;
+        let existing = t.schema.take().map(|s| s.fields).unwrap_or_default();
+        let (fields, added) = build_evolved_fields(existing, columns, cfg)?;
+        t.schema = Some(TableSchema { fields });
+        if added.is_empty() {
+            return Ok(added);
+        }
+        self.client
+            .table()
+            .patch(&t)
+            .await
+            .map_err(|e| EtlError::other(format!("bigquery schema patch (evolve) error: {e}")))?;
+        Ok(added)
+    }
+
     /// Create the internal `_quickhouse_state` watermark-tracking table if
     /// it doesn't exist yet. Unlike ClickHouse's `CREATE TABLE IF NOT
     /// EXISTS`, BigQuery's table creation has no such clause, so the
@@ -756,6 +787,50 @@ fn build_merge_sql(
 /// `Table`, not a DDL string — see the module docs). A free function (not a
 /// `&self` method) so it's unit-testable without a real authenticated
 /// client.
+/// Resolve one column's BigQuery field type: an explicit `type_overrides`
+/// entry (a BigQuery type name like `"NUMERIC"`) wins, else the Arrow-derived
+/// mapping. Shared by table creation and schema evolution.
+fn bq_field_data_type(c: &ColumnType, cfg: &TransferConfig) -> Result<TableFieldType> {
+    match cfg.type_overrides.get(&c.name) {
+        Some(ov) => serde_json::from_value(Value::String(ov.clone())).map_err(|_| {
+            EtlError::config(format!(
+                "invalid BigQuery type override '{ov}' for column '{}': expected a BigQuery type \
+                 name like \"NUMERIC\" or \"BIGNUMERIC\"",
+                c.name
+            ))
+        }),
+        None => arrow_to_bigquery_type(&c.arrow).ok_or_else(|| EtlError::UnsupportedType {
+            engine: "BigQuery",
+            column: c.name.clone(),
+            type_name: format!("{:?}", c.arrow),
+        }),
+    }
+}
+
+/// Append a `Nullable` field for every `desired` column missing from
+/// `existing` (case-insensitive — BigQuery column names are), returning the
+/// merged field list and the names added. Pure (no client), so it's
+/// unit-testable. Added columns are forced `Nullable`: rows predating the
+/// column read back as NULL. Existing fields are carried through untouched.
+fn build_evolved_fields(
+    mut existing: Vec<TableFieldSchema>,
+    desired: &[ColumnType],
+    cfg: &TransferConfig,
+) -> Result<(Vec<TableFieldSchema>, Vec<String>)> {
+    let names: Vec<String> = existing.iter().map(|f| f.name.clone()).collect();
+    let mut added = Vec::new();
+    for c in crate::sink::missing_columns(&names, desired, true) {
+        existing.push(TableFieldSchema {
+            name: c.name.clone(),
+            data_type: bq_field_data_type(c, cfg)?,
+            mode: Some(TableFieldMode::Nullable),
+            ..Default::default()
+        });
+        added.push(c.name.clone());
+    }
+    Ok((existing, added))
+}
+
 fn build_table(
     project_id: &str,
     dataset_id: &str,
@@ -765,23 +840,9 @@ fn build_table(
 ) -> Result<Table> {
     let mut fields = Vec::with_capacity(columns.len());
     for c in columns {
-        let data_type = match cfg.type_overrides.get(&c.name) {
-            Some(ov) => serde_json::from_value(Value::String(ov.clone())).map_err(|_| {
-                EtlError::config(format!(
-                    "invalid BigQuery type override '{ov}' for column '{}': expected a BigQuery type \
-                     name like \"NUMERIC\" or \"BIGNUMERIC\"",
-                    c.name
-                ))
-            })?,
-            None => arrow_to_bigquery_type(&c.arrow).ok_or_else(|| EtlError::UnsupportedType {
-                engine: "BigQuery",
-                column: c.name.clone(),
-                type_name: format!("{:?}", c.arrow),
-            })?,
-        };
         fields.push(TableFieldSchema {
             name: c.name.clone(),
-            data_type,
+            data_type: bq_field_data_type(c, cfg)?,
             mode: Some(if c.nullable { TableFieldMode::Nullable } else { TableFieldMode::Required }),
             ..Default::default()
         });
@@ -886,6 +947,15 @@ fn array_value_to_json(col: &dyn Array, dt: &DataType, row: usize) -> Result<Val
             let micros = downcast::<TimestampMicrosecondArray>(col)?.value(row);
             Value::String(timestamp_micros_to_iso(micros, tz.is_some())?)
         }
+        // BigQuery NUMERIC as exact decimal text — insertAll accepts a JSON
+        // string for a NUMERIC column. REQUIRED companion to the Storage Write
+        // proto arm: plan() promotes a NUMERIC override to Decimal128 for a
+        // BigQuery dest unconditionally, so the DEFAULT insertAll path sees it
+        // too and must encode it rather than hard-fail.
+        DataType::Decimal128(_, scale) => Value::String(crate::decimal::decimal128_to_string(
+            downcast::<Decimal128Array>(col)?.value(row),
+            *scale,
+        )),
         other => {
             return Err(EtlError::internal(format!(
                 "no BigQuery JSON conversion implemented for Arrow type {other:?}"
@@ -969,6 +1039,10 @@ mod tests {
             max_memory_bytes: 0,
             partition_column: None,
             read_max_rows_per_sec: None,
+            chunk_rows: None,
+            retry_max_attempts: 1,
+            column_transforms: HashMap::new(),
+            evolve_schema: false,
             state_key: None,
             seed_watermark: crate::config::WatermarkSeed::None,
             advance_watermark: true,
@@ -977,6 +1051,42 @@ mod tests {
             include: vec![],
             exclude: vec![],
         }
+    }
+
+    #[test]
+    fn build_evolved_fields_appends_missing_as_nullable() {
+        let existing = vec![TableFieldSchema {
+            name: "id".into(),
+            data_type: TableFieldType::Integer,
+            mode: Some(TableFieldMode::Required),
+            ..Default::default()
+        }];
+        let desired = vec![col("id", DataType::Int64, false), col("email", DataType::Utf8, true)];
+        let (fields, added) = build_evolved_fields(existing, &desired, &base_cfg()).unwrap();
+        assert_eq!(added, vec!["email"], "only the genuinely-new column is added");
+        assert_eq!(fields.len(), 2);
+        // The existing field is carried through untouched (still Required).
+        assert_eq!(fields[0].name, "id");
+        assert_eq!(fields[0].mode, Some(TableFieldMode::Required));
+        // The added column is forced Nullable (rows predating it read as NULL).
+        let email = fields.iter().find(|f| f.name == "email").unwrap();
+        assert_eq!(email.mode, Some(TableFieldMode::Nullable));
+        assert_eq!(email.data_type, TableFieldType::String);
+    }
+
+    #[test]
+    fn build_evolved_fields_matches_column_names_case_insensitively() {
+        // BigQuery treats column names case-insensitively: "ID" already exists.
+        let existing = vec![TableFieldSchema {
+            name: "ID".into(),
+            data_type: TableFieldType::Integer,
+            mode: Some(TableFieldMode::Nullable),
+            ..Default::default()
+        }];
+        let desired = vec![col("id", DataType::Int64, false)];
+        let (fields, added) = build_evolved_fields(existing, &desired, &base_cfg()).unwrap();
+        assert!(added.is_empty(), "case-insensitive match must not re-add 'id'");
+        assert_eq!(fields.len(), 1);
     }
 
     #[test]

@@ -11,6 +11,9 @@ pub enum EtlError {
     #[error("postgres error: {}", fmt_pg_error(.0))]
     Postgres(#[from] tokio_postgres::Error),
 
+    #[error("mysql error: {0}")]
+    MySql(#[from] mysql_async::Error),
+
     #[error("clickhouse error: {0}")]
     ClickHouse(String),
 
@@ -114,6 +117,49 @@ fn fmt_pg_error(e: &tokio_postgres::Error) -> String {
     }
 }
 
+/// PostgreSQL SQLSTATEs worth a whole-transfer retry: `40001` = serialization
+/// failure / hot-standby "conflict with recovery"; `57014` = statement
+/// canceled (e.g. a `statement_timeout` or max_standby_streaming_delay cancel).
+pub(crate) fn sqlstate_is_transient(code: &str) -> bool {
+    matches!(code, "40001" | "57014")
+}
+
+fn pg_error_is_transient(e: &tokio_postgres::Error) -> bool {
+    // A server-side error: decide purely on SQLSTATE.
+    if let Some(db) = e.as_db_error() {
+        return sqlstate_is_transient(db.code().code());
+    }
+    // Connection closed under us — always worth a fresh attempt.
+    if e.is_closed() {
+        return true;
+    }
+    // Transport io error (reset / aborted / EOF / timeout) in the source chain.
+    let mut src = StdError::source(e);
+    while let Some(s) = src {
+        if let Some(io) = s.downcast_ref::<std::io::Error>() {
+            use std::io::ErrorKind::*;
+            return matches!(
+                io.kind(),
+                ConnectionReset | ConnectionAborted | BrokenPipe | UnexpectedEof | TimedOut
+            );
+        }
+        src = s.source();
+    }
+    false
+}
+
+fn mysql_error_is_transient(e: &mysql_async::Error) -> bool {
+    use mysql_async::Error;
+    match e {
+        // 1205 = lock wait timeout; 1213 = deadlock (both retryable).
+        Error::Server(se) => matches!(se.code, 1205 | 1213),
+        // Transport failure (server gone away / reset / broken pipe).
+        Error::Io(_) => true,
+        Error::Driver(mysql_async::DriverError::ConnectionClosed) => true,
+        _ => false,
+    }
+}
+
 impl EtlError {
     pub fn decode(msg: impl Into<String>) -> Self {
         EtlError::Decode(msg.into())
@@ -129,6 +175,20 @@ impl EtlError {
     }
     pub fn internal(msg: impl Into<String>) -> Self {
         EtlError::Internal(msg.into())
+    }
+
+    /// True only for a *transient source-read* failure that's worth retrying
+    /// the whole transfer (see `TransferConfig::retry_max_attempts`). Recurses
+    /// through `Context`. Sink/HTTP/config/decode/unsupported-type errors
+    /// return `false`, so a retry never re-reads the source because of a
+    /// destination-side blip (those are retried at the insert layer instead).
+    pub(crate) fn is_transient_source(&self) -> bool {
+        match self {
+            EtlError::Postgres(e) => pg_error_is_transient(e),
+            EtlError::MySql(e) => mysql_error_is_transient(e),
+            EtlError::Context { source, .. } => source.is_transient_source(),
+            _ => false,
+        }
     }
 
     /// Prefix this error with "where it happened" (a table, column, or
@@ -204,5 +264,27 @@ mod tests {
         let msg = EtlError::internal("no column builder for Arrow type Utf8").to_string();
         assert!(msg.contains("quickhouse bug"), "must say it's not the user's fault: {msg}");
         assert!(msg.contains("no column builder"), "must keep the original detail: {msg}");
+    }
+
+    #[test]
+    fn sqlstate_transient_allowlist_is_closed() {
+        assert!(sqlstate_is_transient("40001"), "serialization / hot-standby recovery conflict");
+        assert!(sqlstate_is_transient("57014"), "canceled statement (timeout / standby cancel)");
+        // Deterministic errors must NOT be retried (would re-read the source pointlessly).
+        assert!(!sqlstate_is_transient("23505"), "unique violation is permanent");
+        assert!(!sqlstate_is_transient("42P01"), "undefined table is permanent");
+        assert!(!sqlstate_is_transient(""), "empty is not transient");
+    }
+
+    #[test]
+    fn is_transient_source_false_for_non_source_errors() {
+        // A destination/config/decode blip must never trigger a source re-read
+        // (those are retried at the insert layer instead).
+        assert!(!EtlError::clickhouse("503").is_transient_source());
+        assert!(!EtlError::config("bad").is_transient_source());
+        assert!(!EtlError::decode("short int4").is_transient_source());
+        assert!(!EtlError::other("x").is_transient_source());
+        // Context recurses into the wrapped error (still non-source here).
+        assert!(!EtlError::other("x").context("orders -> dest").is_transient_source());
     }
 }

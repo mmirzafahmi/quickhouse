@@ -6,6 +6,19 @@ pub use bigquery::BigQuerySource;
 pub use mysql::MySqlSource;
 pub use postgres::{PgSource, Partition};
 
+/// One chunk's keyset bound for resumable reads (see `TransferConfig::chunk_rows`).
+/// Shared by both SQL sources: the reader appends `{col_quoted} > {cursor}`
+/// (when resuming) plus `ORDER BY {col_quoted} ASC LIMIT {limit}` to the
+/// SELECT, so each chunk reads the next `limit` rows past the cursor in key
+/// order. `cursor` is a bare integer literal (the keyset column is gated to an
+/// integer type), re-validated as `^-?[0-9]+$` before injection.
+#[derive(Debug, Clone)]
+pub struct Keyset {
+    pub col_quoted: String,
+    pub cursor: Option<String>,
+    pub limit: usize,
+}
+
 /// Which database engine a transfer reads from. `sync.rs` matches on this to
 /// dispatch to each engine's own connection/decode logic.
 pub enum Source {

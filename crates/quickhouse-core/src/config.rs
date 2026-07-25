@@ -173,6 +173,23 @@ impl DestinationConfig {
             DestinationConfig::BigQuery(_) => "bigquery",
         }
     }
+
+    pub fn dest_kind(&self) -> DestKind {
+        match self {
+            DestinationConfig::ClickHouse(_) => DestKind::ClickHouse,
+            DestinationConfig::BigQuery(_) => DestKind::BigQuery,
+        }
+    }
+}
+
+/// Which destination engine a transfer targets — a light discriminant threaded
+/// into [`crate::transform::plan`] for destination-aware type decisions (e.g.
+/// promoting a `NUMERIC`-overridden column to `Decimal128` only for BigQuery)
+/// without carrying the whole [`DestinationConfig`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DestKind {
+    ClickHouse,
+    BigQuery,
 }
 
 /// Full-refresh reloads everything; Incremental appends rows past a watermark.
@@ -326,6 +343,35 @@ pub struct TransferConfig {
     /// path is a managed, separately-metered API).
     pub read_max_rows_per_sec: Option<u64>,
 
+    // ---- 0.5.0 block (kept contiguous; append new fields here) ----
+    /// Incremental + ClickHouse-destination only: read the source in
+    /// keyset-ordered chunks of this many rows, committing the watermark per
+    /// chunk so a mid-read failure resumes instead of restarting from the last
+    /// run's watermark. `None` (default) = one unbounded read per partition, as
+    /// before. Requires a keyset ordering column (see [`Self::keyset_column`])
+    /// that is a **unique, NOT NULL integer** — ties or NULLs would silently
+    /// skip rows. Chunked mode runs single-stream (range partitioning is off).
+    pub chunk_rows: Option<usize>,
+    /// Max total attempts for the whole transfer when it fails with a
+    /// *transient source* error (PostgreSQL hot-standby recovery conflict /
+    /// statement cancel; MySQL server-gone-away / lock-wait / deadlock).
+    /// `1` (default) = no retry, byte-identical to before. Sink/write-side
+    /// retries are separate and always on (see `sink::backoff_delay`).
+    pub retry_max_attempts: u32,
+    /// Per-column SQL value transforms applied in the source `SELECT`
+    /// (source-column name -> expression, e.g. `"CAST(x AS TEXT)"`,
+    /// `"col AT TIME ZONE 'UTC'"`, `"ROUND(amt, 9)"`). Applied over
+    /// `source_table=` so range partitioning is preserved (unlike a
+    /// `source_query`). Changes the *value*, not the resolved column type —
+    /// combine with `type_overrides` if the destination type must change too.
+    /// Not supported for a BigQuery source (use `source_query` there).
+    pub column_transforms: HashMap<String, String>,
+    /// Opt-in schema evolution: when the source has a column the existing
+    /// destination table lacks, `ALTER TABLE ADD COLUMN` (as Nullable) instead
+    /// of hard-erroring. `false` (default) preserves today's behavior. Never
+    /// drops or retypes a column.
+    pub evolve_schema: bool,
+
     // ---- transforms ----
     /// Per-column destination type overrides (column name -> the
     /// destination's own type name, e.g. ClickHouse `"Decimal(18, 2)"` or
@@ -362,6 +408,9 @@ impl TransferConfig {
             // The seed only meaningfully floors an incremental cursor; a
             // full refresh has none, so clear it (mirrors `watermark`).
             self.seed_watermark = WatermarkSeed::None;
+            // Chunked resumable reads are incremental-only (validate rejects
+            // this combo; clearing keeps the effective config honest).
+            self.chunk_rows = None;
         }
     }
 
@@ -374,6 +423,15 @@ impl TransferConfig {
             .or_else(|| self.source_table.clone())
             .or_else(|| self.source_query.clone())
             .unwrap_or_default()
+    }
+
+    /// The keyset ordering column for chunked resumable reads: `partition_column`
+    /// if set, else the first `key` column. Same resolution the range-partition
+    /// planner uses, so chunked and partitioned reads agree on the column.
+    pub fn keyset_column(&self) -> Option<String> {
+        self.partition_column
+            .clone()
+            .or_else(|| self.key.first().cloned())
     }
 
     pub fn validate(&self) -> crate::error::Result<()> {
@@ -428,6 +486,20 @@ impl TransferConfig {
                 "read_max_rows_per_sec must be None (unlimited) or >= 1",
             ));
         }
+        if self.chunk_rows == Some(0) {
+            return Err(EtlError::config("chunk_rows must be None (one-shot) or >= 1"));
+        }
+        if self.chunk_rows.is_some() && self.mode != SyncMode::Incremental {
+            return Err(EtlError::config(
+                "chunk_rows (keyset resumable reads) only applies to incremental mode",
+            ));
+        }
+        if self.chunk_rows.is_some() && self.keyset_column().is_none() {
+            return Err(EtlError::config(
+                "chunk_rows requires a keyset ordering column: set partition_column or key \
+                 (it must be a UNIQUE, NOT NULL integer column, or ties silently skip rows)",
+            ));
+        }
         Ok(())
     }
 }
@@ -440,6 +512,45 @@ pub struct TransferResult {
     pub bytes_written: u64,
     pub duration_secs: f64,
     pub new_watermark: Option<String>,
+}
+
+/// A default `TransferConfig` for tests in other modules (e.g. `sync`), which
+/// can't reach this module's private test `cfg()` helper. Full mode, single
+/// stream, all optional features off.
+#[cfg(test)]
+pub(crate) fn default_test_config() -> TransferConfig {
+    TransferConfig {
+        source_table: Some("t".into()),
+        source_query: None,
+        dest_table: "t".into(),
+        state_key: None,
+        mode: SyncMode::Full,
+        watermark: None,
+        lookback_seconds: 0,
+        seed_watermark: WatermarkSeed::None,
+        advance_watermark: true,
+        key: vec![],
+        create_if_missing: true,
+        engine: None,
+        order_by: vec![],
+        partition_by: None,
+        primary_key: vec![],
+        merge_prune_partition_by: None,
+        parallelism: 1,
+        batch_rows: 1000,
+        batch_bytes: 0,
+        max_memory_bytes: 0,
+        partition_column: None,
+        read_max_rows_per_sec: None,
+        chunk_rows: None,
+        retry_max_attempts: 1,
+        column_transforms: HashMap::new(),
+        evolve_schema: false,
+        type_overrides: HashMap::new(),
+        rename: HashMap::new(),
+        include: vec![],
+        exclude: vec![],
+    }
 }
 
 #[cfg(test)]
@@ -470,6 +581,10 @@ mod tests {
             max_memory_bytes: 0,
             partition_column: None,
             read_max_rows_per_sec: None,
+            chunk_rows: None,
+            retry_max_attempts: 1,
+            column_transforms: HashMap::new(),
+            evolve_schema: false,
             type_overrides: HashMap::new(),
             rename: HashMap::new(),
             include: vec![],
@@ -584,5 +699,38 @@ mod tests {
         c.seed_watermark = WatermarkSeed::CurrentMax;
         c.normalize();
         assert_eq!(c.seed_watermark, WatermarkSeed::None);
+    }
+
+    #[test]
+    fn keyset_column_prefers_partition_column_then_key() {
+        let mut c = cfg(SyncMode::Incremental, Some("write_date"));
+        assert_eq!(c.keyset_column().as_deref(), Some("id")); // default key
+        c.partition_column = Some("pk".into());
+        assert_eq!(c.keyset_column().as_deref(), Some("pk"));
+        c.partition_column = None;
+        c.key = vec![];
+        assert_eq!(c.keyset_column(), None);
+    }
+
+    #[test]
+    fn validate_chunk_rows_rules() {
+        // Zero rejected.
+        let mut c = cfg(SyncMode::Incremental, Some("write_date"));
+        c.chunk_rows = Some(0);
+        assert!(c.validate().unwrap_err().to_string().contains("chunk_rows"));
+        // Full mode rejected.
+        let mut c = cfg(SyncMode::Full, None);
+        c.chunk_rows = Some(1000);
+        assert!(c.validate().unwrap_err().to_string().contains("incremental"));
+        // No keyset column rejected.
+        let mut c = cfg(SyncMode::Incremental, Some("write_date"));
+        c.chunk_rows = Some(1000);
+        c.key = vec![];
+        c.partition_column = None;
+        assert!(c.validate().unwrap_err().to_string().contains("keyset"));
+        // Valid: incremental + a key.
+        let mut c = cfg(SyncMode::Incremental, Some("write_date"));
+        c.chunk_rows = Some(1000);
+        assert!(c.validate().is_ok());
     }
 }

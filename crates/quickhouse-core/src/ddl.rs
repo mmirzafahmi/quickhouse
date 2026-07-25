@@ -104,9 +104,35 @@ pub fn create_state_table(db: &str) -> String {
          \x20   dest_table   String,\n\
          \x20   last_watermark String,\n\
          \x20   rows UInt64,\n\
+         \x20   chunk_cursor String DEFAULT '',\n\
+         \x20   chunk_upper String DEFAULT '',\n\
          \x20   run_ts DateTime64(3) DEFAULT now64(3)\n\
          )\nENGINE = ReplacingMergeTree(run_ts)\nORDER BY (source_table, dest_table)",
         qualified(db, "_quickhouse_state")
+    )
+}
+
+/// Bring a pre-0.5 `_quickhouse_state` table up to date with the chunk-resume
+/// columns (keyset resumable reads). Idempotent via `ADD COLUMN IF NOT EXISTS`,
+/// so it's safe to run unconditionally alongside `create_state_table`.
+pub fn migrate_state_table(db: &str) -> String {
+    format!(
+        "ALTER TABLE {} ADD COLUMN IF NOT EXISTS chunk_cursor String DEFAULT '', \
+         ADD COLUMN IF NOT EXISTS chunk_upper String DEFAULT ''",
+        qualified(db, "_quickhouse_state")
+    )
+}
+
+/// `ALTER TABLE ... ADD COLUMN IF NOT EXISTS <col> Nullable(<inner>)` for
+/// opt-in schema evolution. Always `Nullable` regardless of the column's
+/// resolved nullability: an existing table has rows that predate the column,
+/// which must read back as NULL. `IF NOT EXISTS` makes it idempotent.
+pub fn add_column(db: &str, table: &str, column: &ColumnType) -> String {
+    format!(
+        "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} Nullable({})",
+        qualified(db, table),
+        quote_ident(&column.name),
+        column.clickhouse_inner,
     )
 }
 
@@ -149,6 +175,10 @@ mod tests {
             max_memory_bytes: 0,
             partition_column: None,
             read_max_rows_per_sec: None,
+            chunk_rows: None,
+            retry_max_attempts: 1,
+            column_transforms: HashMap::new(),
+            evolve_schema: false,
             state_key: None,
             seed_watermark: crate::config::WatermarkSeed::None,
             advance_watermark: true,

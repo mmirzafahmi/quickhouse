@@ -223,6 +223,10 @@ errors are surfaced verbatim rather than wrapped in something generic.
 | `seed_watermark` / `skip_to_max` | Seed the cursor on the first run only (explicit floor, or the source's current max) — skips a doomed first full pull; mutually exclusive |
 | `advance_watermark` | `False` reads+merges a window without advancing the cursor (backfill without rewinding the schedule); default `True` |
 | `merge_prune_partition_by` | BigQuery incremental: prune the MERGE's destination scan to the staging range on this column. Only safe for an *immutable* partition column (e.g. `create_date`) — never a mutable `write_date` (would insert dup keys) |
+| `chunk_rows` | Read in keyset-ordered chunks of N rows, committing the cursor per chunk so a mid-read failure resumes. Incremental + ClickHouse dest only; keyset column must be a unique NOT-NULL integer. `None` = one read (default) |
+| `retry_max_attempts` | Re-run the whole transfer on a transient *source* error (PG recovery-conflict/cancel; MySQL gone-away/lock-wait/deadlock). `1` = no retry (default) |
+| `column_transforms` | Per-column SQL value transforms over `source_table=` (e.g. `{"ts":"ts AT TIME ZONE 'UTC'"}`), preserving range partitioning. Postgres/MySQL only |
+| `evolve_schema` | Auto-`ADD COLUMN` (Nullable) when the source has a column the destination lacks, instead of erroring. ADD-only. Default `False` |
 | `key` | Dedup key (required for BigQuery incremental) |
 | `create_if_missing` | Auto-create the destination table (default `True`) |
 | `engine`, `order_by`, `partition_by`, `primary_key` | DDL knobs, interpreted per destination |

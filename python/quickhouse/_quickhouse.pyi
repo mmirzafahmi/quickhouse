@@ -238,6 +238,10 @@ def sync(
     max_memory_bytes: int = 536_870_912,
     partition_column: Optional[str] = None,
     read_max_rows_per_sec: Optional[int] = None,
+    chunk_rows: Optional[int] = None,
+    retry_max_attempts: int = 1,
+    column_transforms: Optional[Mapping[str, str]] = None,
+    evolve_schema: bool = False,
     type_overrides: Optional[Mapping[str, str]] = None,
     rename: Optional[Mapping[str, str]] = None,
     include: Optional[Sequence[str]] = None,
@@ -295,6 +299,31 @@ def sync(
       doesn't rewind the regular schedule. The computed watermark is still
       returned in ``TransferResult.new_watermark`` for observability but is not
       written to ``_quickhouse_state``.
+    - ``chunk_rows`` reads the source in keyset-ordered chunks of this many rows,
+      committing the cursor per chunk so a mid-read failure resumes instead of
+      restarting — for very large tables on a source that cancels long queries
+      (e.g. a hot-standby replica). MVP scope: **incremental mode + a ClickHouse
+      destination only**, and the keyset column (``partition_column`` else the
+      first ``key``) must be a **unique, NOT NULL integer** (ties or NULLs would
+      silently skip rows). Chunked mode is single-stream (``parallelism`` is
+      ignored). ``None`` (default) = one read, as before.
+
+    Robustness & schema:
+
+    - ``retry_max_attempts`` (default ``1`` = no retry) re-runs the whole
+      transfer on a *transient source* error — PostgreSQL hot-standby recovery
+      conflict / statement cancel, MySQL server-gone-away / lock-wait / deadlock.
+      Each retry starts clean (fresh staging; cursor advances only on success).
+      Sink/write blips are retried separately and always.
+    - ``column_transforms={col: "<SQL expr>"}`` applies a per-column SQL value
+      transform in the source SELECT (e.g. ``{"amt": "ROUND(amt, 9)"}``,
+      ``{"ts": "ts AT TIME ZONE 'UTC'"}``) over ``source_table=`` — so range
+      partitioning is preserved (unlike ``source_query=``). It changes the
+      value, not the resolved type (pair with ``type_overrides`` if the type
+      must change too). Not supported for a BigQuery source.
+    - ``evolve_schema=True`` adds a column to the existing destination (as
+      Nullable) when the source has one the destination lacks, instead of
+      hard-erroring. ADD-only — never drops or retypes a column.
 
     ``engine``/``order_by``/``partition_by``/``primary_key``/``key`` are
     interpreted per destination: for ClickHouse they drive `MergeTree`-family

@@ -71,6 +71,37 @@ impl ClickHouseSink {
         Ok(self.query_scalar(&sql).await?.as_deref() == Some("1"))
     }
 
+    /// Run a query returning a single string column, one value per line (the
+    /// HTTP interface's default TabSeparated). Blank lines are dropped.
+    pub async fn query_column(&self, sql: &str) -> Result<Vec<String>> {
+        let resp = self.base_request().body(sql.to_string()).send().await?;
+        let body = Self::check(resp).await?;
+        Ok(body.lines().filter(|l| !l.is_empty()).map(str::to_string).collect())
+    }
+
+    /// `ALTER TABLE ADD COLUMN` (Nullable) for each column missing from the
+    /// existing table. Case-sensitive (ClickHouse column names are). Returns
+    /// the names added. See [`crate::sink::Sink::add_missing_columns`].
+    pub async fn add_missing_columns(
+        &self,
+        table: &str,
+        columns: &[ColumnType],
+        _cfg: &TransferConfig,
+    ) -> Result<Vec<String>> {
+        let sql = format!(
+            "SELECT name FROM system.columns WHERE database = '{}' AND table = '{}'",
+            escape_sql_string(&self.cfg.database),
+            escape_sql_string(table),
+        );
+        let existing = self.query_column(&sql).await?;
+        let mut added = Vec::new();
+        for c in crate::sink::missing_columns(&existing, columns, false) {
+            self.execute(&crate::ddl::add_column(&self.cfg.database, table, c)).await?;
+            added.push(c.name.clone());
+        }
+        Ok(added)
+    }
+
     /// Generate and run this destination's own `CREATE TABLE` DDL for `table`.
     pub async fn create_table(&self, table: &str, columns: &[ColumnType], cfg: &TransferConfig) -> Result<()> {
         let sql = crate::ddl::create_table(&self.cfg.database, table, columns, cfg)?;
@@ -82,7 +113,9 @@ impl ClickHouseSink {
     /// doesn't exist yet (`CREATE TABLE IF NOT EXISTS`, so no prior existence
     /// check is needed here, unlike BigQuery's sink).
     pub async fn ensure_state_table(&self) -> Result<()> {
-        self.execute(&crate::ddl::create_state_table(&self.cfg.database)).await
+        self.execute(&crate::ddl::create_state_table(&self.cfg.database)).await?;
+        // Add the chunk-resume columns to a pre-0.5 state table (idempotent).
+        self.execute(&crate::ddl::migrate_state_table(&self.cfg.database)).await
     }
 
     /// Read the last persisted watermark for this `(state_key, dest_table)` pair.
@@ -103,17 +136,84 @@ impl ClickHouseSink {
         self.query_scalar(&sql).await
     }
 
-    /// Persist a new watermark after a successful incremental run.
+    /// Persist a new watermark after a successful incremental run. Writes empty
+    /// `chunk_cursor`/`chunk_upper`, which clears any in-progress chunk-resume
+    /// marker — a clean finish (chunked or not) leaves nothing to resume.
     pub async fn persist_watermark(&self, cfg: &TransferConfig, watermark: &str, rows: u64) -> Result<()> {
         let source_id = cfg.effective_state_key();
         let sql = format!(
-            "INSERT INTO {}.`_quickhouse_state` (source_table, dest_table, last_watermark, rows) \
-             VALUES ('{}', '{}', '{}', {})",
+            "INSERT INTO {}.`_quickhouse_state` \
+             (source_table, dest_table, last_watermark, rows, chunk_cursor, chunk_upper) \
+             VALUES ('{}', '{}', '{}', {}, '', '')",
             crate::ddl::quote_ident(&self.cfg.database),
             escape_sql_string(&source_id),
             escape_sql_string(&cfg.dest_table),
             escape_sql_string(watermark),
             rows,
+        );
+        self.execute(&sql).await
+    }
+
+    /// Read an in-progress chunk-resume marker `(cursor, upper)` for this
+    /// `(state_key, dest_table)`, or `None` if there's nothing to resume (no
+    /// state row, or `chunk_cursor` empty — the marker a clean run clears).
+    /// `upper` is the frozen snapshot-max the interrupted run was reading up to,
+    /// so resumption reads the same window rather than re-snapshotting.
+    pub async fn read_chunk_state(&self, cfg: &TransferConfig) -> Result<Option<(String, String)>> {
+        if !self.table_exists("_quickhouse_state").await? {
+            return Ok(None);
+        }
+        let source_id = cfg.effective_state_key();
+        let sql = format!(
+            "SELECT chunk_cursor, chunk_upper FROM {}.`_quickhouse_state` FINAL \
+             WHERE source_table = '{}' AND dest_table = '{}' \
+             ORDER BY run_ts DESC LIMIT 1 FORMAT TabSeparated",
+            crate::ddl::quote_ident(&self.cfg.database),
+            escape_sql_string(&source_id),
+            escape_sql_string(&cfg.dest_table),
+        );
+        let rows = self.query_column(&sql).await?;
+        // One TSV line: "<cursor>\t<upper>". Empty cursor = no resume marker.
+        match rows.first() {
+            Some(line) => {
+                let mut it = line.splitn(2, '\t');
+                let cursor = it.next().unwrap_or("").to_string();
+                let upper = it.next().unwrap_or("").to_string();
+                if cursor.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some((cursor, upper)))
+                }
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Persist a per-chunk resume marker: the committed watermark stays put
+    /// (`committed`, unchanged until the whole run finishes), while
+    /// `chunk_cursor`/`chunk_upper` record how far this run has durably read so
+    /// a crash resumes from here. `read_last_watermark` still returns
+    /// `committed` throughout (empty reads back as `None`).
+    pub async fn persist_chunk_cursor(
+        &self,
+        cfg: &TransferConfig,
+        committed: Option<&str>,
+        cursor: &str,
+        upper: &str,
+        rows: u64,
+    ) -> Result<()> {
+        let source_id = cfg.effective_state_key();
+        let sql = format!(
+            "INSERT INTO {}.`_quickhouse_state` \
+             (source_table, dest_table, last_watermark, rows, chunk_cursor, chunk_upper) \
+             VALUES ('{}', '{}', '{}', {}, '{}', '{}')",
+            crate::ddl::quote_ident(&self.cfg.database),
+            escape_sql_string(&source_id),
+            escape_sql_string(&cfg.dest_table),
+            escape_sql_string(committed.unwrap_or("")),
+            rows,
+            escape_sql_string(cursor),
+            escape_sql_string(upper),
         );
         self.execute(&sql).await
     }
