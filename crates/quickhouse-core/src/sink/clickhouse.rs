@@ -85,17 +85,13 @@ impl ClickHouseSink {
         self.execute(&crate::ddl::create_state_table(&self.cfg.database)).await
     }
 
-    /// Read the last persisted watermark for this `(source, dest_table)` pair.
+    /// Read the last persisted watermark for this `(state_key, dest_table)` pair.
     pub async fn read_last_watermark(&self, cfg: &TransferConfig) -> Result<Option<String>> {
         // The state table may not exist yet on the very first incremental run.
         if !self.table_exists("_quickhouse_state").await? {
             return Ok(None);
         }
-        let source_id = cfg
-            .source_table
-            .clone()
-            .or_else(|| cfg.source_query.clone())
-            .unwrap_or_default();
+        let source_id = cfg.effective_state_key();
         let sql = format!(
             "SELECT last_watermark FROM {}.`_quickhouse_state` FINAL \
              WHERE source_table = '{}' AND dest_table = '{}' \
@@ -109,11 +105,7 @@ impl ClickHouseSink {
 
     /// Persist a new watermark after a successful incremental run.
     pub async fn persist_watermark(&self, cfg: &TransferConfig, watermark: &str, rows: u64) -> Result<()> {
-        let source_id = cfg
-            .source_table
-            .clone()
-            .or_else(|| cfg.source_query.clone())
-            .unwrap_or_default();
+        let source_id = cfg.effective_state_key();
         let sql = format!(
             "INSERT INTO {}.`_quickhouse_state` (source_table, dest_table, last_watermark, rows) \
              VALUES ('{}', '{}', '{}', {})",

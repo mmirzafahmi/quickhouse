@@ -389,8 +389,15 @@ impl BigQuerySink {
     /// naturally idempotent: re-running the same merge (e.g. after a crash,
     /// before the watermark advances) re-applies the same key-matched rows
     /// rather than duplicating them.
-    pub async fn merge_into(&self, dest: &str, staging: &str, key: &[String], columns: &[ColumnType]) -> Result<()> {
-        let query = build_merge_sql(&self.project_id, &self.dataset_id, dest, staging, key, columns)?;
+    pub async fn merge_into(
+        &self,
+        dest: &str,
+        staging: &str,
+        key: &[String],
+        columns: &[ColumnType],
+        prune_partition: Option<&str>,
+    ) -> Result<()> {
+        let query = build_merge_sql(&self.project_id, &self.dataset_id, dest, staging, key, columns, prune_partition)?;
         let job = Job {
             job_reference: JobReference {
                 project_id: self.project_id.clone(),
@@ -466,12 +473,12 @@ impl BigQuerySink {
         Ok(())
     }
 
-    /// Read the last persisted watermark for this `(source, dest_table)` pair.
+    /// Read the last persisted watermark for this `(state_key, dest_table)` pair.
     pub async fn read_last_watermark(&self, cfg: &TransferConfig) -> Result<Option<String>> {
         if !self.table_exists(STATE_TABLE).await? {
             return Ok(None);
         }
-        let source_id = cfg.source_table.clone().or_else(|| cfg.source_query.clone()).unwrap_or_default();
+        let source_id = cfg.effective_state_key();
         let query = format!(
             "SELECT last_watermark FROM `{}`.`{}`.`{STATE_TABLE}` \
              WHERE source_table = '{}' AND dest_table = '{}' \
@@ -499,7 +506,7 @@ impl BigQuerySink {
     /// DML `INSERT` run as a query job (BigQuery executes DML through the
     /// same job mechanism as `SELECT`).
     pub async fn persist_watermark(&self, cfg: &TransferConfig, watermark: &str, rows: u64) -> Result<()> {
-        let source_id = cfg.source_table.clone().or_else(|| cfg.source_query.clone()).unwrap_or_default();
+        let source_id = cfg.effective_state_key();
         let query = build_persist_watermark_sql(&self.project_id, &self.dataset_id, &source_id, &cfg.dest_table, watermark, rows);
         let job = Job {
             job_reference: JobReference {
@@ -693,6 +700,7 @@ fn build_merge_sql(
     staging: &str,
     key: &[String],
     columns: &[ColumnType],
+    prune_partition: Option<&str>,
 ) -> Result<String> {
     if key.is_empty() {
         // Should already be caught by sync.rs's prepare_target validation
@@ -701,7 +709,21 @@ fn build_merge_sql(
             "build_merge_sql called with an empty key (should have been validated before staging began)",
         ));
     }
-    let on_clause = key.iter().map(|k| format!("T.`{k}` = S.`{k}`")).collect::<Vec<_>>().join(" AND ");
+    let mut on_clause = key.iter().map(|k| format!("T.`{k}` = S.`{k}`")).collect::<Vec<_>>().join(" AND ");
+    // Optional partition pruning: bound the destination scan to the staging
+    // batch's range on an IMMUTABLE partition column, so BigQuery reads only
+    // the touched partitions instead of the whole table. Scalar subqueries over
+    // the (small) staging table give BigQuery the pruning bounds; the caller
+    // guarantees the column is immutable-per-key (see the correctness contract
+    // on `TransferConfig::merge_prune_partition_by` — a mutable column here
+    // silently inserts duplicate keys).
+    if let Some(pcol) = prune_partition {
+        on_clause.push_str(&format!(
+            " AND T.`{pcol}` BETWEEN \
+             (SELECT MIN(`{pcol}`) FROM `{project_id}`.`{dataset_id}`.`{staging}`) \
+             AND (SELECT MAX(`{pcol}`) FROM `{project_id}`.`{dataset_id}`.`{staging}`)"
+        ));
+    }
 
     let all_cols: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
     let update_cols: Vec<&str> = all_cols.iter().copied().filter(|c| !key.iter().any(|k| k == c)).collect();
@@ -940,12 +962,16 @@ mod tests {
             order_by: vec![],
             partition_by: None,
             primary_key: vec![],
+            merge_prune_partition_by: None,
             parallelism: 1,
             batch_rows: 1000,
             batch_bytes: 0,
             max_memory_bytes: 0,
             partition_column: None,
             read_max_rows_per_sec: None,
+            state_key: None,
+            seed_watermark: crate::config::WatermarkSeed::None,
+            advance_watermark: true,
             type_overrides: HashMap::new(),
             rename: HashMap::new(),
             include: vec![],
@@ -1113,10 +1139,12 @@ mod tests {
             col("amount", DataType::Float64, true),
         ];
         let key = vec!["id".to_string()];
-        let sql = build_merge_sql("proj", "ds", "orders", "orders_quickhouse_tmp", &key, &cols).unwrap();
+        let sql = build_merge_sql("proj", "ds", "orders", "orders_quickhouse_tmp", &key, &cols, None).unwrap();
 
         assert!(sql.starts_with("MERGE INTO `proj`.`ds`.`orders` T USING `proj`.`ds`.`orders_quickhouse_tmp` S"));
         assert!(sql.contains("ON T.`id` = S.`id`"));
+        // No prune column -> no partition-bound predicate (full-scan, correct default).
+        assert!(!sql.contains("BETWEEN"), "unexpected prune predicate without an immutable column: {sql}");
         assert!(sql.contains("WHEN MATCHED THEN UPDATE SET `name` = S.`name`, `amount` = S.`amount`"));
         assert!(sql.contains("WHEN NOT MATCHED THEN INSERT (`id`, `name`, `amount`) VALUES (S.`id`, S.`name`, S.`amount`)"));
         // The key column must never appear in the UPDATE SET list.
@@ -1127,15 +1155,39 @@ mod tests {
     fn build_merge_sql_composite_key() {
         let cols = vec![col("a", DataType::Int64, false), col("b", DataType::Int64, false)];
         let key = vec!["a".to_string(), "b".to_string()];
-        let sql = build_merge_sql("p", "d", "t", "s", &key, &cols).unwrap();
+        let sql = build_merge_sql("p", "d", "t", "s", &key, &cols, None).unwrap();
         assert!(sql.contains("ON T.`a` = S.`a` AND T.`b` = S.`b`"));
+    }
+
+    #[test]
+    fn build_merge_sql_prunes_on_immutable_partition_column() {
+        let cols = vec![
+            col("id", DataType::Int64, false),
+            col("create_date", DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())), false),
+            col("amount", DataType::Float64, true),
+        ];
+        let key = vec!["id".to_string()];
+        let sql = build_merge_sql("p", "d", "orders", "orders_tmp", &key, &cols, Some("create_date")).unwrap();
+        // The join still matches on the key, AND the destination is bounded to
+        // the staging batch's create_date range so BigQuery prunes partitions.
+        assert!(sql.contains("ON T.`id` = S.`id`"), "{sql}");
+        assert!(
+            sql.contains(
+                "AND T.`create_date` BETWEEN \
+                 (SELECT MIN(`create_date`) FROM `p`.`d`.`orders_tmp`) \
+                 AND (SELECT MAX(`create_date`) FROM `p`.`d`.`orders_tmp`)"
+            ),
+            "missing partition-prune predicate: {sql}"
+        );
+        // The pruned column is still upserted like any other non-key column.
+        assert!(sql.contains("`create_date` = S.`create_date`"), "{sql}");
     }
 
     #[test]
     fn build_merge_sql_all_columns_are_key_becomes_insert_only() {
         let cols = vec![col("id", DataType::Int64, false)];
         let key = vec!["id".to_string()];
-        let sql = build_merge_sql("p", "d", "t", "s", &key, &cols).unwrap();
+        let sql = build_merge_sql("p", "d", "t", "s", &key, &cols, None).unwrap();
         assert!(!sql.contains("WHEN MATCHED"), "no columns left to update: {sql}");
         assert!(sql.contains("WHEN NOT MATCHED THEN INSERT (`id`) VALUES (S.`id`)"));
     }
@@ -1143,7 +1195,7 @@ mod tests {
     #[test]
     fn build_merge_sql_rejects_empty_key() {
         let cols = vec![col("id", DataType::Int64, false)];
-        let err = build_merge_sql("p", "d", "t", "s", &[], &cols).unwrap_err().to_string();
+        let err = build_merge_sql("p", "d", "t", "s", &[], &cols, None).unwrap_err().to_string();
         assert!(err.contains("empty key"), "{err}");
         assert!(err.contains("quickhouse bug"), "must be framed as internal, not a config error: {err}");
     }

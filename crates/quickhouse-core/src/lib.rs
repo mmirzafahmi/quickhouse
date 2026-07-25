@@ -28,7 +28,7 @@ pub mod types;
 pub use config::{
     BigQueryConfig, BigQueryDestConfig, BigQueryWriteMethod, ClickHouseConfig, Compression,
     DestinationConfig, MySqlConfig, ParquetCompression, PostgresConfig, S3ArchiveConfig,
-    SourceConfig, SyncMode, TransferConfig, TransferResult,
+    SourceConfig, SyncMode, TransferConfig, TransferResult, WatermarkSeed,
 };
 pub use error::{EtlError, Result};
 pub use sync::{run_transfer, Progress, ProgressCb};

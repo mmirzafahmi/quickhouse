@@ -465,15 +465,20 @@ fn parse_parquet_compression(c: &str) -> PyResult<core::ParquetCompression> {
     *,
     source_table=None,
     source_query=None,
+    state_key=None,
     mode="full".to_string(),
     watermark=None,
     lookback_seconds=0,
+    seed_watermark=None,
+    skip_to_max=false,
+    advance_watermark=true,
     key=None,
     create_if_missing=true,
     engine=None,
     order_by=None,
     partition_by=None,
     primary_key=None,
+    merge_prune_partition_by=None,
     parallelism=4,
     batch_rows=100_000,
     batch_bytes=4_194_304,
@@ -494,15 +499,20 @@ fn sync(
     dest_table: String,
     source_table: Option<String>,
     source_query: Option<String>,
+    state_key: Option<String>,
     mode: String,
     watermark: Option<String>,
     lookback_seconds: u64,
+    seed_watermark: Option<String>,
+    skip_to_max: bool,
+    advance_watermark: bool,
     key: Option<Vec<String>>,
     create_if_missing: bool,
     engine: Option<String>,
     order_by: Option<Vec<String>>,
     partition_by: Option<String>,
     primary_key: Option<Vec<String>>,
+    merge_prune_partition_by: Option<String>,
     parallelism: usize,
     batch_rows: usize,
     batch_bytes: usize,
@@ -518,19 +528,35 @@ fn sync(
     init_logging();
     let source_cfg: core::SourceConfig = source.into();
     let dest_cfg = target.into_config()?;
+    // `seed_watermark` (an explicit floor) and `skip_to_max` (seed to the
+    // source's current MAX) are mutually exclusive ways to seed the first run.
+    let seed_watermark = match (seed_watermark, skip_to_max) {
+        (Some(_), true) => {
+            return Err(PyRuntimeError::new_err(
+                "seed_watermark and skip_to_max are mutually exclusive",
+            ))
+        }
+        (Some(v), false) => core::WatermarkSeed::Value(v),
+        (None, true) => core::WatermarkSeed::CurrentMax,
+        (None, false) => core::WatermarkSeed::None,
+    };
     let cfg = core::TransferConfig {
         source_table,
         source_query,
         dest_table,
+        state_key,
         mode: parse_mode(&mode)?,
         watermark,
         lookback_seconds,
+        seed_watermark,
+        advance_watermark,
         key: key.unwrap_or_default(),
         create_if_missing,
         engine,
         order_by: order_by.unwrap_or_default(),
         partition_by,
         primary_key: primary_key.unwrap_or_default(),
+        merge_prune_partition_by,
         parallelism,
         batch_rows,
         batch_bytes,

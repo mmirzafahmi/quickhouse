@@ -168,6 +168,35 @@ For daily syncs that need to catch late-arriving or edited rows, set
 `lookback_seconds` to re-scan a trailing window (e.g. `3 * 86400` for the last
 three days) — the dedup above keeps that overlap from creating duplicates.
 
+**Cursor control.** A few knobs make the incremental cursor robust in the real
+world:
+
+- `state_key` pins the cursor's identity. By default it's keyed by the source
+  table (or query text) + destination — so editing a `source_query`'s `WHERE`
+  would silently start a fresh full pull, and two syncs into one destination
+  tracking different `watermark` columns would clobber each other's cursor. Set
+  `state_key="orders:updated_at"` to give each a stable, distinct identity.
+- `skip_to_max=True` (or `seed_watermark="<value>"`) seeds the cursor on the
+  **first** run only, then self-retires. Use it when the destination already
+  holds complete data from a previous pipeline and a full first pull would be a
+  waste — it starts the cursor at the source's current max instead of scanning
+  everything.
+- `advance_watermark=False` reads and merges a window *without* moving the
+  cursor — for loading a historical backfill without rewinding your regular
+  schedule.
+
+**MERGE cost on large BigQuery tables.** By default an incremental `MERGE`
+scans the whole destination table (it joins on `key` only), so upserting a few
+delta rows into a huge partitioned table bills the whole table each run. Set
+`merge_prune_partition_by="create_date"` to bound the scan to the staging
+batch's range and let BigQuery prune partitions. **Only do this for an
+*immutable* column** — one whose value never changes for a given `key`, i.e. a
+`create_date`/inserted-at column that is also the partition column. Do **not**
+point it at a `write_date`/updated-at column: an updated row's new value lands
+in a different partition than the existing row, so pruning would miss it and
+insert a duplicate key instead of updating. quickhouse can't detect mutability,
+so this is a deliberate opt-in; the default full scan is always correct.
+
 ### Watching progress and diagnosing failures
 
 `on_progress` is a plain callback you can point at anything; `qh.progress_bar()`
@@ -190,6 +219,10 @@ errors are surfaced verbatim rather than wrapped in something generic.
 | `mode` | `"full"` or `"incremental"` |
 | `watermark` | Monotonic column for incremental (e.g. `updated_at`); ignored in full mode |
 | `lookback_seconds` | Re-scan a trailing window of the watermark to catch late/edited rows; `0` disables (default) |
+| `state_key` | Pin the incremental cursor's identity (stable across `source_query` edits; distinct per watermark column). Default derives it from source+dest |
+| `seed_watermark` / `skip_to_max` | Seed the cursor on the first run only (explicit floor, or the source's current max) — skips a doomed first full pull; mutually exclusive |
+| `advance_watermark` | `False` reads+merges a window without advancing the cursor (backfill without rewinding the schedule); default `True` |
+| `merge_prune_partition_by` | BigQuery incremental: prune the MERGE's destination scan to the staging range on this column. Only safe for an *immutable* partition column (e.g. `create_date`) — never a mutable `write_date` (would insert dup keys) |
 | `key` | Dedup key (required for BigQuery incremental) |
 | `create_if_missing` | Auto-create the destination table (default `True`) |
 | `engine`, `order_by`, `partition_by`, `primary_key` | DDL knobs, interpreted per destination |

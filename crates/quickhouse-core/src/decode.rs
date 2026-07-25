@@ -613,6 +613,58 @@ mod tests {
         v
     }
 
+    /// Golden type matrix for the PostgreSQL source: for every OID `map_oid`
+    /// produces, assert the full type chain END-TO-END from the source type —
+    /// (1) mapping to Arrow + ClickHouse inner, (2) the decoder's output array
+    /// type carries the correct timezone, (3) the batch-vs-schema check
+    /// (`RecordBatch::try_new`, the literal `flush_batch` validation) passes,
+    /// and (4) the Arrow→BigQuery destination-type bridge. Starting from the
+    /// OID (not a hand-built Arrow type) is what makes this catch a mapping
+    /// revert — the exact class of regression that shipped in 0.3.4 for MySQL
+    /// (there was no equivalent Postgres tz coverage at all before this).
+    #[test]
+    fn postgres_type_golden_matrix() {
+        use crate::types::bigquery::arrow_to_bigquery_type as a2b;
+        use crate::types::{map_oid, oid};
+        use arrow_schema::{Field, Schema, TimeUnit};
+        use google_cloud_bigquery::http::table::TableFieldType as Bq;
+        use std::sync::Arc;
+
+        let ts = |tz: Option<&str>| DataType::Timestamp(TimeUnit::Microsecond, tz.map(Arc::from));
+        // (oid, expected Arrow, expected ClickHouse inner, expected BigQuery type)
+        let rows: Vec<(u32, DataType, &str, Bq)> = vec![
+            (oid::BOOL, DataType::Boolean, "Bool", Bq::Boolean),
+            (oid::INT2, DataType::Int16, "Int16", Bq::Integer),
+            (oid::INT4, DataType::Int32, "Int32", Bq::Integer),
+            (oid::INT8, DataType::Int64, "Int64", Bq::Integer),
+            (oid::OID, DataType::UInt32, "UInt32", Bq::Integer),
+            (oid::FLOAT4, DataType::Float32, "Float32", Bq::Float),
+            (oid::FLOAT8, DataType::Float64, "Float64", Bq::Float),
+            (oid::NUMERIC, DataType::Float64, "Float64", Bq::Float),
+            (oid::TEXT, DataType::Utf8, "String", Bq::String),
+            (oid::UUID, DataType::Utf8, "UUID", Bq::String),
+            (oid::BYTEA, DataType::Binary, "String", Bq::Bytes),
+            (oid::DATE, DataType::Date32, "Date32", Bq::Date),
+            (oid::TIMESTAMP, ts(None), "DateTime64(6)", Bq::Datetime),
+            (oid::TIMESTAMPTZ, ts(Some("UTC")), "DateTime64(6, 'UTC')", Bq::Timestamp),
+            (oid::TIME, DataType::Utf8, "String", Bq::String),
+        ];
+        for (o, arrow, ch, bq) in rows {
+            let (mapped_arrow, mapped_ch) = map_oid(o).unwrap_or_else(|| panic!("oid {o} unmapped"));
+            assert_eq!(mapped_arrow, arrow, "oid {o}: Arrow type");
+            assert_eq!(mapped_ch, ch, "oid {o}: ClickHouse inner");
+            // Decoder output type (incl. tz) must equal the resolved schema type.
+            let mut b = ColBuilder::new(&arrow).unwrap();
+            let out = b.finish();
+            assert_eq!(out.data_type(), &arrow, "oid {o}: decoder output type/tz");
+            // The literal flush_batch validation must accept it.
+            let schema = Arc::new(Schema::new(vec![Field::new("c", arrow.clone(), true)]));
+            RecordBatch::try_new(schema, vec![out]).unwrap_or_else(|e| panic!("oid {o}: batch: {e}"));
+            // Destination bridge (Arrow -> BigQuery column type).
+            assert_eq!(a2b(&arrow), Some(bq), "oid {o}: BigQuery type");
+        }
+    }
+
     #[test]
     fn decodes_rows_and_nulls() {
         let cols = vec![

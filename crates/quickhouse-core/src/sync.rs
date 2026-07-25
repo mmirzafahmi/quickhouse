@@ -19,7 +19,7 @@ use tokio::task::JoinSet;
 use crate::archive::{archive_object_key, build_s3_store, S3ArchiveWriter};
 use crate::config::{
     DestinationConfig, ParquetCompression, S3ArchiveConfig, SourceConfig, SyncMode, TransferConfig,
-    TransferResult,
+    TransferResult, WatermarkSeed,
 };
 use crate::decode::CopyDecoder;
 use crate::decode_bigquery::BigQueryBatcher;
@@ -368,6 +368,10 @@ async fn run_transfer_impl(
     let (extra_filter, new_watermark) = if cfg.mode == SyncMode::Incremental {
         let watermark = cfg.watermark.as_ref().unwrap();
         let last = sink.read_last_watermark(&cfg).await?;
+        // First run only (no persisted cursor): apply the configured seed so a
+        // fresh table can skip a doomed whole-table pull. Self-retires once a
+        // real watermark is persisted (`last` is then Some).
+        let last = last.or_else(|| seed_value(&cfg.seed_watermark, snapshot_max.as_deref()));
         tracing::info!(
             "incremental watermark on '{}': last synced={:?}, current source max={:?}",
             watermark,
@@ -492,13 +496,19 @@ async fn run_transfer_impl(
         if cfg.mode == SyncMode::Incremental {
             if sink.requires_staging_for_incremental() {
                 tracing::info!("merging staged incremental rows into '{}'", cfg.dest_table);
-                sink.merge_into(&cfg.dest_table, &staging, &cfg.key, &plan.dest_columns).await?;
+                sink.merge_into(&cfg.dest_table, &staging, &cfg.key, &plan.dest_columns, cfg.merge_prune_partition_by.as_deref()).await?;
                 sink.drop_table(&staging).await?;
             }
             if let Some(w) = &new_watermark {
-                tracing::info!("persisting new watermark: {w}");
-                sink.persist_watermark(&cfg, w, counters.rows_written.load(Ordering::Relaxed))
-                    .await?;
+                if cfg.advance_watermark {
+                    tracing::info!("persisting new watermark: {w}");
+                    sink.persist_watermark(&cfg, w, counters.rows_written.load(Ordering::Relaxed))
+                        .await?;
+                } else {
+                    tracing::info!(
+                        "advance_watermark=false: computed watermark {w} NOT persisted (cursor left unchanged)"
+                    );
+                }
             }
         }
 
@@ -571,6 +581,9 @@ async fn run_transfer_bigquery(
         let snapshot_max = source
             .max_watermark(&client, &project_id, &table_sql, watermark)
             .await?;
+        // First run only: apply the seed (needs snapshot_max, computed above,
+        // for the CurrentMax variant). Self-retires once a cursor is persisted.
+        let last = last.or_else(|| seed_value(&cfg.seed_watermark, snapshot_max.as_deref()));
         tracing::info!(
             "incremental watermark on '{}': last synced={:?}, current source max={:?}",
             watermark,
@@ -679,13 +692,19 @@ async fn run_transfer_bigquery(
         if cfg.mode == SyncMode::Incremental {
             if sink.requires_staging_for_incremental() {
                 tracing::info!("merging staged incremental rows into '{}'", cfg.dest_table);
-                sink.merge_into(&cfg.dest_table, &staging, &cfg.key, &plan.dest_columns).await?;
+                sink.merge_into(&cfg.dest_table, &staging, &cfg.key, &plan.dest_columns, cfg.merge_prune_partition_by.as_deref()).await?;
                 sink.drop_table(&staging).await?;
             }
             if let Some(w) = &new_watermark {
-                tracing::info!("persisting new watermark: {w}");
-                sink.persist_watermark(&cfg, w, counters.rows_written.load(Ordering::Relaxed))
-                    .await?;
+                if cfg.advance_watermark {
+                    tracing::info!("persisting new watermark: {w}");
+                    sink.persist_watermark(&cfg, w, counters.rows_written.load(Ordering::Relaxed))
+                        .await?;
+                } else {
+                    tracing::info!(
+                        "advance_watermark=false: computed watermark {w} NOT persisted (cursor left unchanged)"
+                    );
+                }
             }
         }
 
@@ -1253,6 +1272,19 @@ async fn cleanup_staging(sink: &Sink, staging: &str) {
     }
 }
 
+/// Resolve the first-run seed into the effective `last` watermark. Only ever
+/// consulted when no cursor is persisted yet (`read_last_watermark` returned
+/// `None`), so it self-retires after the first successful run. `CurrentMax`
+/// seeds to the source's current MAX (reading ~nothing — for a destination
+/// already backfilled by a prior pipeline).
+fn seed_value(seed: &WatermarkSeed, snapshot_max: Option<&str>) -> Option<String> {
+    match seed {
+        WatermarkSeed::None => None,
+        WatermarkSeed::Value(v) => Some(v.clone()),
+        WatermarkSeed::CurrentMax => snapshot_max.map(str::to_string),
+    }
+}
+
 fn build_watermark_filter_pg(
     watermark: &str,
     last: Option<&str>,
@@ -1451,6 +1483,24 @@ mod tests {
         // clock-resolution-dependent flaky test; the naming logic is what
         // matters and is deterministic given distinct run_ids.)
         assert_ne!(staging_name("orders", "1"), staging_name("orders", "2"));
+    }
+
+    #[test]
+    fn seed_value_resolves_first_run_floor() {
+        // None seed -> no floor (whole-table first pull).
+        assert_eq!(seed_value(&WatermarkSeed::None, Some("2026-01-01")), None);
+        // Explicit floor is used verbatim.
+        assert_eq!(
+            seed_value(&WatermarkSeed::Value("2026-01-01".into()), Some("2026-06-01")),
+            Some("2026-01-01".to_string())
+        );
+        // CurrentMax seeds to the source's snapshot max (skip the first pull).
+        assert_eq!(
+            seed_value(&WatermarkSeed::CurrentMax, Some("2026-06-01")),
+            Some("2026-06-01".to_string())
+        );
+        // CurrentMax on an empty source (no max) is a safe no-op.
+        assert_eq!(seed_value(&WatermarkSeed::CurrentMax, None), None);
     }
 
     #[test]

@@ -379,6 +379,50 @@ mod tests {
         Row::decode_arrow(&[arr], 0).unwrap()
     }
 
+    /// Golden type matrix for the BigQuery source: for every `TableFieldType`
+    /// `map_type` handles, assert the chain from the BQ type through (1) mapping
+    /// to (type_id, Arrow, ClickHouse inner), (2) the decoder's output array
+    /// type carrying the correct timezone — the TIMESTAMP(→UTC-aware) vs
+    /// DATETIME(→naive) split is the exact cell whose MySQL analogue broke in
+    /// 0.3.4 and had no BigQuery coverage — (3) the batch-vs-schema check, and
+    /// (4) the Arrow→BigQuery bridge (lossy for TIME/NUMERIC, asserted as such).
+    #[test]
+    fn bigquery_type_golden_matrix() {
+        use crate::types::bigquery::arrow_to_bigquery_type as a2b;
+        use crate::types::bigquery::{map_type, type_id as id};
+        use arrow_schema::{Field, Schema, TimeUnit};
+        use google_cloud_bigquery::http::table::TableFieldType as Bq;
+
+        let ts = |tz: Option<&str>| DataType::Timestamp(TimeUnit::Microsecond, tz.map(Arc::from));
+        // (input BQ type, expected type_id, expected Arrow, expected CH inner, expected a2b bridge)
+        let rows: Vec<(Bq, u32, DataType, &str, Bq)> = vec![
+            (Bq::String, id::STRING, DataType::Utf8, "String", Bq::String),
+            (Bq::Bytes, id::BYTES, DataType::Binary, "String", Bq::Bytes),
+            (Bq::Integer, id::INTEGER, DataType::Int64, "Int64", Bq::Integer),
+            (Bq::Float, id::FLOAT, DataType::Float64, "Float64", Bq::Float),
+            (Bq::Boolean, id::BOOLEAN, DataType::Boolean, "Bool", Bq::Boolean),
+            (Bq::Timestamp, id::TIMESTAMP, ts(Some("UTC")), "DateTime64(6, 'UTC')", Bq::Timestamp),
+            (Bq::Date, id::DATE, DataType::Date32, "Date32", Bq::Date),
+            (Bq::Time, id::TIME, DataType::Utf8, "String", Bq::String), // lossy: Time -> String
+            (Bq::Datetime, id::DATETIME, ts(None), "DateTime64(6)", Bq::Datetime),
+            (Bq::Numeric, id::NUMERIC, DataType::Float64, "Float64", Bq::Float), // lossy
+            (Bq::Bignumeric, id::BIGNUMERIC, DataType::Float64, "Float64", Bq::Float), // lossy
+        ];
+        for (input, tid, arrow, ch, bridge) in rows {
+            let (mapped_id, mapped_arrow, mapped_ch) =
+                map_type(&input).unwrap_or_else(|| panic!("{input:?} unmapped"));
+            assert_eq!(mapped_id, tid, "{input:?}: type_id");
+            assert_eq!(mapped_arrow, arrow, "{input:?}: Arrow type");
+            assert_eq!(mapped_ch, ch, "{input:?}: ClickHouse inner");
+            let mut b = ColBuilder::new(&arrow).unwrap();
+            let out = b.finish();
+            assert_eq!(out.data_type(), &arrow, "{input:?}: decoder output type/tz");
+            let schema = Arc::new(Schema::new(vec![Field::new("c", arrow.clone(), true)]));
+            RecordBatch::try_new(schema, vec![out]).unwrap_or_else(|e| panic!("{input:?}: batch: {e}"));
+            assert_eq!(a2b(&arrow), Some(bridge), "{input:?}: Arrow->BigQuery bridge");
+        }
+    }
+
     #[test]
     fn decimal_decodes_exact_text_value() {
         let mut b = ColBuilder::new(&DataType::Decimal128(10, 4)).unwrap();

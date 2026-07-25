@@ -182,6 +182,25 @@ pub enum SyncMode {
     Incremental,
 }
 
+/// How to seed the incremental cursor on the **first** run for a state
+/// identity (i.e. when `_quickhouse_state` has no row yet). Once a real
+/// watermark has been persisted this is ignored, so it self-retires after the
+/// first successful run — a safe no-op thereafter.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum WatermarkSeed {
+    /// First run reads the whole table (today's behavior).
+    #[default]
+    None,
+    /// First run reads only rows past this explicit watermark floor.
+    Value(String),
+    /// First run seeds the cursor to the source's current MAX(watermark),
+    /// reading (almost) nothing — for when the destination already holds
+    /// complete data from a prior/legacy pipeline and a full first pull would
+    /// be a doomed waste. Replaces the manual `INSERT INTO _quickhouse_state`
+    /// hack.
+    CurrentMax,
+}
+
 /// One table transfer.
 #[derive(Debug, Clone)]
 pub struct TransferConfig {
@@ -192,6 +211,16 @@ pub struct TransferConfig {
     /// Destination table name (a bare name within the ClickHouse `database` or
     /// BigQuery `dataset_id`).
     pub dest_table: String,
+    /// Stable identity for the persisted incremental cursor in
+    /// `_quickhouse_state`. `None` (default) derives it from `source_table`,
+    /// else the `source_query` text (byte-identical to pre-`state_key`
+    /// behavior — so existing state is never orphaned). Set it to (a) keep the
+    /// cursor stable when you edit a `source_query`'s WHERE/SELECT (whose text
+    /// would otherwise change the derived key and silently reset the cursor),
+    /// and (b) give two syncs that share a `dest_table` but track different
+    /// `watermark` columns distinct cursors (which otherwise collide on one
+    /// state row). See [`TransferConfig::effective_state_key`].
+    pub state_key: Option<String>,
 
     pub mode: SyncMode,
 
@@ -206,6 +235,17 @@ pub struct TransferConfig {
     /// duplicate them) and a `watermark` column that resolves to a date or
     /// timestamp type.
     pub lookback_seconds: u64,
+    /// How to seed the incremental cursor on the first run for this state
+    /// identity (default [`WatermarkSeed::None`] = read the whole table, as
+    /// before). Only meaningful in incremental mode; ignored once a real
+    /// watermark has been persisted. See [`WatermarkSeed`].
+    pub seed_watermark: WatermarkSeed,
+    /// Whether a successful incremental run persists (advances) the watermark.
+    /// `true` (default) is today's behavior. Set `false` to read+merge a
+    /// window WITHOUT moving the scheduled cursor — the primitive a bounded
+    /// backfill needs so it doesn't rewind the regular schedule. Incremental
+    /// mode only.
+    pub advance_watermark: bool,
     /// Business/dedup key. ClickHouse: contributes to `ORDER BY` when no
     /// explicit `order_by` is given. BigQuery: contributes to `Clustering`
     /// alongside `order_by` (see its docs) — BigQuery has no dedicated key
@@ -230,6 +270,24 @@ pub struct TransferConfig {
     /// resolve to one of those types.
     pub partition_by: Option<String>,
     pub primary_key: Vec<String>,
+    /// BigQuery-destination incremental only: prune the `MERGE`'s destination
+    /// scan to the staging batch's range on this column, so BigQuery reads only
+    /// the touched partitions instead of full-scanning the (possibly huge)
+    /// destination table on every merge. `None` (default) full-scans, as before.
+    ///
+    /// **Correctness contract — read before setting.** This is ONLY safe when
+    /// the named column is IMMUTABLE for a given merge `key` (its value never
+    /// changes across updates to the same row), and it should be the table's
+    /// partition column. A `create_date`/inserted-at column is safe: a row's
+    /// value stays put, so the existing target row always lives in the
+    /// partition the staging row implies. A `write_date`/updated-at column is
+    /// **NOT** safe: an updated row's new `write_date` points at a different
+    /// partition than where the old row lives, so pruning would miss it, fall
+    /// through to `WHEN NOT MATCHED`, and INSERT A DUPLICATE KEY instead of
+    /// updating. (This is the historical `merge_query_filter` duplicate-id bug;
+    /// do not "optimize" a mutable partition column into this field.) quickhouse
+    /// cannot detect mutability, so this is a deliberate per-table opt-in.
+    pub merge_prune_partition_by: Option<String>,
 
     // ---- parallelism / batching ----
     pub parallelism: usize,
@@ -301,7 +359,21 @@ impl TransferConfig {
     pub fn normalize(&mut self) {
         if self.mode == SyncMode::Full {
             self.watermark = None;
+            // The seed only meaningfully floors an incremental cursor; a
+            // full refresh has none, so clear it (mirrors `watermark`).
+            self.seed_watermark = WatermarkSeed::None;
         }
+    }
+
+    /// Identity of the persisted watermark row in `_quickhouse_state`.
+    /// Overridable via `state_key`; otherwise the source table name, else the
+    /// query text (unchanged default — so existing state rows keep matching).
+    pub fn effective_state_key(&self) -> String {
+        self.state_key
+            .clone()
+            .or_else(|| self.source_table.clone())
+            .or_else(|| self.source_query.clone())
+            .unwrap_or_default()
     }
 
     pub fn validate(&self) -> crate::error::Result<()> {
@@ -319,6 +391,16 @@ impl TransferConfig {
         if self.lookback_seconds > 0 && self.mode != SyncMode::Incremental {
             return Err(EtlError::config(
                 "lookback_seconds only applies to incremental mode",
+            ));
+        }
+        if self.seed_watermark != WatermarkSeed::None && self.mode != SyncMode::Incremental {
+            return Err(EtlError::config(
+                "seed_watermark only applies to incremental mode",
+            ));
+        }
+        if !self.advance_watermark && self.mode != SyncMode::Incremental {
+            return Err(EtlError::config(
+                "advance_watermark=false only applies to incremental mode",
             ));
         }
         if self.lookback_seconds > 0 && self.key.is_empty() && self.order_by.is_empty() {
@@ -369,15 +451,19 @@ mod tests {
             source_table: Some("t".into()),
             source_query: None,
             dest_table: "t".into(),
+            state_key: None,
             mode,
             watermark: watermark.map(str::to_string),
             lookback_seconds: 0,
+            seed_watermark: WatermarkSeed::None,
+            advance_watermark: true,
             key: vec!["id".into()],
             create_if_missing: true,
             engine: None,
             order_by: vec![],
             partition_by: None,
             primary_key: vec![],
+            merge_prune_partition_by: None,
             parallelism: 1,
             batch_rows: 1000,
             batch_bytes: 0,
@@ -456,5 +542,47 @@ mod tests {
         assert!(c.validate().is_ok());
         c.read_max_rows_per_sec = Some(10_000);
         assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn effective_state_key_prefers_override_then_table_then_query() {
+        let mut c = cfg(SyncMode::Incremental, Some("write_date"));
+        // Default: source_table.
+        assert_eq!(c.effective_state_key(), "t");
+        // source_query wins over nothing but loses to source_table.
+        c.source_table = None;
+        c.source_query = Some("SELECT * FROM t WHERE x".into());
+        assert_eq!(c.effective_state_key(), "SELECT * FROM t WHERE x");
+        // explicit override wins over both — and is stable across query edits.
+        c.state_key = Some("orders:write_date".into());
+        assert_eq!(c.effective_state_key(), "orders:write_date");
+        c.source_query = Some("SELECT * FROM t WHERE y /* edited */".into());
+        assert_eq!(c.effective_state_key(), "orders:write_date");
+    }
+
+    #[test]
+    fn validate_rejects_seed_and_freeze_outside_incremental() {
+        let mut c = cfg(SyncMode::Full, None);
+        c.seed_watermark = WatermarkSeed::CurrentMax;
+        assert!(c.validate().unwrap_err().to_string().contains("seed_watermark"));
+        c.seed_watermark = WatermarkSeed::None;
+        c.advance_watermark = false;
+        assert!(c.validate().unwrap_err().to_string().contains("advance_watermark"));
+    }
+
+    #[test]
+    fn validate_accepts_seed_and_freeze_in_incremental() {
+        let mut c = cfg(SyncMode::Incremental, Some("write_date"));
+        c.seed_watermark = WatermarkSeed::Value("2026-01-01".into());
+        c.advance_watermark = false;
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn normalize_clears_seed_in_full_mode() {
+        let mut c = cfg(SyncMode::Full, Some("write_date"));
+        c.seed_watermark = WatermarkSeed::CurrentMax;
+        c.normalize();
+        assert_eq!(c.seed_watermark, WatermarkSeed::None);
     }
 }

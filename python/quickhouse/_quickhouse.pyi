@@ -218,15 +218,20 @@ def sync(
     *,
     source_table: Optional[str] = None,
     source_query: Optional[str] = None,
+    state_key: Optional[str] = None,
     mode: str = "full",
     watermark: Optional[str] = None,
     lookback_seconds: int = 0,
+    seed_watermark: Optional[str] = None,
+    skip_to_max: bool = False,
+    advance_watermark: bool = True,
     key: Optional[Sequence[str]] = None,
     create_if_missing: bool = True,
     engine: Optional[str] = None,
     order_by: Optional[Sequence[str]] = None,
     partition_by: Optional[str] = None,
     primary_key: Optional[Sequence[str]] = None,
+    merge_prune_partition_by: Optional[str] = None,
     parallelism: int = 4,
     batch_rows: int = 100_000,
     batch_bytes: int = 4_194_304,
@@ -265,6 +270,32 @@ def sync(
     a whole day. Default ``0`` disables lookback entirely (byte-identical to
     the plain watermark filter).
 
+    Incremental cursor control (all incremental-mode only):
+
+    - ``state_key`` pins the identity of the persisted cursor in the internal
+      ``_quickhouse_state`` table. By default the cursor is keyed by
+      ``source_table`` (or the ``source_query`` text) + ``dest_table``. Set
+      ``state_key`` to (a) keep the cursor stable when you edit a
+      ``source_query``'s WHERE/SELECT — whose changed text would otherwise
+      derive a new key and silently trigger a fresh full pull — and (b) give
+      two syncs that share a ``dest_table`` but track different ``watermark``
+      columns *distinct* cursors (they otherwise collide on one state row and
+      clobber each other). Default ``None`` reproduces the pre-existing key
+      exactly, so existing state is never orphaned.
+    - ``seed_watermark`` / ``skip_to_max`` seed the cursor on the **first** run
+      only (when no cursor is persisted yet), then self-retire. ``seed_watermark``
+      is an explicit floor — the first run reads only rows past it.
+      ``skip_to_max=True`` seeds to the source's current ``MAX(watermark)``,
+      reading (almost) nothing — for when the destination already holds
+      complete data from a prior/legacy pipeline and a full first pull would be
+      a doomed waste. The two are mutually exclusive. Once a real watermark is
+      persisted both are ignored, so they are safe to leave set.
+    - ``advance_watermark=False`` reads and merges a window WITHOUT persisting
+      (advancing) the cursor — the primitive a bounded backfill needs so it
+      doesn't rewind the regular schedule. The computed watermark is still
+      returned in ``TransferResult.new_watermark`` for observability but is not
+      written to ``_quickhouse_state``.
+
     ``engine``/``order_by``/``partition_by``/``primary_key``/``key`` are
     interpreted per destination: for ClickHouse they drive `MergeTree`-family
     DDL as before; for BigQuery, ``engine`` is ignored, ``partition_by`` must
@@ -281,6 +312,19 @@ def sync(
     for full-refresh), but is naturally idempotent: a crashed/retried
     incremental run re-applies the same key-matched rows rather than
     duplicating them.
+
+    By default that ``MERGE`` full-scans the destination table every run (it
+    joins on ``key`` only), which on a large partitioned table bills the whole
+    table to upsert a few delta rows. ``merge_prune_partition_by="<col>"``
+    bounds the destination to the staging batch's range on ``<col>`` so
+    BigQuery reads only the touched partitions. **Only safe when ``<col>`` is
+    immutable per ``key``** (its value never changes across updates to a row)
+    and it is the table's partition column — e.g. a ``create_date``/inserted-at
+    column. Do **not** use a ``write_date``/updated-at column: an updated row's
+    new value points at a different partition than the existing row, so pruning
+    would miss it and INSERT A DUPLICATE KEY instead of updating (the classic
+    merge-filter dup bug). quickhouse can't detect mutability — this is a
+    deliberate per-table opt-in. Default ``None`` keeps the safe full scan.
 
     Memory vs. batch sizing:
 
