@@ -59,8 +59,16 @@ impl ColBuilder {
             DataType::Utf8 => ColBuilder::Str(StringBuilder::new()),
             DataType::Binary => ColBuilder::Bin(BinaryBuilder::new()),
             DataType::Date32 => ColBuilder::Date(Date32Builder::new()),
-            DataType::Timestamp(TimeUnit::Microsecond, _) => {
-                ColBuilder::Ts(TimestampMicrosecondBuilder::new())
+            // Carry the resolved timezone onto the builder so `finish()`
+            // produces an array whose type matches the batch schema exactly.
+            // MySQL datetimes now resolve to `Timestamp(µs, Some("UTC"))` (see
+            // types::map_mysql_type); dropping the tz here (as this used to)
+            // built a naive array that failed the batch-vs-schema check with
+            // "expected Timestamp(.., Some(\"UTC\")) but found Timestamp(..,
+            // None)". The stored micros are unaffected — this only sets the
+            // array's tz metadata. Mirrors the Postgres decoder (decode.rs).
+            DataType::Timestamp(TimeUnit::Microsecond, tz) => {
+                ColBuilder::Ts(TimestampMicrosecondBuilder::new().with_timezone_opt(tz.clone()))
             }
             DataType::Decimal128(p, s) => ColBuilder::Decimal128(
                 Decimal128Builder::new().with_precision_and_scale(*p, *s)?,
@@ -444,6 +452,58 @@ mod tests {
         assert!(!arr.is_null(0));
         assert!(arr.is_null(1));
         assert!(arr.is_null(2));
+    }
+
+    /// End-to-end reproduction of the reported v0.3.4 failure, hermetic (no
+    /// live MySQL needed). The crash was a batch-vs-schema mismatch in
+    /// `RecordBatch::try_new` inside `flush_batch`; this rebuilds that exact
+    /// step — the schema field from the resolved Arrow type (as
+    /// `MySqlBatcher::with_batch_bytes` does via `Field::new(c.arrow, ...)`)
+    /// and the column array from `ColBuilder::finish()` — for a UTC-mapped
+    /// MySQL timestamp column. Before the decoder fix, `try_new` returned
+    /// "column types must match schema types, expected Timestamp(..,
+    /// Some(\"UTC\")) but found Timestamp(.., None)"; now the batch builds and
+    /// the column keeps its UTC type.
+    #[test]
+    fn utc_timestamp_column_builds_a_valid_batch() {
+        let arrow = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+        let schema = Arc::new(Schema::new(vec![Field::new("created_date", arrow.clone(), true)]));
+        let mut b = ColBuilder::new(&arrow).unwrap();
+        b.append_value(Value::Date(2024, 5, 1, 10, 0, 0, 0)).unwrap();
+        let batch = RecordBatch::try_new(schema, vec![b.finish()])
+            .expect("v0.3.4 failed here: naive array vs UTC schema");
+        assert_eq!(batch.column(0).data_type(), &arrow);
+        assert_eq!(batch.num_rows(), 1);
+    }
+
+    /// Regression test for the 0.3.4 follow-up bug: the finished array's *type*
+    /// must carry the timezone from the resolved schema, not merely the correct
+    /// micros. MySQL datetimes resolve to `Timestamp(µs, Some("UTC"))`; a naive
+    /// array (tz `None`) built here failed the downstream batch-vs-schema check
+    /// with "expected Timestamp(.., Some(\"UTC\")) but found Timestamp(.., None)".
+    /// The earlier 0.3.4 tests asserted the mapping and the value, but not this
+    /// — the exact gap that let the regression ship.
+    #[test]
+    fn ts_builder_output_type_carries_timezone() {
+        // UTC-aware (the MySQL datetime default): finished array is tz-aware.
+        let mut utc =
+            ColBuilder::new(&DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))).unwrap();
+        utc.append_value(Value::Date(2024, 5, 1, 10, 0, 0, 0)).unwrap();
+        assert_eq!(
+            utc.finish().data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            "MySQL datetime array must carry the UTC timezone to match the resolved schema"
+        );
+        // Naive (the per-column `type_overrides={col: \"DATETIME\"}` opt-out)
+        // must still produce a naive array — the reverse mismatch.
+        let mut naive =
+            ColBuilder::new(&DataType::Timestamp(TimeUnit::Microsecond, None)).unwrap();
+        naive.append_value(Value::Date(2024, 5, 1, 10, 0, 0, 0)).unwrap();
+        assert_eq!(
+            naive.finish().data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, None),
+            "a naive-mapped datetime column must stay naive"
+        );
     }
 
     #[test]
