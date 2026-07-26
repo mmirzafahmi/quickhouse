@@ -406,8 +406,9 @@ impl BigQuerySink {
         key: &[String],
         columns: &[ColumnType],
         prune_partition: Option<&str>,
+        delete_stale: bool,
     ) -> Result<()> {
-        let query = build_merge_sql(&self.project_id, &self.dataset_id, dest, staging, key, columns, prune_partition)?;
+        let query = build_merge_sql(&self.project_id, &self.dataset_id, dest, staging, key, columns, prune_partition, delete_stale)?;
         let job = Job {
             job_reference: JobReference {
                 project_id: self.project_id.clone(),
@@ -734,6 +735,7 @@ fn build_persist_watermark_sql(
 /// matched on `key` — see `BigQuerySink::merge_into`'s docs. A free function
 /// (not a `&self` method) so it's unit-testable without a real authenticated
 /// client, mirroring `build_table`.
+#[allow(clippy::too_many_arguments)]
 fn build_merge_sql(
     project_id: &str,
     dataset_id: &str,
@@ -742,6 +744,7 @@ fn build_merge_sql(
     key: &[String],
     columns: &[ColumnType],
     prune_partition: Option<&str>,
+    delete_stale: bool,
 ) -> Result<String> {
     if key.is_empty() {
         // Should already be caught by sync.rs's prepare_target validation
@@ -758,12 +761,18 @@ fn build_merge_sql(
     // guarantees the column is immutable-per-key (see the correctness contract
     // on `TransferConfig::merge_prune_partition_by` — a mutable column here
     // silently inserts duplicate keys).
-    if let Some(pcol) = prune_partition {
-        on_clause.push_str(&format!(
-            " AND T.`{pcol}` BETWEEN \
+    // A window bound over the staging batch's range on the IMMUTABLE prune
+    // column, reused by both the ON-clause pruning and (if requested) the
+    // scoped DELETE below.
+    let window_bound = prune_partition.map(|pcol| {
+        format!(
+            "T.`{pcol}` BETWEEN \
              (SELECT MIN(`{pcol}`) FROM `{project_id}`.`{dataset_id}`.`{staging}`) \
              AND (SELECT MAX(`{pcol}`) FROM `{project_id}`.`{dataset_id}`.`{staging}`)"
-        ));
+        )
+    });
+    if let Some(bound) = &window_bound {
+        on_clause.push_str(&format!(" AND {bound}"));
     }
 
     let all_cols: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
@@ -784,6 +793,20 @@ fn build_merge_sql(
     let insert_cols = all_cols.iter().map(|c| format!("`{c}`")).collect::<Vec<_>>().join(", ");
     let insert_vals = all_cols.iter().map(|c| format!("S.`{c}`")).collect::<Vec<_>>().join(", ");
     clauses.push(format!("WHEN NOT MATCHED THEN INSERT ({insert_cols}) VALUES ({insert_vals})"));
+    // Optional window-scoped delete: remove destination rows INSIDE the merged
+    // window that are absent from the source pull ("replace this window", and a
+    // NULL merge key nets to a replace instead of duplicating). Scoped to the
+    // staging window bound so it never touches history outside the batch —
+    // requires the prune column (enforced in config validation; internal error
+    // here is purely defensive).
+    if delete_stale {
+        let bound = window_bound.as_deref().ok_or_else(|| {
+            EtlError::internal(
+                "delete_stale requested without merge_prune_partition_by (should have been validated)",
+            )
+        })?;
+        clauses.push(format!("WHEN NOT MATCHED BY SOURCE AND {bound} THEN DELETE"));
+    }
 
     Ok(format!(
         "MERGE INTO `{project_id}`.`{dataset_id}`.`{dest}` T \
@@ -1043,6 +1066,7 @@ mod tests {
             partition_by: None,
             primary_key: vec![],
             merge_prune_partition_by: None,
+            delete_stale_in_window: false,
             parallelism: 1,
             batch_rows: 1000,
             batch_bytes: 0,
@@ -1259,7 +1283,7 @@ mod tests {
             col("amount", DataType::Float64, true),
         ];
         let key = vec!["id".to_string()];
-        let sql = build_merge_sql("proj", "ds", "orders", "orders_quickhouse_tmp", &key, &cols, None).unwrap();
+        let sql = build_merge_sql("proj", "ds", "orders", "orders_quickhouse_tmp", &key, &cols, None, false).unwrap();
 
         assert!(sql.starts_with("MERGE INTO `proj`.`ds`.`orders` T USING `proj`.`ds`.`orders_quickhouse_tmp` S"));
         assert!(sql.contains("ON T.`id` = S.`id`"));
@@ -1275,7 +1299,7 @@ mod tests {
     fn build_merge_sql_composite_key() {
         let cols = vec![col("a", DataType::Int64, false), col("b", DataType::Int64, false)];
         let key = vec!["a".to_string(), "b".to_string()];
-        let sql = build_merge_sql("p", "d", "t", "s", &key, &cols, None).unwrap();
+        let sql = build_merge_sql("p", "d", "t", "s", &key, &cols, None, false).unwrap();
         assert!(sql.contains("ON T.`a` = S.`a` AND T.`b` = S.`b`"));
     }
 
@@ -1287,7 +1311,7 @@ mod tests {
             col("amount", DataType::Float64, true),
         ];
         let key = vec!["id".to_string()];
-        let sql = build_merge_sql("p", "d", "orders", "orders_tmp", &key, &cols, Some("create_date")).unwrap();
+        let sql = build_merge_sql("p", "d", "orders", "orders_tmp", &key, &cols, Some("create_date"), false).unwrap();
         // The join still matches on the key, AND the destination is bounded to
         // the staging batch's create_date range so BigQuery prunes partitions.
         assert!(sql.contains("ON T.`id` = S.`id`"), "{sql}");
@@ -1304,10 +1328,40 @@ mod tests {
     }
 
     #[test]
+    fn build_merge_sql_delete_stale_scopes_to_the_staging_window() {
+        let cols = vec![
+            col("id", DataType::Int64, false),
+            col("create_date", DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())), false),
+        ];
+        let key = vec!["id".to_string()];
+        let sql = build_merge_sql("p", "d", "orders", "orders_tmp", &key, &cols, Some("create_date"), true).unwrap();
+        // The DELETE is scoped to the SAME staging window as the prune — it must
+        // never delete outside the batch's create_date range.
+        assert!(
+            sql.contains(
+                "WHEN NOT MATCHED BY SOURCE AND T.`create_date` BETWEEN \
+                 (SELECT MIN(`create_date`) FROM `p`.`d`.`orders_tmp`) \
+                 AND (SELECT MAX(`create_date`) FROM `p`.`d`.`orders_tmp`) THEN DELETE"
+            ),
+            "missing window-scoped delete: {sql}"
+        );
+    }
+
+    #[test]
+    fn build_merge_sql_delete_stale_without_prune_is_internal_error() {
+        // Defensive: config validation should reject this combo first, but the
+        // builder must never emit an unscoped (history-nuking) DELETE.
+        let cols = vec![col("id", DataType::Int64, false), col("v", DataType::Int64, true)];
+        let key = vec!["id".to_string()];
+        let err = build_merge_sql("p", "d", "t", "s", &key, &cols, None, true).unwrap_err().to_string();
+        assert!(err.contains("delete_stale"), "{err}");
+    }
+
+    #[test]
     fn build_merge_sql_all_columns_are_key_becomes_insert_only() {
         let cols = vec![col("id", DataType::Int64, false)];
         let key = vec!["id".to_string()];
-        let sql = build_merge_sql("p", "d", "t", "s", &key, &cols, None).unwrap();
+        let sql = build_merge_sql("p", "d", "t", "s", &key, &cols, None, false).unwrap();
         assert!(!sql.contains("WHEN MATCHED"), "no columns left to update: {sql}");
         assert!(sql.contains("WHEN NOT MATCHED THEN INSERT (`id`) VALUES (S.`id`)"));
     }
@@ -1315,7 +1369,7 @@ mod tests {
     #[test]
     fn build_merge_sql_rejects_empty_key() {
         let cols = vec![col("id", DataType::Int64, false)];
-        let err = build_merge_sql("p", "d", "t", "s", &[], &cols, None).unwrap_err().to_string();
+        let err = build_merge_sql("p", "d", "t", "s", &[], &cols, None, false).unwrap_err().to_string();
         assert!(err.contains("empty key"), "{err}");
         assert!(err.contains("quickhouse bug"), "must be framed as internal, not a config error: {err}");
     }

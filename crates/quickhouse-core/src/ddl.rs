@@ -169,6 +169,7 @@ mod tests {
             partition_by: None,
             primary_key: vec![],
             merge_prune_partition_by: None,
+            delete_stale_in_window: false,
             parallelism: 4,
             batch_rows: 1000,
             batch_bytes: 0,

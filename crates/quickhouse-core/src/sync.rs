@@ -586,7 +586,7 @@ async fn run_transfer_impl(
         if cfg.mode == SyncMode::Incremental {
             if sink.requires_staging_for_incremental() {
                 tracing::info!("merging staged incremental rows into '{}'", cfg.dest_table);
-                sink.merge_into(&cfg.dest_table, &staging, &cfg.key, &plan.dest_columns, cfg.merge_prune_partition_by.as_deref()).await?;
+                sink.merge_into(&cfg.dest_table, &staging, &cfg.key, &plan.dest_columns, cfg.merge_prune_partition_by.as_deref(), cfg.delete_stale_in_window).await?;
                 sink.drop_table(&staging).await?;
             }
             if let Some(w) = &new_watermark {
@@ -797,7 +797,7 @@ async fn run_transfer_bigquery(
         if cfg.mode == SyncMode::Incremental {
             if sink.requires_staging_for_incremental() {
                 tracing::info!("merging staged incremental rows into '{}'", cfg.dest_table);
-                sink.merge_into(&cfg.dest_table, &staging, &cfg.key, &plan.dest_columns, cfg.merge_prune_partition_by.as_deref()).await?;
+                sink.merge_into(&cfg.dest_table, &staging, &cfg.key, &plan.dest_columns, cfg.merge_prune_partition_by.as_deref(), cfg.delete_stale_in_window).await?;
                 sink.drop_table(&staging).await?;
             }
             if let Some(w) = &new_watermark {
@@ -878,10 +878,30 @@ fn seed_api_type_overrides(cfg: &mut TransferConfig, cols: &[ApiColumn]) -> Resu
     Ok(())
 }
 
+fn api_lookback_days(source_cfg: &SourceConfig) -> u32 {
+    match source_cfg {
+        SourceConfig::CleverTap(c) => c.lookback_days,
+        SourceConfig::AppsFlyer(a) => a.lookback_days,
+        _ => 0,
+    }
+}
+
+/// Shift a `"YYYY-MM-DD"` date back by `days`.
+fn subtract_days(date: &str, days: u32) -> Result<String> {
+    let d = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .map_err(|e| EtlError::config(format!("invalid lookback date '{date}': {e}")))?;
+    let shifted = d
+        .checked_sub_days(chrono::Days::new(days as u64))
+        .ok_or_else(|| EtlError::config(format!("lookback of {days} days underflows from '{date}'")))?;
+    Ok(shifted.format("%Y-%m-%d").to_string())
+}
+
 /// Resolve the `[from, to]` date window (`"YYYY-MM-DD"`) and the watermark to
-/// persist. Full mode requires an explicit `from_date`. Incremental derives
-/// `from` from the persisted cursor, else the seed, else `from_date`; `to`
-/// defaults to today; the window is clamped to `from <= to`.
+/// persist. Full mode requires an explicit `from_date`. Incremental/append
+/// derive `from` from the persisted cursor, else the seed, else `from_date`; on
+/// a resume, `lookback_days` widens `from` back to re-pull late-arriving rows
+/// (clamped to the `from_date` floor). `to` defaults to today; the window is
+/// clamped to `from <= to`.
 fn derive_api_window(
     cfg: &TransferConfig,
     source_cfg: &SourceConfig,
@@ -896,14 +916,27 @@ fn derive_api_window(
         })?;
         Ok((from, to, None))
     } else {
+        let resuming = committed.is_some();
         let mut from = committed
             .or_else(|| seed_value(&cfg.seed_watermark, Some(&to)))
             .or_else(|| from_date.map(str::to_string))
             .ok_or_else(|| {
                 EtlError::config(
-                    "first incremental API run needs a start date: set from_date, seed_watermark=, or skip_to_max=True",
+                    "first incremental/append API run needs a start date: set from_date, seed_watermark=, or skip_to_max=True",
                 )
             })?;
+        // On a resume, re-pull a rolling lookback window before the cursor so
+        // late-arriving/restated rows past the boundary day aren't missed.
+        let lookback = api_lookback_days(source_cfg);
+        if resuming && lookback > 0 {
+            from = subtract_days(&from, lookback)?;
+            // Never pull before the configured floor.
+            if let Some(floor) = from_date {
+                if from.as_str() < floor {
+                    from = floor.to_string();
+                }
+            }
+        }
         if from > to {
             from = to.clone(); // guard a clock-skew / stale-cursor inversion
         }
@@ -952,7 +985,9 @@ async fn run_transfer_api(
         .map(|n| path_by_name.get(n.as_str()).copied().unwrap_or(n.as_str()).to_string())
         .collect();
 
-    let committed = if cfg.mode == SyncMode::Incremental {
+    // Incremental and append both resume from a persisted date cursor (append
+    // inserts instead of merging); full mode has none.
+    let committed = if matches!(cfg.mode, SyncMode::Incremental | SyncMode::Append) {
         let watermark = cfg.watermark.as_ref().unwrap();
         ensure_watermark_column(watermark, &source_cols)?;
         sink.read_last_watermark(&cfg).await?
@@ -1071,7 +1106,15 @@ async fn run_transfer_api(
         if cfg.mode == SyncMode::Incremental {
             if sink.requires_staging_for_incremental() {
                 tracing::info!("merging staged incremental rows into '{}'", cfg.dest_table);
-                sink.merge_into(&cfg.dest_table, &staging, &cfg.key, &plan.dest_columns, cfg.merge_prune_partition_by.as_deref()).await?;
+                sink.merge_into(
+                    &cfg.dest_table,
+                    &staging,
+                    &cfg.key,
+                    &plan.dest_columns,
+                    cfg.merge_prune_partition_by.as_deref(),
+                    cfg.delete_stale_in_window,
+                )
+                .await?;
                 sink.drop_table(&staging).await?;
             }
             if let Some(w) = &new_watermark {
@@ -1081,6 +1124,20 @@ async fn run_transfer_api(
                         .await?;
                 } else {
                     tracing::info!("advance_watermark=false: window end {w} NOT persisted");
+                }
+            }
+        }
+        if cfg.mode == SyncMode::Append {
+            // Rows were inserted straight into the destination (target_table ==
+            // dest_table): no staging, no merge, no swap. Only persist the
+            // resume cursor.
+            if let Some(w) = &new_watermark {
+                if cfg.advance_watermark {
+                    tracing::info!("append: persisting new watermark (window end): {w}");
+                    sink.persist_watermark(&cfg, w, counters.rows_written.load(Ordering::Relaxed))
+                        .await?;
+                } else {
+                    tracing::info!("append: advance_watermark=false: window end {w} NOT persisted");
                 }
             }
         }
@@ -1912,6 +1969,33 @@ async fn prepare_target(
                 Ok(cfg.dest_table.clone())
             }
         }
+        SyncMode::Append => {
+            // Bronze-landing: insert straight into the destination — no staging,
+            // no merge, no swap, no key, no dedup. Create the dest if missing,
+            // evolve it (inserts reference its columns), and ensure the state
+            // table so the resume cursor can be persisted.
+            if !sink.table_exists(&cfg.dest_table).await? {
+                if cfg.create_if_missing {
+                    tracing::info!("destination table '{}' does not exist; creating it", cfg.dest_table);
+                    sink.create_table(&cfg.dest_table, dest_columns, cfg).await?;
+                } else {
+                    return Err(EtlError::config(format!(
+                        "destination table {} does not exist and create_if_missing=false",
+                        cfg.dest_table
+                    )));
+                }
+            } else if cfg.evolve_schema {
+                let added = sink.add_missing_columns(&cfg.dest_table, dest_columns, cfg).await?;
+                if !added.is_empty() {
+                    tracing::info!(
+                        "evolve_schema: added {} column(s) to '{}': {}",
+                        added.len(), cfg.dest_table, added.join(", ")
+                    );
+                }
+            }
+            sink.ensure_state_table().await?;
+            Ok(cfg.dest_table.clone())
+        }
     }
 }
 
@@ -2565,6 +2649,7 @@ mod tests {
             columns: vec![ApiColumn { name: "ts".into(), bq_type: "TIMESTAMP".into(), path: None }],
             from_date: None,
             to_date: None,
+            lookback_days: 0,
         })
     }
 
@@ -2604,6 +2689,43 @@ mod tests {
         // Inversion (committed > to) clamps `from` to `to`.
         let (from, to, _) = derive_api_window(&cfg, &src, Some("2026-08-01".into())).unwrap();
         assert_eq!(from, to, "from clamped to to on inversion");
+    }
+
+    #[test]
+    fn derive_api_window_lookback_widens_from_on_resume_clamped_to_floor() {
+        let mut src = ct_source();
+        if let SourceConfig::CleverTap(c) = &mut src {
+            c.from_date = Some("2026-07-01".into());
+            c.to_date = Some("2026-07-31".into());
+            c.lookback_days = 3;
+        }
+        let mut cfg = crate::config::default_test_config();
+        cfg.mode = SyncMode::Incremental;
+        // Resume from a committed cursor: `from` is pulled back by lookback_days.
+        let (from, _to, _) = derive_api_window(&cfg, &src, Some("2026-07-20".into())).unwrap();
+        assert_eq!(from, "2026-07-17", "resume from - 3 days");
+        // Lookback never pulls before the configured floor.
+        let (from, _to, _) = derive_api_window(&cfg, &src, Some("2026-07-02".into())).unwrap();
+        assert_eq!(from, "2026-07-01", "clamped to from_date floor");
+        // First run (no committed cursor): lookback does NOT apply.
+        let (from, _to, _) = derive_api_window(&cfg, &src, None).unwrap();
+        assert_eq!(from, "2026-07-01", "first run starts at the floor, no lookback");
+    }
+
+    #[test]
+    fn derive_api_window_append_uses_incremental_windowing() {
+        let mut src = ct_source();
+        if let SourceConfig::CleverTap(c) = &mut src {
+            c.from_date = Some("2026-07-01".into());
+            c.to_date = Some("2026-07-10".into());
+        }
+        let mut cfg = crate::config::default_test_config();
+        cfg.mode = SyncMode::Append;
+        // Append resumes from the committed cursor and persists the window end,
+        // exactly like incremental (it just inserts instead of merging).
+        let (from, _to, wm) = derive_api_window(&cfg, &src, Some("2026-07-05".into())).unwrap();
+        assert_eq!(from, "2026-07-05");
+        assert_eq!(wm, Some("2026-07-10".to_string()));
     }
 
     #[test]

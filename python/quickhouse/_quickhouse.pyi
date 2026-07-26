@@ -188,6 +188,8 @@ class CleverTap:
     is the full-refresh window; in incremental mode ``from_date`` is only the
     first-run floor (thereafter the persisted watermark drives ``from``) and
     ``key`` is required (BigQuery MERGE dedup of the re-pulled boundary day).
+    ``lookback_days`` re-pulls a rolling window on each resume to catch late or
+    restated events past the boundary day.
     """
 
     def __init__(
@@ -201,6 +203,7 @@ class CleverTap:
         batch_size: int = 5000,
         from_date: Optional[str] = None,
         to_date: Optional[str] = None,
+        lookback_days: int = 0,
         paths: Optional[Mapping[str, str]] = None,
         base_url: Optional[str] = None,
     ) -> None: ...
@@ -217,7 +220,8 @@ class AppsFlyer:
     instead. Times are in the account's timezone unless
     ``extra_params={"timezone": "UTC"}`` — declare DATETIME for wall-clock, or
     TIMESTAMP with a UTC timezone param. ``[from_date, to_date]`` as for
-    ``CleverTap``.
+    ``CleverTap``. ``lookback_days`` re-pulls a rolling window on each resume
+    (both APIs restate history — e.g. AppsFlyer attribution updates for days).
     """
 
     def __init__(
@@ -229,6 +233,7 @@ class AppsFlyer:
         *,
         from_date: Optional[str] = None,
         to_date: Optional[str] = None,
+        lookback_days: int = 0,
         paths: Optional[Mapping[str, str]] = None,
         extra_params: Optional[Mapping[str, str]] = None,
         base_url: str = "https://hq1.appsflyer.com",
@@ -304,6 +309,7 @@ def sync(
     partition_by: Optional[str] = None,
     primary_key: Optional[Sequence[str]] = None,
     merge_prune_partition_by: Optional[str] = None,
+    delete_stale_in_window: bool = False,
     parallelism: int = 4,
     batch_rows: int = 100_000,
     batch_bytes: int = 4_194_304,
@@ -331,7 +337,11 @@ def sync(
     For ``mode="incremental"``, ``watermark`` is required and only rows newer
     than the last recorded watermark are copied. In ``mode="full"`` the
     watermark is unused and ignored (cleared to ``None``), and the returned
-    ``new_watermark`` is ``None``.
+    ``new_watermark`` is ``None``. ``mode="append"`` (HTTP API sources only)
+    inserts each window's rows straight into the destination with NO
+    staging/merge/swap and no dedup — a bronze-landing write for when you run
+    your own consolidation downstream; ``watermark`` drives the resume window
+    and ``key`` is not required.
 
     ``lookback_seconds`` widens the tracked watermark's lower bound by this
     many seconds before filtering, so a run re-includes a trailing window of
@@ -426,6 +436,15 @@ def sync(
     would miss it and INSERT A DUPLICATE KEY instead of updating (the classic
     merge-filter dup bug). quickhouse can't detect mutability — this is a
     deliberate per-table opt-in. Default ``None`` keeps the safe full scan.
+
+    ``delete_stale_in_window=True`` (BigQuery incremental only) additionally
+    DELETEs destination rows inside the merged window that are absent from the
+    source pull (``WHEN NOT MATCHED BY SOURCE``) — "replace this window", and a
+    NULL merge key nets to a replace instead of duplicating. It **requires**
+    ``merge_prune_partition_by`` (the DELETE is scoped to that column's staging
+    ``[MIN, MAX]`` range); without it a ``WHEN NOT MATCHED BY SOURCE`` clause
+    would delete the entire destination history outside the batch, so it is a
+    hard config error.
 
     Memory vs. batch sizing:
 

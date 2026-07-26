@@ -77,6 +77,11 @@ pub struct CleverTapConfig {
     pub from_date: Option<String>,
     /// Window end `"YYYY-MM-DD"` (defaults to today).
     pub to_date: Option<String>,
+    /// Incremental/append re-pull window: start `N` days *before* the committed
+    /// watermark so late-arriving/restated events past the boundary day are
+    /// re-fetched. `0` = only the boundary day. MERGE-on-key dedups the overlap
+    /// (incremental); in append mode the overlap re-appends (downstream dedups).
+    pub lookback_days: u32,
 }
 
 /// Read from AppsFlyer's raw-data Pull API. Auth is a V2.0 bearer token. The
@@ -95,6 +100,8 @@ pub struct AppsFlyerConfig {
     pub columns: Vec<ApiColumn>,
     pub from_date: Option<String>,
     pub to_date: Option<String>,
+    /// See [`CleverTapConfig::lookback_days`].
+    pub lookback_days: u32,
 }
 
 /// Which engine/API to read from.
@@ -267,11 +274,15 @@ pub enum DestKind {
     BigQuery,
 }
 
-/// Full-refresh reloads everything; Incremental appends rows past a watermark.
+/// Full-refresh reloads everything; Incremental upserts rows past a watermark;
+/// Append inserts rows past a watermark WITHOUT staging/merge/dedup (a
+/// bronze-landing write — the caller de-duplicates downstream). Append is
+/// currently supported only for HTTP API sources.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncMode {
     Full,
     Incremental,
+    Append,
 }
 
 /// How to seed the incremental cursor on the **first** run for a state
@@ -380,6 +391,19 @@ pub struct TransferConfig {
     /// do not "optimize" a mutable partition column into this field.) quickhouse
     /// cannot detect mutability, so this is a deliberate per-table opt-in.
     pub merge_prune_partition_by: Option<String>,
+    /// BigQuery-destination incremental only: additionally `DELETE` destination
+    /// rows *inside the merged window* that are absent from the source pull
+    /// (`WHEN NOT MATCHED BY SOURCE`), giving "replace this window" semantics
+    /// and making a NULL merge key self-correct (net replace) instead of
+    /// duplicating on re-runs.
+    ///
+    /// **Requires `merge_prune_partition_by`** (a hard config error otherwise):
+    /// the DELETE is scoped to that immutable column's `[MIN, MAX]` range in the
+    /// staging batch — the SAME bound the prune uses. Without a window bound a
+    /// `WHEN NOT MATCHED BY SOURCE` clause would delete the ENTIRE destination
+    /// history outside the delta, so it is never allowed unscoped. `false`
+    /// (default) keeps the insert-or-update-only merge.
+    pub delete_stale_in_window: bool,
 
     // ---- parallelism / batching ----
     pub parallelism: usize,
@@ -466,7 +490,9 @@ impl TransferConfig {
             return e.clone();
         }
         match self.mode {
-            SyncMode::Full => "MergeTree".to_string(),
+            // Append is API-only (BigQuery dest, no engine concept); a plain
+            // MergeTree is the sensible fallback for the ClickHouse-DDL path.
+            SyncMode::Full | SyncMode::Append => "MergeTree".to_string(),
             SyncMode::Incremental => "ReplacingMergeTree".to_string(),
         }
     }
@@ -546,9 +572,10 @@ impl TransferConfig {
                 ));
             }
         }
-        if self.mode == SyncMode::Incremental && self.watermark.is_none() {
+        if matches!(self.mode, SyncMode::Incremental | SyncMode::Append) && self.watermark.is_none() {
             return Err(EtlError::config(
-                "watermark column is required for incremental mode",
+                "watermark column is required for incremental and append mode (it drives the \
+                 resumable date window)",
             ));
         }
         if self.lookback_seconds > 0 && self.mode != SyncMode::Incremental {
@@ -556,14 +583,23 @@ impl TransferConfig {
                 "lookback_seconds only applies to incremental mode",
             ));
         }
-        if self.seed_watermark != WatermarkSeed::None && self.mode != SyncMode::Incremental {
+        // Append is a bronze-landing write for API sources only.
+        if self.mode == SyncMode::Append && !is_api {
             return Err(EtlError::config(
-                "seed_watermark only applies to incremental mode",
+                "append mode is currently supported only for HTTP API sources (CleverTap/AppsFlyer)",
             ));
         }
-        if !self.advance_watermark && self.mode != SyncMode::Incremental {
+        // seed_watermark / advance_watermark drive the resumable cursor, which
+        // both incremental and append use (append inserts instead of merging).
+        let cursor_mode = matches!(self.mode, SyncMode::Incremental | SyncMode::Append);
+        if self.seed_watermark != WatermarkSeed::None && !cursor_mode {
             return Err(EtlError::config(
-                "advance_watermark=false only applies to incremental mode",
+                "seed_watermark only applies to incremental or append mode",
+            ));
+        }
+        if !self.advance_watermark && !cursor_mode {
+            return Err(EtlError::config(
+                "advance_watermark=false only applies to incremental or append mode",
             ));
         }
         if self.lookback_seconds > 0 && self.key.is_empty() && self.order_by.is_empty() {
@@ -605,6 +641,20 @@ impl TransferConfig {
                  (it must be a UNIQUE, NOT NULL integer column, or ties silently skip rows)",
             ));
         }
+        if self.delete_stale_in_window {
+            if self.mode != SyncMode::Incremental {
+                return Err(EtlError::config(
+                    "delete_stale_in_window only applies to incremental mode",
+                ));
+            }
+            if self.merge_prune_partition_by.is_none() {
+                return Err(EtlError::config(
+                    "delete_stale_in_window requires merge_prune_partition_by (the immutable \
+                     window column to scope the DELETE); without it, WHEN NOT MATCHED BY SOURCE \
+                     would delete the ENTIRE destination history outside the current batch",
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -641,6 +691,7 @@ pub(crate) fn default_test_config() -> TransferConfig {
         partition_by: None,
         primary_key: vec![],
         merge_prune_partition_by: None,
+        delete_stale_in_window: false,
         parallelism: 1,
         batch_rows: 1000,
         batch_bytes: 0,
@@ -680,6 +731,7 @@ mod tests {
             partition_by: None,
             primary_key: vec![],
             merge_prune_partition_by: None,
+            delete_stale_in_window: false,
             parallelism: 1,
             batch_rows: 1000,
             batch_bytes: 0,
@@ -854,5 +906,37 @@ mod tests {
         let mut c = cfg(SyncMode::Incremental, Some("write_date"));
         c.chunk_rows = Some(1000);
         assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn append_mode_is_api_only_and_needs_watermark() {
+        // Append is rejected for a DB source, allowed for an API source.
+        let c = cfg(SyncMode::Append, Some("ts"));
+        assert!(c.validate().unwrap_err().to_string().contains("append mode"));
+        assert!(c.validate_api().is_ok());
+        // Append without a watermark (the resume cursor) is rejected.
+        let c2 = cfg(SyncMode::Append, None);
+        assert!(c2.validate_api().unwrap_err().to_string().contains("watermark"));
+        // seed_watermark / advance_watermark are allowed in append mode.
+        let mut c3 = cfg(SyncMode::Append, Some("ts"));
+        c3.seed_watermark = WatermarkSeed::CurrentMax;
+        c3.advance_watermark = false;
+        assert!(c3.validate_api().is_ok());
+    }
+
+    #[test]
+    fn delete_stale_requires_prune_and_incremental() {
+        // Incremental without a prune column -> rejected (would nuke history).
+        let mut c = cfg(SyncMode::Incremental, Some("write_date"));
+        c.delete_stale_in_window = true;
+        assert!(c.validate().unwrap_err().to_string().contains("merge_prune_partition_by"));
+        // With an immutable prune column -> ok.
+        c.merge_prune_partition_by = Some("create_date".into());
+        assert!(c.validate().is_ok());
+        // Full mode -> rejected.
+        let mut c2 = cfg(SyncMode::Full, None);
+        c2.delete_stale_in_window = true;
+        c2.merge_prune_partition_by = Some("create_date".into());
+        assert!(c2.validate().unwrap_err().to_string().contains("incremental"));
     }
 }

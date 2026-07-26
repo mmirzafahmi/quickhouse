@@ -257,13 +257,14 @@ impl Sink {
         key: &[String],
         columns: &[ColumnType],
         prune_partition: Option<&str>,
+        delete_stale: bool,
     ) -> Result<()> {
         match self {
             Sink::ClickHouse(_) => Err(EtlError::internal(
                 "merge_into called on a ClickHouse sink — unreachable, since ClickHouse never \
                  reports requires_staging_for_incremental()",
             )),
-            Sink::BigQuery(s) => s.merge_into(dest, staging, key, columns, prune_partition).await,
+            Sink::BigQuery(s) => s.merge_into(dest, staging, key, columns, prune_partition, delete_stale).await,
         }
     }
 }

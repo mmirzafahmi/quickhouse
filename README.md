@@ -163,6 +163,24 @@ the default) REPLACES the destination; since these sources are day/event-scoped,
 prefer `mode="incremental"` for an existing table (a shrinking full swap is
 warned about but still executes).
 
+Three knobs tune the incremental behavior for these sources:
+
+- **`lookback_days=N`** — on each resume, re-pull a rolling `N`-day window before
+  the cursor so late-arriving/restated events past the boundary day aren't missed
+  (both APIs restate history; AppsFlyer attribution updates for days). MERGE-on-key
+  dedups the overlap in incremental mode.
+- **`mode="append"`** — a bronze-landing write: insert each window's rows straight
+  into the destination with **no** staging/merge/swap and no dedup, running your
+  own consolidation MERGE downstream. `watermark` drives the resume window; `key`
+  isn't required. Avoids per-run table-metadata churn (BigQuery's
+  ~5-ops/10s/table limit) since there's no staging create/swap. API sources only.
+- **`delete_stale_in_window=True`** (BigQuery incremental) — also `DELETE`
+  destination rows inside the merged window that are absent from the source pull
+  ("replace this window"; a NULL merge key nets to a replace instead of
+  duplicating). **Requires `merge_prune_partition_by`** — the DELETE is scoped to
+  that immutable column's staging range, so it never touches history outside the
+  batch (a hard error otherwise).
+
 A ClickHouse destination can also archive every synced batch to S3 as a data
 lake — a secondary, best-effort-free backup independent of ClickHouse's own
 retention:

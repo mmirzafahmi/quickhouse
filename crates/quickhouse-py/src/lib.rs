@@ -217,12 +217,13 @@ struct CleverTap {
     columns: Vec<core::ApiColumn>,
     from_date: Option<String>,
     to_date: Option<String>,
+    lookback_days: u32,
 }
 
 #[pymethods]
 impl CleverTap {
     #[new]
-    #[pyo3(signature = (account_id, passcode, event_name, columns, *, region="sg1".to_string(), batch_size=5000, from_date=None, to_date=None, paths=None, base_url=None))]
+    #[pyo3(signature = (account_id, passcode, event_name, columns, *, region="sg1".to_string(), batch_size=5000, from_date=None, to_date=None, lookback_days=0, paths=None, base_url=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         account_id: String,
@@ -233,12 +234,13 @@ impl CleverTap {
         batch_size: u32,
         from_date: Option<String>,
         to_date: Option<String>,
+        lookback_days: u32,
         paths: Option<HashMap<String, String>>,
         base_url: Option<String>,
     ) -> PyResult<Self> {
         let columns = parse_columns(columns, paths)?;
         let base_url = base_url.unwrap_or_else(|| format!("https://{region}.api.clevertap.com"));
-        Ok(CleverTap { base_url, account_id, passcode, event_name, batch_size, columns, from_date, to_date })
+        Ok(CleverTap { base_url, account_id, passcode, event_name, batch_size, columns, from_date, to_date, lookback_days })
     }
 
     fn __repr__(&self) -> String {
@@ -266,12 +268,13 @@ struct AppsFlyer {
     columns: Vec<core::ApiColumn>,
     from_date: Option<String>,
     to_date: Option<String>,
+    lookback_days: u32,
 }
 
 #[pymethods]
 impl AppsFlyer {
     #[new]
-    #[pyo3(signature = (api_token, app_id, report_type, columns, *, from_date=None, to_date=None, paths=None, extra_params=None, base_url="https://hq1.appsflyer.com".to_string()))]
+    #[pyo3(signature = (api_token, app_id, report_type, columns, *, from_date=None, to_date=None, lookback_days=0, paths=None, extra_params=None, base_url="https://hq1.appsflyer.com".to_string()))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         api_token: String,
@@ -280,6 +283,7 @@ impl AppsFlyer {
         columns: &Bound<'_, PyAny>,
         from_date: Option<String>,
         to_date: Option<String>,
+        lookback_days: u32,
         paths: Option<HashMap<String, String>>,
         extra_params: Option<HashMap<String, String>>,
         base_url: String,
@@ -294,6 +298,7 @@ impl AppsFlyer {
             columns,
             from_date,
             to_date,
+            lookback_days,
         })
     }
 
@@ -346,6 +351,7 @@ impl From<AnySource> for core::SourceConfig {
                 columns: c.columns,
                 from_date: c.from_date,
                 to_date: c.to_date,
+                lookback_days: c.lookback_days,
             }),
             AnySource::AppsFlyer(a) => core::SourceConfig::AppsFlyer(core::AppsFlyerConfig {
                 base_url: a.base_url,
@@ -356,6 +362,7 @@ impl From<AnySource> for core::SourceConfig {
                 columns: a.columns,
                 from_date: a.from_date,
                 to_date: a.to_date,
+                lookback_days: a.lookback_days,
             }),
         }
     }
@@ -590,8 +597,9 @@ fn parse_mode(mode: &str) -> PyResult<core::SyncMode> {
     match mode.to_ascii_lowercase().as_str() {
         "full" => Ok(core::SyncMode::Full),
         "incremental" | "inc" => Ok(core::SyncMode::Incremental),
+        "append" => Ok(core::SyncMode::Append),
         other => Err(PyRuntimeError::new_err(format!(
-            "invalid mode {other:?}; expected 'full' or 'incremental'"
+            "invalid mode {other:?}; expected 'full', 'incremental', or 'append'"
         ))),
     }
 }
@@ -651,6 +659,7 @@ fn parse_parquet_compression(c: &str) -> PyResult<core::ParquetCompression> {
     partition_by=None,
     primary_key=None,
     merge_prune_partition_by=None,
+    delete_stale_in_window=false,
     parallelism=4,
     batch_rows=100_000,
     batch_bytes=4_194_304,
@@ -689,6 +698,7 @@ fn sync(
     partition_by: Option<String>,
     primary_key: Option<Vec<String>>,
     merge_prune_partition_by: Option<String>,
+    delete_stale_in_window: bool,
     parallelism: usize,
     batch_rows: usize,
     batch_bytes: usize,
@@ -737,6 +747,7 @@ fn sync(
         partition_by,
         primary_key: primary_key.unwrap_or_default(),
         merge_prune_partition_by,
+        delete_stale_in_window,
         parallelism,
         batch_rows,
         batch_bytes,
