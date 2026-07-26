@@ -9,6 +9,17 @@ any breaking change is called out explicitly.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-07-27
+
+### Added
+- Richer authentication (all additive; existing calls unchanged):
+  - `Postgres`/`MySQL` accept discrete `host`/`port`/`user`/`password`/`database`
+    fields as an alternative to the DSN string (percent-encoded and assembled
+    into a DSN; pass one or the other, not both).
+  - `BigQuery` accepts inline `credentials_json` (service-account key contents,
+    e.g. from a secrets manager) alongside `credentials_file`/ADC; it takes
+    precedence when both are set.
+
 ## [0.8.0] - 2026-07-27
 
 ### Added
@@ -179,7 +190,8 @@ any breaking change is called out explicitly.
 - Initial release: parallel, bounded-memory PostgreSQL → ClickHouse transfer with
   automatic DDL, full-refresh and incremental modes, and type mapping.
 
-[Unreleased]: https://github.com/mmirzafahmi/quickhouse/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/mmirzafahmi/quickhouse/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/mmirzafahmi/quickhouse/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/mmirzafahmi/quickhouse/compare/v0.7.2...v0.8.0
 [0.7.2]: https://github.com/mmirzafahmi/quickhouse/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/mmirzafahmi/quickhouse/compare/v0.7.0...v0.7.1

@@ -32,8 +32,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, SchemaRef, TimeUnit};
 use base64::Engine;
-use google_cloud_bigquery::client::google_cloud_auth::credentials::CredentialsFile;
-use google_cloud_bigquery::client::{Client, ClientConfig};
+use google_cloud_bigquery::client::Client;
 use google_cloud_bigquery::http::error::Error as BqError;
 use google_cloud_bigquery::http::job::get::GetJobRequest;
 use google_cloud_bigquery::http::job::query::QueryRequest;
@@ -83,19 +82,11 @@ impl BigQuerySink {
     /// creation, many inserts, the swap job, watermark read/persist — so a
     /// held client amortizes the auth handshake).
     pub async fn new(cfg: BigQueryDestConfig) -> Result<Self> {
-        let (config, resolved_project) = match &cfg.credentials_file {
-            Some(path) => {
-                let cred = CredentialsFile::new_from_file(path.clone())
-                    .await
-                    .map_err(|e| EtlError::other(format!("bigquery credentials error: {e}")))?;
-                ClientConfig::new_with_credentials(cred)
-                    .await
-                    .map_err(|e| EtlError::other(format!("bigquery auth error: {e}")))?
-            }
-            None => ClientConfig::new_with_auth()
-                .await
-                .map_err(|e| EtlError::other(format!("bigquery auth error: {e}")))?,
-        };
+        let (config, resolved_project) = crate::source::bigquery::resolve_bq_client_config(
+            &cfg.credentials_json,
+            &cfg.credentials_file,
+        )
+        .await?;
         let project_id = cfg
             .project_id
             .clone()

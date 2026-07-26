@@ -50,6 +50,72 @@ fn init_logging() {
     });
 }
 
+/// Assemble a `scheme://user:pass@host:port/db` DSN from discrete fields,
+/// percent-encoding the userinfo/database so special characters (`@ : / ...`)
+/// survive. Over-encoding unreserved chars is harmless — the driver's URL parser
+/// decodes them back. `host`/`port` are used verbatim.
+fn build_dsn(
+    scheme: &str,
+    host: &str,
+    port: Option<u16>,
+    user: Option<&str>,
+    password: Option<&str>,
+    database: Option<&str>,
+) -> String {
+    use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+    let enc = |s: &str| utf8_percent_encode(s, NON_ALPHANUMERIC).to_string();
+    let mut url = format!("{scheme}://");
+    if let Some(u) = user {
+        url.push_str(&enc(u));
+        if let Some(p) = password {
+            url.push(':');
+            url.push_str(&enc(p));
+        }
+        url.push('@');
+    }
+    url.push_str(host);
+    if let Some(port) = port {
+        url.push_str(&format!(":{port}"));
+    }
+    url.push('/');
+    if let Some(db) = database {
+        url.push_str(&enc(db));
+    }
+    url
+}
+
+/// Resolve a connection to a single DSN string from either an explicit `dsn` or
+/// discrete `host`/`port`/... fields (exactly one path must be given).
+#[allow(clippy::too_many_arguments)]
+fn resolve_dsn(
+    scheme: &str,
+    role: &str,
+    dsn: Option<String>,
+    host: Option<String>,
+    port: Option<u16>,
+    user: Option<String>,
+    password: Option<String>,
+    database: Option<String>,
+) -> PyResult<String> {
+    match (dsn, host) {
+        (Some(d), None) => Ok(d),
+        (None, Some(h)) => Ok(build_dsn(
+            scheme,
+            &h,
+            port,
+            user.as_deref(),
+            password.as_deref(),
+            database.as_deref(),
+        )),
+        (Some(_), Some(_)) => Err(PyRuntimeError::new_err(format!(
+            "{role}: pass either `dsn` or discrete host/port/user/... fields, not both"
+        ))),
+        (None, None) => Err(PyRuntimeError::new_err(format!(
+            "{role}: pass a `dsn`, or discrete `host` (with optional port/user/password/database)"
+        ))),
+    }
+}
+
 /// PostgreSQL source connection descriptor.
 #[pyclass]
 #[derive(Clone)]
@@ -62,13 +128,24 @@ struct Postgres {
 #[pymethods]
 impl Postgres {
     #[new]
-    #[pyo3(signature = (dsn, *, statement_timeout_secs=0, ca_cert_file=None))]
-    fn new(dsn: String, statement_timeout_secs: u64, ca_cert_file: Option<String>) -> Self {
-        Postgres {
+    #[pyo3(signature = (dsn=None, *, host=None, port=None, user=None, password=None, database=None, statement_timeout_secs=0, ca_cert_file=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        dsn: Option<String>,
+        host: Option<String>,
+        port: Option<u16>,
+        user: Option<String>,
+        password: Option<String>,
+        database: Option<String>,
+        statement_timeout_secs: u64,
+        ca_cert_file: Option<String>,
+    ) -> PyResult<Self> {
+        let dsn = resolve_dsn("postgresql", "Postgres", dsn, host, port, user, password, database)?;
+        Ok(Postgres {
             dsn,
             statement_timeout_secs,
             ca_cert_file,
-        }
+        })
     }
 
     fn __repr__(&self) -> String {
@@ -89,19 +166,26 @@ struct MySQL {
 #[pymethods]
 impl MySQL {
     #[new]
-    #[pyo3(signature = (dsn, *, statement_timeout_secs=0, ca_cert_file=None, require_tls=false))]
+    #[pyo3(signature = (dsn=None, *, host=None, port=None, user=None, password=None, database=None, statement_timeout_secs=0, ca_cert_file=None, require_tls=false))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
-        dsn: String,
+        dsn: Option<String>,
+        host: Option<String>,
+        port: Option<u16>,
+        user: Option<String>,
+        password: Option<String>,
+        database: Option<String>,
         statement_timeout_secs: u64,
         ca_cert_file: Option<String>,
         require_tls: bool,
-    ) -> Self {
-        MySQL {
+    ) -> PyResult<Self> {
+        let dsn = resolve_dsn("mysql", "MySQL", dsn, host, port, user, password, database)?;
+        Ok(MySQL {
             dsn,
             statement_timeout_secs,
             ca_cert_file,
             require_tls,
-        }
+        })
     }
 
     fn __repr__(&self) -> String {
@@ -128,6 +212,7 @@ impl MySQL {
 struct BigQuery {
     project_id: Option<String>,
     credentials_file: Option<String>,
+    credentials_json: Option<String>,
     dataset_id: Option<String>,
     write_method: String,
 }
@@ -135,16 +220,18 @@ struct BigQuery {
 #[pymethods]
 impl BigQuery {
     #[new]
-    #[pyo3(signature = (project_id=None, *, credentials_file=None, dataset_id=None, write_method="insert_all".to_string()))]
+    #[pyo3(signature = (project_id=None, *, credentials_file=None, credentials_json=None, dataset_id=None, write_method="insert_all".to_string()))]
     fn new(
         project_id: Option<String>,
         credentials_file: Option<String>,
+        credentials_json: Option<String>,
         dataset_id: Option<String>,
         write_method: String,
     ) -> Self {
         BigQuery {
             project_id,
             credentials_file,
+            credentials_json,
             dataset_id,
             write_method,
         }
@@ -366,6 +453,7 @@ impl From<AnySource> for core::SourceConfig {
             AnySource::BigQuery(b) => core::SourceConfig::BigQuery(core::BigQueryConfig {
                 project_id: b.project_id,
                 credentials_file: b.credentials_file,
+                credentials_json: b.credentials_json,
                 // dataset_id is a target-only field (see BigQuery's doc comment) — ignored here.
             }),
             AnySource::CleverTap(c) => core::SourceConfig::CleverTap(core::CleverTapConfig {
@@ -550,6 +638,7 @@ impl AnyDestination {
                     core::BigQueryDestConfig {
                         project_id: b.project_id,
                         credentials_file: b.credentials_file,
+                        credentials_json: b.credentials_json,
                         dataset_id,
                         write_method: parse_bq_write_method(&b.write_method)?,
                     },

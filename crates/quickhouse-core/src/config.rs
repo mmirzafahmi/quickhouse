@@ -42,6 +42,10 @@ pub struct BigQueryConfig {
     /// `GOOGLE_APPLICATION_CREDENTIALS_JSON`, the metadata server, or the
     /// gcloud CLI's well-known ADC file).
     pub credentials_file: Option<String>,
+    /// Inline service-account JSON key contents (an alternative to writing a
+    /// file — e.g. loaded straight from a secrets manager). Takes precedence
+    /// over `credentials_file` when both are set.
+    pub credentials_json: Option<String>,
 }
 
 /// One declared output column for an HTTP API source. API responses have no
@@ -232,6 +236,10 @@ pub struct BigQueryDestConfig {
     /// `GOOGLE_APPLICATION_CREDENTIALS_JSON`, the metadata server, or the
     /// gcloud CLI's well-known ADC file).
     pub credentials_file: Option<String>,
+    /// Inline service-account JSON key contents (an alternative to writing a
+    /// file — e.g. loaded straight from a secrets manager). Takes precedence
+    /// over `credentials_file` when both are set.
+    pub credentials_json: Option<String>,
     /// Destination dataset (BigQuery's equivalent of ClickHouse's `database`).
     /// `dest_table` names a bare table within it.
     pub dataset_id: String,

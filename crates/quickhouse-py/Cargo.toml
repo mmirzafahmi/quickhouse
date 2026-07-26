@@ -18,3 +18,4 @@ crate-type = ["cdylib"]
 quickhouse-core = { path = "../quickhouse-core" }
 pyo3 = { version = "0.22", features = ["abi3-py39"] }
 tracing-subscriber.workspace = true
+percent-encoding = "2"

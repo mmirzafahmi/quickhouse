@@ -32,31 +32,57 @@ use crate::types::ColumnType;
 pub struct BigQuerySource {
     project_id: Option<String>,
     credentials_file: Option<String>,
+    credentials_json: Option<String>,
+}
+
+/// Resolve a BigQuery `ClientConfig` (+ any project id the credentials embed)
+/// from, in precedence order: inline JSON, a key file, then Application Default
+/// Credentials. Shared by the BigQuery source and sink so both honor the same
+/// auth options identically.
+pub(crate) async fn resolve_bq_client_config(
+    credentials_json: &Option<String>,
+    credentials_file: &Option<String>,
+) -> Result<(ClientConfig, Option<String>)> {
+    Ok(match (credentials_json, credentials_file) {
+        (Some(json), _) => {
+            let cred = CredentialsFile::new_from_str(json).await.map_err(|e| {
+                EtlError::other(format!("bigquery credentials (inline JSON) error: {e}"))
+            })?;
+            ClientConfig::new_with_credentials(cred)
+                .await
+                .map_err(|e| EtlError::other(format!("bigquery auth error: {e}")))?
+        }
+        (None, Some(path)) => {
+            let cred = CredentialsFile::new_from_file(path.clone())
+                .await
+                .map_err(|e| EtlError::other(format!("bigquery credentials error: {e}")))?;
+            ClientConfig::new_with_credentials(cred)
+                .await
+                .map_err(|e| EtlError::other(format!("bigquery auth error: {e}")))?
+        }
+        (None, None) => ClientConfig::new_with_auth()
+            .await
+            .map_err(|e| EtlError::other(format!("bigquery auth error: {e}")))?,
+    })
 }
 
 impl BigQuerySource {
-    pub fn new(project_id: Option<String>, credentials_file: Option<String>) -> Self {
+    pub fn new(
+        project_id: Option<String>,
+        credentials_file: Option<String>,
+        credentials_json: Option<String>,
+    ) -> Self {
         Self {
             project_id,
             credentials_file,
+            credentials_json,
         }
     }
 
     /// Authenticate and return a connected client plus the resolved project ID.
     pub async fn connect(&self) -> Result<(Client, String)> {
-        let (config, resolved_project) = match &self.credentials_file {
-            Some(path) => {
-                let cred = CredentialsFile::new_from_file(path.clone())
-                    .await
-                    .map_err(|e| EtlError::other(format!("bigquery credentials error: {e}")))?;
-                ClientConfig::new_with_credentials(cred)
-                    .await
-                    .map_err(|e| EtlError::other(format!("bigquery auth error: {e}")))?
-            }
-            None => ClientConfig::new_with_auth()
-                .await
-                .map_err(|e| EtlError::other(format!("bigquery auth error: {e}")))?,
-        };
+        let (config, resolved_project) =
+            resolve_bq_client_config(&self.credentials_json, &self.credentials_file).await?;
         let project_id = self
             .project_id
             .clone()
@@ -270,7 +296,7 @@ mod tests {
 
     #[test]
     fn parse_table_ref_two_parts() {
-        let src = BigQuerySource::new(None, None);
+        let src = BigQuerySource::new(None, None, None);
         let t = src
             .parse_table_ref("dataset.table", "default-proj")
             .unwrap();
@@ -281,7 +307,7 @@ mod tests {
 
     #[test]
     fn parse_table_ref_three_parts() {
-        let src = BigQuerySource::new(None, None);
+        let src = BigQuerySource::new(None, None, None);
         let t = src
             .parse_table_ref("proj.dataset.table", "default-proj")
             .unwrap();
@@ -292,7 +318,7 @@ mod tests {
 
     #[test]
     fn parse_table_ref_invalid() {
-        let src = BigQuerySource::new(None, None);
+        let src = BigQuerySource::new(None, None, None);
         assert!(src.parse_table_ref("just_a_table", "default-proj").is_err());
     }
 

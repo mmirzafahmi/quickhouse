@@ -27,11 +27,20 @@ class Postgres:
 
     def __init__(
         self,
-        dsn: str,
+        dsn: Optional[str] = None,
         *,
+        host: Optional[str] = None,
+        port: Optional[int] = None,
+        user: Optional[str] = None,
+        password: Optional[str] = None,
+        database: Optional[str] = None,
         statement_timeout_secs: int = 0,
         ca_cert_file: Optional[str] = None,
-    ) -> None: ...
+    ) -> None:
+        """Pass either ``dsn`` or discrete ``host``/``port``/``user``/
+        ``password``/``database`` fields (not both). The discrete fields are
+        percent-encoded and assembled into a DSN."""
+        ...
 
 class MySQL:
     """MySQL source connection descriptor (e.g. AWS RDS for MySQL).
@@ -53,12 +62,21 @@ class MySQL:
 
     def __init__(
         self,
-        dsn: str,
+        dsn: Optional[str] = None,
         *,
+        host: Optional[str] = None,
+        port: Optional[int] = None,
+        user: Optional[str] = None,
+        password: Optional[str] = None,
+        database: Optional[str] = None,
         statement_timeout_secs: int = 0,
         ca_cert_file: Optional[str] = None,
         require_tls: bool = False,
-    ) -> None: ...
+    ) -> None:
+        """Pass either ``dsn`` or discrete ``host``/``port``/``user``/
+        ``password``/``database`` fields (not both). The discrete fields are
+        percent-encoded and assembled into a DSN."""
+        ...
 
 class BigQuery:
     """Google BigQuery connection descriptor — usable as either a ``source``
@@ -112,9 +130,14 @@ class BigQuery:
         project_id: Optional[str] = None,
         *,
         credentials_file: Optional[str] = None,
+        credentials_json: Optional[str] = None,
         dataset_id: Optional[str] = None,
         write_method: str = "insert_all",
-    ) -> None: ...
+    ) -> None:
+        """``credentials_json`` holds inline service-account JSON key contents
+        (e.g. loaded from a secrets manager) as an alternative to
+        ``credentials_file``; it takes precedence when both are set."""
+        ...
 
 class S3Archive:
     """Optional S3 (or S3-compatible, e.g. MinIO) data-lake archive attached

@@ -372,7 +372,11 @@ async fn run_transfer_impl(
     // flow rather than contorting the partition-based abstraction below,
     // which was built for connection-oriented sources.
     if let SourceConfig::BigQuery(bq) = &source_cfg {
-        let source = BigQuerySource::new(bq.project_id.clone(), bq.credentials_file.clone());
+        let source = BigQuerySource::new(
+            bq.project_id.clone(),
+            bq.credentials_file.clone(),
+            bq.credentials_json.clone(),
+        );
         let sink = Sink::new(dest).await?;
         return run_transfer_bigquery(&source, sink, cfg, progress, started, archive_info, staging)
             .await;
@@ -2935,6 +2939,7 @@ mod tests {
         let bq = DestinationConfig::BigQuery(crate::config::BigQueryDestConfig {
             project_id: None,
             credentials_file: None,
+            credentials_json: None,
             dataset_id: "ds".into(),
             write_method: crate::config::BigQueryWriteMethod::InsertAll,
         });
