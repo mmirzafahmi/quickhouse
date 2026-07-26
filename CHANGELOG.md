@@ -9,6 +9,22 @@ any breaking change is called out explicitly.
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-07-26
+
+### Added
+- `examples/` directory with runnable end-to-end scripts (Postgres → ClickHouse,
+  incremental, MySQL → BigQuery, CleverTap append → BigQuery).
+- Community health files: issue and pull-request templates, `CODE_OF_CONDUCT.md`.
+- A documented stability & versioning policy, and *experimental* markers on the
+  sharper-edged knobs (`chunk_rows`, `merge_prune_partition_by`,
+  `delete_stale_in_window`, `storage_write`, `column_transforms`).
+
+### Changed
+- CI now runs the full test suite (including the MySQL and S3-archival suites)
+  across Python 3.9 and 3.12, and enforces `cargo fmt` + `clippy` gates.
+- Neutralized ERP-specific example naming in the docs and benchmark (generic
+  order-line schema; `created_at`/`updated_at` in the pruning examples).
+
 ## [0.7.1] - 2026-07-26
 
 ### Added
@@ -151,7 +167,8 @@ any breaking change is called out explicitly.
 - Initial release: parallel, bounded-memory PostgreSQL → ClickHouse transfer with
   automatic DDL, full-refresh and incremental modes, and type mapping.
 
-[Unreleased]: https://github.com/mmirzafahmi/quickhouse/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/mmirzafahmi/quickhouse/compare/v0.7.2...HEAD
+[0.7.2]: https://github.com/mmirzafahmi/quickhouse/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/mmirzafahmi/quickhouse/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/mmirzafahmi/quickhouse/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/mmirzafahmi/quickhouse/compare/v0.6.0...v0.6.1

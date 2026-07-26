@@ -25,9 +25,10 @@ CH_URL = os.environ.get("QUICKHOUSE_CH_URL", "http://localhost:8123")
 TABLE = "bench_transfer"
 
 
-# 20 columns modeled on a typical accounting ledger line (a mix of bigint FKs,
-# some nullable, floats, text, bool, and timestamps), so the benchmark reflects
-# a realistic wide production column mix rather than a handful of synthetic types.
+# 20 columns modeled on a wide transactional table (order lines): a mix of
+# bigint FKs (some nullable), floats, text, bool, and timestamps, so the
+# benchmark reflects a realistic wide production column mix rather than a handful
+# of synthetic types.
 def seed(conn: psycopg.Connection, rows: int) -> float:
     t0 = time.time()
     with conn.cursor() as cur:
@@ -36,43 +37,43 @@ def seed(conn: psycopg.Connection, rows: int) -> float:
             f"""
             CREATE TABLE "{TABLE}" (
                 id              bigint PRIMARY KEY,
-                move_name       text,
-                account_id      bigint,
-                partner_id      bigint,
+                order_ref       text,
+                customer_id     bigint,
+                vendor_id       bigint,
                 product_id      bigint,
-                name            text,
+                description     text,
                 quantity        double precision,
-                price_unit      double precision,
+                unit_price      double precision,
                 discount        double precision,
-                debit           double precision,
-                credit          double precision,
-                balance         double precision,
-                amount_currency double precision,
+                subtotal        double precision,
+                tax             double precision,
+                total           double precision,
+                amount_usd      double precision,
                 currency_id     integer,
-                company_id      integer,
-                state           text,
-                blocked         boolean,
-                reconciled      boolean,
-                date_maturity   timestamp,
-                write_date      timestamp NOT NULL
+                warehouse_id    integer,
+                status          text,
+                flagged         boolean,
+                settled         boolean,
+                due_date        timestamp,
+                updated_at      timestamp NOT NULL
             )
             """
         )
         cur.execute(
             f"""
             INSERT INTO "{TABLE}" (
-                id, move_name, account_id, partner_id, product_id, name,
-                quantity, price_unit, discount, debit, credit, balance,
-                amount_currency, currency_id, company_id, state,
-                blocked, reconciled, date_maturity, write_date
+                id, order_ref, customer_id, vendor_id, product_id, description,
+                quantity, unit_price, discount, subtotal, tax, total,
+                amount_usd, currency_id, warehouse_id, status,
+                flagged, settled, due_date, updated_at
             )
             SELECT
                 i,
-                'INV/2024/' || i,
+                'ORD/2024/' || i,
                 (i %% 500) + 1,
                 CASE WHEN i %% 7 = 0 THEN NULL ELSE (i %% 10000) + 1 END,
                 CASE WHEN i %% 5 = 0 THEN NULL ELSE (i %% 50000) + 1 END,
-                'Line item ' || i,
+                'Order line ' || i,
                 (i %% 100) + 0.5,
                 (i %% 1000) * 1.25,
                 (i %% 20)::float,
@@ -82,7 +83,7 @@ def seed(conn: psycopg.Connection, rows: int) -> float:
                 (i %% 1000) * 1.3,
                 CASE WHEN i %% 3 = 0 THEN NULL ELSE (i %% 5) + 1 END,
                 (i %% 3) + 1,
-                (ARRAY['draft', 'posted', 'cancel'])[(i %% 3) + 1],
+                (ARRAY['pending', 'shipped', 'cancelled'])[(i %% 3) + 1],
                 (i %% 13 = 0),
                 (i %% 2 = 0),
                 CASE WHEN i %% 6 = 0 THEN NULL ELSE TIMESTAMP '2024-01-01' + (i || ' seconds')::interval END,

@@ -343,6 +343,15 @@ def sync(
     your own consolidation downstream; ``watermark`` drives the resume window
     and ``key`` is not required.
 
+    **Experimental features** (may change without a major-version bump, and carry
+    sharper edges — read their notes before relying on them):
+    ``chunk_rows`` (keyset resumable reads; ClickHouse-destination incremental
+    only, and requires a unique NOT-NULL integer keyset column),
+    ``BigQuery(write_method="storage_write")``, ``merge_prune_partition_by`` and
+    ``delete_stale_in_window`` (both can insert duplicate keys or delete history
+    if pointed at the wrong column), and ``column_transforms`` (injects raw SQL
+    into the source ``SELECT``).
+
     ``lookback_seconds`` widens the tracked watermark's lower bound by this
     many seconds before filtering, so a run re-includes a trailing window of
     already-synced rows — catches late-arriving or edited rows that don't
@@ -430,8 +439,8 @@ def sync(
     bounds the destination to the staging batch's range on ``<col>`` so
     BigQuery reads only the touched partitions. **Only safe when ``<col>`` is
     immutable per ``key``** (its value never changes across updates to a row)
-    and it is the table's partition column — e.g. a ``create_date``/inserted-at
-    column. Do **not** use a ``write_date``/updated-at column: an updated row's
+    and it is the table's partition column — e.g. a ``created_at``/inserted-at
+    column. Do **not** use a ``updated_at``/updated-at column: an updated row's
     new value points at a different partition than the existing row, so pruning
     would miss it and INSERT A DUPLICATE KEY instead of updating (the classic
     merge-filter dup bug). quickhouse can't detect mutability — this is a

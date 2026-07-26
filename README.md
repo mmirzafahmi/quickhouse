@@ -296,11 +296,11 @@ world:
 **MERGE cost on large BigQuery tables.** By default an incremental `MERGE`
 scans the whole destination table (it joins on `key` only), so upserting a few
 delta rows into a huge partitioned table bills the whole table each run. Set
-`merge_prune_partition_by="create_date"` to bound the scan to the staging
+`merge_prune_partition_by="created_at"` to bound the scan to the staging
 batch's range and let BigQuery prune partitions. **Only do this for an
 *immutable* column** — one whose value never changes for a given `key`, i.e. a
-`create_date`/inserted-at column that is also the partition column. Do **not**
-point it at a `write_date`/updated-at column: an updated row's new value lands
+`created_at`/inserted-at column that is also the partition column. Do **not**
+point it at a `updated_at`/updated-at column: an updated row's new value lands
 in a different partition than the existing row, so pruning would miss it and
 insert a duplicate key instead of updating. quickhouse can't detect mutability,
 so this is a deliberate opt-in; the default full scan is always correct.
@@ -330,7 +330,7 @@ errors are surfaced verbatim rather than wrapped in something generic.
 | `state_key` | Pin the incremental cursor's identity (stable across `source_query` edits; distinct per watermark column). Default derives it from source+dest |
 | `seed_watermark` / `skip_to_max` | Seed the cursor on the first run only (explicit floor, or the source's current max) — skips a doomed first full pull; mutually exclusive |
 | `advance_watermark` | `False` reads+merges a window without advancing the cursor (backfill without rewinding the schedule); default `True` |
-| `merge_prune_partition_by` | BigQuery incremental: prune the MERGE's destination scan to the staging range on this column. Only safe for an *immutable* partition column (e.g. `create_date`) — never a mutable `write_date` (would insert dup keys) |
+| `merge_prune_partition_by` | BigQuery incremental: prune the MERGE's destination scan to the staging range on this column. Only safe for an *immutable* partition column (e.g. `created_at`) — never a mutable `updated_at` (would insert dup keys) |
 | `chunk_rows` | Read in keyset-ordered chunks of N rows, committing the cursor per chunk so a mid-read failure resumes. Incremental + ClickHouse dest only; keyset column must be a unique NOT-NULL integer. `None` = one read (default) |
 | `retry_max_attempts` | Re-run the whole transfer on a transient *source* error (PG recovery-conflict/cancel; MySQL gone-away/lock-wait/deadlock). `1` = no retry (default) |
 | `column_transforms` | Per-column SQL value transforms over `source_table=` (e.g. `{"ts":"ts AT TIME ZONE 'UTC'"}`), preserving range partitioning. Postgres/MySQL only |
@@ -386,6 +386,21 @@ Arrays and composite (`RECORD`/`STRUCT`) types aren't supported yet.
   becomes a server-side hint rather than true client-side fan-out (a limitation
   of the underlying crate's read API).
 - **No CLI yet**, and CDC / custom transforms are future work.
+- **Single table per call** — `sync()` moves one table; loop over a list for many.
+
+## Stability and versioning
+
+quickhouse follows [Semantic Versioning](https://semver.org). It is **pre-1.0**:
+while on `0.x`, minor versions (`0.7 → 0.8`) may contain breaking API changes,
+and patch versions (`0.7.0 → 0.7.1`) are backwards-compatible fixes. Every change
+is recorded in the [CHANGELOG](CHANGELOG.md); pin a compatible range (e.g.
+`quickhouse~=0.7`).
+
+A few surfaces are **experimental** and may change even in a patch release —
+they're flagged in the API docstrings: `chunk_rows`, `merge_prune_partition_by`,
+`delete_stale_in_window`, `BigQuery(write_method="storage_write")`, and
+`column_transforms`. The core `sync()` call and the connection descriptor classes
+are considered stable within a minor version.
 
 ## Contributing
 
