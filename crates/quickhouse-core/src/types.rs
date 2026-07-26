@@ -192,6 +192,59 @@ pub mod bigquery {
         pub const JSON: u32 = 12;
     }
 
+    /// Parse a user-declared BigQuery type-name string (for an API source's
+    /// declared schema) into a `TableFieldType`. Case-insensitive, closed
+    /// allow-list; `RECORD`/`STRUCT`/`INTERVAL`/`RANGE` and anything unknown are
+    /// rejected up front with a clear error naming the column.
+    pub fn parse_bq_type_name(col: &str, decl: &str) -> crate::error::Result<BqType> {
+        use BqType as T;
+        Ok(match decl.trim().to_ascii_uppercase().as_str() {
+            "STRING" => T::String,
+            "BYTES" => T::Bytes,
+            "INTEGER" | "INT64" => T::Integer,
+            "FLOAT" | "FLOAT64" => T::Float,
+            "BOOLEAN" | "BOOL" => T::Boolean,
+            "TIMESTAMP" => T::Timestamp,
+            "DATE" => T::Date,
+            "TIME" => T::Time,
+            "DATETIME" => T::Datetime,
+            "NUMERIC" | "DECIMAL" => T::Numeric,
+            "BIGNUMERIC" | "BIGDECIMAL" => T::Bignumeric,
+            "JSON" => T::Json,
+            other => {
+                return Err(crate::error::EtlError::config(format!(
+                    "column '{col}': unsupported declared BigQuery type '{other}'; expected one of \
+                     STRING, BYTES, INTEGER, FLOAT, BOOLEAN, TIMESTAMP, DATE, TIME, DATETIME, \
+                     NUMERIC, BIGNUMERIC, JSON"
+                )))
+            }
+        })
+    }
+
+    /// The exact SCREAMING BigQuery type name that round-trips through
+    /// `bq_field_data_type`'s `serde_json::from_value(Value::String(..))` in the
+    /// sink — i.e. the canonical serde name, avoiding the `INT64`/`FLOAT64`/
+    /// `BOOL` aliases. Used to seed `type_overrides` for a declared API column
+    /// so the destination table gets the exact declared type.
+    pub fn canonical_bq_type_name(t: &BqType) -> &'static str {
+        use BqType as T;
+        match t {
+            T::String => "STRING",
+            T::Bytes => "BYTES",
+            T::Integer | T::Int64 => "INTEGER",
+            T::Float | T::Float64 => "FLOAT",
+            T::Boolean | T::Bool => "BOOLEAN",
+            T::Timestamp => "TIMESTAMP",
+            T::Date => "DATE",
+            T::Time => "TIME",
+            T::Datetime => "DATETIME",
+            T::Numeric => "NUMERIC",
+            T::Bignumeric => "BIGNUMERIC",
+            T::Json => "JSON",
+            _ => "STRING",
+        }
+    }
+
     /// Map a BigQuery field type to (`type_id`, Arrow type, ClickHouse inner type).
     ///
     /// `NUMERIC`/`BIGNUMERIC`/`DECIMAL`/`BIGDECIMAL` map to `Float64` by

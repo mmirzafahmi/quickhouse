@@ -111,6 +111,51 @@ Application Default Credentials. As a **destination** it also takes
 `write_method`: the default `"insert_all"` (simple, proven) or the opt-in
 `"storage_write"` (the gRPC Storage Write API — free and higher-throughput).
 
+### HTTP API sources — CleverTap & AppsFlyer (BigQuery destination only)
+
+These pull directly from the vendor APIs. API data has no catalog, so you
+**declare the schema**: each column's name, its BigQuery type, and — for
+CleverTap's nested event JSON — a dotted path into the record. The declared
+type drives the destination table; the watermark's `from`/`to` date window
+drives incremental pulls.
+
+```python
+# CleverTap Data Export API (events) -> BigQuery. region picks the API host.
+qh.sync(
+    qh.CleverTap(
+        account_id="...", passcode="...",   # or load from a secret manager
+        event_name="App Launched", region="sg1",
+        columns=[
+            ("identity", "STRING", "profile.identity"),   # dotted path into the record
+            ("email",    "STRING", "profile.email"),
+            ("ts",       "TIMESTAMP"),                     # top-level epoch seconds
+            ("app_ver",  "STRING", "profile.app_version"),
+        ],
+        from_date="2026-07-01",             # window start (first-run floor for incremental)
+    ),
+    qh.BigQuery("my-gcp-project", dataset_id="analytics"),
+    dest_table="clevertap_app_launched",
+    mode="incremental", watermark="ts", key=["identity"],
+)
+
+# AppsFlyer raw-data Pull API (CSV report) -> BigQuery. columns map to CSV headers.
+qh.sync(
+    qh.AppsFlyer(
+        api_token="...", app_id="id123456789", report_type="installs_report",
+        columns={"install_time": "TIMESTAMP", "media_source": "STRING", "campaign": "STRING"},
+        from_date="2026-07-01",
+    ),
+    qh.BigQuery("my-gcp-project", dataset_id="analytics"),
+    dest_table="af_installs", mode="full",
+)
+```
+
+Notes: incremental re-pulls the boundary day each run, so `key` is required
+(BigQuery MERGE dedups it). `NUMERIC` is delivered exactly (declare it only for
+values sent as JSON strings/integers); `BIGNUMERIC` is lossy. AppsFlyer's Pull
+API has hard daily-call/row caps — for high volume use its Data Locker (files
+in a bucket) instead.
+
 A ClickHouse destination can also archive every synced batch to S3 as a data
 lake — a secondary, best-effort-free backup independent of ClickHouse's own
 retention:

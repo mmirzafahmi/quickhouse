@@ -18,11 +18,14 @@ use tokio::task::JoinSet;
 
 use crate::archive::{archive_object_key, build_s3_store, S3ArchiveWriter};
 use crate::config::{
-    DestinationConfig, ParquetCompression, S3ArchiveConfig, SourceConfig, SyncMode, TransferConfig,
-    TransferResult, WatermarkSeed,
+    ApiColumn, DestinationConfig, ParquetCompression, S3ArchiveConfig, SourceConfig, SyncMode,
+    TransferConfig, TransferResult, WatermarkSeed,
 };
 use crate::decode::CopyDecoder;
+use crate::decode_api::{resolve_api_columns, ApiBatcher};
 use crate::decode_bigquery::BigQueryBatcher;
+use crate::source::appsflyer::AppsFlyerSource;
+use crate::source::clevertap::{CleverTapSource, PageStatus};
 use crate::decode_mysql::MySqlBatcher;
 use crate::error::{EtlError, Result};
 use crate::memory::MemoryBudget;
@@ -244,7 +247,7 @@ pub async fn run_transfer(
         cfg.source_table
             .as_deref()
             .or(cfg.source_query.as_deref())
-            .unwrap_or(""),
+            .unwrap_or_else(|| source_cfg.kind()),
         cfg.dest_table
     );
     let max_attempts = cfg.retry_max_attempts.max(1);
@@ -299,17 +302,26 @@ async fn run_transfer_impl(
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let mut cfg = cfg;
-    cfg.validate()?;
+    // API sources have no source_table/source_query and reject a few DB-only
+    // knobs; validate them under the API rules.
+    if source_cfg.is_api() {
+        cfg.validate_api()?;
+    } else {
+        cfg.validate()?;
+    }
     // Drop mode-irrelevant fields (e.g. a watermark passed with mode="full")
     // so the config that runs matches what's effective — see normalize().
     cfg.normalize();
+    // API sources write only to BigQuery — reject any other destination with a
+    // clean config error before any client/archive setup.
+    ensure_api_dest_supported(&source_cfg, &dest)?;
     let started = Instant::now();
 
     let source_label = cfg
         .source_table
         .clone()
         .or_else(|| cfg.source_query.clone())
-        .unwrap_or_default();
+        .unwrap_or_else(|| source_cfg.kind().into());
     tracing::info!(
         "starting {} sync: {} -> {} (mode={:?})",
         source_cfg.kind(),
@@ -345,6 +357,14 @@ async fn run_transfer_impl(
         return run_transfer_bigquery(&source, sink, cfg, progress, started, archive_info, staging).await;
     }
 
+    // HTTP API sources (CleverTap/AppsFlyer): a declared schema + paginated
+    // fetch into the BigQuery sink — a separate flow from the DB partition
+    // machinery. archive is always None (BigQuery-only).
+    if source_cfg.is_api() {
+        let sink = Sink::new(dest).await?;
+        return run_transfer_api(source_cfg, sink, cfg, progress, started, staging).await;
+    }
+
     let source = Arc::new(match &source_cfg {
         SourceConfig::Postgres(pg) => Source::Postgres(PgSource::new(
             pg.dsn.clone(),
@@ -358,6 +378,9 @@ async fn run_transfer_impl(
             my.require_tls,
         )),
         SourceConfig::BigQuery(_) => unreachable!("handled via early return above"),
+        SourceConfig::CleverTap(_) | SourceConfig::AppsFlyer(_) => {
+            unreachable!("API sources handled via early return above")
+        }
     });
     let sink = Sink::new(dest).await?;
 
@@ -796,6 +819,252 @@ async fn run_transfer_bigquery(
             counters.rows_written.load(Ordering::Relaxed),
             duration_secs,
             counters.rows_written.load(Ordering::Relaxed) as f64 / duration_secs.max(0.001)
+        );
+        Ok(TransferResult {
+            rows_read: counters.rows_read.load(Ordering::Relaxed),
+            rows_written: counters.rows_written.load(Ordering::Relaxed),
+            bytes_written: counters.bytes_written.load(Ordering::Relaxed),
+            duration_secs,
+            new_watermark,
+        })
+    }
+    .await;
+
+    if outcome.is_err() && used_staging {
+        cleanup_staging(&cleanup_sink, &cleanup_staging_name).await;
+    }
+    outcome
+}
+
+// ---- HTTP API sources (CleverTap / AppsFlyer) ----
+
+/// API sources write only to BigQuery. Reject any other destination up front
+/// with a clear config error.
+fn ensure_api_dest_supported(source_cfg: &SourceConfig, dest: &DestinationConfig) -> Result<()> {
+    if source_cfg.is_api() && !matches!(dest, DestinationConfig::BigQuery(_)) {
+        return Err(EtlError::config(format!(
+            "the {} source only supports a BigQuery destination (got {})",
+            source_cfg.kind(),
+            dest.kind()
+        )));
+    }
+    Ok(())
+}
+
+fn api_columns_of(source_cfg: &SourceConfig) -> &[ApiColumn] {
+    match source_cfg {
+        SourceConfig::CleverTap(c) => &c.columns,
+        SourceConfig::AppsFlyer(a) => &a.columns,
+        _ => &[],
+    }
+}
+
+fn api_source_window(source_cfg: &SourceConfig) -> (Option<&str>, Option<&str>) {
+    match source_cfg {
+        SourceConfig::CleverTap(c) => (c.from_date.as_deref(), c.to_date.as_deref()),
+        SourceConfig::AppsFlyer(a) => (a.from_date.as_deref(), a.to_date.as_deref()),
+        _ => (None, None),
+    }
+}
+
+/// Seed `type_overrides` from each declared column's BigQuery type so the
+/// destination table is created with the exact declared type (JSON/TIME/NUMERIC
+/// etc.). A user-supplied override for the same column wins (escape hatch).
+fn seed_api_type_overrides(cfg: &mut TransferConfig, cols: &[ApiColumn]) -> Result<()> {
+    for c in cols {
+        let canon = crate::decode_api::canonical_declared_type(c)?;
+        cfg.type_overrides.entry(c.name.clone()).or_insert_with(|| canon.to_string());
+    }
+    Ok(())
+}
+
+/// Resolve the `[from, to]` date window (`"YYYY-MM-DD"`) and the watermark to
+/// persist. Full mode requires an explicit `from_date`. Incremental derives
+/// `from` from the persisted cursor, else the seed, else `from_date`; `to`
+/// defaults to today; the window is clamped to `from <= to`.
+fn derive_api_window(
+    cfg: &TransferConfig,
+    source_cfg: &SourceConfig,
+    committed: Option<String>,
+) -> Result<(String, String, Option<String>)> {
+    let (from_date, to_date) = api_source_window(source_cfg);
+    let today = Utc::now().format("%Y-%m-%d").to_string();
+    let to = to_date.map(str::to_string).unwrap_or(today);
+    if cfg.mode == SyncMode::Full {
+        let from = from_date.map(str::to_string).ok_or_else(|| {
+            EtlError::config("API full-refresh needs a from_date (window start, \"YYYY-MM-DD\")")
+        })?;
+        Ok((from, to, None))
+    } else {
+        let mut from = committed
+            .or_else(|| seed_value(&cfg.seed_watermark, Some(&to)))
+            .or_else(|| from_date.map(str::to_string))
+            .ok_or_else(|| {
+                EtlError::config(
+                    "first incremental API run needs a start date: set from_date, seed_watermark=, or skip_to_max=True",
+                )
+            })?;
+        if from > to {
+            from = to.clone(); // guard a clock-skew / stale-cursor inversion
+        }
+        Ok((from, to.clone(), Some(to)))
+    }
+}
+
+fn warn_coerced_scalars(scope: &str, n: u64) {
+    if n > 0 {
+        tracing::warn!(
+            "{scope}: {n} value(s) couldn't be parsed to their declared type and were set to NULL"
+        );
+    }
+}
+
+/// Transfer from an HTTP API source (CleverTap/AppsFlyer) into BigQuery.
+/// Mirrors `run_transfer_bigquery`'s staging/swap/merge/watermark tail; only the
+/// read side differs — a declared schema + paginated fetch instead of a DB read.
+async fn run_transfer_api(
+    source_cfg: SourceConfig,
+    sink: Sink,
+    mut cfg: TransferConfig,
+    progress: Option<ProgressCb>,
+    started: Instant,
+    staging: String,
+) -> Result<TransferResult> {
+    // Without a source_table, `effective_state_key()` is empty — give the
+    // incremental cursor a stable identity. A user `state_key` still wins.
+    if cfg.state_key.is_none() {
+        cfg.state_key = source_cfg.api_state_identity();
+    }
+    let cols = api_columns_of(&source_cfg).to_vec();
+    seed_api_type_overrides(&mut cfg, &cols)?;
+    let source_cols = resolve_api_columns(&cols)?;
+    let plan: SelectPlan = transform::plan(&source_cols, &cfg, sink.dest_kind())?;
+
+    // Per-output-column lookup path, aligned to `plan.source_columns` (which
+    // survives include/exclude; keyed on the source name, unaffected by rename).
+    let path_by_name: std::collections::HashMap<&str, &str> = cols
+        .iter()
+        .map(|c| (c.name.as_str(), c.path.as_deref().unwrap_or(c.name.as_str())))
+        .collect();
+    let lookups: Vec<String> = plan
+        .source_columns
+        .iter()
+        .map(|n| path_by_name.get(n.as_str()).copied().unwrap_or(n.as_str()).to_string())
+        .collect();
+
+    let committed = if cfg.mode == SyncMode::Incremental {
+        let watermark = cfg.watermark.as_ref().unwrap();
+        ensure_watermark_column(watermark, &source_cols)?;
+        sink.read_last_watermark(&cfg).await?
+    } else {
+        None
+    };
+    let (from, to, new_watermark) = derive_api_window(&cfg, &source_cfg, committed)?;
+
+    let target_table = prepare_target(&sink, &cfg, &plan.dest_columns, &staging).await?;
+    let used_staging = target_table != cfg.dest_table;
+    let cleanup_sink = sink.clone();
+    let cleanup_staging_name = staging.clone();
+
+    let outcome: Result<TransferResult> = async move {
+        tracing::info!(
+            "quickhouse: {} API transfer into {} for [{from}, {to}]",
+            source_cfg.kind(),
+            target_table
+        );
+        let counters = Arc::new(Counters::default());
+        let ctx = SendCtx {
+            sink: sink.clone(),
+            budget: MemoryBudget::new(cfg.max_memory_bytes),
+            target_table: Arc::new(target_table),
+            counters: counters.clone(),
+            progress: progress.clone(),
+            started,
+            archive: None,
+            throttle: None,
+        };
+        let mut batcher = ApiBatcher::new(&plan.dest_columns, &lookups, cfg.batch_rows, cfg.batch_bytes)?;
+        let schema = batcher.schema();
+        let mut sends: JoinSet<Result<()>> = JoinSet::new();
+
+        match &source_cfg {
+            SourceConfig::CleverTap(c) => {
+                let src = CleverTapSource::new(c)?;
+                let from_i = crate::source::clevertap::iso_to_yyyymmdd(&from)?;
+                let to_i = crate::source::clevertap::iso_to_yyyymmdd(&to)?;
+                let mut cursor = src.create_export(&c.event_name, from_i, to_i).await?;
+                loop {
+                    let page = src.next_page(&cursor).await?;
+                    for rec in &page.records {
+                        if let Some(b) = batcher.append_record(rec)? {
+                            ctx.spawn_upload(&mut sends, schema.clone(), b).await;
+                            reap(&mut sends, false).await?;
+                        }
+                    }
+                    // Records are processed above BEFORE this check, so the
+                    // terminal `success` page is never dropped.
+                    if matches!(page.status, PageStatus::Success) || page.records.is_empty() {
+                        break;
+                    }
+                    match page.cursor {
+                        Some(next) => cursor = next,
+                        None => break,
+                    }
+                }
+            }
+            SourceConfig::AppsFlyer(a) => {
+                let src = AppsFlyerSource::new(a)?;
+                let records = src.fetch_records(&from, &to, &lookups).await?;
+                for rec in &records {
+                    if let Some(b) = batcher.append_record(rec)? {
+                        ctx.spawn_upload(&mut sends, schema.clone(), b).await;
+                        reap(&mut sends, false).await?;
+                    }
+                }
+            }
+            _ => unreachable!("run_transfer_api only handles API sources"),
+        }
+        if let Some(b) = batcher.finish()? {
+            ctx.spawn_upload(&mut sends, schema.clone(), b).await;
+        }
+        reap(&mut sends, true).await?;
+        counters.rows_read.fetch_add(batcher.rows_total, Ordering::Relaxed);
+        emit_progress(&counters, &progress, started);
+        warn_coerced_scalars("api read", batcher.invalid_scalars_total);
+        warn_coerced_dates("api read", batcher.invalid_dates_total);
+        warn_coerced_decimals("api read", batcher.invalid_decimals_total);
+        tracing::info!(
+            "api read complete: {} rows written",
+            counters.rows_written.load(Ordering::Relaxed)
+        );
+
+        if cfg.mode == SyncMode::Full {
+            tracing::info!("swapping staging table into '{}'", cfg.dest_table);
+            sink.atomic_swap(&cfg.dest_table, &staging, &plan.dest_columns).await?;
+            sink.drop_table(&staging).await?;
+        }
+        if cfg.mode == SyncMode::Incremental {
+            if sink.requires_staging_for_incremental() {
+                tracing::info!("merging staged incremental rows into '{}'", cfg.dest_table);
+                sink.merge_into(&cfg.dest_table, &staging, &cfg.key, &plan.dest_columns, cfg.merge_prune_partition_by.as_deref()).await?;
+                sink.drop_table(&staging).await?;
+            }
+            if let Some(w) = &new_watermark {
+                if cfg.advance_watermark {
+                    tracing::info!("persisting new watermark (window end): {w}");
+                    sink.persist_watermark(&cfg, w, counters.rows_written.load(Ordering::Relaxed))
+                        .await?;
+                } else {
+                    tracing::info!("advance_watermark=false: window end {w} NOT persisted");
+                }
+            }
+        }
+
+        let duration_secs = started.elapsed().as_secs_f64();
+        tracing::info!(
+            "transfer complete: {} rows in {:.2}s",
+            counters.rows_written.load(Ordering::Relaxed),
+            duration_secs
         );
         Ok(TransferResult {
             rows_read: counters.rows_read.load(Ordering::Relaxed),
@@ -2259,6 +2528,57 @@ mod tests {
         assert_eq!(cp.keyset_col, "id");
         assert_eq!(cp.keyset_idx, 0);
         assert_eq!(cp.limit, 1000);
+    }
+
+    fn ct_source() -> SourceConfig {
+        SourceConfig::CleverTap(crate::config::CleverTapConfig {
+            base_url: "https://sg1.api.clevertap.com".into(),
+            account_id: "a".into(),
+            passcode: "p".into(),
+            event_name: "App Launched".into(),
+            batch_size: 0,
+            columns: vec![ApiColumn { name: "ts".into(), bq_type: "TIMESTAMP".into(), path: None }],
+            from_date: None,
+            to_date: None,
+        })
+    }
+
+    #[test]
+    fn api_dest_gate_requires_bigquery() {
+        let src = ct_source();
+        let ch = DestinationConfig::ClickHouse(crate::config::ClickHouseConfig {
+            url: "http://x".into(), database: "d".into(), user: "u".into(),
+            password: "".into(), compression: crate::config::Compression::None, s3_archive: None,
+        });
+        assert!(ensure_api_dest_supported(&src, &ch).unwrap_err().to_string().contains("BigQuery"));
+        let bq = DestinationConfig::BigQuery(crate::config::BigQueryDestConfig {
+            project_id: None, credentials_file: None, dataset_id: "ds".into(),
+            write_method: crate::config::BigQueryWriteMethod::InsertAll,
+        });
+        assert!(ensure_api_dest_supported(&src, &bq).is_ok());
+    }
+
+    #[test]
+    fn derive_api_window_full_and_incremental() {
+        // Full: from_date required.
+        let mut src = ct_source();
+        let mut cfg = crate::config::default_test_config();
+        cfg.mode = SyncMode::Full;
+        assert!(derive_api_window(&cfg, &src, None).is_err(), "full needs from_date");
+        if let SourceConfig::CleverTap(c) = &mut src {
+            c.from_date = Some("2026-07-01".into());
+            c.to_date = Some("2026-07-10".into());
+        }
+        let (from, to, wm) = derive_api_window(&cfg, &src, None).unwrap();
+        assert_eq!((from.as_str(), to.as_str(), wm), ("2026-07-01", "2026-07-10", None));
+        // Incremental: committed cursor wins as `from`; window end is persisted.
+        cfg.mode = SyncMode::Incremental;
+        let (from, _to, wm) = derive_api_window(&cfg, &src, Some("2026-07-05".into())).unwrap();
+        assert_eq!(from, "2026-07-05");
+        assert_eq!(wm, Some("2026-07-10".to_string()));
+        // Inversion (committed > to) clamps `from` to `to`.
+        let (from, to, _) = derive_api_window(&cfg, &src, Some("2026-08-01".into())).unwrap();
+        assert_eq!(from, to, "from clamped to to on inversion");
     }
 
     #[test]

@@ -38,6 +38,7 @@ prost.workspace = true
 prost-types.workspace = true
 parquet.workspace = true
 object_store.workspace = true
+csv.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true

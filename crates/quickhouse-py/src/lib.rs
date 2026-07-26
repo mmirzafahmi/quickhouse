@@ -158,12 +158,164 @@ impl BigQuery {
     }
 }
 
-/// Accepts `Postgres`, `MySQL`, or `BigQuery` as `sync()`'s `source` argument.
+/// Parse a declared-column spec into `ApiColumn`s. Accepts either a list of
+/// `(name, type)` / `(name, type, path)` tuples, or a `{name: type}` dict
+/// (with optional `paths={name: dotted_path}`).
+fn parse_columns(
+    columns: &Bound<'_, PyAny>,
+    paths: Option<HashMap<String, String>>,
+) -> PyResult<Vec<core::ApiColumn>> {
+    let paths = paths.unwrap_or_default();
+    let mut out = Vec::new();
+    if let Ok(dict) = columns.downcast::<pyo3::types::PyDict>() {
+        for (k, v) in dict.iter() {
+            let name: String = k.extract()?;
+            let bq_type: String = v.extract()?;
+            let path = paths.get(&name).cloned();
+            out.push(core::ApiColumn { name, bq_type, path });
+        }
+        if out.is_empty() {
+            return Err(PyRuntimeError::new_err("columns is empty; declare at least one column"));
+        }
+        return Ok(out);
+    }
+    for item in columns.iter()? {
+        let item = item?;
+        if let Ok((name, bq_type, path)) = item.extract::<(String, String, String)>() {
+            out.push(core::ApiColumn { name, bq_type, path: Some(path) });
+        } else if let Ok((name, bq_type)) = item.extract::<(String, String)>() {
+            let path = paths.get(&name).cloned();
+            out.push(core::ApiColumn { name, bq_type, path });
+        } else {
+            return Err(PyRuntimeError::new_err(
+                "each column must be (name, type) or (name, type, path), or use a {name: type} dict",
+            ));
+        }
+    }
+    if out.is_empty() {
+        return Err(PyRuntimeError::new_err("columns is empty; declare at least one column"));
+    }
+    Ok(out)
+}
+
+/// CleverTap Data Export API source (events). BigQuery-only destination.
+///
+/// `columns` declares the output schema (list of `(name, bq_type)` /
+/// `(name, bq_type, dotted_path)` tuples, or a `{name: bq_type}` dict); `path`
+/// (or `paths={name: "a.b"}`) extracts a value from the nested event JSON.
+/// Auth is `account_id` + `passcode`; `region` picks the API host (default
+/// `sg1` -> `https://sg1.api.clevertap.com`). The `[from_date, to_date]` window
+/// (`"YYYY-MM-DD"`) is the full-refresh window / incremental first-run floor.
+#[pyclass]
+#[derive(Clone)]
+struct CleverTap {
+    base_url: String,
+    account_id: String,
+    passcode: String,
+    event_name: String,
+    batch_size: u32,
+    columns: Vec<core::ApiColumn>,
+    from_date: Option<String>,
+    to_date: Option<String>,
+}
+
+#[pymethods]
+impl CleverTap {
+    #[new]
+    #[pyo3(signature = (account_id, passcode, event_name, columns, *, region="sg1".to_string(), batch_size=5000, from_date=None, to_date=None, paths=None, base_url=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        account_id: String,
+        passcode: String,
+        event_name: String,
+        columns: &Bound<'_, PyAny>,
+        region: String,
+        batch_size: u32,
+        from_date: Option<String>,
+        to_date: Option<String>,
+        paths: Option<HashMap<String, String>>,
+        base_url: Option<String>,
+    ) -> PyResult<Self> {
+        let columns = parse_columns(columns, paths)?;
+        let base_url = base_url.unwrap_or_else(|| format!("https://{region}.api.clevertap.com"));
+        Ok(CleverTap { base_url, account_id, passcode, event_name, batch_size, columns, from_date, to_date })
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "CleverTap(event_name={:?}, columns={}, account_id=***, passcode=***)",
+            self.event_name,
+            self.columns.len()
+        )
+    }
+}
+
+/// AppsFlyer raw-data Pull API source (CSV report). BigQuery-only destination.
+///
+/// `columns` declares the output schema; each column reads the CSV header equal
+/// to its `path` (or its `name`). Auth is the V2.0 `api_token`. The Pull API has
+/// hard daily-call/row caps — for high volume use AppsFlyer Data Locker.
+#[pyclass]
+#[derive(Clone)]
+struct AppsFlyer {
+    base_url: String,
+    api_token: String,
+    app_id: String,
+    report_type: String,
+    extra_params: HashMap<String, String>,
+    columns: Vec<core::ApiColumn>,
+    from_date: Option<String>,
+    to_date: Option<String>,
+}
+
+#[pymethods]
+impl AppsFlyer {
+    #[new]
+    #[pyo3(signature = (api_token, app_id, report_type, columns, *, from_date=None, to_date=None, paths=None, extra_params=None, base_url="https://hq1.appsflyer.com".to_string()))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        api_token: String,
+        app_id: String,
+        report_type: String,
+        columns: &Bound<'_, PyAny>,
+        from_date: Option<String>,
+        to_date: Option<String>,
+        paths: Option<HashMap<String, String>>,
+        extra_params: Option<HashMap<String, String>>,
+        base_url: String,
+    ) -> PyResult<Self> {
+        let columns = parse_columns(columns, paths)?;
+        Ok(AppsFlyer {
+            base_url,
+            api_token,
+            app_id,
+            report_type,
+            extra_params: extra_params.unwrap_or_default(),
+            columns,
+            from_date,
+            to_date,
+        })
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "AppsFlyer(app_id={:?}, report_type={:?}, columns={}, api_token=***)",
+            self.app_id,
+            self.report_type,
+            self.columns.len()
+        )
+    }
+}
+
+/// Accepts `Postgres`, `MySQL`, `BigQuery`, `CleverTap`, or `AppsFlyer` as
+/// `sync()`'s `source` argument.
 #[derive(FromPyObject)]
 enum AnySource {
     Postgres(Postgres),
     MySQL(MySQL),
     BigQuery(BigQuery),
+    CleverTap(CleverTap),
+    AppsFlyer(AppsFlyer),
 }
 
 impl From<AnySource> for core::SourceConfig {
@@ -184,6 +336,26 @@ impl From<AnySource> for core::SourceConfig {
                 project_id: b.project_id,
                 credentials_file: b.credentials_file,
                 // dataset_id is a target-only field (see BigQuery's doc comment) — ignored here.
+            }),
+            AnySource::CleverTap(c) => core::SourceConfig::CleverTap(core::CleverTapConfig {
+                base_url: c.base_url,
+                account_id: c.account_id,
+                passcode: c.passcode,
+                event_name: c.event_name,
+                batch_size: c.batch_size,
+                columns: c.columns,
+                from_date: c.from_date,
+                to_date: c.to_date,
+            }),
+            AnySource::AppsFlyer(a) => core::SourceConfig::AppsFlyer(core::AppsFlyerConfig {
+                base_url: a.base_url,
+                api_token: a.api_token,
+                app_id: a.app_id,
+                report_type: a.report_type,
+                extra_params: a.extra_params,
+                columns: a.columns,
+                from_date: a.from_date,
+                to_date: a.to_date,
             }),
         }
     }
@@ -622,6 +794,8 @@ fn _quickhouse(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Postgres>()?;
     m.add_class::<MySQL>()?;
     m.add_class::<BigQuery>()?;
+    m.add_class::<CleverTap>()?;
+    m.add_class::<AppsFlyer>()?;
     m.add_class::<ClickHouse>()?;
     m.add_class::<S3Archive>()?;
     m.add_class::<Progress>()?;

@@ -41,7 +41,9 @@ For a tqdm progress bar instead of a print callback (``pip install quickhouse[pr
 """
 
 from ._quickhouse import (
+    AppsFlyer,
     BigQuery,
+    CleverTap,
     ClickHouse,
     MySQL,
     Postgres,
@@ -58,6 +60,8 @@ __all__ = [
     "Postgres",
     "MySQL",
     "BigQuery",
+    "CleverTap",
+    "AppsFlyer",
     "ClickHouse",
     "S3Archive",
     "Progress",

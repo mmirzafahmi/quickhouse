@@ -44,23 +44,98 @@ pub struct BigQueryConfig {
     pub credentials_file: Option<String>,
 }
 
-/// Which database engine to read from.
+/// One declared output column for an HTTP API source. API responses have no
+/// catalog to resolve a schema from, so the user declares the destination
+/// column `name`, its BigQuery type (`bq_type` — a BigQuery type-name string:
+/// `STRING`/`INTEGER`/`FLOAT`/`BOOLEAN`/`TIMESTAMP`/`DATETIME`/`DATE`/`TIME`/
+/// `NUMERIC`/`BIGNUMERIC`/`BYTES`/`JSON`), and — for a nested-JSON source
+/// (CleverTap) — an optional dotted `path` locating the value inside each
+/// record (e.g. `"profile.identity"`, `"event_props.amount"`). `path=None`
+/// looks the value up by `name` at the record's top level. For AppsFlyer CSV,
+/// `path` (if set) is the CSV header to read from; else `name` is the header.
+#[derive(Debug, Clone)]
+pub struct ApiColumn {
+    pub name: String,
+    pub bq_type: String,
+    pub path: Option<String>,
+}
+
+/// Read from CleverTap's Data Export API (events). Auth is Account ID +
+/// Passcode; the host is region-specific (e.g. `https://sg1.api.clevertap.com`).
+#[derive(Debug, Clone)]
+pub struct CleverTapConfig {
+    /// Region base URL, e.g. `https://sg1.api.clevertap.com`.
+    pub base_url: String,
+    pub account_id: String,
+    pub passcode: String,
+    /// Event to export (the `event_name` in the create-export request).
+    pub event_name: String,
+    /// `?batch_size=N` per page; `0` uses the client default.
+    pub batch_size: u32,
+    pub columns: Vec<ApiColumn>,
+    /// Window start `"YYYY-MM-DD"` (full-mode start / incremental first-run floor).
+    pub from_date: Option<String>,
+    /// Window end `"YYYY-MM-DD"` (defaults to today).
+    pub to_date: Option<String>,
+}
+
+/// Read from AppsFlyer's raw-data Pull API. Auth is a V2.0 bearer token. The
+/// Pull API has hard daily-call and row caps — for high volume, Data Locker
+/// (files in a bucket) is the vendor-recommended path.
+#[derive(Debug, Clone)]
+pub struct AppsFlyerConfig {
+    /// API host, default `https://hq1.appsflyer.com`.
+    pub base_url: String,
+    pub api_token: String,
+    pub app_id: String,
+    /// e.g. `installs_report`, `in_app_events_report`, `organic_installs_report`.
+    pub report_type: String,
+    /// Extra query params appended to the report URL (e.g. `timezone`, `maximum_rows`).
+    pub extra_params: HashMap<String, String>,
+    pub columns: Vec<ApiColumn>,
+    pub from_date: Option<String>,
+    pub to_date: Option<String>,
+}
+
+/// Which engine/API to read from.
 #[derive(Debug, Clone)]
 pub enum SourceConfig {
     Postgres(PostgresConfig),
     MySql(MySqlConfig),
     BigQuery(BigQueryConfig),
+    CleverTap(CleverTapConfig),
+    AppsFlyer(AppsFlyerConfig),
 }
 
 impl SourceConfig {
     /// A short label identifying the source, used to persist watermark state
     /// under a source-qualified key (so the same table name in different
-    /// engines doesn't collide).
+    /// engines doesn't collide) and in log lines.
     pub fn kind(&self) -> &'static str {
         match self {
             SourceConfig::Postgres(_) => "postgres",
             SourceConfig::MySql(_) => "mysql",
             SourceConfig::BigQuery(_) => "bigquery",
+            SourceConfig::CleverTap(_) => "clevertap",
+            SourceConfig::AppsFlyer(_) => "appsflyer",
+        }
+    }
+
+    /// Whether this is an HTTP API source (CleverTap/AppsFlyer) — those take a
+    /// declared schema + date window and bypass the DB schema-resolution /
+    /// partition machinery, writing only to BigQuery.
+    pub fn is_api(&self) -> bool {
+        matches!(self, SourceConfig::CleverTap(_) | SourceConfig::AppsFlyer(_))
+    }
+
+    /// A stable identity string for an API source's incremental cursor in
+    /// `_quickhouse_state` (API sources have no `source_table`). `None` for a
+    /// non-API source.
+    pub fn api_state_identity(&self) -> Option<String> {
+        match self {
+            SourceConfig::CleverTap(c) => Some(format!("clevertap:{}", c.event_name)),
+            SourceConfig::AppsFlyer(a) => Some(format!("appsflyer:{}:{}", a.app_id, a.report_type)),
+            _ => None,
         }
     }
 }
@@ -434,12 +509,42 @@ impl TransferConfig {
             .or_else(|| self.key.first().cloned())
     }
 
+    /// Validation for a DB source (Postgres/MySQL/BigQuery) — byte-identical to
+    /// the original `validate`.
     pub fn validate(&self) -> crate::error::Result<()> {
+        self.validate_impl(false)
+    }
+
+    /// Validation for an HTTP API source (CleverTap/AppsFlyer): no
+    /// `source_table`/`source_query` is expected (the "what to read" lives on
+    /// the source descriptor), and a few DB-only knobs are rejected.
+    pub fn validate_api(&self) -> crate::error::Result<()> {
+        self.validate_impl(true)
+    }
+
+    fn validate_impl(&self, is_api: bool) -> crate::error::Result<()> {
         use crate::error::EtlError;
-        if self.source_table.is_none() && self.source_query.is_none() {
+        if !is_api && self.source_table.is_none() && self.source_query.is_none() {
             return Err(EtlError::config(
                 "either source_table or source_query must be set",
             ));
+        }
+        if is_api {
+            if !self.column_transforms.is_empty() {
+                return Err(EtlError::config(
+                    "column_transforms is not supported for an API source (declare the columns instead)",
+                ));
+            }
+            if self.chunk_rows.is_some() {
+                return Err(EtlError::config(
+                    "chunk_rows (keyset resumable reads) is not supported for an API source",
+                ));
+            }
+            if self.lookback_seconds > 0 {
+                return Err(EtlError::config(
+                    "lookback_seconds is not supported for an API source",
+                ));
+            }
         }
         if self.mode == SyncMode::Incremental && self.watermark.is_none() {
             return Err(EtlError::config(
@@ -710,6 +815,23 @@ mod tests {
         c.partition_column = None;
         c.key = vec![];
         assert_eq!(c.keyset_column(), None);
+    }
+
+    #[test]
+    fn validate_api_allows_no_table_and_rejects_db_only_knobs() {
+        // No source_table/query is fine under the API rules.
+        let mut c = cfg(SyncMode::Full, None);
+        c.source_table = None;
+        c.source_query = None;
+        assert!(c.validate_api().is_ok());
+        assert!(c.validate().is_err(), "DB validation still requires a table/query");
+        // API rejects column_transforms / chunk_rows / lookback.
+        let mut c = cfg(SyncMode::Incremental, Some("ts"));
+        c.column_transforms = HashMap::from([("x".to_string(), "y".to_string())]);
+        assert!(c.validate_api().unwrap_err().to_string().contains("column_transforms"));
+        let mut c = cfg(SyncMode::Incremental, Some("ts"));
+        c.chunk_rows = Some(1000);
+        assert!(c.validate_api().unwrap_err().to_string().contains("chunk_rows"));
     }
 
     #[test]

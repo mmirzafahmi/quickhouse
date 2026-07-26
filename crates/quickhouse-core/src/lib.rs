@@ -15,6 +15,7 @@ pub mod config;
 mod decimal;
 pub mod ddl;
 pub mod decode;
+pub mod decode_api;
 pub mod decode_bigquery;
 pub mod decode_mysql;
 pub mod error;
@@ -26,9 +27,10 @@ pub mod transform;
 pub mod types;
 
 pub use config::{
-    BigQueryConfig, BigQueryDestConfig, BigQueryWriteMethod, ClickHouseConfig, Compression,
-    DestinationConfig, MySqlConfig, ParquetCompression, PostgresConfig, S3ArchiveConfig,
-    SourceConfig, SyncMode, TransferConfig, TransferResult, WatermarkSeed,
+    ApiColumn, AppsFlyerConfig, BigQueryConfig, BigQueryDestConfig, BigQueryWriteMethod,
+    CleverTapConfig, ClickHouseConfig, Compression, DestinationConfig, MySqlConfig,
+    ParquetCompression, PostgresConfig, S3ArchiveConfig, SourceConfig, SyncMode, TransferConfig,
+    TransferResult, WatermarkSeed,
 };
 pub use error::{EtlError, Result};
 pub use sync::{run_transfer, Progress, ProgressCb};

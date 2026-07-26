@@ -1,6 +1,10 @@
 """Type stubs for the compiled ``quickhouse._quickhouse`` extension module."""
 
-from typing import Callable, Mapping, Optional, Sequence, Union
+from typing import Callable, Mapping, Optional, Sequence, Tuple, Union
+
+# A declared API-source schema: a list of (name, bq_type) / (name, bq_type,
+# path) tuples, or a {name: bq_type} dict.
+_ApiColumns = Union[Sequence[Union[Tuple[str, str], Tuple[str, str, str]]], Mapping[str, str]]
 
 __version__: str
 
@@ -162,6 +166,69 @@ class S3Archive:
         compression: str = "zstd",
     ) -> None: ...
 
+class CleverTap:
+    """CleverTap Data Export API source (events). **BigQuery destination only.**
+
+    API responses have no catalog, so you *declare* the output schema via
+    ``columns`` (a list of ``(name, bq_type)`` / ``(name, bq_type, path)``
+    tuples, or a ``{name: bq_type}`` dict). ``path`` (or ``paths={name: "a.b"}``)
+    extracts a value from the nested event JSON by dotted path (e.g.
+    ``"profile.email"``, ``"event_props.amount"``); default is ``name`` at the
+    top level. ``bq_type`` is a BigQuery type name (STRING/INTEGER/FLOAT/
+    BOOLEAN/TIMESTAMP/DATETIME/DATE/TIME/NUMERIC/BIGNUMERIC/BYTES/JSON); NUMERIC
+    is delivered exactly (declare NUMERIC only for values sent as JSON strings
+    or integers), BIGNUMERIC is lossy (Float64). The top-level ``ts`` is epoch
+    seconds. ``region`` selects the API host (default ``sg1`` ->
+    ``https://sg1.api.clevertap.com``). ``[from_date, to_date]`` (``"YYYY-MM-DD"``)
+    is the full-refresh window; in incremental mode ``from_date`` is only the
+    first-run floor (thereafter the persisted watermark drives ``from``) and
+    ``key`` is required (BigQuery MERGE dedup of the re-pulled boundary day).
+    """
+
+    def __init__(
+        self,
+        account_id: str,
+        passcode: str,
+        event_name: str,
+        columns: _ApiColumns,
+        *,
+        region: str = "sg1",
+        batch_size: int = 5000,
+        from_date: Optional[str] = None,
+        to_date: Optional[str] = None,
+        paths: Optional[Mapping[str, str]] = None,
+        base_url: Optional[str] = None,
+    ) -> None: ...
+
+class AppsFlyer:
+    """AppsFlyer raw-data Pull API source (CSV report). **BigQuery destination
+    only.**
+
+    Declare the output schema via ``columns`` (same forms as ``CleverTap``);
+    each column reads the CSV header equal to its ``path`` (or ``name``). Auth
+    is the V2.0 ``api_token``. ``report_type`` is e.g. ``installs_report`` /
+    ``in_app_events_report`` / ``organic_installs_report``. The Pull API has
+    **hard daily-call and row caps** — for high volume use AppsFlyer Data Locker
+    instead. Times are in the account's timezone unless
+    ``extra_params={"timezone": "UTC"}`` — declare DATETIME for wall-clock, or
+    TIMESTAMP with a UTC timezone param. ``[from_date, to_date]`` as for
+    ``CleverTap``.
+    """
+
+    def __init__(
+        self,
+        api_token: str,
+        app_id: str,
+        report_type: str,
+        columns: _ApiColumns,
+        *,
+        from_date: Optional[str] = None,
+        to_date: Optional[str] = None,
+        paths: Optional[Mapping[str, str]] = None,
+        extra_params: Optional[Mapping[str, str]] = None,
+        base_url: str = "https://hq1.appsflyer.com",
+    ) -> None: ...
+
 class ClickHouse:
     """ClickHouse destination connection descriptor.
 
@@ -212,7 +279,7 @@ class TransferResult:
     new_watermark: Optional[str]
 
 def sync(
-    source: Union[Postgres, MySQL, BigQuery],
+    source: Union[Postgres, MySQL, BigQuery, CleverTap, AppsFlyer],
     target: Union[ClickHouse, BigQuery],
     dest_table: str,
     *,

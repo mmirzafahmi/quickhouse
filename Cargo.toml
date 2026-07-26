@@ -68,6 +68,9 @@ parquet = { version = "53", default-features = false, features = ["arrow", "asyn
 # crypto backend, but the process-wide `ring` install in sync.rs already
 # handles exactly this "another dependency's rustls backend" scenario.
 object_store = { version = "=0.11.2", default-features = false, features = ["aws"] }
+# RFC-4180 CSV parsing for the AppsFlyer Pull API report (quoted fields with
+# embedded commas/newlines, "" escapes) — the only new dep for the API sources.
+csv = "1"
 
 # Faster release builds for the shipped wheel.
 [profile.release]
