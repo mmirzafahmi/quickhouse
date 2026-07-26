@@ -68,6 +68,7 @@ pub struct PgSource {
     dsn: String,
     statement_timeout_secs: u64,
     ca_cert_file: Option<String>,
+    application_name: String,
 }
 
 impl PgSource {
@@ -75,11 +76,13 @@ impl PgSource {
         dsn: impl Into<String>,
         statement_timeout_secs: u64,
         ca_cert_file: Option<String>,
+        application_name: impl Into<String>,
     ) -> Self {
         Self {
             dsn: dsn.into(),
             statement_timeout_secs,
             ca_cert_file,
+            application_name: application_name.into(),
         }
     }
 
@@ -102,7 +105,10 @@ impl PgSource {
         // block vacuum and bloat the source). The bulk COPY itself runs in
         // autocommit, so statement_timeout is the primary guard; this covers the
         // edge/future transactional paths.
-        let mut setup = String::from("SET application_name = 'quickhouse'");
+        // Single-quote-escape the (usually trivial) application_name for the
+        // SQL string literal (standard_conforming_strings is on by default).
+        let app = self.application_name.replace('\'', "''");
+        let mut setup = format!("SET application_name = '{app}'");
         if self.statement_timeout_secs > 0 {
             let ms = self.statement_timeout_secs * 1000;
             setup.push_str(&format!("; SET statement_timeout = {ms}"));
@@ -423,7 +429,7 @@ OCm3XK2CW4/x+Z55ntrAffyyonL3V3vHIz7fokiz5H+l
 
     #[test]
     fn copy_sql_with_table_and_filters() {
-        let src = PgSource::new("postgresql://x", 0, None);
+        let src = PgSource::new("postgresql://x", 0, None, "quickhouse");
         let part = Partition {
             label: "r0".into(),
             predicate: Some("\"id\" >= 1 AND \"id\" <= 100".into()),
@@ -447,7 +453,7 @@ OCm3XK2CW4/x+Z55ntrAffyyonL3V3vHIz7fokiz5H+l
 
     #[test]
     fn copy_sql_applies_column_transform_expr() {
-        let src = PgSource::new("postgresql://x", 0, None);
+        let src = PgSource::new("postgresql://x", 0, None, "quickhouse");
         let part = Partition {
             label: "all".into(),
             predicate: None,
@@ -470,7 +476,7 @@ OCm3XK2CW4/x+Z55ntrAffyyonL3V3vHIz7fokiz5H+l
 
     #[test]
     fn copy_sql_keyset_adds_cursor_and_order_limit() {
-        let src = PgSource::new("postgresql://x", 0, None);
+        let src = PgSource::new("postgresql://x", 0, None, "quickhouse");
         let part = Partition {
             label: "all".into(),
             predicate: None,

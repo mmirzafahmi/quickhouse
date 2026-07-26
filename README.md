@@ -385,8 +385,43 @@ Arrays and composite (`RECORD`/`STRUCT`) types aren't supported yet.
 - **BigQuery as a source** reads through a single connection — `parallelism`
   becomes a server-side hint rather than true client-side fan-out (a limitation
   of the underlying crate's read API).
-- **No CLI yet**, and CDC / custom transforms are future work.
+- **CDC / streaming** and arbitrary in-source transforms are out of scope.
 - **Single table per call** — `sync()` moves one table; loop over a list for many.
+
+## Command-line interface
+
+For cron/CI jobs you can drive a transfer from a TOML file instead of writing
+Python:
+
+```bash
+pip install "quickhouse[cli]"   # the extra is only needed on Python < 3.11
+quickhouse run job.toml
+quickhouse --version
+```
+
+The job file has three tables — `[source]`, `[target]`, `[sync]`. `type` picks
+the engine; every other key maps to that descriptor's constructor / to `sync()`'s
+arguments, and `${ENV_VAR}` is expanded so credentials stay in the environment:
+
+```toml
+[source]
+type = "postgres"
+dsn = "${PG_DSN}"
+
+[target]
+type = "clickhouse"
+url = "http://localhost:8123"
+database = "analytics"
+
+[sync]
+dest_table = "orders"
+source_table = "orders"
+mode = "incremental"
+watermark = "updated_at"
+key = ["id"]
+```
+
+See [examples/job.toml](examples/job.toml).
 
 ## Stability and versioning
 

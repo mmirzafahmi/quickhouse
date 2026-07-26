@@ -320,6 +320,9 @@ def sync(
     retry_max_attempts: int = 1,
     column_transforms: Optional[Mapping[str, str]] = None,
     evolve_schema: bool = False,
+    state_table_name: str = "_quickhouse_state",
+    staging_suffix: str = "_quickhouse_tmp",
+    application_name: str = "quickhouse",
     type_overrides: Optional[Mapping[str, str]] = None,
     rename: Optional[Mapping[str, str]] = None,
     include: Optional[Sequence[str]] = None,
@@ -454,6 +457,16 @@ def sync(
     ``[MIN, MAX]`` range); without it a ``WHEN NOT MATCHED BY SOURCE`` clause
     would delete the entire destination history outside the batch, so it is a
     hard config error.
+
+    Internal names (defaults preserve prior behavior): ``state_table_name``
+    (default ``_quickhouse_state``) is quickhouse's watermark/chunk-cursor
+    bookkeeping table, created inside the destination — override it for
+    table-naming policies (a cursor persisted under the old name isn't found
+    after a rename, so treat a change as a first run). ``staging_suffix``
+    (default ``_quickhouse_tmp``) names the per-run staging table. And
+    ``application_name`` (default ``quickhouse``) is the PostgreSQL
+    ``application_name`` announced to the source, visible in
+    ``pg_stat_activity``.
 
     Memory vs. batch sizing:
 

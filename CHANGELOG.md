@@ -9,6 +9,18 @@ any breaking change is called out explicitly.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-07-27
+
+### Added
+- Configurable internal names via new `sync()` arguments (defaults unchanged, so
+  existing calls are byte-identical): `state_table_name` (default
+  `_quickhouse_state`), `staging_suffix` (default `_quickhouse_tmp`), and
+  `application_name` (default `quickhouse`, the PostgreSQL `application_name`).
+- A command-line runner: `quickhouse run job.toml` (and `quickhouse --version`),
+  installed as a console script. TOML job files have `[source]`/`[target]`/`[sync]`
+  tables with `${ENV_VAR}` expansion. New `[cli]` extra pulls the TOML parser on
+  Python < 3.11 (3.11+ uses stdlib `tomllib`).
+
 ## [0.7.2] - 2026-07-26
 
 ### Added
@@ -167,7 +179,8 @@ any breaking change is called out explicitly.
 - Initial release: parallel, bounded-memory PostgreSQL → ClickHouse transfer with
   automatic DDL, full-refresh and incremental modes, and type mapping.
 
-[Unreleased]: https://github.com/mmirzafahmi/quickhouse/compare/v0.7.2...HEAD
+[Unreleased]: https://github.com/mmirzafahmi/quickhouse/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/mmirzafahmi/quickhouse/compare/v0.7.2...v0.8.0
 [0.7.2]: https://github.com/mmirzafahmi/quickhouse/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/mmirzafahmi/quickhouse/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/mmirzafahmi/quickhouse/compare/v0.6.1...v0.7.0

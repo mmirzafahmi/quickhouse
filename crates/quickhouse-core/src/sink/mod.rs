@@ -156,11 +156,12 @@ impl Sink {
         }
     }
 
-    /// Create the internal watermark-tracking table if it doesn't exist yet.
-    pub async fn ensure_state_table(&self) -> Result<()> {
+    /// Create the internal watermark-tracking table (named `state_table`) if it
+    /// doesn't exist yet.
+    pub async fn ensure_state_table(&self, state_table: &str) -> Result<()> {
         match self {
-            Sink::ClickHouse(s) => s.ensure_state_table().await,
-            Sink::BigQuery(s) => s.ensure_state_table().await,
+            Sink::ClickHouse(s) => s.ensure_state_table(state_table).await,
+            Sink::BigQuery(s) => s.ensure_state_table(state_table).await,
         }
     }
 

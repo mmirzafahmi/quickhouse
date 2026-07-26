@@ -1,0 +1,26 @@
+# Example quickhouse CLI job file. Run it with:
+#
+#     quickhouse run examples/job.toml
+#
+# Three tables: [source], [target], and [sync]. `type` selects the engine; every
+# other key maps straight to that descriptor's constructor / to sync()'s keyword
+# arguments. String values expand ${ENV_VAR}, so credentials can stay in the
+# environment (e.g. export PG_DSN=postgresql://user:pw@host:5432/db).
+
+[source]
+type = "postgres"          # postgres | mysql | bigquery | clevertap | appsflyer
+dsn = "${PG_DSN}"
+
+[target]
+type = "clickhouse"        # clickhouse | bigquery
+url = "http://localhost:8123"
+database = "analytics"
+
+[sync]
+dest_table = "orders"
+source_table = "orders"
+mode = "incremental"       # full | incremental | append
+watermark = "updated_at"
+key = ["id"]
+create_if_missing = true
+parallelism = 4

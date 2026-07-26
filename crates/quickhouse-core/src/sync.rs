@@ -237,7 +237,6 @@ fn join_result(res: std::result::Result<Result<()>, tokio::task::JoinError>) -> 
     }
 }
 
-const STAGING_SUFFIX: &str = "_quickhouse_tmp";
 
 struct SourceSetup {
     source_cols: Vec<ColumnType>,
@@ -364,7 +363,7 @@ async fn run_transfer_impl(
     // Per-run-unique staging table name (see `staging_name`), computed once
     // and reused at every create/swap/merge/drop site this run.
     let run_id = new_run_id();
-    let staging = staging_name(&cfg.dest_table, &run_id);
+    let staging = staging_name(&cfg.dest_table, &cfg.staging_suffix, &run_id);
 
     // BigQuery has a genuinely different execution model (no discrete
     // range-partitions to fan out; a single read session that streams via
@@ -392,6 +391,7 @@ async fn run_transfer_impl(
             pg.dsn.clone(),
             pg.statement_timeout_secs,
             pg.ca_cert_file.clone(),
+            cfg.application_name.clone(),
         )),
         SourceConfig::MySql(my) => Source::MySql(MySqlSource::new(
             my.dsn.clone(),
@@ -2132,7 +2132,7 @@ async fn prepare_target(
                     }
                 }
             }
-            sink.ensure_state_table().await?;
+            sink.ensure_state_table(&cfg.state_table_name).await?;
 
             if sink.requires_staging_for_incremental() {
                 tracing::info!("creating staging table '{staging}' for incremental merge");
@@ -2174,7 +2174,7 @@ async fn prepare_target(
                     );
                 }
             }
-            sink.ensure_state_table().await?;
+            sink.ensure_state_table(&cfg.state_table_name).await?;
             Ok(cfg.dest_table.clone())
         }
     }
@@ -2291,8 +2291,8 @@ async fn compute_partitions_mysql(
 /// run's orphaned staging table can't poison the next run (which uses a
 /// different name) — at the cost that orphans are no longer auto-reclaimed by
 /// the next run, so callers drop staging on the error path too.
-fn staging_name(dest: &str, run_id: &str) -> String {
-    format!("{dest}{STAGING_SUFFIX}_{run_id}")
+fn staging_name(dest: &str, suffix: &str, run_id: &str) -> String {
+    format!("{dest}{suffix}_{run_id}")
 }
 
 /// A run id unique enough that a staging table name built from it is never
@@ -2528,10 +2528,11 @@ mod tests {
 
     #[test]
     fn staging_name_includes_dest_suffix_and_run_id() {
-        let name = staging_name("orders", "12345");
+        let name = staging_name("orders", "_quickhouse_tmp", "12345");
         assert_eq!(name, "orders_quickhouse_tmp_12345");
         assert!(name.starts_with("orders"));
-        assert!(name.contains(STAGING_SUFFIX));
+        // A custom suffix flows through (C1 configurable internals).
+        assert_eq!(staging_name("orders", "_stg", "12345"), "orders_stg_12345");
     }
 
     #[test]
@@ -2542,7 +2543,10 @@ mod tests {
         // from a nanosecond wall clock — not asserted here to avoid a
         // clock-resolution-dependent flaky test; the naming logic is what
         // matters and is deterministic given distinct run_ids.)
-        assert_ne!(staging_name("orders", "1"), staging_name("orders", "2"));
+        assert_ne!(
+            staging_name("orders", "_quickhouse_tmp", "1"),
+            staging_name("orders", "_quickhouse_tmp", "2")
+        );
     }
 
     #[test]

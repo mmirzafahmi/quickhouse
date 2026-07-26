@@ -97,7 +97,7 @@ pub fn create_table(
 }
 
 /// DDL for the internal state table that tracks incremental watermarks.
-pub fn create_state_table(db: &str) -> String {
+pub fn create_state_table(db: &str, state_table: &str) -> String {
     format!(
         "CREATE TABLE IF NOT EXISTS {}\n(\n\
          \x20   source_table String,\n\
@@ -108,18 +108,18 @@ pub fn create_state_table(db: &str) -> String {
          \x20   chunk_upper String DEFAULT '',\n\
          \x20   run_ts DateTime64(3) DEFAULT now64(3)\n\
          )\nENGINE = ReplacingMergeTree(run_ts)\nORDER BY (source_table, dest_table)",
-        qualified(db, "_quickhouse_state")
+        qualified(db, state_table)
     )
 }
 
-/// Bring a pre-0.5 `_quickhouse_state` table up to date with the chunk-resume
-/// columns (keyset resumable reads). Idempotent via `ADD COLUMN IF NOT EXISTS`,
-/// so it's safe to run unconditionally alongside `create_state_table`.
-pub fn migrate_state_table(db: &str) -> String {
+/// Bring a pre-0.5 state table up to date with the chunk-resume columns (keyset
+/// resumable reads). Idempotent via `ADD COLUMN IF NOT EXISTS`, so it's safe to
+/// run unconditionally alongside `create_state_table`.
+pub fn migrate_state_table(db: &str, state_table: &str) -> String {
     format!(
         "ALTER TABLE {} ADD COLUMN IF NOT EXISTS chunk_cursor String DEFAULT '', \
          ADD COLUMN IF NOT EXISTS chunk_upper String DEFAULT ''",
-        qualified(db, "_quickhouse_state")
+        qualified(db, state_table)
     )
 }
 
@@ -180,6 +180,9 @@ mod tests {
             retry_max_attempts: 1,
             column_transforms: HashMap::new(),
             evolve_schema: false,
+            state_table_name: "_quickhouse_state".into(),
+            staging_suffix: "_quickhouse_tmp".into(),
+            application_name: "quickhouse".into(),
             state_key: None,
             seed_watermark: crate::config::WatermarkSeed::None,
             advance_watermark: true,

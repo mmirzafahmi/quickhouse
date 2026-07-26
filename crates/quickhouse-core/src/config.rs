@@ -474,6 +474,21 @@ pub struct TransferConfig {
     /// drops or retypes a column.
     pub evolve_schema: bool,
 
+    // ---- 0.9.0 block (configurable internal names; defaults preserve prior behavior) ----
+    /// Name of quickhouse's internal watermark/chunk-cursor bookkeeping table,
+    /// created inside the destination database/dataset. Default
+    /// `_quickhouse_state`. Override for teams with table-naming policies (an
+    /// incremental cursor persisted under the old name won't be found after a
+    /// rename — treat a change as a first run).
+    pub state_table_name: String,
+    /// Suffix for the per-run staging table name (`{dest}{suffix}_{run_id}`).
+    /// Default `_quickhouse_tmp`.
+    pub staging_suffix: String,
+    /// Client application name announced to the source server — PostgreSQL
+    /// `application_name` (visible in `pg_stat_activity`, so a DBA can see/kill
+    /// the export). Default `quickhouse`.
+    pub application_name: String,
+
     // ---- transforms ----
     /// Per-column destination type overrides (column name -> the
     /// destination's own type name, e.g. ClickHouse `"Decimal(18, 2)"` or
@@ -708,6 +723,9 @@ pub(crate) fn default_test_config() -> TransferConfig {
         retry_max_attempts: 1,
         column_transforms: HashMap::new(),
         evolve_schema: false,
+        state_table_name: "_quickhouse_state".into(),
+        staging_suffix: "_quickhouse_tmp".into(),
+        application_name: "quickhouse".into(),
         type_overrides: HashMap::new(),
         rename: HashMap::new(),
         include: vec![],
@@ -748,6 +766,9 @@ mod tests {
             retry_max_attempts: 1,
             column_transforms: HashMap::new(),
             evolve_schema: false,
+            state_table_name: "_quickhouse_state".into(),
+            staging_suffix: "_quickhouse_tmp".into(),
+            application_name: "quickhouse".into(),
             type_overrides: HashMap::new(),
             rename: HashMap::new(),
             include: vec![],

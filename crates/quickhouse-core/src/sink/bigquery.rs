@@ -68,8 +68,6 @@ const INSERT_ALL_MAX_ROWS_PER_REQUEST: usize = 5_000;
 /// headroom for typical rows (byte size isn't pre-computed, same as insertAll).
 const STORAGE_WRITE_MAX_ROWS_PER_APPEND: usize = 5_000;
 
-const STATE_TABLE: &str = "_quickhouse_state";
-
 #[derive(Clone)]
 pub struct BigQuerySink {
     client: Client,
@@ -548,8 +546,8 @@ impl BigQuerySink {
     /// it doesn't exist yet. Unlike ClickHouse's `CREATE TABLE IF NOT
     /// EXISTS`, BigQuery's table creation has no such clause, so the
     /// existence check happens here explicitly.
-    pub async fn ensure_state_table(&self) -> Result<()> {
-        if self.table_exists(STATE_TABLE).await? {
+    pub async fn ensure_state_table(&self, state_table: &str) -> Result<()> {
+        if self.table_exists(state_table).await? {
             return Ok(());
         }
         let field = |name: &str, data_type: TableFieldType| TableFieldSchema {
@@ -562,7 +560,7 @@ impl BigQuerySink {
             table_reference: TableReference {
                 project_id: self.project_id.clone(),
                 dataset_id: self.dataset_id.clone(),
-                table_id: STATE_TABLE.to_string(),
+                table_id: state_table.to_string(),
             },
             schema: Some(TableSchema {
                 fields: vec![
@@ -585,16 +583,17 @@ impl BigQuerySink {
 
     /// Read the last persisted watermark for this `(state_key, dest_table)` pair.
     pub async fn read_last_watermark(&self, cfg: &TransferConfig) -> Result<Option<String>> {
-        if !self.table_exists(STATE_TABLE).await? {
+        if !self.table_exists(&cfg.state_table_name).await? {
             return Ok(None);
         }
         let source_id = cfg.effective_state_key();
         let query = format!(
-            "SELECT last_watermark FROM `{}`.`{}`.`{STATE_TABLE}` \
+            "SELECT last_watermark FROM `{}`.`{}`.`{}` \
              WHERE source_table = '{}' AND dest_table = '{}' \
              ORDER BY run_ts DESC LIMIT 1",
             self.project_id,
             self.dataset_id,
+            cfg.state_table_name,
             escape_sql_string(&source_id),
             escape_sql_string(&cfg.dest_table),
         );
@@ -632,6 +631,7 @@ impl BigQuerySink {
         let query = build_persist_watermark_sql(
             &self.project_id,
             &self.dataset_id,
+            &cfg.state_table_name,
             &source_id,
             &cfg.dest_table,
             watermark,
@@ -818,16 +818,18 @@ fn build_swap_sql(
 /// because it's a reserved GoogleSQL keyword (window-framing syntax, e.g.
 /// `ROWS BETWEEN ... PRECEDING`) — every other bare identifier here is a
 /// column name that happens not to collide with a keyword.
+#[allow(clippy::too_many_arguments)]
 fn build_persist_watermark_sql(
     project_id: &str,
     dataset_id: &str,
+    state_table: &str,
     source_id: &str,
     dest_table: &str,
     watermark: &str,
     rows: u64,
 ) -> String {
     format!(
-        "INSERT INTO `{project_id}`.`{dataset_id}`.`{STATE_TABLE}` \
+        "INSERT INTO `{project_id}`.`{dataset_id}`.`{state_table}` \
          (source_table, dest_table, last_watermark, `rows`, run_ts) \
          VALUES ('{}', '{}', '{}', {rows}, CURRENT_TIMESTAMP())",
         escape_sql_string(source_id),
@@ -1219,6 +1221,9 @@ mod tests {
             retry_max_attempts: 1,
             column_transforms: HashMap::new(),
             evolve_schema: false,
+            state_table_name: "_quickhouse_state".into(),
+            staging_suffix: "_quickhouse_tmp".into(),
+            application_name: "quickhouse".into(),
             state_key: None,
             seed_watermark: crate::config::WatermarkSeed::None,
             advance_watermark: true,
@@ -1426,8 +1431,15 @@ mod tests {
         // or every persist_watermark call fails with a syntax error right
         // after a successful incremental run — 100% reproducible, since it's
         // independent of write_method, watermark value, or row count.
-        let sql =
-            build_persist_watermark_sql("proj", "ds", "orders", "orders_dest", "2024-06-01", 42);
+        let sql = build_persist_watermark_sql(
+            "proj",
+            "ds",
+            "_quickhouse_state",
+            "orders",
+            "orders_dest",
+            "2024-06-01",
+            42,
+        );
         assert!(
             sql.contains("(source_table, dest_table, last_watermark, `rows`, run_ts)"),
             "`rows` must be backtick-quoted: {sql}"
@@ -1436,6 +1448,11 @@ mod tests {
             sql.starts_with("INSERT INTO `proj`.`ds`.`_quickhouse_state`"),
             "{sql}"
         );
+        // A custom state-table name flows through (C1 configurable internals).
+        let custom = build_persist_watermark_sql(
+            "proj", "ds", "wh_state", "orders", "orders_dest", "2024-06-01", 1,
+        );
+        assert!(custom.starts_with("INSERT INTO `proj`.`ds`.`wh_state`"), "{custom}");
         assert!(
             sql.contains("VALUES ('orders', 'orders_dest', '2024-06-01', 42, CURRENT_TIMESTAMP())"),
             "{sql}"
@@ -1447,7 +1464,8 @@ mod tests {
         // GoogleSQL doesn't recognize the ANSI doubled-quote escape ('') at
         // all — only a backslash-escaped quote (\') is valid, so this must
         // NOT double the quote like the Postgres/ClickHouse/MySQL sinks do.
-        let sql = build_persist_watermark_sql("p", "d", "o'brien", "dest", "it's here", 1);
+        let sql =
+            build_persist_watermark_sql("p", "d", "_quickhouse_state", "o'brien", "dest", "it's here", 1);
         assert!(sql.contains(r"'o\'brien'"), "{sql}");
         assert!(sql.contains(r"'it\'s here'"), "{sql}");
     }
@@ -1457,7 +1475,7 @@ mod tests {
         // Regression test: a trailing backslash must not swallow the
         // literal's closing quote (`'ends_with_backslash\'` is an unclosed
         // string in GoogleSQL) — backslash has to be escaped first.
-        let sql = build_persist_watermark_sql("p", "d", r"a\b", "dest", "wm", 1);
+        let sql = build_persist_watermark_sql("p", "d", "_quickhouse_state", r"a\b", "dest", "wm", 1);
         assert!(sql.contains(r"'a\\b'"), "{sql}");
     }
 

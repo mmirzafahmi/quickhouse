@@ -136,26 +136,27 @@ impl ClickHouseSink {
     /// Create the internal `_quickhouse_state` watermark-tracking table if it
     /// doesn't exist yet (`CREATE TABLE IF NOT EXISTS`, so no prior existence
     /// check is needed here, unlike BigQuery's sink).
-    pub async fn ensure_state_table(&self) -> Result<()> {
-        self.execute(&crate::ddl::create_state_table(&self.cfg.database))
+    pub async fn ensure_state_table(&self, state_table: &str) -> Result<()> {
+        self.execute(&crate::ddl::create_state_table(&self.cfg.database, state_table))
             .await?;
         // Add the chunk-resume columns to a pre-0.5 state table (idempotent).
-        self.execute(&crate::ddl::migrate_state_table(&self.cfg.database))
+        self.execute(&crate::ddl::migrate_state_table(&self.cfg.database, state_table))
             .await
     }
 
     /// Read the last persisted watermark for this `(state_key, dest_table)` pair.
     pub async fn read_last_watermark(&self, cfg: &TransferConfig) -> Result<Option<String>> {
         // The state table may not exist yet on the very first incremental run.
-        if !self.table_exists("_quickhouse_state").await? {
+        if !self.table_exists(&cfg.state_table_name).await? {
             return Ok(None);
         }
         let source_id = cfg.effective_state_key();
         let sql = format!(
-            "SELECT last_watermark FROM {}.`_quickhouse_state` FINAL \
+            "SELECT last_watermark FROM {}.{} FINAL \
              WHERE source_table = '{}' AND dest_table = '{}' \
              ORDER BY run_ts DESC LIMIT 1",
             crate::ddl::quote_ident(&self.cfg.database),
+            crate::ddl::quote_ident(&cfg.state_table_name),
             escape_sql_string(&source_id),
             escape_sql_string(&cfg.dest_table),
         );
@@ -173,10 +174,11 @@ impl ClickHouseSink {
     ) -> Result<()> {
         let source_id = cfg.effective_state_key();
         let sql = format!(
-            "INSERT INTO {}.`_quickhouse_state` \
+            "INSERT INTO {}.{} \
              (source_table, dest_table, last_watermark, rows, chunk_cursor, chunk_upper) \
              VALUES ('{}', '{}', '{}', {}, '', '')",
             crate::ddl::quote_ident(&self.cfg.database),
+            crate::ddl::quote_ident(&cfg.state_table_name),
             escape_sql_string(&source_id),
             escape_sql_string(&cfg.dest_table),
             escape_sql_string(watermark),
@@ -191,15 +193,16 @@ impl ClickHouseSink {
     /// `upper` is the frozen snapshot-max the interrupted run was reading up to,
     /// so resumption reads the same window rather than re-snapshotting.
     pub async fn read_chunk_state(&self, cfg: &TransferConfig) -> Result<Option<(String, String)>> {
-        if !self.table_exists("_quickhouse_state").await? {
+        if !self.table_exists(&cfg.state_table_name).await? {
             return Ok(None);
         }
         let source_id = cfg.effective_state_key();
         let sql = format!(
-            "SELECT chunk_cursor, chunk_upper FROM {}.`_quickhouse_state` FINAL \
+            "SELECT chunk_cursor, chunk_upper FROM {}.{} FINAL \
              WHERE source_table = '{}' AND dest_table = '{}' \
              ORDER BY run_ts DESC LIMIT 1 FORMAT TabSeparated",
             crate::ddl::quote_ident(&self.cfg.database),
+            crate::ddl::quote_ident(&cfg.state_table_name),
             escape_sql_string(&source_id),
             escape_sql_string(&cfg.dest_table),
         );
@@ -235,10 +238,11 @@ impl ClickHouseSink {
     ) -> Result<()> {
         let source_id = cfg.effective_state_key();
         let sql = format!(
-            "INSERT INTO {}.`_quickhouse_state` \
+            "INSERT INTO {}.{} \
              (source_table, dest_table, last_watermark, rows, chunk_cursor, chunk_upper) \
              VALUES ('{}', '{}', '{}', {}, '{}', '{}')",
             crate::ddl::quote_ident(&self.cfg.database),
+            crate::ddl::quote_ident(&cfg.state_table_name),
             escape_sql_string(&source_id),
             escape_sql_string(&cfg.dest_table),
             escape_sql_string(committed.unwrap_or("")),
