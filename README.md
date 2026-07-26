@@ -20,6 +20,41 @@ result = quickhouse.sync(src, dst, dest_table="orders",
 print(result)   # rows_read, rows_written, bytes_written, duration_secs, new_watermark
 ```
 
+> **Status: pre-1.0.** quickhouse is used against real production data and is
+> covered by an integration test suite, but the Python API may still change
+> between minor versions before 1.0. Pin a compatible range (e.g.
+> `quickhouse~=0.7`) and watch the [CHANGELOG](CHANGELOG.md). A few knobs are
+> marked *experimental* in the API docs — those may change without a major bump.
+
+### When to use quickhouse
+
+Reach for it when you want to move whole tables — full refresh or incremental —
+from PostgreSQL/MySQL/BigQuery into ClickHouse or BigQuery, fast, from your own
+Python jobs with almost no setup. It fits cron/Airflow/Dagster tasks and one-off
+backfills well.
+
+Look elsewhere when you need in-warehouse SQL transformations (use **dbt**),
+change-data-capture or streaming (use **Debezium/Kafka**), a large catalog of
+SaaS connectors (use **Airbyte / Fivetran / dlt**), or arbitrary
+source↔destination pairs — quickhouse deliberately supports a focused, fast set:
+
+### Supported sources and destinations
+
+| Source | → ClickHouse | → BigQuery |
+|---|:--:|:--:|
+| PostgreSQL | ✅ | ✅ |
+| MySQL | ✅ | ✅ |
+| BigQuery | ✅ | ✅ |
+| CleverTap (HTTP API) | — | ✅ |
+| AppsFlyer (HTTP API) | — | ✅ |
+
+ClickHouse is a destination only; BigQuery is both a source and a destination.
+The HTTP API sources currently write to BigQuery only. Some knobs are
+engine-specific: `column_transforms` / `read_max_rows_per_sec` apply to the
+PostgreSQL and MySQL sources; `merge_prune_partition_by` / `delete_stale_in_window`
+apply to BigQuery-destination incremental syncs; S3 archival applies to ClickHouse
+destinations.
+
 ## Why quickhouse
 
 - **It's fast.** Rows are decoded straight off the wire into Arrow, in Rust —
@@ -62,9 +97,10 @@ pip install quickhouse
 pip install "quickhouse[progress]"   # adds a ready-made tqdm progress bar
 ```
 
-Prebuilt wheels ship for Python 3.9+ on Linux, macOS (Intel + Apple Silicon),
-and Windows (x86_64) — no Rust toolchain needed. Building from source is only
-for development; see [CONTRIBUTING.md](CONTRIBUTING.md).
+Prebuilt wheels ship for Python 3.9+ on **Linux (x86_64)**, **macOS (Apple
+Silicon)**, and **Windows (x64)** — no Rust toolchain needed. On other platforms
+(Intel macOS, Linux aarch64) `pip` builds from the source distribution, which
+needs a Rust toolchain (see [CONTRIBUTING.md](CONTRIBUTING.md)).
 
 ## Using it
 
@@ -120,7 +156,9 @@ type drives the destination table; the watermark's `from`/`to` date window
 drives incremental pulls.
 
 ```python
-# CleverTap Data Export API (events) -> BigQuery. region picks the API host.
+# CleverTap Data Export API (events) -> BigQuery.
+# region MUST match your CleverTap account's region (sg1 / us1 / eu1 / in1 / aps3 / mec1);
+# it selects the API host, and the wrong region silently returns no data.
 qh.sync(
     qh.CleverTap(
         account_id="...", passcode="...",   # or load from a secret manager

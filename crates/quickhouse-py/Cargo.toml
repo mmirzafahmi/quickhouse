@@ -7,6 +7,8 @@ authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 description = "PyO3 bindings exposing quickhouse-core to Python."
+# A cdylib Python-extension crate; not meaningfully publishable to crates.io.
+publish = false
 
 [lib]
 name = "_quickhouse"

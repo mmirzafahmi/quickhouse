@@ -6,7 +6,13 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Core engine for quickhouse: PostgreSQL -> ClickHouse streaming transfer."
+description = "Core engine for quickhouse: parallel, bounded-memory, Arrow-based streaming ETL from PostgreSQL/MySQL/BigQuery and CleverTap/AppsFlyer APIs into ClickHouse or BigQuery."
+readme = "../../README.md"
+keywords = ["etl", "clickhouse", "bigquery", "arrow", "data-pipeline"]
+categories = ["database"]
+# Distributed only as the `quickhouse` Python wheel today. Flip to publish this
+# engine as a standalone crate (metadata above is ready for it).
+publish = false
 
 [dependencies]
 tokio.workspace = true

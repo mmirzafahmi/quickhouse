@@ -12,13 +12,16 @@ venv/
 dist/
 build/
 .pytest_cache/
-benchmarks/
+
+# Local, untracked benchmark scratch (the tracked bench_transfer.py is kept)
+/benchmarks/bench_apitap.py
+/benchmarks/bench_dlt.py
 
 # maturin build artifacts
-python/etlhouse/*.so
-python/etlhouse/*.pyd
-python/etlhouse/_etlhouse*.so
-python/etlhouse/_etlhouse*.pyd
+python/quickhouse/*.so
+python/quickhouse/*.pyd
+python/quickhouse/_quickhouse*.so
+python/quickhouse/_quickhouse*.pyd
 
 # Editor / OS
 .idea/

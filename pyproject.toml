@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "quickhouse"
 version = "0.7.0"
-description = "Fast PostgreSQL/MySQL/BigQuery -> ClickHouse ETL with a Rust engine (parallel, bounded-memory, Arrow-based)."
+description = "Fast ETL with a Rust engine (parallel, bounded-memory, Arrow-based): PostgreSQL/MySQL/BigQuery and CleverTap/AppsFlyer API sources into ClickHouse or BigQuery."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
@@ -18,13 +18,22 @@ classifiers = [
     "Operating System :: OS Independent",
     "Programming Language :: Rust",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Database",
+    "Topic :: Database :: Database Engines/Servers",
     "Topic :: Software Development :: Libraries",
+    "Typing :: Typed",
 ]
 
 [project.urls]
 Homepage = "https://github.com/mmirzafahmi/quickhouse"
 Repository = "https://github.com/mmirzafahmi/quickhouse"
+Documentation = "https://github.com/mmirzafahmi/quickhouse#readme"
+Changelog = "https://github.com/mmirzafahmi/quickhouse/blob/main/CHANGELOG.md"
 Issues = "https://github.com/mmirzafahmi/quickhouse/issues"
 
 [project.optional-dependencies]
