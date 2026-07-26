@@ -131,6 +131,16 @@ impl Sink {
         }
     }
 
+    /// Current committed row count of `table`, or `None` if it doesn't exist.
+    /// Best-effort/diagnostic (BigQuery reads free table metadata; the count may
+    /// lag a streaming buffer) — callers use it for warnings, not correctness.
+    pub async fn current_row_count(&self, table: &str) -> Result<Option<u64>> {
+        match self {
+            Sink::ClickHouse(s) => s.current_row_count(table).await,
+            Sink::BigQuery(s) => s.current_row_count(table).await,
+        }
+    }
+
     pub async fn drop_table(&self, table: &str) -> Result<()> {
         match self {
             Sink::ClickHouse(s) => s.drop_table(table).await,

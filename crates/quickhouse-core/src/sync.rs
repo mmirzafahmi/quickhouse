@@ -1033,12 +1033,37 @@ async fn run_transfer_api(
         warn_coerced_scalars("api read", batcher.invalid_scalars_total);
         warn_coerced_dates("api read", batcher.invalid_dates_total);
         warn_coerced_decimals("api read", batcher.invalid_decimals_total);
+        // Distinct, actionable warning for a declared DATE/TIMESTAMP column that
+        // came out NULL for EVERY source value — a unit/format mismatch (e.g. a
+        // packed `yyyyMMddHHmmSS` `ts` mis-declared), not real nulls.
+        for (col, n, sample) in batcher.fully_coerced_temporal_columns() {
+            tracing::warn!(
+                "api read: declared date/time column '{col}' was NULL for all {n} non-empty source \
+                 value(s) (e.g. raw {sample:?}) — likely a unit/format mismatch, not genuine nulls. \
+                 Verify the declared type matches the source field's format."
+            );
+        }
         tracing::info!(
             "api read complete: {} rows written",
             counters.rows_written.load(Ordering::Relaxed)
         );
 
         if cfg.mode == SyncMode::Full {
+            // A full-refresh REPLACES the destination. API sources are naturally
+            // day/event-scoped, so a full run against an existing large table can
+            // silently swap 100Ms of rows away for a handful. Warn on any shrink;
+            // best-effort (a metadata lookup failure must not fail the transfer).
+            let new_rows = counters.rows_written.load(Ordering::Relaxed);
+            if let Ok(Some(existing)) = sink.current_row_count(&cfg.dest_table).await {
+                if existing > new_rows {
+                    tracing::warn!(
+                        "full-refresh will REPLACE '{}' ({existing} row(s)) with only {new_rows} row(s) \
+                         from window [{from}, {to}] — the destination will SHRINK. If you meant to \
+                         append/upsert rather than replace, use mode=\"incremental\" with key=.",
+                        cfg.dest_table
+                    );
+                }
+            }
             tracing::info!("swapping staging table into '{}'", cfg.dest_table);
             sink.atomic_swap(&cfg.dest_table, &staging, &plan.dest_columns).await?;
             sink.drop_table(&staging).await?;

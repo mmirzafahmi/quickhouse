@@ -335,11 +335,20 @@ fn json_scalar_text(v: &Value) -> Option<Cow<'_, str>> {
     }
 }
 
-/// Parse a `YYYY-MM-DD` (or integer epoch-seconds) date into Date32 days-from-epoch.
+/// Parse a date into Date32 days-from-epoch. Accepts `YYYY-MM-DD`, CleverTap's
+/// packed all-digit civil forms `yyyyMMdd` (8) / `yyyyMMddHHmmSS` (14) — the
+/// leading `yyyyMMdd` is taken as the date — and finally integer epoch seconds.
+/// The packed forms are checked before the epoch-seconds branch for the same
+/// reason as [`parse_ts_micros`] (a 14-digit `ts` is civil, not epoch).
 fn parse_date_days(s: &str) -> Option<i32> {
+    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1)?;
     if let Ok(d) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-        let epoch = NaiveDate::from_ymd_opt(1970, 1, 1)?;
         return Some(d.signed_duration_since(epoch).num_days() as i32);
+    }
+    if (s.len() == 8 || s.len() == 14) && s.bytes().all(|b| b.is_ascii_digit()) {
+        if let Ok(d) = NaiveDate::parse_from_str(&s[..8], "%Y%m%d") {
+            return Some(d.signed_duration_since(epoch).num_days() as i32);
+        }
     }
     // Integer epoch seconds -> day.
     if let Ok(secs) = s.parse::<i64>() {
@@ -348,15 +357,28 @@ fn parse_date_days(s: &str) -> Option<i32> {
     None
 }
 
-/// Parse a timestamp into UTC epoch microseconds. Accepts RFC3339, a
-/// `YYYY-MM-DD HH:MM:SS` civil string (interpreted as UTC), and integer epoch
-/// **seconds** (CleverTap's `ts` is seconds, not millis).
+/// Parse a timestamp into UTC epoch microseconds. Accepts, in order: RFC3339, a
+/// `YYYY-MM-DD HH:MM:SS` civil string (interpreted as UTC), a 14-digit
+/// `yyyyMMddHHmmSS` packed civil integer (CleverTap's `ts` in several regions —
+/// e.g. `sg1` — is this, NOT epoch seconds), and finally integer epoch seconds.
+///
+/// The 14-digit packed form is disambiguated from epoch seconds purely by shape:
+/// a genuine 14-digit epoch-seconds value would be ~year 644,000, so an
+/// all-digit string of length 14 is unambiguously the packed civil form. This
+/// is checked BEFORE the epoch-seconds branch — otherwise `20260722193602`
+/// parses as an i64 and `* 1_000_000` overflows to `None`, silently NULLing
+/// every declared TIMESTAMP/DATETIME column (the 0.6.0 CleverTap bug).
 fn parse_ts_micros(s: &str) -> Option<i64> {
     if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
         return Some(dt.timestamp_micros());
     }
     if let Ok(ndt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
         return Some(ndt.and_utc().timestamp_micros());
+    }
+    if s.len() == 14 && s.bytes().all(|b| b.is_ascii_digit()) {
+        if let Ok(ndt) = NaiveDateTime::parse_from_str(s, "%Y%m%d%H%M%S") {
+            return Some(ndt.and_utc().timestamp_micros());
+        }
     }
     if let Ok(secs) = s.parse::<i64>() {
         return secs.checked_mul(1_000_000);
@@ -378,6 +400,17 @@ pub struct ApiBatcher {
     pub invalid_scalars_total: u64,
     pub invalid_dates_total: u64,
     pub invalid_decimals_total: u64,
+    /// Per-column output name (aligned to `builders`), for diagnostics.
+    col_names: Vec<String>,
+    /// Whether column `i` is a declared DATE/TIMESTAMP (temporal) column.
+    col_temporal: Vec<bool>,
+    /// Per-temporal-column count of non-empty source values actually fed to the
+    /// date/timestamp parser, and how many of those coerced to NULL, plus a
+    /// sample of the first coerced raw value — used to detect a unit/format
+    /// mismatch (a declared date/time column that comes out 100% NULL).
+    col_attempted: Vec<u64>,
+    col_coerced_null: Vec<u64>,
+    col_sample: Vec<Option<String>>,
 }
 
 impl ApiBatcher {
@@ -396,6 +429,12 @@ impl ApiBatcher {
             .iter()
             .map(|l| l.split('.').map(str::to_string).collect())
             .collect();
+        let col_names: Vec<String> = dest_columns.iter().map(|c| c.name.clone()).collect();
+        let col_temporal: Vec<bool> = dest_columns
+            .iter()
+            .map(|c| matches!(c.arrow, DataType::Date32 | DataType::Timestamp(..)))
+            .collect();
+        let n = dest_columns.len();
         Ok(Self {
             schema: Arc::new(Schema::new(fields)),
             builders,
@@ -408,7 +447,31 @@ impl ApiBatcher {
             invalid_scalars_total: 0,
             invalid_dates_total: 0,
             invalid_decimals_total: 0,
+            col_names,
+            col_temporal,
+            col_attempted: vec![0; n],
+            col_coerced_null: vec![0; n],
+            col_sample: vec![None; n],
         })
+    }
+
+    /// Declared DATE/TIMESTAMP columns where EVERY non-empty source value failed
+    /// to parse and was set to NULL — a strong signal of a unit/format mismatch
+    /// (e.g. a packed `yyyyMMddHHmmSS` `ts` declared as TIMESTAMP) rather than
+    /// genuinely-null data. Returns `(column, coerced_count, sample_raw_value)`.
+    pub fn fully_coerced_temporal_columns(&self) -> Vec<(String, u64, String)> {
+        (0..self.col_temporal.len())
+            .filter(|&i| {
+                self.col_temporal[i] && self.col_attempted[i] > 0 && self.col_coerced_null[i] == self.col_attempted[i]
+            })
+            .map(|i| {
+                (
+                    self.col_names[i].clone(),
+                    self.col_coerced_null[i],
+                    self.col_sample[i].clone().unwrap_or_default(),
+                )
+            })
+            .collect()
     }
 
     pub fn schema(&self) -> SchemaRef {
@@ -420,6 +483,9 @@ impl ApiBatcher {
         let mut row_bytes = 0usize;
         for (i, builder) in self.builders.iter_mut().enumerate() {
             let text = resolve_path(rec, &self.paths[i]).and_then(json_scalar_text);
+            // A non-empty source value is what the date/timestamp parser actually
+            // attempts (empty/whitespace and missing both null out uncounted).
+            let attempted = text.as_deref().is_some_and(|s| !s.trim().is_empty());
             let (size, coercion) = builder.append_text(text.as_deref());
             row_bytes += size;
             match coercion {
@@ -427,6 +493,15 @@ impl ApiBatcher {
                 ApiCoercion::Scalar => self.invalid_scalars_total += 1,
                 ApiCoercion::Date => self.invalid_dates_total += 1,
                 ApiCoercion::Decimal => self.invalid_decimals_total += 1,
+            }
+            if self.col_temporal[i] && attempted {
+                self.col_attempted[i] += 1;
+                if matches!(coercion, ApiCoercion::Date) {
+                    self.col_coerced_null[i] += 1;
+                    if self.col_sample[i].is_none() {
+                        self.col_sample[i] = text.as_deref().map(|s| s.chars().take(64).collect());
+                    }
+                }
             }
         }
         self.rows_in_batch += 1;
@@ -526,6 +601,62 @@ mod tests {
         let ts = batch.column(3).as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap();
         assert_eq!(ts.value(0), 1_700_000_000_000_000, "epoch SECONDS -> micros *1e6");
         assert!(ts.is_null(1));
+    }
+
+    #[test]
+    fn parse_ts_micros_handles_packed_civil_and_epoch_forms() {
+        let expected = NaiveDate::from_ymd_opt(2026, 7, 22)
+            .unwrap()
+            .and_hms_opt(19, 36, 2)
+            .unwrap()
+            .and_utc()
+            .timestamp_micros();
+        // The 0.6.0 regression value: CleverTap sg1 `ts` = 14-digit yyyyMMddHHmmSS.
+        // Previously overflowed (`* 1e6`) -> None -> silent NULL; now parsed.
+        assert_eq!(parse_ts_micros("20260722193602"), Some(expected), "packed civil ts");
+        // Same instant via the civil-string and RFC3339 forms.
+        assert_eq!(parse_ts_micros("2026-07-22 19:36:02"), Some(expected));
+        assert_eq!(parse_ts_micros("2026-07-22T19:36:02Z"), Some(expected));
+        // 10-digit epoch seconds still multiply by 1e6 (backward compatible).
+        assert_eq!(parse_ts_micros("1700000000"), Some(1_700_000_000_000_000));
+        // A 14-digit string that isn't a valid datetime (month 13) has no civil
+        // reading and overflows the epoch branch -> None (was already NULL).
+        assert_eq!(parse_ts_micros("20261399999999"), None);
+    }
+
+    #[test]
+    fn parse_date_days_handles_packed_forms() {
+        let d = NaiveDate::from_ymd_opt(2026, 7, 22).unwrap();
+        let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        let days = d.signed_duration_since(epoch).num_days() as i32;
+        assert_eq!(parse_date_days("2026-07-22"), Some(days));
+        assert_eq!(parse_date_days("20260722"), Some(days), "packed yyyyMMdd");
+        assert_eq!(parse_date_days("20260722193602"), Some(days), "14-digit -> date part");
+    }
+
+    #[test]
+    fn detects_fully_coerced_temporal_column() {
+        // The `ts` column (index 3) is declared TIMESTAMP. Feed only unparseable
+        // values -> every one coerces to NULL -> flagged as a likely mismatch.
+        let (mut b, _) = batcher();
+        b.append_record(&serde_json::json!({"id": 1, "ts": "nope"})).unwrap();
+        b.append_record(&serde_json::json!({"id": 2, "ts": "also-bad"})).unwrap();
+        b.finish().unwrap();
+        let flagged = b.fully_coerced_temporal_columns();
+        assert_eq!(flagged.len(), 1);
+        assert_eq!(flagged[0].0, "ts");
+        assert_eq!(flagged[0].1, 2, "both non-empty ts values coerced");
+        assert_eq!(flagged[0].2, "nope", "sample is the first coerced raw value");
+    }
+
+    #[test]
+    fn partial_temporal_coercion_is_not_flagged() {
+        // One value parses (the packed form fixed in this release), one doesn't.
+        let (mut b, _) = batcher();
+        b.append_record(&serde_json::json!({"id": 1, "ts": "20260722193602"})).unwrap();
+        b.append_record(&serde_json::json!({"id": 2, "ts": "garbage"})).unwrap();
+        b.finish().unwrap();
+        assert!(b.fully_coerced_temporal_columns().is_empty(), "not 100% coerced -> no warning");
     }
 
     #[test]

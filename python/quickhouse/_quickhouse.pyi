@@ -177,8 +177,13 @@ class CleverTap:
     top level. ``bq_type`` is a BigQuery type name (STRING/INTEGER/FLOAT/
     BOOLEAN/TIMESTAMP/DATETIME/DATE/TIME/NUMERIC/BIGNUMERIC/BYTES/JSON); NUMERIC
     is delivered exactly (declare NUMERIC only for values sent as JSON strings
-    or integers), BIGNUMERIC is lossy (Float64). The top-level ``ts`` is epoch
-    seconds. ``region`` selects the API host (default ``sg1`` ->
+    or integers), BIGNUMERIC is lossy (Float64). Nested RECORD/STRUCT types can't
+    be declared — point a JSON (or STRING) column at a nested object/array via
+    ``path`` and it lands as compact JSON text. The top-level ``ts`` is a packed
+    ``yyyyMMddHHmmSS`` integer in several regions (e.g. ``sg1``), **not** epoch
+    seconds — declare it as TIMESTAMP/DATETIME (or DATE) and it is parsed as UTC
+    civil time; 10-digit epoch seconds are also accepted. ``region`` selects the
+    API host (default ``sg1`` ->
     ``https://sg1.api.clevertap.com``). ``[from_date, to_date]`` (``"YYYY-MM-DD"``)
     is the full-refresh window; in incremental mode ``from_date`` is only the
     first-run floor (thereafter the persisted watermark drives ``from``) and

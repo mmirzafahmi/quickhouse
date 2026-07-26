@@ -128,7 +128,7 @@ qh.sync(
         columns=[
             ("identity", "STRING", "profile.identity"),   # dotted path into the record
             ("email",    "STRING", "profile.email"),
-            ("ts",       "TIMESTAMP"),                     # top-level epoch seconds
+            ("ts",       "TIMESTAMP"),                     # packed yyyyMMddHHmmSS int (parsed as UTC)
             ("app_ver",  "STRING", "profile.app_version"),
         ],
         from_date="2026-07-01",             # window start (first-run floor for incremental)
@@ -152,9 +152,16 @@ qh.sync(
 
 Notes: incremental re-pulls the boundary day each run, so `key` is required
 (BigQuery MERGE dedups it). `NUMERIC` is delivered exactly (declare it only for
-values sent as JSON strings/integers); `BIGNUMERIC` is lossy. AppsFlyer's Pull
-API has hard daily-call/row caps — for high volume use its Data Locker (files
-in a bucket) instead.
+values sent as JSON strings/integers); `BIGNUMERIC` is lossy. CleverTap's
+top-level `ts` is a packed `yyyyMMddHHmmSS` integer (not epoch seconds) — declare
+it `TIMESTAMP`/`DATETIME`/`DATE` and it's parsed as UTC civil time. Nested
+`RECORD`/`STRUCT` types can't be declared in `bq_type`; point a `JSON` (or
+`STRING`) column at a nested object/array via its `path` and it lands as compact
+JSON text. AppsFlyer's Pull API has hard daily-call/row caps — for high volume
+use its Data Locker (files in a bucket) instead. A full-refresh (`mode="full"`,
+the default) REPLACES the destination; since these sources are day/event-scoped,
+prefer `mode="incremental"` for an existing table (a shrinking full swap is
+warned about but still executes).
 
 A ClickHouse destination can also archive every synced batch to S3 as a data
 lake — a secondary, best-effort-free backup independent of ClickHouse's own

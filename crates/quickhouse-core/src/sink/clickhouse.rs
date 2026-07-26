@@ -71,6 +71,15 @@ impl ClickHouseSink {
         Ok(self.query_scalar(&sql).await?.as_deref() == Some("1"))
     }
 
+    /// Current row count of `table`, or `None` if it doesn't exist. Diagnostic.
+    pub async fn current_row_count(&self, table: &str) -> Result<Option<u64>> {
+        if !self.table_exists(table).await? {
+            return Ok(None);
+        }
+        let sql = format!("SELECT count() FROM {}.{}", ident(&self.cfg.database), ident(table));
+        Ok(self.query_scalar(&sql).await?.and_then(|s| s.trim().parse::<u64>().ok()))
+    }
+
     /// Run a query returning a single string column, one value per line (the
     /// HTTP interface's default TabSeparated). Blank lines are dropped.
     pub async fn query_column(&self, sql: &str) -> Result<Vec<String>> {

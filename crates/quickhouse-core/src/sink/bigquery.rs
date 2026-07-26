@@ -122,6 +122,16 @@ impl BigQuerySink {
         }
     }
 
+    /// Committed row count from free table metadata (`numRows`); `None` if the
+    /// table doesn't exist. May lag the streaming buffer — diagnostic only.
+    pub async fn current_row_count(&self, table: &str) -> Result<Option<u64>> {
+        match self.client.table().get(&self.project_id, &self.dataset_id, table).await {
+            Ok(t) => Ok(Some(t.num_rows)),
+            Err(e) if is_not_found(&e) => Ok(None),
+            Err(e) => Err(EtlError::other(format!("bigquery table get error: {e}"))),
+        }
+    }
+
     /// Build and run this destination's own structured `Table` creation —
     /// no DDL string templating, unlike ClickHouse (BigQuery's REST API
     /// takes a schema object directly).
