@@ -41,8 +41,8 @@ use google_cloud_bigquery::http::job::{
     Job, JobConfiguration, JobConfigurationQuery, JobReference, JobState, JobType,
 };
 use google_cloud_bigquery::http::table::{
-    Clustering, Table, TableFieldMode, TableFieldSchema, TableFieldType, TableReference, TableSchema,
-    TimePartitionType, TimePartitioning,
+    Clustering, Table, TableFieldMode, TableFieldSchema, TableFieldType, TableReference,
+    TableSchema, TimePartitionType, TimePartitioning,
 };
 use google_cloud_bigquery::http::tabledata::insert_all::{InsertAllRequest, Row as InsertRow};
 use google_cloud_bigquery::query::row::Row as QueryRow;
@@ -115,7 +115,12 @@ impl BigQuerySink {
     }
 
     pub async fn table_exists(&self, table: &str) -> Result<bool> {
-        match self.client.table().get(&self.project_id, &self.dataset_id, table).await {
+        match self
+            .client
+            .table()
+            .get(&self.project_id, &self.dataset_id, table)
+            .await
+        {
             Ok(_) => Ok(true),
             Err(e) if is_not_found(&e) => Ok(false),
             Err(e) => Err(EtlError::other(format!("bigquery table get error: {e}"))),
@@ -125,7 +130,12 @@ impl BigQuerySink {
     /// Committed row count from free table metadata (`numRows`); `None` if the
     /// table doesn't exist. May lag the streaming buffer — diagnostic only.
     pub async fn current_row_count(&self, table: &str) -> Result<Option<u64>> {
-        match self.client.table().get(&self.project_id, &self.dataset_id, table).await {
+        match self
+            .client
+            .table()
+            .get(&self.project_id, &self.dataset_id, table)
+            .await
+        {
             Ok(t) => Ok(Some(t.num_rows)),
             Err(e) if is_not_found(&e) => Ok(None),
             Err(e) => Err(EtlError::other(format!("bigquery table get error: {e}"))),
@@ -135,7 +145,12 @@ impl BigQuerySink {
     /// Build and run this destination's own structured `Table` creation —
     /// no DDL string templating, unlike ClickHouse (BigQuery's REST API
     /// takes a schema object directly).
-    pub async fn create_table(&self, table: &str, columns: &[ColumnType], cfg: &TransferConfig) -> Result<()> {
+    pub async fn create_table(
+        &self,
+        table: &str,
+        columns: &[ColumnType],
+        cfg: &TransferConfig,
+    ) -> Result<()> {
         let t = build_table(&self.project_id, &self.dataset_id, table, columns, cfg)?;
         tracing::debug!(
             "creating BigQuery table {}.{}.{}",
@@ -154,10 +169,18 @@ impl BigQuerySink {
     /// Insert Arrow batches, dispatching on the configured write method:
     /// `insertAll` (default) or the Storage Write API (opt-in). Both share the
     /// transient-failure retry/backoff policy of the ClickHouse sink.
-    pub async fn insert_batches(&self, table: &str, schema: SchemaRef, batches: &[RecordBatch]) -> Result<u64> {
+    pub async fn insert_batches(
+        &self,
+        table: &str,
+        schema: SchemaRef,
+        batches: &[RecordBatch],
+    ) -> Result<u64> {
         match self.write_method {
             BigQueryWriteMethod::InsertAll => self.insert_batches_insert_all(table, batches).await,
-            BigQueryWriteMethod::StorageWrite => self.insert_batches_storage_write(table, schema, batches).await,
+            BigQueryWriteMethod::StorageWrite => {
+                self.insert_batches_storage_write(table, schema, batches)
+                    .await
+            }
         }
     }
 
@@ -175,12 +198,19 @@ impl BigQuerySink {
                 let end = (start + INSERT_ALL_MAX_ROWS_PER_REQUEST).min(batch.num_rows());
                 let rows = (start..end)
                     .map(|r| {
-                        batch_row_to_json(batch, r)
-                            .map(|json| InsertRow { insert_id: None, json: Value::Object(json) })
+                        batch_row_to_json(batch, r).map(|json| InsertRow {
+                            insert_id: None,
+                            json: Value::Object(json),
+                        })
                     })
                     .collect::<Result<Vec<_>>>()?;
-                let request = InsertAllRequest { rows, ..Default::default() };
-                total_bytes += serde_json::to_vec(&request).map(|b| b.len() as u64).unwrap_or(0);
+                let request = InsertAllRequest {
+                    rows,
+                    ..Default::default()
+                };
+                total_bytes += serde_json::to_vec(&request)
+                    .map(|b| b.len() as u64)
+                    .unwrap_or(0);
 
                 let mut attempt = 0u32;
                 loop {
@@ -215,7 +245,11 @@ impl BigQuerySink {
     /// transport/5xx/429 failures and per-row `insertErrors` (a schema
     /// mismatch BigQuery rejected outright) are both surfaced, the former
     /// retried, the latter not.
-    async fn try_insert(&self, table: &str, request: &InsertAllRequest<Value>) -> std::result::Result<(), SendError> {
+    async fn try_insert(
+        &self,
+        table: &str,
+        request: &InsertAllRequest<Value>,
+    ) -> std::result::Result<(), SendError> {
         let response = self
             .client
             .tabledata()
@@ -253,7 +287,12 @@ impl BigQuerySink {
     /// semantics; idempotency for incremental syncs comes from the staging +
     /// MERGE flow, and for full-refresh from writing to staging then swapping.
     /// Returns the total encoded protobuf bytes sent.
-    async fn insert_batches_storage_write(&self, table: &str, schema: SchemaRef, batches: &[RecordBatch]) -> Result<u64> {
+    async fn insert_batches_storage_write(
+        &self,
+        table: &str,
+        schema: SchemaRef,
+        batches: &[RecordBatch],
+    ) -> Result<u64> {
         if batches.iter().all(|b| b.num_rows() == 0) {
             return Ok(0);
         }
@@ -261,13 +300,20 @@ impl BigQuerySink {
         let descriptor = build_proto_descriptor(&fields)?;
         // `_default` is a persistent server-side stream; this fetches its
         // handle (a lightweight GetWriteStream), created once per call.
-        let resource = format!("projects/{}/datasets/{}/tables/{table}", self.project_id, self.dataset_id);
+        let resource = format!(
+            "projects/{}/datasets/{}/tables/{table}",
+            self.project_id, self.dataset_id
+        );
         let stream = self
             .client
             .default_storage_writer()
             .create_write_stream(&resource)
             .await
-            .map_err(|e| EtlError::other(format!("bigquery storage-write: open stream for {resource}: {e}")))?;
+            .map_err(|e| {
+                EtlError::other(format!(
+                    "bigquery storage-write: open stream for {resource}: {e}"
+                ))
+            })?;
 
         let mut total_bytes = 0u64;
         for batch in batches {
@@ -287,7 +333,10 @@ impl BigQuerySink {
                     attempt += 1;
                     // Clone per attempt: retries are rare, and the builder
                     // consumes the row bytes.
-                    match self.try_append(&stream, &descriptor, serialized.clone(), table).await {
+                    match self
+                        .try_append(&stream, &descriptor, serialized.clone(), table)
+                        .await
+                    {
                         Ok(()) => break,
                         Err(SendError::Permanent(e)) => return Err(e),
                         Err(SendError::Transient(e)) => {
@@ -362,7 +411,12 @@ impl BigQuerySink {
     /// `WRITE_TRUNCATE` copy job (which silently drops rows still in
     /// `staging`'s streaming buffer) or `CREATE OR REPLACE TABLE ... AS
     /// SELECT` (which would drop `dest`'s partitioning/clustering).
-    pub async fn atomic_swap(&self, dest: &str, staging: &str, columns: &[ColumnType]) -> Result<()> {
+    pub async fn atomic_swap(
+        &self,
+        dest: &str,
+        staging: &str,
+        columns: &[ColumnType],
+    ) -> Result<()> {
         let query = build_swap_sql(&self.project_id, &self.dataset_id, dest, staging, columns);
         let job = Job {
             job_reference: JobReference {
@@ -408,7 +462,16 @@ impl BigQuerySink {
         prune_partition: Option<&str>,
         delete_stale: bool,
     ) -> Result<()> {
-        let query = build_merge_sql(&self.project_id, &self.dataset_id, dest, staging, key, columns, prune_partition, delete_stale)?;
+        let query = build_merge_sql(
+            &self.project_id,
+            &self.dataset_id,
+            dest,
+            staging,
+            key,
+            columns,
+            prune_partition,
+            delete_stale,
+        )?;
         let job = Job {
             job_reference: JobReference {
                 project_id: self.project_id.clone(),
@@ -438,7 +501,12 @@ impl BigQuerySink {
     /// Idempotent, matching ClickHouse's `DROP TABLE IF EXISTS`: a
     /// not-found is success, not an error.
     pub async fn drop_table(&self, table: &str) -> Result<()> {
-        match self.client.table().delete(&self.project_id, &self.dataset_id, table).await {
+        match self
+            .client
+            .table()
+            .delete(&self.project_id, &self.dataset_id, table)
+            .await
+        {
             Ok(()) => Ok(()),
             Err(e) if is_not_found(&e) => Ok(()),
             Err(e) => Err(EtlError::other(format!("bigquery table delete error: {e}"))),
@@ -530,13 +598,20 @@ impl BigQuerySink {
             escape_sql_string(&source_id),
             escape_sql_string(&cfg.dest_table),
         );
-        let request = QueryRequest { query, ..Default::default() };
+        let request = QueryRequest {
+            query,
+            ..Default::default()
+        };
         let mut iter = self
             .client
             .query::<QueryRow>(&self.project_id, request)
             .await
             .map_err(|e| EtlError::other(format!("bigquery query error: {e}")))?;
-        match iter.next().await.map_err(|e| EtlError::other(format!("bigquery row error: {e}")))? {
+        match iter
+            .next()
+            .await
+            .map_err(|e| EtlError::other(format!("bigquery row error: {e}")))?
+        {
             Some(row) => row
                 .column::<Option<String>>(0)
                 .map_err(|e| EtlError::other(format!("bigquery column error: {e}"))),
@@ -547,9 +622,21 @@ impl BigQuerySink {
     /// Persist a new watermark after a successful incremental run, via a
     /// DML `INSERT` run as a query job (BigQuery executes DML through the
     /// same job mechanism as `SELECT`).
-    pub async fn persist_watermark(&self, cfg: &TransferConfig, watermark: &str, rows: u64) -> Result<()> {
+    pub async fn persist_watermark(
+        &self,
+        cfg: &TransferConfig,
+        watermark: &str,
+        rows: u64,
+    ) -> Result<()> {
         let source_id = cfg.effective_state_key();
-        let query = build_persist_watermark_sql(&self.project_id, &self.dataset_id, &source_id, &cfg.dest_table, watermark, rows);
+        let query = build_persist_watermark_sql(
+            &self.project_id,
+            &self.dataset_id,
+            &source_id,
+            &cfg.dest_table,
+            watermark,
+            rows,
+        );
         let job = Job {
             job_reference: JobReference {
                 project_id: self.project_id.clone(),
@@ -566,12 +653,10 @@ impl BigQuerySink {
             },
             ..Default::default()
         };
-        let created = self
-            .client
-            .job()
-            .create(&job)
-            .await
-            .map_err(|e| EtlError::other(format!("bigquery persist_watermark job error: {e}")))?;
+        let created =
+            self.client.job().create(&job).await.map_err(|e| {
+                EtlError::other(format!("bigquery persist_watermark job error: {e}"))
+            })?;
         self.poll_job_until_done(created).await?;
         Ok(())
     }
@@ -588,7 +673,9 @@ impl BigQuerySink {
                 .get(
                     &job.job_reference.project_id,
                     &job.job_reference.job_id,
-                    &GetJobRequest { location: job.job_reference.location.clone() },
+                    &GetJobRequest {
+                        location: job.job_reference.location.clone(),
+                    },
                 )
                 .await
                 .map_err(|e| EtlError::other(format!("bigquery job get error: {e}")))?;
@@ -630,7 +717,11 @@ fn classify_bq_error(e: BqError, context: &str) -> SendError {
 /// everything else (e.g. `INVALID_ARGUMENT`, auth) is deterministic.
 fn classify_status(status: &google_cloud_gax::grpc::Status, context: &str) -> SendError {
     use google_cloud_gax::grpc::Code;
-    let err = EtlError::other(format!("{context}: {} ({:?})", status.message(), status.code()));
+    let err = EtlError::other(format!(
+        "{context}: {} ({:?})",
+        status.message(),
+        status.code()
+    ));
     match status.code() {
         Code::Unavailable
         | Code::Internal
@@ -646,7 +737,11 @@ fn classify_status(status: &google_cloud_gax::grpc::Status, context: &str) -> Se
 /// failure). Codes are `google.rpc.Code` integers: INTERNAL(13),
 /// UNAVAILABLE(14), ABORTED(10), RESOURCE_EXHAUSTED(8), DEADLINE_EXCEEDED(4)
 /// are transient; everything else (e.g. INVALID_ARGUMENT(3)) is deterministic.
-fn classify_rpc_status(status: &google_cloud_googleapis::rpc::Status, table: &str, dataset: &str) -> SendError {
+fn classify_rpc_status(
+    status: &google_cloud_googleapis::rpc::Status,
+    table: &str,
+    dataset: &str,
+) -> SendError {
     let err = EtlError::other(format!(
         "bigquery storage-write append error into {dataset}.{table}: code {} {}",
         status.code, status.message
@@ -694,10 +789,20 @@ fn escape_sql_string(s: &str) -> String {
 /// rolls back too and `dest` is left untouched. A free function (not a
 /// `&self` method) so it's unit-testable without a real authenticated
 /// client, mirroring `build_merge_sql`/`build_table`.
-fn build_swap_sql(project_id: &str, dataset_id: &str, dest: &str, staging: &str, columns: &[ColumnType]) -> String {
+fn build_swap_sql(
+    project_id: &str,
+    dataset_id: &str,
+    dest: &str,
+    staging: &str,
+    columns: &[ColumnType],
+) -> String {
     let dest_ref = format!("`{project_id}`.`{dataset_id}`.`{dest}`");
     let staging_ref = format!("`{project_id}`.`{dataset_id}`.`{staging}`");
-    let col_list = columns.iter().map(|c| format!("`{}`", c.name)).collect::<Vec<_>>().join(", ");
+    let col_list = columns
+        .iter()
+        .map(|c| format!("`{}`", c.name))
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
         "BEGIN TRANSACTION; \
          TRUNCATE TABLE {dest_ref}; \
@@ -753,7 +858,11 @@ fn build_merge_sql(
             "build_merge_sql called with an empty key (should have been validated before staging began)",
         ));
     }
-    let mut on_clause = key.iter().map(|k| format!("T.`{k}` = S.`{k}`")).collect::<Vec<_>>().join(" AND ");
+    let mut on_clause = key
+        .iter()
+        .map(|k| format!("T.`{k}` = S.`{k}`"))
+        .collect::<Vec<_>>()
+        .join(" AND ");
     // Optional partition pruning: bound the destination scan to the staging
     // batch's range on an IMMUTABLE partition column, so BigQuery reads only
     // the touched partitions instead of the whole table. Scalar subqueries over
@@ -776,7 +885,11 @@ fn build_merge_sql(
     }
 
     let all_cols: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
-    let update_cols: Vec<&str> = all_cols.iter().copied().filter(|c| !key.iter().any(|k| k == c)).collect();
+    let update_cols: Vec<&str> = all_cols
+        .iter()
+        .copied()
+        .filter(|c| !key.iter().any(|k| k == c))
+        .collect();
 
     let mut clauses = Vec::new();
     if !update_cols.is_empty() {
@@ -790,9 +903,19 @@ fn build_merge_sql(
     // If every column is part of `key`, there's nothing left to update on a
     // match — this degrades to an insert-only merge (a de-duplicating
     // "insert if new"), which is still correct, just a no-op for existing rows.
-    let insert_cols = all_cols.iter().map(|c| format!("`{c}`")).collect::<Vec<_>>().join(", ");
-    let insert_vals = all_cols.iter().map(|c| format!("S.`{c}`")).collect::<Vec<_>>().join(", ");
-    clauses.push(format!("WHEN NOT MATCHED THEN INSERT ({insert_cols}) VALUES ({insert_vals})"));
+    let insert_cols = all_cols
+        .iter()
+        .map(|c| format!("`{c}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let insert_vals = all_cols
+        .iter()
+        .map(|c| format!("S.`{c}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    clauses.push(format!(
+        "WHEN NOT MATCHED THEN INSERT ({insert_cols}) VALUES ({insert_vals})"
+    ));
     // Optional window-scoped delete: remove destination rows INSIDE the merged
     // window that are absent from the source pull ("replace this window", and a
     // NULL merge key nets to a replace instead of duplicating). Scoped to the
@@ -805,7 +928,9 @@ fn build_merge_sql(
                 "delete_stale requested without merge_prune_partition_by (should have been validated)",
             )
         })?;
-        clauses.push(format!("WHEN NOT MATCHED BY SOURCE AND {bound} THEN DELETE"));
+        clauses.push(format!(
+            "WHEN NOT MATCHED BY SOURCE AND {bound} THEN DELETE"
+        ));
     }
 
     Ok(format!(
@@ -876,7 +1001,11 @@ fn build_table(
         fields.push(TableFieldSchema {
             name: c.name.clone(),
             data_type: bq_field_data_type(c, cfg)?,
-            mode: Some(if c.nullable { TableFieldMode::Nullable } else { TableFieldMode::Required }),
+            mode: Some(if c.nullable {
+                TableFieldMode::Nullable
+            } else {
+                TableFieldMode::Required
+            }),
             ..Default::default()
         });
     }
@@ -921,7 +1050,13 @@ fn build_table(
             cluster_cols.join(", ")
         )));
     }
-    let clustering = if cluster_cols.is_empty() { None } else { Some(Clustering { fields: cluster_cols }) };
+    let clustering = if cluster_cols.is_empty() {
+        None
+    } else {
+        Some(Clustering {
+            fields: cluster_cols,
+        })
+    };
 
     Ok(Table {
         table_reference: TableReference {
@@ -998,21 +1133,25 @@ fn array_value_to_json(col: &dyn Array, dt: &DataType, row: usize) -> Result<Val
 }
 
 fn downcast<T: 'static>(col: &dyn Array) -> Result<&T> {
-    col.as_any()
-        .downcast_ref::<T>()
-        .ok_or_else(|| EtlError::internal("Arrow array downcast failed (schema/builder type mismatch)"))
+    col.as_any().downcast_ref::<T>().ok_or_else(|| {
+        EtlError::internal("Arrow array downcast failed (schema/builder type mismatch)")
+    })
 }
 
 /// `NaN`/`Infinity` aren't representable in JSON — coerced to `null` rather
 /// than erroring (matches this crate's general policy of degrading gracefully
 /// on unrepresentable values rather than aborting the whole transfer).
 fn json_float(v: f64) -> Value {
-    serde_json::Number::from_f64(v).map(Value::Number).unwrap_or(Value::Null)
+    serde_json::Number::from_f64(v)
+        .map(Value::Number)
+        .unwrap_or(Value::Null)
 }
 
 fn date32_to_iso(days: i32) -> String {
     let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-    (epoch + chrono::Duration::days(days as i64)).format("%Y-%m-%d").to_string()
+    (epoch + chrono::Duration::days(days as i64))
+        .format("%Y-%m-%d")
+        .to_string()
 }
 
 /// `has_tz` distinguishes BigQuery `DATETIME` (naive, no suffix) from
@@ -1023,8 +1162,11 @@ fn date32_to_iso(days: i32) -> String {
 pub(crate) fn timestamp_micros_to_iso(micros: i64, has_tz: bool) -> Result<String> {
     let secs = micros.div_euclid(1_000_000);
     let nanos = (micros.rem_euclid(1_000_000) * 1000) as u32;
-    let dt = chrono::DateTime::from_timestamp(secs, nanos)
-        .ok_or_else(|| EtlError::internal(format!("timestamp {micros} (µs) out of representable range")))?;
+    let dt = chrono::DateTime::from_timestamp(secs, nanos).ok_or_else(|| {
+        EtlError::internal(format!(
+            "timestamp {micros} (µs) out of representable range"
+        ))
+    })?;
     Ok(if has_tz {
         dt.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
     } else {
@@ -1095,9 +1237,16 @@ mod tests {
             mode: Some(TableFieldMode::Required),
             ..Default::default()
         }];
-        let desired = vec![col("id", DataType::Int64, false), col("email", DataType::Utf8, true)];
+        let desired = vec![
+            col("id", DataType::Int64, false),
+            col("email", DataType::Utf8, true),
+        ];
         let (fields, added) = build_evolved_fields(existing, &desired, &base_cfg()).unwrap();
-        assert_eq!(added, vec!["email"], "only the genuinely-new column is added");
+        assert_eq!(
+            added,
+            vec!["email"],
+            "only the genuinely-new column is added"
+        );
         assert_eq!(fields.len(), 2);
         // The existing field is carried through untouched (still Required).
         assert_eq!(fields[0].name, "id");
@@ -1119,7 +1268,10 @@ mod tests {
         }];
         let desired = vec![col("id", DataType::Int64, false)];
         let (fields, added) = build_evolved_fields(existing, &desired, &base_cfg()).unwrap();
-        assert!(added.is_empty(), "case-insensitive match must not re-add 'id'");
+        assert!(
+            added.is_empty(),
+            "case-insensitive match must not re-add 'id'"
+        );
         assert_eq!(fields.len(), 1);
     }
 
@@ -1146,20 +1298,27 @@ mod tests {
         let mut cfg = base_cfg();
         cfg.type_overrides.insert("amount".into(), "NUMERIC".into());
         let t = build_table("p", "d", "t", &cols, &cfg).unwrap();
-        assert_eq!(t.schema.unwrap().fields[0].data_type, TableFieldType::Numeric);
+        assert_eq!(
+            t.schema.unwrap().fields[0].data_type,
+            TableFieldType::Numeric
+        );
     }
 
     #[test]
     fn build_table_rejects_invalid_type_override() {
         let cols = vec![col("amount", DataType::Float64, false)];
         let mut cfg = base_cfg();
-        cfg.type_overrides.insert("amount".into(), "NOT_A_REAL_TYPE".into());
+        cfg.type_overrides
+            .insert("amount".into(), "NOT_A_REAL_TYPE".into());
         assert!(build_table("p", "d", "t", &cols, &cfg).is_err());
     }
 
     #[test]
     fn build_table_clustering_from_order_by_and_key_deduped() {
-        let cols = vec![col("a", DataType::Int64, false), col("b", DataType::Int64, false)];
+        let cols = vec![
+            col("a", DataType::Int64, false),
+            col("b", DataType::Int64, false),
+        ];
         let mut cfg = base_cfg();
         cfg.order_by = vec!["a".into(), "b".into()];
         cfg.key = vec!["a".into()]; // duplicate of order_by[0], must not double up
@@ -1169,10 +1328,14 @@ mod tests {
 
     #[test]
     fn build_table_rejects_more_than_four_clustering_columns() {
-        let cols = (0..5).map(|i| col(&format!("c{i}"), DataType::Int64, false)).collect::<Vec<_>>();
+        let cols = (0..5)
+            .map(|i| col(&format!("c{i}"), DataType::Int64, false))
+            .collect::<Vec<_>>();
         let mut cfg = base_cfg();
         cfg.order_by = cols.iter().map(|c| c.name.clone()).collect();
-        let err = build_table("p", "d", "t", &cols, &cfg).unwrap_err().to_string();
+        let err = build_table("p", "d", "t", &cols, &cfg)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("at most 4"), "{err}");
     }
 
@@ -1181,7 +1344,9 @@ mod tests {
         let cols = vec![col("id", DataType::Int64, false)];
         let mut cfg = base_cfg();
         cfg.partition_by = Some("id".into());
-        let err = build_table("p", "d", "t", &cols, &cfg).unwrap_err().to_string();
+        let err = build_table("p", "d", "t", &cols, &cfg)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("DATE/DATETIME/TIMESTAMP"), "{err}");
     }
 
@@ -1190,13 +1355,18 @@ mod tests {
         let cols = vec![col("id", DataType::Int64, false)];
         let mut cfg = base_cfg();
         cfg.partition_by = Some("nonexistent".into());
-        let err = build_table("p", "d", "t", &cols, &cfg).unwrap_err().to_string();
+        let err = build_table("p", "d", "t", &cols, &cfg)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("nonexistent"), "{err}");
     }
 
     #[test]
     fn build_table_partition_by_valid_date_column() {
-        let cols = vec![col("id", DataType::Int64, false), col("event_date", DataType::Date32, false)];
+        let cols = vec![
+            col("id", DataType::Int64, false),
+            col("event_date", DataType::Date32, false),
+        ];
         let mut cfg = base_cfg();
         cfg.partition_by = Some("event_date".into());
         let t = build_table("p", "d", "t", &cols, &cfg).unwrap();
@@ -1216,7 +1386,10 @@ mod tests {
 
         assert!(sql.starts_with("BEGIN TRANSACTION;"), "{sql}");
         assert!(sql.trim_end().ends_with("COMMIT TRANSACTION;"), "{sql}");
-        assert!(sql.contains("TRUNCATE TABLE `proj`.`ds`.`orders`;"), "{sql}");
+        assert!(
+            sql.contains("TRUNCATE TABLE `proj`.`ds`.`orders`;"),
+            "{sql}"
+        );
         assert!(
             sql.contains(
                 "INSERT INTO `proj`.`ds`.`orders` (`id`, `name`, `amount`) \
@@ -1228,14 +1401,20 @@ mod tests {
         let truncate_pos = sql.find("TRUNCATE TABLE").unwrap();
         let insert_pos = sql.find("INSERT INTO").unwrap();
         let commit_pos = sql.find("COMMIT TRANSACTION").unwrap();
-        assert!(truncate_pos < insert_pos && insert_pos < commit_pos, "wrong statement order: {sql}");
+        assert!(
+            truncate_pos < insert_pos && insert_pos < commit_pos,
+            "wrong statement order: {sql}"
+        );
     }
 
     #[test]
     fn build_swap_sql_includes_every_column_not_just_a_key_subset() {
         // Unlike build_merge_sql there's no key/non-key split — every column
         // is both truncated away and re-inserted.
-        let cols = vec![col("a", DataType::Int64, false), col("b", DataType::Utf8, true)];
+        let cols = vec![
+            col("a", DataType::Int64, false),
+            col("b", DataType::Utf8, true),
+        ];
         let sql = build_swap_sql("p", "d", "dest", "staging", &cols);
         assert!(sql.contains("(`a`, `b`) SELECT `a`, `b` FROM"), "{sql}");
     }
@@ -1247,13 +1426,20 @@ mod tests {
         // or every persist_watermark call fails with a syntax error right
         // after a successful incremental run — 100% reproducible, since it's
         // independent of write_method, watermark value, or row count.
-        let sql = build_persist_watermark_sql("proj", "ds", "orders", "orders_dest", "2024-06-01", 42);
+        let sql =
+            build_persist_watermark_sql("proj", "ds", "orders", "orders_dest", "2024-06-01", 42);
         assert!(
             sql.contains("(source_table, dest_table, last_watermark, `rows`, run_ts)"),
             "`rows` must be backtick-quoted: {sql}"
         );
-        assert!(sql.starts_with("INSERT INTO `proj`.`ds`.`_quickhouse_state`"), "{sql}");
-        assert!(sql.contains("VALUES ('orders', 'orders_dest', '2024-06-01', 42, CURRENT_TIMESTAMP())"), "{sql}");
+        assert!(
+            sql.starts_with("INSERT INTO `proj`.`ds`.`_quickhouse_state`"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("VALUES ('orders', 'orders_dest', '2024-06-01', 42, CURRENT_TIMESTAMP())"),
+            "{sql}"
+        );
     }
 
     #[test]
@@ -1283,21 +1469,44 @@ mod tests {
             col("amount", DataType::Float64, true),
         ];
         let key = vec!["id".to_string()];
-        let sql = build_merge_sql("proj", "ds", "orders", "orders_quickhouse_tmp", &key, &cols, None, false).unwrap();
+        let sql = build_merge_sql(
+            "proj",
+            "ds",
+            "orders",
+            "orders_quickhouse_tmp",
+            &key,
+            &cols,
+            None,
+            false,
+        )
+        .unwrap();
 
-        assert!(sql.starts_with("MERGE INTO `proj`.`ds`.`orders` T USING `proj`.`ds`.`orders_quickhouse_tmp` S"));
+        assert!(sql.starts_with(
+            "MERGE INTO `proj`.`ds`.`orders` T USING `proj`.`ds`.`orders_quickhouse_tmp` S"
+        ));
         assert!(sql.contains("ON T.`id` = S.`id`"));
         // No prune column -> no partition-bound predicate (full-scan, correct default).
-        assert!(!sql.contains("BETWEEN"), "unexpected prune predicate without an immutable column: {sql}");
-        assert!(sql.contains("WHEN MATCHED THEN UPDATE SET `name` = S.`name`, `amount` = S.`amount`"));
+        assert!(
+            !sql.contains("BETWEEN"),
+            "unexpected prune predicate without an immutable column: {sql}"
+        );
+        assert!(
+            sql.contains("WHEN MATCHED THEN UPDATE SET `name` = S.`name`, `amount` = S.`amount`")
+        );
         assert!(sql.contains("WHEN NOT MATCHED THEN INSERT (`id`, `name`, `amount`) VALUES (S.`id`, S.`name`, S.`amount`)"));
         // The key column must never appear in the UPDATE SET list.
-        assert!(!sql.contains("`id` = S.`id`,"), "key column leaked into UPDATE SET: {sql}");
+        assert!(
+            !sql.contains("`id` = S.`id`,"),
+            "key column leaked into UPDATE SET: {sql}"
+        );
     }
 
     #[test]
     fn build_merge_sql_composite_key() {
-        let cols = vec![col("a", DataType::Int64, false), col("b", DataType::Int64, false)];
+        let cols = vec![
+            col("a", DataType::Int64, false),
+            col("b", DataType::Int64, false),
+        ];
         let key = vec!["a".to_string(), "b".to_string()];
         let sql = build_merge_sql("p", "d", "t", "s", &key, &cols, None, false).unwrap();
         assert!(sql.contains("ON T.`a` = S.`a` AND T.`b` = S.`b`"));
@@ -1307,11 +1516,25 @@ mod tests {
     fn build_merge_sql_prunes_on_immutable_partition_column() {
         let cols = vec![
             col("id", DataType::Int64, false),
-            col("create_date", DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())), false),
+            col(
+                "create_date",
+                DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
             col("amount", DataType::Float64, true),
         ];
         let key = vec!["id".to_string()];
-        let sql = build_merge_sql("p", "d", "orders", "orders_tmp", &key, &cols, Some("create_date"), false).unwrap();
+        let sql = build_merge_sql(
+            "p",
+            "d",
+            "orders",
+            "orders_tmp",
+            &key,
+            &cols,
+            Some("create_date"),
+            false,
+        )
+        .unwrap();
         // The join still matches on the key, AND the destination is bounded to
         // the staging batch's create_date range so BigQuery prunes partitions.
         assert!(sql.contains("ON T.`id` = S.`id`"), "{sql}");
@@ -1331,10 +1554,24 @@ mod tests {
     fn build_merge_sql_delete_stale_scopes_to_the_staging_window() {
         let cols = vec![
             col("id", DataType::Int64, false),
-            col("create_date", DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())), false),
+            col(
+                "create_date",
+                DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
         ];
         let key = vec!["id".to_string()];
-        let sql = build_merge_sql("p", "d", "orders", "orders_tmp", &key, &cols, Some("create_date"), true).unwrap();
+        let sql = build_merge_sql(
+            "p",
+            "d",
+            "orders",
+            "orders_tmp",
+            &key,
+            &cols,
+            Some("create_date"),
+            true,
+        )
+        .unwrap();
         // The DELETE is scoped to the SAME staging window as the prune — it must
         // never delete outside the batch's create_date range.
         assert!(
@@ -1351,9 +1588,14 @@ mod tests {
     fn build_merge_sql_delete_stale_without_prune_is_internal_error() {
         // Defensive: config validation should reject this combo first, but the
         // builder must never emit an unscoped (history-nuking) DELETE.
-        let cols = vec![col("id", DataType::Int64, false), col("v", DataType::Int64, true)];
+        let cols = vec![
+            col("id", DataType::Int64, false),
+            col("v", DataType::Int64, true),
+        ];
         let key = vec!["id".to_string()];
-        let err = build_merge_sql("p", "d", "t", "s", &key, &cols, None, true).unwrap_err().to_string();
+        let err = build_merge_sql("p", "d", "t", "s", &key, &cols, None, true)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("delete_stale"), "{err}");
     }
 
@@ -1362,16 +1604,24 @@ mod tests {
         let cols = vec![col("id", DataType::Int64, false)];
         let key = vec!["id".to_string()];
         let sql = build_merge_sql("p", "d", "t", "s", &key, &cols, None, false).unwrap();
-        assert!(!sql.contains("WHEN MATCHED"), "no columns left to update: {sql}");
+        assert!(
+            !sql.contains("WHEN MATCHED"),
+            "no columns left to update: {sql}"
+        );
         assert!(sql.contains("WHEN NOT MATCHED THEN INSERT (`id`) VALUES (S.`id`)"));
     }
 
     #[test]
     fn build_merge_sql_rejects_empty_key() {
         let cols = vec![col("id", DataType::Int64, false)];
-        let err = build_merge_sql("p", "d", "t", "s", &[], &cols, None, false).unwrap_err().to_string();
+        let err = build_merge_sql("p", "d", "t", "s", &[], &cols, None, false)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("empty key"), "{err}");
-        assert!(err.contains("quickhouse bug"), "must be framed as internal, not a config error: {err}");
+        assert!(
+            err.contains("quickhouse bug"),
+            "must be framed as internal, not a config error: {err}"
+        );
     }
 
     fn sample_batch() -> RecordBatch {

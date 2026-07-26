@@ -54,9 +54,16 @@ pub(crate) enum ResponseClass {
 /// Matches AppsFlyer's cap/limit responses (case-insensitive) in the body head.
 pub(crate) fn looks_like_limit_message(head: &str) -> bool {
     let h = head.to_ascii_lowercase();
-    ["limit", "reached", "exceeded", "maximum number", "your api calls", "daily"]
-        .iter()
-        .any(|p| h.contains(p))
+    [
+        "limit",
+        "reached",
+        "exceeded",
+        "maximum number",
+        "your api calls",
+        "daily",
+    ]
+    .iter()
+    .any(|p| h.contains(p))
 }
 
 /// Classify a Pull API response. `head` is the first ~200 bytes of the body.
@@ -66,13 +73,17 @@ pub(crate) fn classify_appsflyer(status: u16, head: &str) -> ResponseClass {
             if looks_like_limit_message(head) {
                 // HTTP 200 + plain-text cap message — NOT data. Fail permanently
                 // so a full refresh never truncates the dest with garbage.
-                ResponseClass::Permanent(format!("AppsFlyer returned a limit/cap message (not CSV): {head}"))
+                ResponseClass::Permanent(format!(
+                    "AppsFlyer returned a limit/cap message (not CSV): {head}"
+                ))
             } else {
                 ResponseClass::Ok
             }
         }
         401 | 403 => ResponseClass::Permanent(format!("AppsFlyer auth error {status}: {head}")),
-        404 => ResponseClass::Permanent(format!("AppsFlyer 404 (check app_id/report_type): {head}")),
+        404 => {
+            ResponseClass::Permanent(format!("AppsFlyer 404 (check app_id/report_type): {head}"))
+        }
         429 => {
             if looks_like_limit_message(head) {
                 ResponseClass::Permanent(format!("AppsFlyer daily/row cap reached (429): {head}"))
@@ -80,7 +91,9 @@ pub(crate) fn classify_appsflyer(status: u16, head: &str) -> ResponseClass {
                 ResponseClass::Transient(format!("AppsFlyer rate-limited (429): {head}"))
             }
         }
-        s if (500..=599).contains(&s) => ResponseClass::Transient(format!("AppsFlyer HTTP {s}: {head}")),
+        s if (500..=599).contains(&s) => {
+            ResponseClass::Transient(format!("AppsFlyer HTTP {s}: {head}"))
+        }
         s => ResponseClass::Permanent(format!("AppsFlyer HTTP {s}: {head}")),
     }
 }
@@ -88,7 +101,10 @@ pub(crate) fn classify_appsflyer(status: u16, head: &str) -> ResponseClass {
 /// Parse a CSV report into flat JSON objects keyed by header (column-order
 /// independent). Strips a UTF-8 BOM off the first header; validates every
 /// `expected_headers` entry exists; ragged short rows null-fill.
-pub(crate) fn csv_bytes_to_records(bytes: &[u8], expected_headers: &[String]) -> Result<Vec<Value>> {
+pub(crate) fn csv_bytes_to_records(
+    bytes: &[u8],
+    expected_headers: &[String],
+) -> Result<Vec<Value>> {
     // Strip a leading UTF-8 BOM so the first header matches by name.
     let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
     let mut rdr = csv::ReaderBuilder::new()
@@ -102,7 +118,9 @@ pub(crate) fn csv_bytes_to_records(bytes: &[u8], expected_headers: &[String]) ->
         .map(str::to_string)
         .collect();
     if headers.is_empty() {
-        return Err(EtlError::other("AppsFlyer CSV had no header row".to_string()));
+        return Err(EtlError::other(
+            "AppsFlyer CSV had no header row".to_string(),
+        ));
     }
     for want in expected_headers {
         if !headers.iter().any(|h| h == want) {
@@ -159,8 +177,20 @@ impl AppsFlyerSource {
 
     /// Fetch and parse the report for `[from, to]` (YYYY-MM-DD) into flat JSON
     /// records. Retries transient failures; surfaces caps as a clear error.
-    pub(crate) async fn fetch_records(&self, from: &str, to: &str, expected_headers: &[String]) -> Result<Vec<Value>> {
-        let url = report_url(&self.base_url, &self.app_id, &self.report_type, from, to, &self.extra_params)?;
+    pub(crate) async fn fetch_records(
+        &self,
+        from: &str,
+        to: &str,
+        expected_headers: &[String],
+    ) -> Result<Vec<Value>> {
+        let url = report_url(
+            &self.base_url,
+            &self.app_id,
+            &self.report_type,
+            from,
+            to,
+            &self.extra_params,
+        )?;
         let max = crate::sink::MAX_INSERT_ATTEMPTS;
         let mut attempt = 1u32;
         loop {
@@ -173,7 +203,10 @@ impl AppsFlyerSource {
                         .get(reqwest::header::RETRY_AFTER)
                         .and_then(|v| v.to_str().ok())
                         .and_then(|s| s.parse::<u64>().ok());
-                    let bytes = r.bytes().await.map_err(|e| EtlError::other(format!("AppsFlyer body read: {e}")))?;
+                    let bytes = r
+                        .bytes()
+                        .await
+                        .map_err(|e| EtlError::other(format!("AppsFlyer body read: {e}")))?;
                     let head = String::from_utf8_lossy(&bytes[..bytes.len().min(200)]).into_owned();
                     match classify_appsflyer(status, &head) {
                         ResponseClass::Ok => return csv_bytes_to_records(&bytes, expected_headers),
@@ -181,7 +214,9 @@ impl AppsFlyerSource {
                             let delay = retry_after
                                 .map(Duration::from_secs)
                                 .unwrap_or_else(|| crate::sink::backoff_delay(attempt));
-                            tracing::warn!("{msg} (attempt {attempt}/{max}); retrying in {delay:?}");
+                            tracing::warn!(
+                                "{msg} (attempt {attempt}/{max}); retrying in {delay:?}"
+                            );
                             tokio::time::sleep(delay).await;
                             attempt += 1;
                         }
@@ -211,38 +246,83 @@ mod tests {
         let mut extra = HashMap::new();
         extra.insert("timezone".to_string(), "UTC".to_string());
         extra.insert("maximum_rows".to_string(), "1000".to_string());
-        let u = report_url("https://hq1.appsflyer.com", "id123", "installs_report", "2026-07-01", "2026-07-02", &extra).unwrap();
-        assert!(u.starts_with("https://hq1.appsflyer.com/api/raw-data/export/app/id123/installs_report/v5?"), "{u}");
-        assert!(u.contains("from=2026-07-01") && u.contains("to=2026-07-02"), "{u}");
-        assert!(u.contains("maximum_rows=1000") && u.contains("timezone=UTC"), "{u}");
+        let u = report_url(
+            "https://hq1.appsflyer.com",
+            "id123",
+            "installs_report",
+            "2026-07-01",
+            "2026-07-02",
+            &extra,
+        )
+        .unwrap();
+        assert!(
+            u.starts_with(
+                "https://hq1.appsflyer.com/api/raw-data/export/app/id123/installs_report/v5?"
+            ),
+            "{u}"
+        );
+        assert!(
+            u.contains("from=2026-07-01") && u.contains("to=2026-07-02"),
+            "{u}"
+        );
+        assert!(
+            u.contains("maximum_rows=1000") && u.contains("timezone=UTC"),
+            "{u}"
+        );
     }
 
     #[test]
     fn classify_guards_the_200_limit_body() {
-        assert!(matches!(classify_appsflyer(200, "install_time,event_name\n"), ResponseClass::Ok));
+        assert!(matches!(
+            classify_appsflyer(200, "install_time,event_name\n"),
+            ResponseClass::Ok
+        ));
         assert!(matches!(
             classify_appsflyer(200, "Your daily limit of API calls has been reached"),
             ResponseClass::Permanent(_)
         ));
-        assert!(matches!(classify_appsflyer(429, "slow down"), ResponseClass::Transient(_)));
-        assert!(matches!(classify_appsflyer(429, "maximum number of rows exceeded"), ResponseClass::Permanent(_)));
-        assert!(matches!(classify_appsflyer(401, "bad token"), ResponseClass::Permanent(_)));
-        assert!(matches!(classify_appsflyer(503, ""), ResponseClass::Transient(_)));
+        assert!(matches!(
+            classify_appsflyer(429, "slow down"),
+            ResponseClass::Transient(_)
+        ));
+        assert!(matches!(
+            classify_appsflyer(429, "maximum number of rows exceeded"),
+            ResponseClass::Permanent(_)
+        ));
+        assert!(matches!(
+            classify_appsflyer(401, "bad token"),
+            ResponseClass::Permanent(_)
+        ));
+        assert!(matches!(
+            classify_appsflyer(503, ""),
+            ResponseClass::Transient(_)
+        ));
     }
 
     #[test]
     fn csv_parses_quotes_bom_ragged_and_validates_headers() {
         // BOM on first header + a quoted field with an embedded comma.
         let csv = "\u{feff}id,name\n1,\"Doe, John\"\n2,\n";
-        let recs = csv_bytes_to_records(csv.as_bytes(), &["id".to_string(), "name".to_string()]).unwrap();
+        let recs =
+            csv_bytes_to_records(csv.as_bytes(), &["id".to_string(), "name".to_string()]).unwrap();
         assert_eq!(recs.len(), 2);
         assert_eq!(recs[0]["id"], "1");
-        assert_eq!(recs[0]["name"], "Doe, John", "quoted embedded comma preserved");
+        assert_eq!(
+            recs[0]["name"], "Doe, John",
+            "quoted embedded comma preserved"
+        );
         assert_eq!(recs[1]["name"], "", "empty cell kept as empty string");
         // Missing declared header -> clear error listing available headers.
-        let err = csv_bytes_to_records(csv.as_bytes(), &["nope".to_string()]).unwrap_err().to_string();
+        let err = csv_bytes_to_records(csv.as_bytes(), &["nope".to_string()])
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("nope") && err.contains("id"), "{err}");
         // Header-only CSV -> 0 rows.
-        assert_eq!(csv_bytes_to_records(b"a,b\n", &["a".to_string()]).unwrap().len(), 0);
+        assert_eq!(
+            csv_bytes_to_records(b"a,b\n", &["a".to_string()])
+                .unwrap()
+                .len(),
+            0
+        );
     }
 }

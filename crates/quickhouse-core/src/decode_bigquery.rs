@@ -65,7 +65,7 @@ impl ColBuilder {
                 // an Arrow type this decoder doesn't implement a builder for.
                 return Err(EtlError::internal(format!(
                     "no column builder for Arrow type {other:?}"
-                )))
+                )));
             }
         })
     }
@@ -79,7 +79,12 @@ impl ColBuilder {
     /// ClickHouse's, so this is reachable. [`Coercion::DecimalOverflow`] is
     /// returned for a NUMERIC/BIGNUMERIC value overridden to an exact
     /// `Decimal(P,S)` that doesn't fit `P`.
-    fn append_from_row(&mut self, row: &Row, index: usize, type_id: u32) -> Result<(usize, Coercion)> {
+    fn append_from_row(
+        &mut self,
+        row: &Row,
+        index: usize,
+        type_id: u32,
+    ) -> Result<(usize, Coercion)> {
         let mut coercion = Coercion::None;
         let size = match (&mut *self, type_id) {
             (ColBuilder::Bool(b), t) if t == id::BOOLEAN => {
@@ -108,9 +113,9 @@ impl ColBuilder {
             (ColBuilder::F64(b), t) if t == id::NUMERIC || t == id::BIGNUMERIC => {
                 match row.column::<Option<String>>(index).map_err(conv_err)? {
                     Some(s) => {
-                        let v: f64 = s
-                            .parse()
-                            .map_err(|e| EtlError::decode(format!("invalid BigQuery numeric '{s}': {e}")))?;
+                        let v: f64 = s.parse().map_err(|e| {
+                            EtlError::decode(format!("invalid BigQuery numeric '{s}': {e}"))
+                        })?;
                         b.append_value(v);
                         s.len()
                     }
@@ -132,23 +137,25 @@ impl ColBuilder {
                                 b.append_null();
                                 coercion = Coercion::DecimalOverflow;
                             }
-                            DecimalText::Ok { negative, magnitude, scale } => {
-                                match rescale_mantissa(magnitude, scale, *s as i32) {
-                                    Some(m) => {
-                                        let signed = if negative { -m } else { m };
-                                        if Decimal128Type::is_valid_decimal_precision(signed, *p) {
-                                            b.append_value(signed);
-                                        } else {
-                                            b.append_null();
-                                            coercion = Coercion::DecimalOverflow;
-                                        }
-                                    }
-                                    None => {
+                            DecimalText::Ok {
+                                negative,
+                                magnitude,
+                                scale,
+                            } => match rescale_mantissa(magnitude, scale, *s as i32) {
+                                Some(m) => {
+                                    let signed = if negative { -m } else { m };
+                                    if Decimal128Type::is_valid_decimal_precision(signed, *p) {
+                                        b.append_value(signed);
+                                    } else {
                                         b.append_null();
                                         coercion = Coercion::DecimalOverflow;
                                     }
                                 }
-                            }
+                                None => {
+                                    b.append_null();
+                                    coercion = Coercion::DecimalOverflow;
+                                }
+                            },
                         }
                         n
                     }
@@ -199,7 +206,10 @@ impl ColBuilder {
                 4
             }
             (ColBuilder::Ts(b, _), t) if t == id::TIMESTAMP || t == id::DATETIME => {
-                match row.column::<Option<time::OffsetDateTime>>(index).map_err(conv_err)? {
+                match row
+                    .column::<Option<time::OffsetDateTime>>(index)
+                    .map_err(conv_err)?
+                {
                     Some(dt) if ch_range::year_in_range(dt.year()) => {
                         b.append_value((dt.unix_timestamp_nanos() / 1000) as i64)
                     }
@@ -243,7 +253,7 @@ impl ColBuilder {
                 // row's actual value could cause.
                 return Err(EtlError::internal(format!(
                     "unexpected BigQuery type_id {t} for column index {index}"
-                )))
+                )));
             }
         };
         Ok((size, coercion))
@@ -292,7 +302,11 @@ impl BigQueryBatcher {
         Self::with_batch_bytes(columns, batch_rows, 0)
     }
 
-    pub fn with_batch_bytes(columns: &[ColumnType], batch_rows: usize, batch_bytes: usize) -> Result<Self> {
+    pub fn with_batch_bytes(
+        columns: &[ColumnType],
+        batch_rows: usize,
+        batch_bytes: usize,
+    ) -> Result<Self> {
         let fields: Vec<Field> = columns
             .iter()
             .map(|c| Field::new(&c.name, c.arrow.clone(), c.nullable))
@@ -398,15 +412,57 @@ mod tests {
         let rows: Vec<(Bq, u32, DataType, &str, Bq)> = vec![
             (Bq::String, id::STRING, DataType::Utf8, "String", Bq::String),
             (Bq::Bytes, id::BYTES, DataType::Binary, "String", Bq::Bytes),
-            (Bq::Integer, id::INTEGER, DataType::Int64, "Int64", Bq::Integer),
-            (Bq::Float, id::FLOAT, DataType::Float64, "Float64", Bq::Float),
-            (Bq::Boolean, id::BOOLEAN, DataType::Boolean, "Bool", Bq::Boolean),
-            (Bq::Timestamp, id::TIMESTAMP, ts(Some("UTC")), "DateTime64(6, 'UTC')", Bq::Timestamp),
+            (
+                Bq::Integer,
+                id::INTEGER,
+                DataType::Int64,
+                "Int64",
+                Bq::Integer,
+            ),
+            (
+                Bq::Float,
+                id::FLOAT,
+                DataType::Float64,
+                "Float64",
+                Bq::Float,
+            ),
+            (
+                Bq::Boolean,
+                id::BOOLEAN,
+                DataType::Boolean,
+                "Bool",
+                Bq::Boolean,
+            ),
+            (
+                Bq::Timestamp,
+                id::TIMESTAMP,
+                ts(Some("UTC")),
+                "DateTime64(6, 'UTC')",
+                Bq::Timestamp,
+            ),
             (Bq::Date, id::DATE, DataType::Date32, "Date32", Bq::Date),
             (Bq::Time, id::TIME, DataType::Utf8, "String", Bq::String), // lossy: Time -> String
-            (Bq::Datetime, id::DATETIME, ts(None), "DateTime64(6)", Bq::Datetime),
-            (Bq::Numeric, id::NUMERIC, DataType::Float64, "Float64", Bq::Float), // lossy
-            (Bq::Bignumeric, id::BIGNUMERIC, DataType::Float64, "Float64", Bq::Float), // lossy
+            (
+                Bq::Datetime,
+                id::DATETIME,
+                ts(None),
+                "DateTime64(6)",
+                Bq::Datetime,
+            ),
+            (
+                Bq::Numeric,
+                id::NUMERIC,
+                DataType::Float64,
+                "Float64",
+                Bq::Float,
+            ), // lossy
+            (
+                Bq::Bignumeric,
+                id::BIGNUMERIC,
+                DataType::Float64,
+                "Float64",
+                Bq::Float,
+            ), // lossy
         ];
         for (input, tid, arrow, ch, bridge) in rows {
             let (mapped_id, mapped_arrow, mapped_ch) =
@@ -418,58 +474,88 @@ mod tests {
             let out = b.finish();
             assert_eq!(out.data_type(), &arrow, "{input:?}: decoder output type/tz");
             let schema = Arc::new(Schema::new(vec![Field::new("c", arrow.clone(), true)]));
-            RecordBatch::try_new(schema, vec![out]).unwrap_or_else(|e| panic!("{input:?}: batch: {e}"));
-            assert_eq!(a2b(&arrow), Some(bridge), "{input:?}: Arrow->BigQuery bridge");
+            RecordBatch::try_new(schema, vec![out])
+                .unwrap_or_else(|e| panic!("{input:?}: batch: {e}"));
+            assert_eq!(
+                a2b(&arrow),
+                Some(bridge),
+                "{input:?}: Arrow->BigQuery bridge"
+            );
         }
     }
 
     #[test]
     fn decimal_decodes_exact_text_value() {
         let mut b = ColBuilder::new(&DataType::Decimal128(10, 4)).unwrap();
-        let (_, coercion) = b.append_from_row(&numeric_row(Some("123.4500")), 0, id::NUMERIC).unwrap();
+        let (_, coercion) = b
+            .append_from_row(&numeric_row(Some("123.4500")), 0, id::NUMERIC)
+            .unwrap();
         assert_eq!(coercion, Coercion::None);
         let arr = b.finish();
-        let arr = arr.as_any().downcast_ref::<arrow_array::Decimal128Array>().unwrap();
+        let arr = arr
+            .as_any()
+            .downcast_ref::<arrow_array::Decimal128Array>()
+            .unwrap();
         assert_eq!(arr.value(0), 1_234_500);
     }
 
     #[test]
     fn decimal_rounds_half_away_from_zero_when_narrowing() {
         let mut b = ColBuilder::new(&DataType::Decimal128(10, 2)).unwrap();
-        let (_, coercion) = b.append_from_row(&numeric_row(Some("12.345")), 0, id::BIGNUMERIC).unwrap();
+        let (_, coercion) = b
+            .append_from_row(&numeric_row(Some("12.345")), 0, id::BIGNUMERIC)
+            .unwrap();
         assert_eq!(coercion, Coercion::None);
         let arr = b.finish();
-        let arr = arr.as_any().downcast_ref::<arrow_array::Decimal128Array>().unwrap();
+        let arr = arr
+            .as_any()
+            .downcast_ref::<arrow_array::Decimal128Array>()
+            .unwrap();
         assert_eq!(arr.value(0), 1235); // 12.345 -> 12.35, not truncated to 12.34
     }
 
     #[test]
     fn decimal_negative_value_round_trips_exactly() {
         let mut b = ColBuilder::new(&DataType::Decimal128(10, 2)).unwrap();
-        let (_, coercion) = b.append_from_row(&numeric_row(Some("-42.5")), 0, id::NUMERIC).unwrap();
+        let (_, coercion) = b
+            .append_from_row(&numeric_row(Some("-42.5")), 0, id::NUMERIC)
+            .unwrap();
         assert_eq!(coercion, Coercion::None);
         let arr = b.finish();
-        let arr = arr.as_any().downcast_ref::<arrow_array::Decimal128Array>().unwrap();
+        let arr = arr
+            .as_any()
+            .downcast_ref::<arrow_array::Decimal128Array>()
+            .unwrap();
         assert_eq!(arr.value(0), -4250);
     }
 
     #[test]
     fn decimal_coerces_to_null_when_value_overflows_declared_precision() {
         let mut b = ColBuilder::new(&DataType::Decimal128(3, 0)).unwrap();
-        let (_, coercion) = b.append_from_row(&numeric_row(Some("1234")), 0, id::NUMERIC).unwrap();
+        let (_, coercion) = b
+            .append_from_row(&numeric_row(Some("1234")), 0, id::NUMERIC)
+            .unwrap();
         assert_eq!(coercion, Coercion::DecimalOverflow);
         let arr = b.finish();
-        let arr = arr.as_any().downcast_ref::<arrow_array::Decimal128Array>().unwrap();
+        let arr = arr
+            .as_any()
+            .downcast_ref::<arrow_array::Decimal128Array>()
+            .unwrap();
         assert!(arr.is_null(0));
     }
 
     #[test]
     fn decimal_null_value_stays_null_with_no_coercion() {
         let mut b = ColBuilder::new(&DataType::Decimal128(10, 2)).unwrap();
-        let (_, coercion) = b.append_from_row(&numeric_row(None), 0, id::NUMERIC).unwrap();
+        let (_, coercion) = b
+            .append_from_row(&numeric_row(None), 0, id::NUMERIC)
+            .unwrap();
         assert_eq!(coercion, Coercion::None);
         let arr = b.finish();
-        let arr = arr.as_any().downcast_ref::<arrow_array::Decimal128Array>().unwrap();
+        let arr = arr
+            .as_any()
+            .downcast_ref::<arrow_array::Decimal128Array>()
+            .unwrap();
         assert!(arr.is_null(0));
     }
 }

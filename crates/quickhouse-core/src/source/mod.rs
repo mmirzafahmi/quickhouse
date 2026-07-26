@@ -6,7 +6,7 @@ pub mod postgres;
 
 pub use bigquery::BigQuerySource;
 pub use mysql::MySqlSource;
-pub use postgres::{PgSource, Partition};
+pub use postgres::{Partition, PgSource};
 
 /// One chunk's keyset bound for resumable reads (see `TransferConfig::chunk_rows`).
 /// Shared by both SQL sources: the reader appends `{col_quoted} > {cursor}`
@@ -75,7 +75,10 @@ mod tests {
         // is back.
         let parts = range_partitions(0, i64::MAX as i128, 4, "`id`");
         assert_eq!(parts.len(), 4);
-        assert_eq!(parts[0].predicate.as_deref(), Some("`id` >= 0 AND `id` <= 2305843009213693951"));
+        assert_eq!(
+            parts[0].predicate.as_deref(),
+            Some("`id` >= 0 AND `id` <= 2305843009213693951")
+        );
         assert_eq!(
             parts[3].predicate.as_deref(),
             Some("`id` >= 6917529027641081856 AND `id` <= 9223372036854775807")
@@ -86,8 +89,17 @@ mod tests {
     fn range_partitions_covers_full_span_with_no_gaps_or_overlaps() {
         let parts = range_partitions(10, 25, 3, "col");
         assert_eq!(parts.len(), 3);
-        assert_eq!(parts[0].predicate.as_deref(), Some("col >= 10 AND col <= 15"));
-        assert_eq!(parts[1].predicate.as_deref(), Some("col >= 16 AND col <= 21"));
-        assert_eq!(parts[2].predicate.as_deref(), Some("col >= 22 AND col <= 25"));
+        assert_eq!(
+            parts[0].predicate.as_deref(),
+            Some("col >= 10 AND col <= 15")
+        );
+        assert_eq!(
+            parts[1].predicate.as_deref(),
+            Some("col >= 16 AND col <= 21")
+        );
+        assert_eq!(
+            parts[2].predicate.as_deref(),
+            Some("col >= 22 AND col <= 25")
+        );
     }
 }

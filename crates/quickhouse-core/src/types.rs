@@ -61,7 +61,10 @@ pub mod ch_range {
 /// of truth: `transform::plan` feeds both the Arrow schema construction (via
 /// each decoder's `Field::new(.., nullable)`) and the destination DDL.
 pub fn may_coerce_to_null(arrow: &DataType) -> bool {
-    matches!(arrow, DataType::Date32 | DataType::Timestamp(_, _) | DataType::Decimal128(_, _))
+    matches!(
+        arrow,
+        DataType::Date32 | DataType::Timestamp(_, _) | DataType::Decimal128(_, _)
+    )
 }
 
 /// Well-known PostgreSQL `pg_type.oid` values we decode natively.
@@ -258,7 +261,9 @@ pub mod bigquery {
             BqType::String | BqType::Json => (id::STRING, DataType::Utf8, "String".to_string()),
             BqType::Bytes => (id::BYTES, DataType::Binary, "String".to_string()),
             BqType::Integer | BqType::Int64 => (id::INTEGER, DataType::Int64, "Int64".to_string()),
-            BqType::Float | BqType::Float64 => (id::FLOAT, DataType::Float64, "Float64".to_string()),
+            BqType::Float | BqType::Float64 => {
+                (id::FLOAT, DataType::Float64, "Float64".to_string())
+            }
             BqType::Boolean | BqType::Bool => (id::BOOLEAN, DataType::Boolean, "Bool".to_string()),
             BqType::Timestamp => (
                 id::TIMESTAMP,
@@ -450,7 +455,10 @@ mod tests {
     #[test]
     fn may_coerce_to_null_covers_date_timestamp_and_decimal_only() {
         assert!(may_coerce_to_null(&DataType::Date32));
-        assert!(may_coerce_to_null(&DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None)));
+        assert!(may_coerce_to_null(&DataType::Timestamp(
+            arrow_schema::TimeUnit::Microsecond,
+            None
+        )));
         assert!(may_coerce_to_null(&DataType::Timestamp(
             arrow_schema::TimeUnit::Microsecond,
             Some("UTC".into())
@@ -515,9 +523,17 @@ mod tests {
             MyType::MYSQL_TYPE_BLOB,
         ] {
             // Non-binary charset => TEXT => Utf8/STRING.
-            assert_eq!(map_mysql_type(ty, false, false, false).unwrap().0, DataType::Utf8, "{ty:?} TEXT");
+            assert_eq!(
+                map_mysql_type(ty, false, false, false).unwrap().0,
+                DataType::Utf8,
+                "{ty:?} TEXT"
+            );
             // Binary charset => real BLOB => Binary/BYTES.
-            assert_eq!(map_mysql_type(ty, false, false, true).unwrap().0, DataType::Binary, "{ty:?} BLOB");
+            assert_eq!(
+                map_mysql_type(ty, false, false, true).unwrap().0,
+                DataType::Binary,
+                "{ty:?} BLOB"
+            );
         }
     }
 
@@ -549,15 +565,15 @@ mod tests {
         assert!(!ch_range::year_in_range(2300));
         assert!(!ch_range::year_in_range(1000)); // legacy MySQL min
         assert!(!ch_range::year_in_range(9999)); // "never expires" sentinel
-        // Day form (Postgres Date32). Endpoints are epoch-day offsets for
-        // 1900-01-01 / 2299-12-31 (independently confirmed: 2299-12-31 is day
-        // 120_529, 2300-01-01 is day 120_530 — regression guard for the
-        // fencepost bug where MAX_DAYS was off by one).
+                                                 // Day form (Postgres Date32). Endpoints are epoch-day offsets for
+                                                 // 1900-01-01 / 2299-12-31 (independently confirmed: 2299-12-31 is day
+                                                 // 120_529, 2300-01-01 is day 120_530 — regression guard for the
+                                                 // fencepost bug where MAX_DAYS was off by one).
         assert!(ch_range::days_in_range(-25_567)); // 1900-01-01
         assert!(ch_range::days_in_range(120_529)); // 2299-12-31
         assert!(!ch_range::days_in_range(-25_568));
         assert!(!ch_range::days_in_range(120_530)); // 2300-01-01 — must be rejected
-        // Micro form (Postgres DateTime64): first/last representable instants.
+                                                    // Micro form (Postgres DateTime64): first/last representable instants.
         assert!(ch_range::micros_in_range(ch_range::MIN_MICROS));
         assert!(ch_range::micros_in_range(ch_range::MAX_MICROS));
         assert!(!ch_range::micros_in_range(ch_range::MIN_MICROS - 1));
@@ -593,7 +609,10 @@ mod tests {
             Some(BqType::Datetime)
         );
         assert_eq!(
-            a2b(&DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))),
+            a2b(&DataType::Timestamp(
+                TimeUnit::Microsecond,
+                Some("UTC".into())
+            )),
             Some(BqType::Timestamp)
         );
         // Not produced by any current decoder (all three sources map TIME to

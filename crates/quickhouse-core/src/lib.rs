@@ -12,8 +12,8 @@
 
 mod archive;
 pub mod config;
-mod decimal;
 pub mod ddl;
+mod decimal;
 pub mod decode;
 pub mod decode_api;
 pub mod decode_bigquery;

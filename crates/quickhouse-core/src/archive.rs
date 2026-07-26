@@ -67,7 +67,13 @@ pub(crate) fn build_s3_store(cfg: &S3ArchiveConfig) -> Result<Arc<dyn ObjectStor
 /// be empty (writes at the bucket root); a non-empty prefix's own leading/
 /// trailing slashes are trimmed so callers don't need to worry about
 /// double-slashes.
-pub(crate) fn archive_object_key(prefix: &str, dest_table: &str, run_date: &str, run_id: &str, partition_label: &str) -> String {
+pub(crate) fn archive_object_key(
+    prefix: &str,
+    dest_table: &str,
+    run_date: &str,
+    run_id: &str,
+    partition_label: &str,
+) -> String {
     let trimmed = prefix.trim_matches('/');
     let mut parts = Vec::with_capacity(5);
     if !trimmed.is_empty() {
@@ -98,27 +104,40 @@ pub(crate) struct S3ArchiveWriter {
 }
 
 impl S3ArchiveWriter {
-    pub(crate) fn new(store: Arc<dyn ObjectStore>, key: String, schema: SchemaRef, compression: ParquetCompression) -> Result<Self> {
+    pub(crate) fn new(
+        store: Arc<dyn ObjectStore>,
+        key: String,
+        schema: SchemaRef,
+        compression: ParquetCompression,
+    ) -> Result<Self> {
         let writer = ParquetObjectWriter::new(store, Path::from(key.as_str()));
-        let props = WriterProperties::builder().set_compression(parquet_compression(compression)).build();
-        let inner = AsyncArrowWriter::try_new(writer, schema, Some(props))
-            .map_err(|e| EtlError::other(format!("s3 archive: failed to open parquet writer for '{key}': {e}")))?;
+        let props = WriterProperties::builder()
+            .set_compression(parquet_compression(compression))
+            .build();
+        let inner = AsyncArrowWriter::try_new(writer, schema, Some(props)).map_err(|e| {
+            EtlError::other(format!(
+                "s3 archive: failed to open parquet writer for '{key}': {e}"
+            ))
+        })?;
         Ok(Self { inner, key })
     }
 
     pub(crate) async fn write(&mut self, batch: &RecordBatch) -> Result<()> {
-        self.inner
-            .write(batch)
-            .await
-            .map_err(|e| EtlError::other(format!("s3 archive: parquet write error for '{}': {e}", self.key)))
+        self.inner.write(batch).await.map_err(|e| {
+            EtlError::other(format!(
+                "s3 archive: parquet write error for '{}': {e}",
+                self.key
+            ))
+        })
     }
 
     pub(crate) async fn close(self) -> Result<()> {
         let key = self.key.clone();
-        self.inner
-            .close()
-            .await
-            .map_err(|e| EtlError::other(format!("s3 archive: failed to finalize parquet file '{key}': {e}")))?;
+        self.inner.close().await.map_err(|e| {
+            EtlError::other(format!(
+                "s3 archive: failed to finalize parquet file '{key}': {e}"
+            ))
+        })?;
         Ok(())
     }
 }
@@ -130,7 +149,10 @@ mod tests {
     #[test]
     fn archive_object_key_full_hive_style_path() {
         let key = archive_object_key("lake", "orders", "2026-07-23", "1753234567", "range-0");
-        assert_eq!(key, "lake/orders/dt=2026-07-23/run=1753234567/part-range-0.parquet");
+        assert_eq!(
+            key,
+            "lake/orders/dt=2026-07-23/run=1753234567/part-range-0.parquet"
+        );
     }
 
     #[test]
@@ -149,9 +171,18 @@ mod tests {
 
     #[test]
     fn parquet_compression_maps_every_variant() {
-        assert_eq!(parquet_compression(ParquetCompression::Zstd), Compression::ZSTD(ZstdLevel::default()));
-        assert_eq!(parquet_compression(ParquetCompression::Snappy), Compression::SNAPPY);
-        assert_eq!(parquet_compression(ParquetCompression::Uncompressed), Compression::UNCOMPRESSED);
+        assert_eq!(
+            parquet_compression(ParquetCompression::Zstd),
+            Compression::ZSTD(ZstdLevel::default())
+        );
+        assert_eq!(
+            parquet_compression(ParquetCompression::Snappy),
+            Compression::SNAPPY
+        );
+        assert_eq!(
+            parquet_compression(ParquetCompression::Uncompressed),
+            Compression::UNCOMPRESSED
+        );
     }
 
     // `build_s3_store` itself does not validate that `bucket` is non-empty —

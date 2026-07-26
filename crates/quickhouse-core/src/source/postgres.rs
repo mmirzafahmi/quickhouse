@@ -250,19 +250,23 @@ impl PgSource {
         let col_list = columns
             .iter()
             .enumerate()
-            .map(|(i, c)| match select_exprs.get(i).and_then(|e| e.as_ref()) {
-                Some(expr) => format!("{expr} AS {}", quote_pg(c)),
-                None => quote_pg(c),
-            })
+            .map(
+                |(i, c)| match select_exprs.get(i).and_then(|e| e.as_ref()) {
+                    Some(expr) => format!("{expr} AS {}", quote_pg(c)),
+                    None => quote_pg(c),
+                },
+            )
             .collect::<Vec<_>>()
             .join(", ");
 
         // Merge the incremental/extra filter with the keyset cursor predicate,
         // then with the partition predicate (all AND-ed). Cursor is a bare
         // validated integer literal — no quoting.
-        let cursor_pred = keyset
-            .as_ref()
-            .and_then(|k| k.cursor.as_ref().map(|cur| format!("{} > {}", k.col_quoted, cur)));
+        let cursor_pred = keyset.as_ref().and_then(|k| {
+            k.cursor
+                .as_ref()
+                .map(|cur| format!("{} > {}", k.col_quoted, cur))
+        });
         let extra_owned = extra_filter.map(str::to_string);
         let extra_and_cursor = combine_filters(&extra_owned, cursor_pred.as_deref());
         let filters = combine_filters(&partition.predicate, extra_and_cursor.as_deref());
@@ -444,7 +448,10 @@ OCm3XK2CW4/x+Z55ntrAffyyonL3V3vHIz7fokiz5H+l
     #[test]
     fn copy_sql_applies_column_transform_expr() {
         let src = PgSource::new("postgresql://x", 0, None);
-        let part = Partition { label: "all".into(), predicate: None };
+        let part = Partition {
+            label: "all".into(),
+            predicate: None,
+        };
         let sql = src.copy_sql(
             &["id".to_string(), "partner_id".to_string()],
             &[None, Some("CAST(\"partner_id\" AS TEXT)".to_string())],
@@ -455,14 +462,24 @@ OCm3XK2CW4/x+Z55ntrAffyyonL3V3vHIz7fokiz5H+l
             None,
         );
         // Transformed column is emitted as "<expr> AS <col>"; the other is bare.
-        assert!(sql.contains("SELECT \"id\", CAST(\"partner_id\" AS TEXT) AS \"partner_id\""), "{sql}");
+        assert!(
+            sql.contains("SELECT \"id\", CAST(\"partner_id\" AS TEXT) AS \"partner_id\""),
+            "{sql}"
+        );
     }
 
     #[test]
     fn copy_sql_keyset_adds_cursor_and_order_limit() {
         let src = PgSource::new("postgresql://x", 0, None);
-        let part = Partition { label: "all".into(), predicate: None };
-        let keyset = Keyset { col_quoted: "\"id\"".into(), cursor: Some("500".into()), limit: 1000 };
+        let part = Partition {
+            label: "all".into(),
+            predicate: None,
+        };
+        let keyset = Keyset {
+            col_quoted: "\"id\"".into(),
+            cursor: Some("500".into()),
+            limit: 1000,
+        };
         let sql = src.copy_sql(
             &["id".to_string()],
             &[None],
@@ -473,21 +490,45 @@ OCm3XK2CW4/x+Z55ntrAffyyonL3V3vHIz7fokiz5H+l
             Some(keyset),
         );
         assert!(sql.contains("WHERE"), "{sql}");
-        assert!(sql.contains("\"id\" > 500"), "cursor predicate missing: {sql}");
-        assert!(sql.contains("\"wm\" <= '2024-01-01'"), "extra filter dropped: {sql}");
-        assert!(sql.contains("ORDER BY \"id\" ASC LIMIT 1000"), "order/limit missing: {sql}");
+        assert!(
+            sql.contains("\"id\" > 500"),
+            "cursor predicate missing: {sql}"
+        );
+        assert!(
+            sql.contains("\"wm\" <= '2024-01-01'"),
+            "extra filter dropped: {sql}"
+        );
+        assert!(
+            sql.contains("ORDER BY \"id\" ASC LIMIT 1000"),
+            "order/limit missing: {sql}"
+        );
         // First chunk (cursor=None) has ORDER BY/LIMIT but no `> cursor`.
         let first = src.copy_sql(
-            &["id".to_string()], &[None], Some("t"), None, &part, None,
-            Some(Keyset { col_quoted: "\"id\"".into(), cursor: None, limit: 1000 }),
+            &["id".to_string()],
+            &[None],
+            Some("t"),
+            None,
+            &part,
+            None,
+            Some(Keyset {
+                col_quoted: "\"id\"".into(),
+                cursor: None,
+                limit: 1000,
+            }),
         );
         assert!(first.contains("ORDER BY \"id\" ASC LIMIT 1000"), "{first}");
-        assert!(!first.contains(" > "), "first chunk must not have a cursor predicate: {first}");
+        assert!(
+            !first.contains(" > "),
+            "first chunk must not have a cursor predicate: {first}"
+        );
     }
 
     #[test]
     fn qualified_split() {
-        assert_eq!(split_qualified("public.t"), (Some("public".into()), "t".into()));
+        assert_eq!(
+            split_qualified("public.t"),
+            (Some("public".into()), "t".into())
+        );
         assert_eq!(split_qualified("t"), (None, "t".into()));
     }
 

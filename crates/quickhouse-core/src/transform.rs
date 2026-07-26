@@ -116,7 +116,11 @@ pub struct SelectPlan {
     pub dest_columns: Vec<ColumnType>,
 }
 
-pub fn plan(source: &[ColumnType], cfg: &TransferConfig, dest_kind: DestKind) -> Result<SelectPlan> {
+pub fn plan(
+    source: &[ColumnType],
+    cfg: &TransferConfig,
+    dest_kind: DestKind,
+) -> Result<SelectPlan> {
     // 1. Apply include (allowlist) then exclude (denylist) on source names.
     let included: Vec<&ColumnType> = source
         .iter()
@@ -181,7 +185,11 @@ pub fn plan(source: &[ColumnType], cfg: &TransferConfig, dest_kind: DestKind) ->
         // The transform changes the VALUE, not the resolved column type — pair
         // it with type_overrides if the destination type must change too.
         source_select_exprs.push(cfg.column_transforms.get(&c.name).cloned());
-        let dest_name = cfg.rename.get(&c.name).cloned().unwrap_or_else(|| c.name.clone());
+        let dest_name = cfg
+            .rename
+            .get(&c.name)
+            .cloned()
+            .unwrap_or_else(|| c.name.clone());
         let ch_inner = cfg
             .type_overrides
             .get(&c.name)
@@ -201,8 +209,9 @@ pub fn plan(source: &[ColumnType], cfg: &TransferConfig, dest_kind: DestKind) ->
         // Only ClickHouse's ReplacingMergeTree version column must be
         // non-nullable; gate on the destination so a BigQuery watermark column
         // isn't spuriously forced non-nullable (BigQuery has no such engine).
-        let is_ch_version_column =
-            is_watermark && cfg.effective_engine() == "ReplacingMergeTree" && dest_kind == DestKind::ClickHouse;
+        let is_ch_version_column = is_watermark
+            && cfg.effective_engine() == "ReplacingMergeTree"
+            && dest_kind == DestKind::ClickHouse;
         let force_non_nullable = is_key || is_ch_version_column;
         // Date32/Timestamp columns are otherwise forced nullable regardless
         // of the source's own NOT NULL constraint: their decoders coerce
@@ -263,7 +272,9 @@ pub fn plan(source: &[ColumnType], cfg: &TransferConfig, dest_kind: DestKind) ->
             // ClickHouse RMT case above), force the watermark nullable. Without
             // this, a null watermark value fails the Arrow schema-consistency
             // check ("declared non-nullable but contains null values").
-            c.nullable || may_coerce_to_null(&arrow) || (is_watermark && dest_kind != DestKind::ClickHouse)
+            c.nullable
+                || may_coerce_to_null(&arrow)
+                || (is_watermark && dest_kind != DestKind::ClickHouse)
         };
         dest_columns.push(ColumnType {
             name: dest_name,
@@ -391,8 +402,14 @@ mod tests {
         let mut cfg = cfg();
         cfg.key = vec!["id".into()];
         let p = plan(&src, &cfg, DestKind::ClickHouse).unwrap();
-        assert!(!p.dest_columns[0].nullable, "key column must not be nullable");
-        assert!(p.dest_columns[1].nullable, "non-key column keeps its resolved nullability");
+        assert!(
+            !p.dest_columns[0].nullable,
+            "key column must not be nullable"
+        );
+        assert!(
+            p.dest_columns[1].nullable,
+            "non-key column keeps its resolved nullability"
+        );
     }
 
     /// Regression test for bug report 06: a NOT NULL MySQL DATE/DATETIME
@@ -418,7 +435,10 @@ mod tests {
             typed_col("name", DataType::Utf8, false), // NOT NULL, but not a coercible type
         ];
         let p = plan(&src, &cfg(), DestKind::ClickHouse).unwrap();
-        assert!(!p.dest_columns[0].nullable, "plain NOT NULL Int64 column is untouched");
+        assert!(
+            !p.dest_columns[0].nullable,
+            "plain NOT NULL Int64 column is untouched"
+        );
         assert!(
             p.dest_columns[1].nullable,
             "NOT NULL DATE column must be forced nullable (zero-date coercion target)"
@@ -442,7 +462,10 @@ mod tests {
         let mut cfg = cfg();
         cfg.key = vec!["event_date".into()];
         let p = plan(&src, &cfg, DestKind::ClickHouse).unwrap();
-        assert!(!p.dest_columns[0].nullable, "key column must stay non-nullable even for a date type");
+        assert!(
+            !p.dest_columns[0].nullable,
+            "key column must stay non-nullable even for a date type"
+        );
     }
 
     /// Regression test: forcing the watermark column nullable (as a
@@ -490,7 +513,10 @@ mod tests {
         cfg.watermark = Some("write_date".into());
         cfg.engine = Some("MergeTree".into());
         let p = plan(&src, &cfg, DestKind::ClickHouse).unwrap();
-        assert!(p.dest_columns[0].nullable, "no ReplacingMergeTree version-column constraint applies here");
+        assert!(
+            p.dest_columns[0].nullable,
+            "no ReplacingMergeTree version-column constraint applies here"
+        );
     }
 
     /// order_by/primary_key are matched against the *destination* (post-rename)
@@ -558,9 +584,14 @@ mod tests {
         let src = vec![decimal_col("amount")];
         let mut cfg = cfg();
         cfg.type_overrides = HashMap::from([("amount".to_string(), "Decimal(50, 10)".to_string())]);
-        let err = plan(&src, &cfg, DestKind::ClickHouse).unwrap_err().to_string();
+        let err = plan(&src, &cfg, DestKind::ClickHouse)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("amount"), "must name the column: {err}");
-        assert!(err.contains("Decimal256"), "must mention the Decimal256 follow-up: {err}");
+        assert!(
+            err.contains("Decimal256"),
+            "must mention the Decimal256 follow-up: {err}"
+        );
     }
 
     fn ts(tz: Option<&str>) -> DataType {
@@ -572,10 +603,22 @@ mod tests {
     #[test]
     fn datetime_override_tz_classifies_type_names() {
         // tz-aware
-        assert_eq!(datetime_override_tz("TIMESTAMP"), Some(Some(Arc::from("UTC"))));
-        assert_eq!(datetime_override_tz("timestamp"), Some(Some(Arc::from("UTC"))));
-        assert_eq!(datetime_override_tz("DateTime64(6, 'UTC')"), Some(Some(Arc::from("UTC"))));
-        assert_eq!(datetime_override_tz("DateTime('Asia/Jakarta')"), Some(Some(Arc::from("Asia/Jakarta"))));
+        assert_eq!(
+            datetime_override_tz("TIMESTAMP"),
+            Some(Some(Arc::from("UTC")))
+        );
+        assert_eq!(
+            datetime_override_tz("timestamp"),
+            Some(Some(Arc::from("UTC")))
+        );
+        assert_eq!(
+            datetime_override_tz("DateTime64(6, 'UTC')"),
+            Some(Some(Arc::from("UTC")))
+        );
+        assert_eq!(
+            datetime_override_tz("DateTime('Asia/Jakarta')"),
+            Some(Some(Arc::from("Asia/Jakarta")))
+        );
         // naive
         assert_eq!(datetime_override_tz("DATETIME"), Some(None));
         assert_eq!(datetime_override_tz("DateTime64(6)"), Some(None));
@@ -597,7 +640,11 @@ mod tests {
         let mut cfg = cfg();
         cfg.type_overrides = HashMap::from([("event_at".to_string(), "DATETIME".to_string())]);
         let p = plan(&src, &cfg, DestKind::ClickHouse).unwrap();
-        assert_eq!(p.dest_columns[0].arrow, ts(None), "override must flip tz-aware -> naive");
+        assert_eq!(
+            p.dest_columns[0].arrow,
+            ts(None),
+            "override must flip tz-aware -> naive"
+        );
         assert_eq!(p.dest_columns[0].clickhouse_inner, "DATETIME");
     }
 
@@ -609,7 +656,11 @@ mod tests {
         let mut cfg = cfg();
         cfg.type_overrides = HashMap::from([("event_at".to_string(), "TIMESTAMP".to_string())]);
         let p = plan(&src, &cfg, DestKind::ClickHouse).unwrap();
-        assert_eq!(p.dest_columns[0].arrow, ts(Some("UTC")), "override must flip naive -> tz-aware UTC");
+        assert_eq!(
+            p.dest_columns[0].arrow,
+            ts(Some("UTC")),
+            "override must flip naive -> tz-aware UTC"
+        );
     }
 
     /// With no override, a timestamp column keeps its source tz exactly — the
@@ -622,8 +673,16 @@ mod tests {
         let mut naive_col = typed_col("b", ts(None), true);
         naive_col.clickhouse_inner = "DateTime64(6)".into();
         let p = plan(&[utc_col, naive_col], &cfg(), DestKind::ClickHouse).unwrap();
-        assert_eq!(p.dest_columns[0].arrow, ts(Some("UTC")), "UTC source stays UTC");
-        assert_eq!(p.dest_columns[1].arrow, ts(None), "naive source stays naive");
+        assert_eq!(
+            p.dest_columns[0].arrow,
+            ts(Some("UTC")),
+            "UTC source stays UTC"
+        );
+        assert_eq!(
+            p.dest_columns[1].arrow,
+            ts(None),
+            "naive source stays naive"
+        );
     }
 
     /// A non-datetime override (e.g. storing a timestamp as text) leaves the
@@ -635,19 +694,34 @@ mod tests {
         let mut cfg = cfg();
         cfg.type_overrides = HashMap::from([("event_at".to_string(), "String".to_string())]);
         let p = plan(&src, &cfg, DestKind::ClickHouse).unwrap();
-        assert_eq!(p.dest_columns[0].arrow, ts(Some("UTC")), "arrow type unchanged by a non-datetime override");
-        assert_eq!(p.dest_columns[0].clickhouse_inner, "String", "DDL string still honored");
+        assert_eq!(
+            p.dest_columns[0].arrow,
+            ts(Some("UTC")),
+            "arrow type unchanged by a non-datetime override"
+        );
+        assert_eq!(
+            p.dest_columns[0].clickhouse_inner, "String",
+            "DDL string still honored"
+        );
     }
 
     #[test]
     fn column_transforms_fill_select_exprs_by_source_name() {
         let src = vec![c("id"), c("partner_id")];
         let mut cfg = cfg();
-        cfg.column_transforms =
-            HashMap::from([("partner_id".to_string(), "CAST(partner_id AS TEXT)".to_string())]);
+        cfg.column_transforms = HashMap::from([(
+            "partner_id".to_string(),
+            "CAST(partner_id AS TEXT)".to_string(),
+        )]);
         let p = plan(&src, &cfg, DestKind::ClickHouse).unwrap();
-        assert_eq!(p.source_select_exprs[0], None, "untransformed column reads bare");
-        assert_eq!(p.source_select_exprs[1].as_deref(), Some("CAST(partner_id AS TEXT)"));
+        assert_eq!(
+            p.source_select_exprs[0], None,
+            "untransformed column reads bare"
+        );
+        assert_eq!(
+            p.source_select_exprs[1].as_deref(),
+            Some("CAST(partner_id AS TEXT)")
+        );
         // The transform changes the VALUE, not the resolved column type.
         assert_eq!(p.dest_columns[1].arrow, DataType::Int32);
     }
@@ -657,7 +731,9 @@ mod tests {
         let src = vec![c("id")];
         let mut cfg = cfg();
         cfg.column_transforms = HashMap::from([("nope".to_string(), "x".to_string())]);
-        let err = plan(&src, &cfg, DestKind::ClickHouse).unwrap_err().to_string();
+        let err = plan(&src, &cfg, DestKind::ClickHouse)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("column_transforms"), "{err}");
         assert!(err.contains("nope"), "{err}");
     }
@@ -667,7 +743,9 @@ mod tests {
         let src = vec![c("id")];
         let mut cfg = cfg();
         cfg.column_transforms = HashMap::from([("id".to_string(), "   ".to_string())]);
-        let err = plan(&src, &cfg, DestKind::ClickHouse).unwrap_err().to_string();
+        let err = plan(&src, &cfg, DestKind::ClickHouse)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("empty expression"), "{err}");
     }
 
@@ -679,7 +757,10 @@ mod tests {
         let p = plan(&src, &cfg, DestKind::BigQuery).unwrap();
         // BigQuery NUMERIC == NUMERIC(38,9) -> exact Decimal128(38,9), not Float64.
         assert_eq!(p.dest_columns[0].arrow, DataType::Decimal128(38, 9));
-        assert!(p.dest_columns[0].nullable, "coercible decimal stays nullable");
+        assert!(
+            p.dest_columns[0].nullable,
+            "coercible decimal stays nullable"
+        );
     }
 
     #[test]
@@ -715,9 +796,15 @@ mod tests {
         cfg.watermark = Some("wm".into());
         // BigQuery dest: forced nullable (no RMT version-column constraint).
         let p = plan(&src, &cfg, DestKind::BigQuery).unwrap();
-        assert!(p.dest_columns[0].nullable, "BigQuery watermark must be forced nullable");
+        assert!(
+            p.dest_columns[0].nullable,
+            "BigQuery watermark must be forced nullable"
+        );
         // ClickHouse dest (RMT default): version column stays non-nullable.
         let p = plan(&src, &cfg, DestKind::ClickHouse).unwrap();
-        assert!(!p.dest_columns[0].nullable, "CH ReplacingMergeTree version column must be non-nullable");
+        assert!(
+            !p.dest_columns[0].nullable,
+            "CH ReplacingMergeTree version column must be non-nullable"
+        );
     }
 }

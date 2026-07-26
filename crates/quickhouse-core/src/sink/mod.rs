@@ -47,7 +47,10 @@ pub(crate) fn missing_columns<'a>(
         }
     };
     let have: std::collections::HashSet<String> = existing.iter().map(|s| norm(s)).collect();
-    desired.iter().filter(|c| !have.contains(&norm(&c.name))).collect()
+    desired
+        .iter()
+        .filter(|c| !have.contains(&norm(&c.name)))
+        .collect()
 }
 
 /// Outcome of a single send attempt, telling the caller whether to retry.
@@ -124,7 +127,12 @@ impl Sink {
     /// exist): ClickHouse's `EXCHANGE TABLES`, or BigQuery's `TRUNCATE` +
     /// `INSERT ... SELECT` transaction (needs `columns` to build the
     /// `INSERT`/`SELECT` column list; ClickHouse's swap needs no column list).
-    pub async fn atomic_swap(&self, dest: &str, staging: &str, columns: &[ColumnType]) -> Result<()> {
+    pub async fn atomic_swap(
+        &self,
+        dest: &str,
+        staging: &str,
+        columns: &[ColumnType],
+    ) -> Result<()> {
         match self {
             Sink::ClickHouse(s) => s.exchange_tables(dest, staging).await,
             Sink::BigQuery(s) => s.atomic_swap(dest, staging, columns).await,
@@ -166,7 +174,12 @@ impl Sink {
     }
 
     /// Persist a new watermark after a successful incremental run.
-    pub async fn persist_watermark(&self, cfg: &TransferConfig, watermark: &str, rows: u64) -> Result<()> {
+    pub async fn persist_watermark(
+        &self,
+        cfg: &TransferConfig,
+        watermark: &str,
+        rows: u64,
+    ) -> Result<()> {
         match self {
             Sink::ClickHouse(s) => s.persist_watermark(cfg, watermark, rows).await,
             Sink::BigQuery(s) => s.persist_watermark(cfg, watermark, rows).await,
@@ -264,7 +277,10 @@ impl Sink {
                 "merge_into called on a ClickHouse sink — unreachable, since ClickHouse never \
                  reports requires_staging_for_incremental()",
             )),
-            Sink::BigQuery(s) => s.merge_into(dest, staging, key, columns, prune_partition, delete_stale).await,
+            Sink::BigQuery(s) => {
+                s.merge_into(dest, staging, key, columns, prune_partition, delete_stale)
+                    .await
+            }
         }
     }
 }

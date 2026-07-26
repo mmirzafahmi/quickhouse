@@ -34,8 +34,8 @@ mod type_code {
 }
 
 fn build_opts(dsn: &str, ca_cert_file: Option<&str>, require_tls: bool) -> Result<Opts> {
-    let base = Opts::from_url(dsn)
-        .map_err(|e| EtlError::config(format!("invalid MySQL DSN: {e}")))?;
+    let base =
+        Opts::from_url(dsn).map_err(|e| EtlError::config(format!("invalid MySQL DSN: {e}")))?;
     let mut builder = OptsBuilder::from_opts(base);
     if require_tls || ca_cert_file.is_some() {
         let mut ssl_opts = SslOpts::default();
@@ -87,7 +87,11 @@ impl MySqlSource {
     }
 
     /// Resolve all output columns of `select_sql` (name, type, nullability).
-    pub async fn resolve_columns(&self, conn: &mut Conn, select_sql: &str) -> Result<Vec<ColumnType>> {
+    pub async fn resolve_columns(
+        &self,
+        conn: &mut Conn,
+        select_sql: &str,
+    ) -> Result<Vec<ColumnType>> {
         let stmt = conn
             .prep(select_sql)
             .await
@@ -105,13 +109,13 @@ impl MySqlSource {
             let is_binary = c.character_set() == 63;
             let (arrow, ch_inner) = map_mysql_type(col_type, is_unsigned, is_tinyint1, is_binary)
                 .ok_or_else(|| EtlError::UnsupportedType {
-                    engine: "MySQL",
-                    column: c.name_str().to_string(),
-                    // ColumnType's Debug repr is its wire-protocol constant
-                    // name (e.g. "MYSQL_TYPE_GEOMETRY") — human-readable,
-                    // unlike the raw numeric code used previously.
-                    type_name: format!("{col_type:?}"),
-                })?;
+                engine: "MySQL",
+                column: c.name_str().to_string(),
+                // ColumnType's Debug repr is its wire-protocol constant
+                // name (e.g. "MYSQL_TYPE_GEOMETRY") — human-readable,
+                // unlike the raw numeric code used previously.
+                type_name: format!("{col_type:?}"),
+            })?;
             let nullable = !c.flags().contains(ColumnFlags::NOT_NULL_FLAG);
             cols.push(ColumnType {
                 name: c.name_str().to_string(),
@@ -148,7 +152,11 @@ impl MySqlSource {
 
         let is_int = matches!(
             column_type_id,
-            type_code::TINY | type_code::SHORT | type_code::INT24 | type_code::LONG | type_code::LONGLONG
+            type_code::TINY
+                | type_code::SHORT
+                | type_code::INT24
+                | type_code::LONG
+                | type_code::LONGLONG
         );
         if n <= 1 || !is_int {
             return Ok(single());
@@ -211,16 +219,20 @@ impl MySqlSource {
         let col_list = columns
             .iter()
             .enumerate()
-            .map(|(i, c)| match select_exprs.get(i).and_then(|e| e.as_ref()) {
-                Some(expr) => format!("{expr} AS {}", quote_my(c)),
-                None => quote_my(c),
-            })
+            .map(
+                |(i, c)| match select_exprs.get(i).and_then(|e| e.as_ref()) {
+                    Some(expr) => format!("{expr} AS {}", quote_my(c)),
+                    None => quote_my(c),
+                },
+            )
             .collect::<Vec<_>>()
             .join(", ");
 
-        let cursor_pred = keyset
-            .as_ref()
-            .and_then(|k| k.cursor.as_ref().map(|cur| format!("{} > {}", k.col_quoted, cur)));
+        let cursor_pred = keyset.as_ref().and_then(|k| {
+            k.cursor
+                .as_ref()
+                .map(|cur| format!("{} > {}", k.col_quoted, cur))
+        });
         let extra_owned = extra_filter.map(str::to_string);
         let extra_and_cursor = combine_filters(&extra_owned, cursor_pred.as_deref());
         let filters = combine_filters(&partition.predicate, extra_and_cursor.as_deref());
@@ -348,7 +360,10 @@ mod tests {
     #[test]
     fn select_sql_transform_and_keyset() {
         let src = MySqlSource::new("mysql://x", 0, None, false);
-        let part = Partition { label: "all".into(), predicate: None };
+        let part = Partition {
+            label: "all".into(),
+            predicate: None,
+        };
         let sql = src.select_sql(
             &["id".to_string(), "amt".to_string()],
             &[None, Some("ROUND(`amt`, 9)".to_string())],
@@ -356,7 +371,11 @@ mod tests {
             None,
             &part,
             None,
-            Some(Keyset { col_quoted: "`id`".into(), cursor: Some("42".into()), limit: 500 }),
+            Some(Keyset {
+                col_quoted: "`id`".into(),
+                cursor: Some("42".into()),
+                limit: 500,
+            }),
         );
         assert!(sql.contains("ROUND(`amt`, 9) AS `amt`"), "{sql}");
         assert!(sql.contains("`id` > 42"), "{sql}");

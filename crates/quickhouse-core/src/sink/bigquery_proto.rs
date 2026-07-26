@@ -130,39 +130,88 @@ pub(crate) fn build_proto_descriptor(fields: &[FieldEnc]) -> Result<DescriptorPr
 
 /// Encode one Arrow row into protobuf wire bytes, appended to `buf`. Null cells
 /// are skipped (proto3 absence = NULL).
-pub(crate) fn encode_row(batch: &RecordBatch, row: usize, fields: &[FieldEnc], buf: &mut Vec<u8>) -> Result<()> {
+pub(crate) fn encode_row(
+    batch: &RecordBatch,
+    row: usize,
+    fields: &[FieldEnc],
+    buf: &mut Vec<u8>,
+) -> Result<()> {
     for fe in fields {
         let col = batch.column((fe.number - 1) as usize);
         if col.is_null(row) {
             continue;
         }
         match &fe.data_type {
-            DataType::Boolean => {
-                write_varint(buf, fe.number, downcast::<BooleanArray>(col)?.value(row) as u64)
-            }
-            DataType::Int8 => write_int(buf, fe.number, downcast::<Int8Array>(col)?.value(row) as i64),
-            DataType::Int16 => write_int(buf, fe.number, downcast::<Int16Array>(col)?.value(row) as i64),
-            DataType::Int32 => write_int(buf, fe.number, downcast::<Int32Array>(col)?.value(row) as i64),
+            DataType::Boolean => write_varint(
+                buf,
+                fe.number,
+                downcast::<BooleanArray>(col)?.value(row) as u64,
+            ),
+            DataType::Int8 => write_int(
+                buf,
+                fe.number,
+                downcast::<Int8Array>(col)?.value(row) as i64,
+            ),
+            DataType::Int16 => write_int(
+                buf,
+                fe.number,
+                downcast::<Int16Array>(col)?.value(row) as i64,
+            ),
+            DataType::Int32 => write_int(
+                buf,
+                fe.number,
+                downcast::<Int32Array>(col)?.value(row) as i64,
+            ),
             DataType::Int64 => write_int(buf, fe.number, downcast::<Int64Array>(col)?.value(row)),
-            DataType::UInt8 => write_int(buf, fe.number, downcast::<UInt8Array>(col)?.value(row) as i64),
-            DataType::UInt16 => write_int(buf, fe.number, downcast::<UInt16Array>(col)?.value(row) as i64),
-            DataType::UInt32 => write_int(buf, fe.number, downcast::<UInt32Array>(col)?.value(row) as i64),
+            DataType::UInt8 => write_int(
+                buf,
+                fe.number,
+                downcast::<UInt8Array>(col)?.value(row) as i64,
+            ),
+            DataType::UInt16 => write_int(
+                buf,
+                fe.number,
+                downcast::<UInt16Array>(col)?.value(row) as i64,
+            ),
+            DataType::UInt32 => write_int(
+                buf,
+                fe.number,
+                downcast::<UInt32Array>(col)?.value(row) as i64,
+            ),
             // BigQuery INTEGER is signed 64-bit; a UInt64 above i64::MAX wraps
             // to negative here (documented overflow caveat, same as the DDL /
             // JSON paths).
-            DataType::UInt64 => write_int(buf, fe.number, downcast::<UInt64Array>(col)?.value(row) as i64),
-            DataType::Float32 => {
-                write_double(buf, fe.number, downcast::<Float32Array>(col)?.value(row) as f64)
+            DataType::UInt64 => write_int(
+                buf,
+                fe.number,
+                downcast::<UInt64Array>(col)?.value(row) as i64,
+            ),
+            DataType::Float32 => write_double(
+                buf,
+                fe.number,
+                downcast::<Float32Array>(col)?.value(row) as f64,
+            ),
+            DataType::Float64 => {
+                write_double(buf, fe.number, downcast::<Float64Array>(col)?.value(row))
             }
-            DataType::Float64 => write_double(buf, fe.number, downcast::<Float64Array>(col)?.value(row)),
-            DataType::Utf8 => write_len(buf, fe.number, downcast::<StringArray>(col)?.value(row).as_bytes()),
+            DataType::Utf8 => write_len(
+                buf,
+                fe.number,
+                downcast::<StringArray>(col)?.value(row).as_bytes(),
+            ),
             DataType::Binary => write_len(buf, fe.number, downcast::<BinaryArray>(col)?.value(row)),
             // int32 days-from-epoch; negatives (pre-1970) sign-extend to a
             // 10-byte varint, same as any negative proto int.
-            DataType::Date32 => write_int(buf, fe.number, downcast::<Date32Array>(col)?.value(row) as i64),
-            DataType::Timestamp(TimeUnit::Microsecond, Some(_)) => {
-                write_int(buf, fe.number, downcast::<TimestampMicrosecondArray>(col)?.value(row))
-            }
+            DataType::Date32 => write_int(
+                buf,
+                fe.number,
+                downcast::<Date32Array>(col)?.value(row) as i64,
+            ),
+            DataType::Timestamp(TimeUnit::Microsecond, Some(_)) => write_int(
+                buf,
+                fe.number,
+                downcast::<TimestampMicrosecondArray>(col)?.value(row),
+            ),
             DataType::Timestamp(TimeUnit::Microsecond, None) => {
                 let micros = downcast::<TimestampMicrosecondArray>(col)?.value(row);
                 let s = timestamp_micros_to_iso(micros, false)?;
@@ -184,9 +233,9 @@ pub(crate) fn encode_row(batch: &RecordBatch, row: usize, fields: &[FieldEnc], b
 }
 
 fn downcast<T: 'static>(col: &dyn Array) -> Result<&T> {
-    col.as_any()
-        .downcast_ref::<T>()
-        .ok_or_else(|| EtlError::internal("Arrow array downcast failed (schema/builder type mismatch)"))
+    col.as_any().downcast_ref::<T>().ok_or_else(|| {
+        EtlError::internal("Arrow array downcast failed (schema/builder type mismatch)")
+    })
 }
 
 // ---- protobuf wire-format primitives ----
@@ -280,7 +329,11 @@ mod tests {
             Field::new("s", DataType::Utf8, true),
             Field::new("by", DataType::Binary, true),
             Field::new("d", DataType::Date32, true),
-            Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), true),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                true,
+            ),
             Field::new("dt", DataType::Timestamp(TimeUnit::Microsecond, None), true),
         ])
     }
@@ -371,7 +424,16 @@ mod tests {
     #[test]
     fn present_zero_is_distinct_from_null() {
         // A present zero/empty must be written (Some), not omitted (None).
-        let batch = batch_with(Some(false), Some(0), Some(0.0), Some(""), Some(&[]), Some(0), Some(0), Some(0));
+        let batch = batch_with(
+            Some(false),
+            Some(0),
+            Some(0.0),
+            Some(""),
+            Some(&[]),
+            Some(0),
+            Some(0),
+            Some(0),
+        );
         let got = encode_first_row(&batch);
         assert_eq!(got.b, Some(false));
         assert_eq!(got.i, Some(0));
@@ -392,8 +454,15 @@ mod tests {
 
     #[test]
     fn resolve_rejects_unsupported_type() {
-        let schema = Schema::new(vec![Field::new("x", DataType::Duration(TimeUnit::Second), true)]);
+        let schema = Schema::new(vec![Field::new(
+            "x",
+            DataType::Duration(TimeUnit::Second),
+            true,
+        )]);
         let err = resolve_fields(&schema).unwrap_err().to_string();
-        assert!(err.contains("no BigQuery Storage Write proto mapping"), "got: {err}");
+        assert!(
+            err.contains("no BigQuery Storage Write proto mapping"),
+            "got: {err}"
+        );
     }
 }

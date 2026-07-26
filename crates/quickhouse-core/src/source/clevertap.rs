@@ -20,7 +20,11 @@ use crate::error::{EtlError, Result};
 /// derives the base URL directly, so this is currently exercised by tests.
 #[allow(dead_code)]
 pub(crate) fn clevertap_host(region: &str) -> Result<String> {
-    if region.is_empty() || !region.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()) {
+    if region.is_empty()
+        || !region
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+    {
         return Err(EtlError::config(format!(
             "invalid CleverTap region '{region}' (expected lowercase alphanumeric, e.g. sg1/us1/eu1)"
         )));
@@ -36,7 +40,9 @@ pub(crate) fn iso_to_yyyymmdd(d: &str) -> Result<u32> {
             "CleverTap date '{d}' must be YYYY-MM-DD"
         )));
     }
-    digits.parse::<u32>().map_err(|e| EtlError::config(format!("bad date '{d}': {e}")))
+    digits
+        .parse::<u32>()
+        .map_err(|e| EtlError::config(format!("bad date '{d}': {e}")))
 }
 
 pub(crate) fn create_export_body(event_name: &str, from: u32, to: u32) -> Value {
@@ -49,13 +55,20 @@ pub(crate) fn parse_create_response(bytes: &[u8]) -> Result<String> {
         .map_err(|e| EtlError::other(format!("CleverTap create-export: bad JSON: {e}")))?;
     let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("");
     if status != "success" {
-        let err = v.get("error").and_then(|e| e.as_str()).unwrap_or("unknown error");
-        return Err(EtlError::other(format!("CleverTap create-export failed: {err} (status={status})")));
+        let err = v
+            .get("error")
+            .and_then(|e| e.as_str())
+            .unwrap_or("unknown error");
+        return Err(EtlError::other(format!(
+            "CleverTap create-export failed: {err} (status={status})"
+        )));
     }
     v.get("cursor")
         .and_then(|c| c.as_str())
         .map(str::to_string)
-        .ok_or_else(|| EtlError::other("CleverTap create-export: no cursor in success response".to_string()))
+        .ok_or_else(|| {
+            EtlError::other("CleverTap create-export: no cursor in success response".to_string())
+        })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,7 +95,11 @@ pub(crate) fn parse_events_page(bytes: &[u8]) -> Result<EventsPage> {
                 "CleverTap events page: unexpected status '{other}' {err}"
             )));
         }
-        None => return Err(EtlError::other("CleverTap events page: missing status".to_string())),
+        None => {
+            return Err(EtlError::other(
+                "CleverTap events page: missing status".to_string(),
+            ))
+        }
     };
     let cursor = v.get("cursor").and_then(|c| c.as_str()).map(str::to_string);
     let records = v
@@ -90,7 +107,11 @@ pub(crate) fn parse_events_page(bytes: &[u8]) -> Result<EventsPage> {
         .and_then(|r| r.as_array())
         .cloned()
         .unwrap_or_default();
-    Ok(EventsPage { status, cursor, records })
+    Ok(EventsPage {
+        status,
+        cursor,
+        records,
+    })
 }
 
 enum HttpClass {
@@ -118,8 +139,9 @@ impl CleverTapSource {
         let mut headers = HeaderMap::new();
         headers.insert(
             "X-CleverTap-Account-Id",
-            HeaderValue::from_str(&cfg.account_id)
-                .map_err(|_| EtlError::config("invalid CleverTap account_id (non-header characters)"))?,
+            HeaderValue::from_str(&cfg.account_id).map_err(|_| {
+                EtlError::config("invalid CleverTap account_id (non-header characters)")
+            })?,
         );
         let mut pass = HeaderValue::from_str(&cfg.passcode)
             .map_err(|_| EtlError::config("invalid CleverTap passcode (non-header characters)"))?;
@@ -131,7 +153,11 @@ impl CleverTapSource {
             .timeout(Duration::from_secs(120))
             .build()
             .map_err(|e| EtlError::other(format!("building CleverTap client: {e}")))?;
-        Ok(Self { client, base_url: cfg.base_url.clone(), batch_size: cfg.batch_size })
+        Ok(Self {
+            client,
+            base_url: cfg.base_url.clone(),
+            batch_size: cfg.batch_size,
+        })
     }
 
     /// Send a request with transient-retry/backoff, returning the response body.
@@ -166,7 +192,9 @@ impl CleverTapSource {
                             tokio::time::sleep(delay).await;
                             attempt += 1;
                         }
-                        _ => return Err(EtlError::other(format!("CleverTap HTTP {status}: {head}"))),
+                        _ => {
+                            return Err(EtlError::other(format!("CleverTap HTTP {status}: {head}")))
+                        }
                     }
                 }
                 Err(e) if attempt < max && (e.is_timeout() || e.is_connect() || e.is_request()) => {
@@ -181,8 +209,17 @@ impl CleverTapSource {
     }
 
     /// Create the export job for `[from, to]` (YYYYMMDD) and return the cursor.
-    pub(crate) async fn create_export(&self, event_name: &str, from: u32, to: u32) -> Result<String> {
-        let bs = if self.batch_size == 0 { 5000 } else { self.batch_size };
+    pub(crate) async fn create_export(
+        &self,
+        event_name: &str,
+        from: u32,
+        to: u32,
+    ) -> Result<String> {
+        let bs = if self.batch_size == 0 {
+            5000
+        } else {
+            self.batch_size
+        };
         let url = format!("{}/1/events.json?batch_size={bs}", self.base_url);
         let body = serde_json::to_vec(&create_export_body(event_name, from, to))
             .map_err(|e| EtlError::internal(format!("serialize CleverTap body: {e}")))?;
@@ -211,7 +248,10 @@ mod tests {
 
     #[test]
     fn host_validates_region() {
-        assert_eq!(clevertap_host("sg1").unwrap(), "https://sg1.api.clevertap.com");
+        assert_eq!(
+            clevertap_host("sg1").unwrap(),
+            "https://sg1.api.clevertap.com"
+        );
         assert!(clevertap_host("../evil").is_err());
         assert!(clevertap_host("sg1.api.clevertap.com/x").is_err());
         assert!(clevertap_host("").is_err());
@@ -233,22 +273,33 @@ mod tests {
 
     #[test]
     fn parse_create_ok_and_failures() {
-        assert_eq!(parse_create_response(br#"{"status":"success","cursor":"abc"}"#).unwrap(), "abc");
-        assert!(parse_create_response(br#"{"status":"fail","error":"Invalid Credentials"}"#)
-            .unwrap_err()
-            .to_string()
-            .contains("Invalid Credentials"));
-        assert!(parse_create_response(br#"{"status":"success"}"#).is_err(), "missing cursor");
+        assert_eq!(
+            parse_create_response(br#"{"status":"success","cursor":"abc"}"#).unwrap(),
+            "abc"
+        );
+        assert!(
+            parse_create_response(br#"{"status":"fail","error":"Invalid Credentials"}"#)
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid Credentials")
+        );
+        assert!(
+            parse_create_response(br#"{"status":"success"}"#).is_err(),
+            "missing cursor"
+        );
     }
 
     #[test]
     fn parse_page_retains_terminal_success_records() {
-        let p = parse_events_page(br#"{"status":"partial","cursor":"n","records":[{"a":1}]}"#).unwrap();
+        let p =
+            parse_events_page(br#"{"status":"partial","cursor":"n","records":[{"a":1}]}"#).unwrap();
         assert_eq!(p.status, PageStatus::Partial);
         assert_eq!(p.cursor.as_deref(), Some("n"));
         assert_eq!(p.records.len(), 1);
         // The terminal success page STILL carries records — must be processed.
-        let s = parse_events_page(br#"{"status":"success","cursor":"z","records":[{"a":2},{"a":3}]}"#).unwrap();
+        let s =
+            parse_events_page(br#"{"status":"success","cursor":"z","records":[{"a":2},{"a":3}]}"#)
+                .unwrap();
         assert_eq!(s.status, PageStatus::Success);
         assert_eq!(s.records.len(), 2);
         // Unknown status -> error (never an infinite loop).

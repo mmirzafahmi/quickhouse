@@ -23,9 +23,7 @@ pub struct ClickHouseSink {
 
 impl ClickHouseSink {
     pub fn new(cfg: ClickHouseConfig) -> Result<Self> {
-        let client = Client::builder()
-            .build()
-            .map_err(EtlError::from)?;
+        let client = Client::builder().build().map_err(EtlError::from)?;
         Ok(Self {
             client,
             cfg: Arc::new(cfg),
@@ -76,8 +74,15 @@ impl ClickHouseSink {
         if !self.table_exists(table).await? {
             return Ok(None);
         }
-        let sql = format!("SELECT count() FROM {}.{}", ident(&self.cfg.database), ident(table));
-        Ok(self.query_scalar(&sql).await?.and_then(|s| s.trim().parse::<u64>().ok()))
+        let sql = format!(
+            "SELECT count() FROM {}.{}",
+            ident(&self.cfg.database),
+            ident(table)
+        );
+        Ok(self
+            .query_scalar(&sql)
+            .await?
+            .and_then(|s| s.trim().parse::<u64>().ok()))
     }
 
     /// Run a query returning a single string column, one value per line (the
@@ -85,7 +90,11 @@ impl ClickHouseSink {
     pub async fn query_column(&self, sql: &str) -> Result<Vec<String>> {
         let resp = self.base_request().body(sql.to_string()).send().await?;
         let body = Self::check(resp).await?;
-        Ok(body.lines().filter(|l| !l.is_empty()).map(str::to_string).collect())
+        Ok(body
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect())
     }
 
     /// `ALTER TABLE ADD COLUMN` (Nullable) for each column missing from the
@@ -105,14 +114,20 @@ impl ClickHouseSink {
         let existing = self.query_column(&sql).await?;
         let mut added = Vec::new();
         for c in crate::sink::missing_columns(&existing, columns, false) {
-            self.execute(&crate::ddl::add_column(&self.cfg.database, table, c)).await?;
+            self.execute(&crate::ddl::add_column(&self.cfg.database, table, c))
+                .await?;
             added.push(c.name.clone());
         }
         Ok(added)
     }
 
     /// Generate and run this destination's own `CREATE TABLE` DDL for `table`.
-    pub async fn create_table(&self, table: &str, columns: &[ColumnType], cfg: &TransferConfig) -> Result<()> {
+    pub async fn create_table(
+        &self,
+        table: &str,
+        columns: &[ColumnType],
+        cfg: &TransferConfig,
+    ) -> Result<()> {
         let sql = crate::ddl::create_table(&self.cfg.database, table, columns, cfg)?;
         tracing::debug!("DDL: {sql}");
         self.execute(&sql).await
@@ -122,9 +137,11 @@ impl ClickHouseSink {
     /// doesn't exist yet (`CREATE TABLE IF NOT EXISTS`, so no prior existence
     /// check is needed here, unlike BigQuery's sink).
     pub async fn ensure_state_table(&self) -> Result<()> {
-        self.execute(&crate::ddl::create_state_table(&self.cfg.database)).await?;
+        self.execute(&crate::ddl::create_state_table(&self.cfg.database))
+            .await?;
         // Add the chunk-resume columns to a pre-0.5 state table (idempotent).
-        self.execute(&crate::ddl::migrate_state_table(&self.cfg.database)).await
+        self.execute(&crate::ddl::migrate_state_table(&self.cfg.database))
+            .await
     }
 
     /// Read the last persisted watermark for this `(state_key, dest_table)` pair.
@@ -148,7 +165,12 @@ impl ClickHouseSink {
     /// Persist a new watermark after a successful incremental run. Writes empty
     /// `chunk_cursor`/`chunk_upper`, which clears any in-progress chunk-resume
     /// marker — a clean finish (chunked or not) leaves nothing to resume.
-    pub async fn persist_watermark(&self, cfg: &TransferConfig, watermark: &str, rows: u64) -> Result<()> {
+    pub async fn persist_watermark(
+        &self,
+        cfg: &TransferConfig,
+        watermark: &str,
+        rows: u64,
+    ) -> Result<()> {
         let source_id = cfg.effective_state_key();
         let sql = format!(
             "INSERT INTO {}.`_quickhouse_state` \
@@ -454,6 +476,9 @@ mod tests {
         // a real ClickHouse server: `SELECT 'ends_with_backslash\'` fails
         // with "Code: 62. Single quoted string is not closed").
         assert_eq!(escape_sql_string(r"a\b"), r"a\\b");
-        assert_eq!(escape_sql_string(r"ends_with_backslash\"), r"ends_with_backslash\\");
+        assert_eq!(
+            escape_sql_string(r"ends_with_backslash\"),
+            r"ends_with_backslash\\"
+        );
     }
 }

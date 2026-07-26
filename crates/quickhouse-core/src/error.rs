@@ -242,7 +242,10 @@ mod tests {
         assert_eq!(ok.context("irrelevant").unwrap(), 5);
 
         let err: Result<i32> = Err(EtlError::other("boom"));
-        assert_eq!(err.context("while doing x").unwrap_err().to_string(), "while doing x: boom");
+        assert_eq!(
+            err.context("while doing x").unwrap_err().to_string(),
+            "while doing x: boom"
+        );
     }
 
     #[test]
@@ -253,8 +256,14 @@ mod tests {
             type_name: "MYSQL_TYPE_GEOMETRY".into(),
         };
         let msg = e.to_string();
-        assert!(msg.contains("MySQL"), "must name the real engine, not PostgreSQL: {msg}");
-        assert!(msg.contains("MYSQL_TYPE_GEOMETRY"), "must name the real type: {msg}");
+        assert!(
+            msg.contains("MySQL"),
+            "must name the real engine, not PostgreSQL: {msg}"
+        );
+        assert!(
+            msg.contains("MYSQL_TYPE_GEOMETRY"),
+            "must name the real type: {msg}"
+        );
         assert!(msg.contains("location"), "must name the column: {msg}");
         assert!(msg.contains("exclude"), "must suggest a workaround: {msg}");
     }
@@ -262,17 +271,35 @@ mod tests {
     #[test]
     fn internal_error_frames_it_as_a_bug_not_a_data_problem() {
         let msg = EtlError::internal("no column builder for Arrow type Utf8").to_string();
-        assert!(msg.contains("quickhouse bug"), "must say it's not the user's fault: {msg}");
-        assert!(msg.contains("no column builder"), "must keep the original detail: {msg}");
+        assert!(
+            msg.contains("quickhouse bug"),
+            "must say it's not the user's fault: {msg}"
+        );
+        assert!(
+            msg.contains("no column builder"),
+            "must keep the original detail: {msg}"
+        );
     }
 
     #[test]
     fn sqlstate_transient_allowlist_is_closed() {
-        assert!(sqlstate_is_transient("40001"), "serialization / hot-standby recovery conflict");
-        assert!(sqlstate_is_transient("57014"), "canceled statement (timeout / standby cancel)");
+        assert!(
+            sqlstate_is_transient("40001"),
+            "serialization / hot-standby recovery conflict"
+        );
+        assert!(
+            sqlstate_is_transient("57014"),
+            "canceled statement (timeout / standby cancel)"
+        );
         // Deterministic errors must NOT be retried (would re-read the source pointlessly).
-        assert!(!sqlstate_is_transient("23505"), "unique violation is permanent");
-        assert!(!sqlstate_is_transient("42P01"), "undefined table is permanent");
+        assert!(
+            !sqlstate_is_transient("23505"),
+            "unique violation is permanent"
+        );
+        assert!(
+            !sqlstate_is_transient("42P01"),
+            "undefined table is permanent"
+        );
         assert!(!sqlstate_is_transient(""), "empty is not transient");
     }
 
@@ -285,6 +312,8 @@ mod tests {
         assert!(!EtlError::decode("short int4").is_transient_source());
         assert!(!EtlError::other("x").is_transient_source());
         // Context recurses into the wrapped error (still non-source here).
-        assert!(!EtlError::other("x").context("orders -> dest").is_transient_source());
+        assert!(!EtlError::other("x")
+            .context("orders -> dest")
+            .is_transient_source());
     }
 }

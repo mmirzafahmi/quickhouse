@@ -132,7 +132,10 @@ impl SourceConfig {
     /// declared schema + date window and bypass the DB schema-resolution /
     /// partition machinery, writing only to BigQuery.
     pub fn is_api(&self) -> bool {
-        matches!(self, SourceConfig::CleverTap(_) | SourceConfig::AppsFlyer(_))
+        matches!(
+            self,
+            SourceConfig::CleverTap(_) | SourceConfig::AppsFlyer(_)
+        )
     }
 
     /// A stable identity string for an API source's incremental cursor in
@@ -572,7 +575,8 @@ impl TransferConfig {
                 ));
             }
         }
-        if matches!(self.mode, SyncMode::Incremental | SyncMode::Append) && self.watermark.is_none() {
+        if matches!(self.mode, SyncMode::Incremental | SyncMode::Append) && self.watermark.is_none()
+        {
             return Err(EtlError::config(
                 "watermark column is required for incremental and append mode (it drives the \
                  resumable date window)",
@@ -628,7 +632,9 @@ impl TransferConfig {
             ));
         }
         if self.chunk_rows == Some(0) {
-            return Err(EtlError::config("chunk_rows must be None (one-shot) or >= 1"));
+            return Err(EtlError::config(
+                "chunk_rows must be None (one-shot) or >= 1",
+            ));
         }
         if self.chunk_rows.is_some() && self.mode != SyncMode::Incremental {
             return Err(EtlError::config(
@@ -836,10 +842,18 @@ mod tests {
     fn validate_rejects_seed_and_freeze_outside_incremental() {
         let mut c = cfg(SyncMode::Full, None);
         c.seed_watermark = WatermarkSeed::CurrentMax;
-        assert!(c.validate().unwrap_err().to_string().contains("seed_watermark"));
+        assert!(c
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("seed_watermark"));
         c.seed_watermark = WatermarkSeed::None;
         c.advance_watermark = false;
-        assert!(c.validate().unwrap_err().to_string().contains("advance_watermark"));
+        assert!(c
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("advance_watermark"));
     }
 
     #[test]
@@ -876,14 +890,25 @@ mod tests {
         c.source_table = None;
         c.source_query = None;
         assert!(c.validate_api().is_ok());
-        assert!(c.validate().is_err(), "DB validation still requires a table/query");
+        assert!(
+            c.validate().is_err(),
+            "DB validation still requires a table/query"
+        );
         // API rejects column_transforms / chunk_rows / lookback.
         let mut c = cfg(SyncMode::Incremental, Some("ts"));
         c.column_transforms = HashMap::from([("x".to_string(), "y".to_string())]);
-        assert!(c.validate_api().unwrap_err().to_string().contains("column_transforms"));
+        assert!(c
+            .validate_api()
+            .unwrap_err()
+            .to_string()
+            .contains("column_transforms"));
         let mut c = cfg(SyncMode::Incremental, Some("ts"));
         c.chunk_rows = Some(1000);
-        assert!(c.validate_api().unwrap_err().to_string().contains("chunk_rows"));
+        assert!(c
+            .validate_api()
+            .unwrap_err()
+            .to_string()
+            .contains("chunk_rows"));
     }
 
     #[test]
@@ -895,7 +920,11 @@ mod tests {
         // Full mode rejected.
         let mut c = cfg(SyncMode::Full, None);
         c.chunk_rows = Some(1000);
-        assert!(c.validate().unwrap_err().to_string().contains("incremental"));
+        assert!(c
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("incremental"));
         // No keyset column rejected.
         let mut c = cfg(SyncMode::Incremental, Some("write_date"));
         c.chunk_rows = Some(1000);
@@ -912,11 +941,19 @@ mod tests {
     fn append_mode_is_api_only_and_needs_watermark() {
         // Append is rejected for a DB source, allowed for an API source.
         let c = cfg(SyncMode::Append, Some("ts"));
-        assert!(c.validate().unwrap_err().to_string().contains("append mode"));
+        assert!(c
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("append mode"));
         assert!(c.validate_api().is_ok());
         // Append without a watermark (the resume cursor) is rejected.
         let c2 = cfg(SyncMode::Append, None);
-        assert!(c2.validate_api().unwrap_err().to_string().contains("watermark"));
+        assert!(c2
+            .validate_api()
+            .unwrap_err()
+            .to_string()
+            .contains("watermark"));
         // seed_watermark / advance_watermark are allowed in append mode.
         let mut c3 = cfg(SyncMode::Append, Some("ts"));
         c3.seed_watermark = WatermarkSeed::CurrentMax;
@@ -929,7 +966,11 @@ mod tests {
         // Incremental without a prune column -> rejected (would nuke history).
         let mut c = cfg(SyncMode::Incremental, Some("write_date"));
         c.delete_stale_in_window = true;
-        assert!(c.validate().unwrap_err().to_string().contains("merge_prune_partition_by"));
+        assert!(c
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("merge_prune_partition_by"));
         // With an immutable prune column -> ok.
         c.merge_prune_partition_by = Some("create_date".into());
         assert!(c.validate().is_ok());
@@ -937,6 +978,10 @@ mod tests {
         let mut c2 = cfg(SyncMode::Full, None);
         c2.delete_stale_in_window = true;
         c2.merge_prune_partition_by = Some("create_date".into());
-        assert!(c2.validate().unwrap_err().to_string().contains("incremental"));
+        assert!(c2
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("incremental"));
     }
 }

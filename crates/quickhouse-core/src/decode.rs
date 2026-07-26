@@ -14,8 +14,9 @@
 use std::sync::Arc;
 
 use arrow_array::builder::{
-    BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, Float32Builder, Float64Builder,
-    Int16Builder, Int32Builder, Int64Builder, StringBuilder, TimestampMicrosecondBuilder, UInt32Builder,
+    BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, Float32Builder,
+    Float64Builder, Int16Builder, Int32Builder, Int64Builder, StringBuilder,
+    TimestampMicrosecondBuilder, UInt32Builder,
 };
 use arrow_array::types::{Decimal128Type, DecimalType};
 use arrow_array::{ArrayRef, RecordBatch};
@@ -76,7 +77,7 @@ impl ColBuilder {
                 // decoder mismatch, not anything a source column can trigger.
                 return Err(EtlError::internal(format!(
                     "no column builder for Arrow type {other:?}"
-                )))
+                )));
             }
         })
     }
@@ -169,23 +170,25 @@ impl ColBuilder {
                     b.append_null();
                     coercion = Coercion::DecimalOverflow;
                 }
-                NumericWire::Value { negative, magnitude, native_scale } => {
-                    match rescale_mantissa(magnitude, native_scale, *s as i32) {
-                        Some(m) => {
-                            let signed = if negative { -m } else { m };
-                            if Decimal128Type::is_valid_decimal_precision(signed, *p) {
-                                b.append_value(signed);
-                            } else {
-                                b.append_null();
-                                coercion = Coercion::DecimalOverflow;
-                            }
-                        }
-                        None => {
+                NumericWire::Value {
+                    negative,
+                    magnitude,
+                    native_scale,
+                } => match rescale_mantissa(magnitude, native_scale, *s as i32) {
+                    Some(m) => {
+                        let signed = if negative { -m } else { m };
+                        if Decimal128Type::is_valid_decimal_precision(signed, *p) {
+                            b.append_value(signed);
+                        } else {
                             b.append_null();
                             coercion = Coercion::DecimalOverflow;
                         }
                     }
-                }
+                    None => {
+                        b.append_null();
+                        coercion = Coercion::DecimalOverflow;
+                    }
+                },
             },
         }
         Ok(coercion)
@@ -239,17 +242,32 @@ fn format_pg_time(micros: i64) -> String {
 fn read_i16(buf: &[u8]) -> Result<i16> {
     buf.get(0..2)
         .map(|b| i16::from_be_bytes([b[0], b[1]]))
-        .ok_or_else(|| EtlError::internal(format!("expected a 2-byte int2 field, got {} byte(s)", buf.len())))
+        .ok_or_else(|| {
+            EtlError::internal(format!(
+                "expected a 2-byte int2 field, got {} byte(s)",
+                buf.len()
+            ))
+        })
 }
 fn read_i32(buf: &[u8]) -> Result<i32> {
     buf.get(0..4)
         .map(|b| i32::from_be_bytes([b[0], b[1], b[2], b[3]]))
-        .ok_or_else(|| EtlError::internal(format!("expected a 4-byte int4 field, got {} byte(s)", buf.len())))
+        .ok_or_else(|| {
+            EtlError::internal(format!(
+                "expected a 4-byte int4 field, got {} byte(s)",
+                buf.len()
+            ))
+        })
 }
 fn read_i64(buf: &[u8]) -> Result<i64> {
     buf.get(0..8)
         .map(|b| i64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
-        .ok_or_else(|| EtlError::internal(format!("expected an 8-byte int8 field, got {} byte(s)", buf.len())))
+        .ok_or_else(|| {
+            EtlError::internal(format!(
+                "expected an 8-byte int8 field, got {} byte(s)",
+                buf.len()
+            ))
+        })
 }
 
 /// Decode PostgreSQL's `numeric` binary form to `f64` (approximate; used
@@ -304,7 +322,11 @@ fn decode_numeric(buf: &[u8]) -> Result<f64> {
 /// for any Decimal128" category as a post-rescale precision overflow (see
 /// `append_value`'s `ColBuilder::Decimal128` arm), not a hard error.
 enum NumericWire {
-    Value { negative: bool, magnitude: i128, native_scale: i32 },
+    Value {
+        negative: bool,
+        magnitude: i128,
+        native_scale: i32,
+    },
     MagnitudeOverflow,
     NanOrInf,
 }
@@ -344,7 +366,10 @@ fn parse_numeric_wire(buf: &[u8]) -> Result<NumericWire> {
     for i in 0..ndigits {
         let off = 8 + i * 2;
         let digit = i16::from_be_bytes([buf[off], buf[off + 1]]) as i128;
-        magnitude = match magnitude.checked_mul(10_000).and_then(|m| m.checked_add(digit)) {
+        magnitude = match magnitude
+            .checked_mul(10_000)
+            .and_then(|m| m.checked_add(digit))
+        {
             Some(m) => m,
             None => return Ok(NumericWire::MagnitudeOverflow),
         };
@@ -393,7 +418,11 @@ impl CopyDecoder {
         Self::with_batch_bytes(columns, batch_rows, 0)
     }
 
-    pub fn with_batch_bytes(columns: &[ColumnType], batch_rows: usize, batch_bytes: usize) -> Result<Self> {
+    pub fn with_batch_bytes(
+        columns: &[ColumnType],
+        batch_rows: usize,
+        batch_bytes: usize,
+    ) -> Result<Self> {
         let fields: Vec<Field> = columns
             .iter()
             .map(|c| Field::new(&c.name, c.arrow.clone(), c.nullable))
@@ -557,7 +586,9 @@ impl CopyDecoder {
                     let oid = self.oids[i];
                     let coercion = self.builders[i]
                         .append_value(oid, &self.buf[*s..*e])
-                        .map_err(|err| err.context(format!("column '{}'", self.schema.field(i).name())))?;
+                        .map_err(|err| {
+                            err.context(format!("column '{}'", self.schema.field(i).name()))
+                        })?;
                     match coercion {
                         Coercion::None => {}
                         Coercion::DateRange => self.invalid_dates_total += 1,
@@ -646,11 +677,17 @@ mod tests {
             (oid::BYTEA, DataType::Binary, "String", Bq::Bytes),
             (oid::DATE, DataType::Date32, "Date32", Bq::Date),
             (oid::TIMESTAMP, ts(None), "DateTime64(6)", Bq::Datetime),
-            (oid::TIMESTAMPTZ, ts(Some("UTC")), "DateTime64(6, 'UTC')", Bq::Timestamp),
+            (
+                oid::TIMESTAMPTZ,
+                ts(Some("UTC")),
+                "DateTime64(6, 'UTC')",
+                Bq::Timestamp,
+            ),
             (oid::TIME, DataType::Utf8, "String", Bq::String),
         ];
         for (o, arrow, ch, bq) in rows {
-            let (mapped_arrow, mapped_ch) = map_oid(o).unwrap_or_else(|| panic!("oid {o} unmapped"));
+            let (mapped_arrow, mapped_ch) =
+                map_oid(o).unwrap_or_else(|| panic!("oid {o} unmapped"));
             assert_eq!(mapped_arrow, arrow, "oid {o}: Arrow type");
             assert_eq!(mapped_ch, ch, "oid {o}: ClickHouse inner");
             // Decoder output type (incl. tz) must equal the resolved schema type.
@@ -659,7 +696,8 @@ mod tests {
             assert_eq!(out.data_type(), &arrow, "oid {o}: decoder output type/tz");
             // The literal flush_batch validation must accept it.
             let schema = Arc::new(Schema::new(vec![Field::new("c", arrow.clone(), true)]));
-            RecordBatch::try_new(schema, vec![out]).unwrap_or_else(|e| panic!("oid {o}: batch: {e}"));
+            RecordBatch::try_new(schema, vec![out])
+                .unwrap_or_else(|e| panic!("oid {o}: batch: {e}"));
             // Destination bridge (Arrow -> BigQuery column type).
             assert_eq!(a2b(&arrow), Some(bq), "oid {o}: BigQuery type");
         }
@@ -735,7 +773,10 @@ mod tests {
         assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 10);
         // No single batch should wildly exceed the byte budget.
         for b in &batches {
-            assert!(b.num_rows() <= 3, "batch too large for a 250-byte budget at ~106B/row");
+            assert!(
+                b.num_rows() <= 3,
+                "batch too large for a 250-byte budget at ~106B/row"
+            );
         }
     }
 
@@ -750,7 +791,11 @@ mod tests {
         if let Some(b) = dec.finish().unwrap() {
             batches.push(b);
         }
-        assert_eq!(batches.len(), 1, "batch_bytes=0 should leave row count as the only trigger");
+        assert_eq!(
+            batches.len(),
+            1,
+            "batch_bytes=0 should leave row count as the only trigger"
+        );
     }
 
     #[test]
@@ -799,7 +844,10 @@ mod tests {
         let mut b = ColBuilder::new(&DataType::Decimal128(10, 4)).unwrap();
         let (coercion, arr) = decimal_value(&mut b, &numeric_wire(0, 0x0000, &[12, 3400]));
         assert_eq!(coercion, Coercion::None);
-        let arr = arr.as_any().downcast_ref::<arrow_array::Decimal128Array>().unwrap();
+        let arr = arr
+            .as_any()
+            .downcast_ref::<arrow_array::Decimal128Array>()
+            .unwrap();
         assert_eq!(arr.value(0), 123_400);
     }
 
@@ -811,7 +859,10 @@ mod tests {
         let mut b = ColBuilder::new(&DataType::Decimal128(10, 2)).unwrap();
         let (coercion, arr) = decimal_value(&mut b, &numeric_wire(0, 0x0000, &[12, 3450]));
         assert_eq!(coercion, Coercion::None);
-        let arr = arr.as_any().downcast_ref::<arrow_array::Decimal128Array>().unwrap();
+        let arr = arr
+            .as_any()
+            .downcast_ref::<arrow_array::Decimal128Array>()
+            .unwrap();
         assert_eq!(arr.value(0), 1235);
     }
 
@@ -820,7 +871,10 @@ mod tests {
         let mut b = ColBuilder::new(&DataType::Decimal128(10, 4)).unwrap();
         let (coercion, arr) = decimal_value(&mut b, &numeric_wire(0, 0x4000, &[12, 3400]));
         assert_eq!(coercion, Coercion::None);
-        let arr = arr.as_any().downcast_ref::<arrow_array::Decimal128Array>().unwrap();
+        let arr = arr
+            .as_any()
+            .downcast_ref::<arrow_array::Decimal128Array>()
+            .unwrap();
         assert_eq!(arr.value(0), -123_400);
     }
 
@@ -830,7 +884,10 @@ mod tests {
         let mut b = ColBuilder::new(&DataType::Decimal128(3, 0)).unwrap();
         let (coercion, arr) = decimal_value(&mut b, &numeric_wire(0, 0x0000, &[1234]));
         assert_eq!(coercion, Coercion::DecimalOverflow);
-        let arr = arr.as_any().downcast_ref::<arrow_array::Decimal128Array>().unwrap();
+        let arr = arr
+            .as_any()
+            .downcast_ref::<arrow_array::Decimal128Array>()
+            .unwrap();
         assert!(arr.is_null(0));
     }
 
@@ -840,7 +897,10 @@ mod tests {
             let mut b = ColBuilder::new(&DataType::Decimal128(10, 2)).unwrap();
             let (coercion, arr) = decimal_value(&mut b, &numeric_wire(0, sign, &[]));
             assert_eq!(coercion, Coercion::DecimalOverflow, "sign {sign:#06x}");
-            let arr = arr.as_any().downcast_ref::<arrow_array::Decimal128Array>().unwrap();
+            let arr = arr
+                .as_any()
+                .downcast_ref::<arrow_array::Decimal128Array>()
+                .unwrap();
             assert!(arr.is_null(0), "sign {sign:#06x}");
         }
     }
@@ -855,7 +915,10 @@ mod tests {
         let mut b = ColBuilder::new(&DataType::Decimal128(38, 30)).unwrap();
         let (coercion, arr) = decimal_value(&mut b, &numeric_wire(0, 0x0000, &[]));
         assert_eq!(coercion, Coercion::None);
-        let arr = arr.as_any().downcast_ref::<arrow_array::Decimal128Array>().unwrap();
+        let arr = arr
+            .as_any()
+            .downcast_ref::<arrow_array::Decimal128Array>()
+            .unwrap();
         assert_eq!(arr.value(0), 0);
     }
 
@@ -864,8 +927,16 @@ mod tests {
         // The plain (non-overridden) Float64 path: previously only NaN was
         // checked, so a real Infinity/-Infinity value silently decoded to
         // 0.0 instead of representing it (or erroring).
-        assert!(decode_numeric(&numeric_wire(0, 0xC000, &[])).unwrap().is_nan());
-        assert_eq!(decode_numeric(&numeric_wire(0, 0xD000, &[])).unwrap(), f64::INFINITY);
-        assert_eq!(decode_numeric(&numeric_wire(0, 0xF000, &[])).unwrap(), f64::NEG_INFINITY);
+        assert!(decode_numeric(&numeric_wire(0, 0xC000, &[]))
+            .unwrap()
+            .is_nan());
+        assert_eq!(
+            decode_numeric(&numeric_wire(0, 0xD000, &[])).unwrap(),
+            f64::INFINITY
+        );
+        assert_eq!(
+            decode_numeric(&numeric_wire(0, 0xF000, &[])).unwrap(),
+            f64::NEG_INFINITY
+        );
     }
 }

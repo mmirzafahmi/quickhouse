@@ -19,9 +19,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Once};
 
-use quickhouse_core as core;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
+use quickhouse_core as core;
 
 fn map_err(e: core::EtlError) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
@@ -40,8 +40,8 @@ static INIT_LOGGING: Once = Once::new();
 fn init_logging() {
     INIT_LOGGING.call_once(|| {
         use tracing_subscriber::EnvFilter;
-        let filter =
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("quickhouse_core=info"));
+        let filter = EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new("quickhouse_core=info"));
         let _ = tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_target(false)
@@ -172,20 +172,34 @@ fn parse_columns(
             let name: String = k.extract()?;
             let bq_type: String = v.extract()?;
             let path = paths.get(&name).cloned();
-            out.push(core::ApiColumn { name, bq_type, path });
+            out.push(core::ApiColumn {
+                name,
+                bq_type,
+                path,
+            });
         }
         if out.is_empty() {
-            return Err(PyRuntimeError::new_err("columns is empty; declare at least one column"));
+            return Err(PyRuntimeError::new_err(
+                "columns is empty; declare at least one column",
+            ));
         }
         return Ok(out);
     }
     for item in columns.iter()? {
         let item = item?;
         if let Ok((name, bq_type, path)) = item.extract::<(String, String, String)>() {
-            out.push(core::ApiColumn { name, bq_type, path: Some(path) });
+            out.push(core::ApiColumn {
+                name,
+                bq_type,
+                path: Some(path),
+            });
         } else if let Ok((name, bq_type)) = item.extract::<(String, String)>() {
             let path = paths.get(&name).cloned();
-            out.push(core::ApiColumn { name, bq_type, path });
+            out.push(core::ApiColumn {
+                name,
+                bq_type,
+                path,
+            });
         } else {
             return Err(PyRuntimeError::new_err(
                 "each column must be (name, type) or (name, type, path), or use a {name: type} dict",
@@ -193,7 +207,9 @@ fn parse_columns(
         }
     }
     if out.is_empty() {
-        return Err(PyRuntimeError::new_err("columns is empty; declare at least one column"));
+        return Err(PyRuntimeError::new_err(
+            "columns is empty; declare at least one column",
+        ));
     }
     Ok(out)
 }
@@ -240,7 +256,17 @@ impl CleverTap {
     ) -> PyResult<Self> {
         let columns = parse_columns(columns, paths)?;
         let base_url = base_url.unwrap_or_else(|| format!("https://{region}.api.clevertap.com"));
-        Ok(CleverTap { base_url, account_id, passcode, event_name, batch_size, columns, from_date, to_date, lookback_days })
+        Ok(CleverTap {
+            base_url,
+            account_id,
+            passcode,
+            event_name,
+            batch_size,
+            columns,
+            from_date,
+            to_date,
+            lookback_days,
+        })
     }
 
     fn __repr__(&self) -> String {
@@ -462,7 +488,10 @@ impl ClickHouse {
     }
 
     fn __repr__(&self) -> String {
-        format!("ClickHouse(url={:?}, database={:?})", self.url, self.database)
+        format!(
+            "ClickHouse(url={:?}, database={:?})",
+            self.url, self.database
+        )
     }
 }
 
@@ -499,14 +528,16 @@ impl AnyDestination {
                     }
                     None => None,
                 };
-                Ok(core::DestinationConfig::ClickHouse(core::ClickHouseConfig {
-                    url: c.url,
-                    database: c.database,
-                    user: c.user,
-                    password: c.password,
-                    compression: parse_compression(&c.compression)?,
-                    s3_archive,
-                }))
+                Ok(core::DestinationConfig::ClickHouse(
+                    core::ClickHouseConfig {
+                        url: c.url,
+                        database: c.database,
+                        user: c.user,
+                        password: c.password,
+                        compression: parse_compression(&c.compression)?,
+                        s3_archive,
+                    },
+                ))
             }
             AnyDestination::BigQuery(b) => {
                 let dataset_id = b.dataset_id.ok_or_else(|| {
@@ -515,12 +546,14 @@ impl AnyDestination {
                          e.g. quickhouse.BigQuery(\"my-project\", dataset_id=\"analytics\")",
                     )
                 })?;
-                Ok(core::DestinationConfig::BigQuery(core::BigQueryDestConfig {
-                    project_id: b.project_id,
-                    credentials_file: b.credentials_file,
-                    dataset_id,
-                    write_method: parse_bq_write_method(&b.write_method)?,
-                }))
+                Ok(core::DestinationConfig::BigQuery(
+                    core::BigQueryDestConfig {
+                        project_id: b.project_id,
+                        credentials_file: b.credentials_file,
+                        dataset_id,
+                        write_method: parse_bq_write_method(&b.write_method)?,
+                    },
+                ))
             }
         }
     }

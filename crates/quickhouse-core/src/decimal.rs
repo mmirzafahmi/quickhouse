@@ -110,7 +110,11 @@ pub(crate) fn rescale_mantissa(magnitude: i128, from_scale: i32, to_scale: i32) 
 /// transfer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DecimalText {
-    Ok { negative: bool, magnitude: i128, scale: i32 },
+    Ok {
+        negative: bool,
+        magnitude: i128,
+        scale: i32,
+    },
     MagnitudeOverflow,
 }
 
@@ -150,7 +154,11 @@ pub(crate) fn parse_decimal_text(s: &str) -> Result<DecimalText> {
             None => return Ok(DecimalText::MagnitudeOverflow),
         };
     }
-    Ok(DecimalText::Ok { negative, magnitude, scale })
+    Ok(DecimalText::Ok {
+        negative,
+        magnitude,
+        scale,
+    })
 }
 
 /// Which kind of otherwise-valid value a decoder coerced to NULL instead of
@@ -244,26 +252,45 @@ mod tests {
     fn parse_decimal_text_handles_common_shapes() {
         assert_eq!(
             parse_decimal_text("123.456").unwrap(),
-            DecimalText::Ok { negative: false, magnitude: 123456, scale: 3 }
+            DecimalText::Ok {
+                negative: false,
+                magnitude: 123456,
+                scale: 3
+            }
         );
         assert_eq!(
             parse_decimal_text("-42").unwrap(),
-            DecimalText::Ok { negative: true, magnitude: 42, scale: 0 }
+            DecimalText::Ok {
+                negative: true,
+                magnitude: 42,
+                scale: 0
+            }
         );
         assert_eq!(
             parse_decimal_text("42").unwrap(),
-            DecimalText::Ok { negative: false, magnitude: 42, scale: 0 }
+            DecimalText::Ok {
+                negative: false,
+                magnitude: 42,
+                scale: 0
+            }
         );
         assert_eq!(
             parse_decimal_text("0.00").unwrap(),
-            DecimalText::Ok { negative: false, magnitude: 0, scale: 2 }
+            DecimalText::Ok {
+                negative: false,
+                magnitude: 0,
+                scale: 2
+            }
         );
     }
 
     #[test]
     fn parse_decimal_text_reports_magnitude_overflow_not_an_error() {
         let forty_nines = "9".repeat(40);
-        assert_eq!(parse_decimal_text(&forty_nines).unwrap(), DecimalText::MagnitudeOverflow);
+        assert_eq!(
+            parse_decimal_text(&forty_nines).unwrap(),
+            DecimalText::MagnitudeOverflow
+        );
     }
 
     #[test]

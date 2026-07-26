@@ -89,15 +89,19 @@ impl BigQuerySource {
     }
 
     /// Resolve a base table's columns via the REST `tables.get` API.
-    pub async fn resolve_table_columns(&self, client: &Client, table: &TableReference) -> Result<Vec<ColumnType>> {
+    pub async fn resolve_table_columns(
+        &self,
+        client: &Client,
+        table: &TableReference,
+    ) -> Result<Vec<ColumnType>> {
         let t = client
             .table()
             .get(&table.project_id, &table.dataset_id, &table.table_id)
             .await
             .map_err(|e| EtlError::other(format!("bigquery tables.get error: {e}")))?;
-        let schema = t
-            .schema
-            .ok_or_else(|| EtlError::other(format!("BigQuery table '{}' has no schema", table.table_id)))?;
+        let schema = t.schema.ok_or_else(|| {
+            EtlError::other(format!("BigQuery table '{}' has no schema", table.table_id))
+        })?;
         columns_from_schema(&schema)
     }
 
@@ -156,10 +160,11 @@ impl BigQuerySource {
             JobType::Query(config) => config,
             _ => return Err(EtlError::other("BigQuery job is not a query job")),
         };
-        let destination = query_config
-            .destination_table
-            .clone()
-            .ok_or_else(|| EtlError::other("BigQuery query job has no destination table (script jobs aren't supported)"))?;
+        let destination = query_config.destination_table.clone().ok_or_else(|| {
+            EtlError::other(
+                "BigQuery query job has no destination table (script jobs aren't supported)",
+            )
+        })?;
 
         Ok((columns, destination))
     }
@@ -228,20 +233,24 @@ impl BigQuerySource {
 /// The BigQuery-SQL table expression for a resolved [`TableReference`], for
 /// interpolating into ad hoc queries like [`BigQuerySource::max_watermark`].
 pub fn table_sql(table: &TableReference) -> String {
-    format!("`{}`.`{}`.`{}`", table.project_id, table.dataset_id, table.table_id)
+    format!(
+        "`{}`.`{}`.`{}`",
+        table.project_id, table.dataset_id, table.table_id
+    )
 }
 
 fn columns_from_schema(schema: &TableSchema) -> Result<Vec<ColumnType>> {
     let mut cols = Vec::with_capacity(schema.fields.len());
     for f in &schema.fields {
-        let (type_id, arrow, ch_inner) = map_type(&f.data_type).ok_or_else(|| EtlError::UnsupportedType {
-            engine: "BigQuery",
-            column: f.name.clone(),
-            // TableFieldType's Debug repr is its variant name (e.g. "Record",
-            // "Struct"), not a placeholder — every unsupported BigQuery type
-            // (RECORD/STRUCT, repeated/ARRAY fields) is one of these.
-            type_name: format!("{:?}", f.data_type),
-        })?;
+        let (type_id, arrow, ch_inner) =
+            map_type(&f.data_type).ok_or_else(|| EtlError::UnsupportedType {
+                engine: "BigQuery",
+                column: f.name.clone(),
+                // TableFieldType's Debug repr is its variant name (e.g. "Record",
+                // "Struct"), not a placeholder — every unsupported BigQuery type
+                // (RECORD/STRUCT, repeated/ARRAY fields) is one of these.
+                type_name: format!("{:?}", f.data_type),
+            })?;
         let nullable = !matches!(f.mode, Some(TableFieldMode::Required));
         cols.push(ColumnType {
             name: f.name.clone(),
@@ -262,7 +271,9 @@ mod tests {
     #[test]
     fn parse_table_ref_two_parts() {
         let src = BigQuerySource::new(None, None);
-        let t = src.parse_table_ref("dataset.table", "default-proj").unwrap();
+        let t = src
+            .parse_table_ref("dataset.table", "default-proj")
+            .unwrap();
         assert_eq!(t.project_id, "default-proj");
         assert_eq!(t.dataset_id, "dataset");
         assert_eq!(t.table_id, "table");
@@ -271,7 +282,9 @@ mod tests {
     #[test]
     fn parse_table_ref_three_parts() {
         let src = BigQuerySource::new(None, None);
-        let t = src.parse_table_ref("proj.dataset.table", "default-proj").unwrap();
+        let t = src
+            .parse_table_ref("proj.dataset.table", "default-proj")
+            .unwrap();
         assert_eq!(t.project_id, "proj");
         assert_eq!(t.dataset_id, "dataset");
         assert_eq!(t.table_id, "table");

@@ -24,15 +24,15 @@ use crate::config::{
 use crate::decode::CopyDecoder;
 use crate::decode_api::{resolve_api_columns, ApiBatcher};
 use crate::decode_bigquery::BigQueryBatcher;
-use crate::source::appsflyer::AppsFlyerSource;
-use crate::source::clevertap::{CleverTapSource, PageStatus};
 use crate::decode_mysql::MySqlBatcher;
 use crate::error::{EtlError, Result};
 use crate::memory::MemoryBudget;
 use crate::sink::Sink;
+use crate::source::appsflyer::AppsFlyerSource;
+use crate::source::clevertap::{CleverTapSource, PageStatus};
 use crate::source::mysql::{quote_my, quote_my_table};
 use crate::source::postgres::{quote_pg, quote_pg_table};
-use crate::source::{BigQuerySource, Keyset, MySqlSource, PgSource, Partition, Source};
+use crate::source::{BigQuerySource, Keyset, MySqlSource, Partition, PgSource, Source};
 use crate::transform::{self, SelectPlan};
 use crate::types::bigquery::arrow_to_bigquery_type;
 use crate::types::ColumnType;
@@ -137,7 +137,12 @@ impl SendCtx {
     /// until in-flight uploads drain — then spawn its upload as a background
     /// task and return immediately so decoding can continue overlapping the
     /// network round-trip. The reservation is held until the upload completes.
-    async fn spawn_upload(&self, sends: &mut JoinSet<Result<()>>, schema: SchemaRef, batch: RecordBatch) {
+    async fn spawn_upload(
+        &self,
+        sends: &mut JoinSet<Result<()>>,
+        schema: SchemaRef,
+        batch: RecordBatch,
+    ) {
         let reservation = self.budget.reserve(batch.get_array_memory_size()).await;
         let ctx = self.clone();
         sends.spawn(async move {
@@ -148,7 +153,9 @@ impl SendCtx {
                 .insert_batches(&ctx.target_table, schema, std::slice::from_ref(&batch))
                 .await?;
             ctx.counters.rows_written.fetch_add(rows, Ordering::Relaxed);
-            ctx.counters.bytes_written.fetch_add(bytes, Ordering::Relaxed);
+            ctx.counters
+                .bytes_written
+                .fetch_add(bytes, Ordering::Relaxed);
             // Progress fires on *completion*, so rows_written reflects rows
             // actually landed in ClickHouse, not merely decoded.
             emit_progress(&ctx.counters, &ctx.progress, ctx.started);
@@ -171,7 +178,13 @@ struct ArchiveRunInfo {
 
 impl ArchiveRunInfo {
     fn writer_for(&self, partition_label: &str, schema: SchemaRef) -> Result<S3ArchiveWriter> {
-        let key = archive_object_key(&self.prefix, &self.dest_table, &self.run_date, &self.run_id, partition_label);
+        let key = archive_object_key(
+            &self.prefix,
+            &self.dest_table,
+            &self.run_date,
+            &self.run_id,
+            partition_label,
+        );
         S3ArchiveWriter::new(self.store.clone(), key, schema, self.compression)
     }
 }
@@ -180,7 +193,10 @@ impl ArchiveRunInfo {
 /// archival isn't configured. Building the S3 client here — before any
 /// source connection is opened — means a bad archive config (e.g. a missing
 /// bucket) fails fast rather than being discovered mid-transfer.
-fn build_archive_run_info(s3_archive: Option<S3ArchiveConfig>, dest_table: &str) -> Result<Option<Arc<ArchiveRunInfo>>> {
+fn build_archive_run_info(
+    s3_archive: Option<S3ArchiveConfig>,
+    dest_table: &str,
+) -> Result<Option<Arc<ArchiveRunInfo>>> {
     let Some(cfg) = s3_archive else {
         return Ok(None);
     };
@@ -265,8 +281,13 @@ pub async fn run_transfer(
     // separately at the insert layer, so those never re-read the source here.
     let mut attempt = 1u32;
     loop {
-        let result =
-            run_transfer_impl(source_cfg.clone(), dest.clone(), cfg.clone(), progress.clone()).await;
+        let result = run_transfer_impl(
+            source_cfg.clone(),
+            dest.clone(),
+            cfg.clone(),
+            progress.clone(),
+        )
+        .await;
         match result {
             Ok(r) => return Ok(r),
             Err(e) if attempt < max_attempts && e.is_transient_source() => {
@@ -354,7 +375,8 @@ async fn run_transfer_impl(
     if let SourceConfig::BigQuery(bq) = &source_cfg {
         let source = BigQuerySource::new(bq.project_id.clone(), bq.credentials_file.clone());
         let sink = Sink::new(dest).await?;
-        return run_transfer_bigquery(&source, sink, cfg, progress, started, archive_info, staging).await;
+        return run_transfer_bigquery(&source, sink, cfg, progress, started, archive_info, staging)
+            .await;
     }
 
     // HTTP API sources (CleverTap/AppsFlyer): a declared schema + paginated
@@ -402,14 +424,28 @@ async fn run_transfer_impl(
     // all on one control connection. ---
     let setup = match source.as_ref() {
         Source::Postgres(s) => {
-            setup_postgres(s, &cfg, base_table.as_deref(), base_query.as_deref(), watermark.as_deref())
-                .await?
+            setup_postgres(
+                s,
+                &cfg,
+                base_table.as_deref(),
+                base_query.as_deref(),
+                watermark.as_deref(),
+            )
+            .await?
         }
         Source::MySql(s) => {
-            setup_mysql(s, &cfg, base_table.as_deref(), base_query.as_deref(), watermark.as_deref())
-                .await?
+            setup_mysql(
+                s,
+                &cfg,
+                base_table.as_deref(),
+                base_query.as_deref(),
+                watermark.as_deref(),
+            )
+            .await?
         }
-        Source::BigQuery(_) => unreachable!("BigQuery is handled via the early return in run_transfer"),
+        Source::BigQuery(_) => {
+            unreachable!("BigQuery is handled via the early return in run_transfer")
+        }
     };
     let SourceSetup {
         source_cols,
@@ -460,16 +496,30 @@ async fn run_transfer_impl(
         );
         let filter = match source.as_ref() {
             Source::Postgres(_) => build_watermark_filter_pg(
-                watermark, last.as_deref(), effective_upper.as_deref(), cfg.lookback_seconds,
+                watermark,
+                last.as_deref(),
+                effective_upper.as_deref(),
+                cfg.lookback_seconds,
             ),
             Source::MySql(_) => build_watermark_filter_mysql(
-                watermark, last.as_deref(), effective_upper.as_deref(), cfg.lookback_seconds,
+                watermark,
+                last.as_deref(),
+                effective_upper.as_deref(),
+                cfg.lookback_seconds,
             ),
-            Source::BigQuery(_) => unreachable!("BigQuery is handled via the early return in run_transfer"),
+            Source::BigQuery(_) => {
+                unreachable!("BigQuery is handled via the early return in run_transfer")
+            }
         };
         let chunk_plan = match cfg.chunk_rows {
             Some(limit) => Some(build_chunk_plan(
-                &cfg, &plan, &source_cols, limit, committed, effective_upper.clone(), start_cursor,
+                &cfg,
+                &plan,
+                &source_cols,
+                limit,
+                committed,
+                effective_upper.clone(),
+                start_cursor,
             )?),
             None => None,
         };
@@ -873,7 +923,9 @@ fn api_source_window(source_cfg: &SourceConfig) -> (Option<&str>, Option<&str>) 
 fn seed_api_type_overrides(cfg: &mut TransferConfig, cols: &[ApiColumn]) -> Result<()> {
     for c in cols {
         let canon = crate::decode_api::canonical_declared_type(c)?;
-        cfg.type_overrides.entry(c.name.clone()).or_insert_with(|| canon.to_string());
+        cfg.type_overrides
+            .entry(c.name.clone())
+            .or_insert_with(|| canon.to_string());
     }
     Ok(())
 }
@@ -892,7 +944,9 @@ fn subtract_days(date: &str, days: u32) -> Result<String> {
         .map_err(|e| EtlError::config(format!("invalid lookback date '{date}': {e}")))?;
     let shifted = d
         .checked_sub_days(chrono::Days::new(days as u64))
-        .ok_or_else(|| EtlError::config(format!("lookback of {days} days underflows from '{date}'")))?;
+        .ok_or_else(|| {
+            EtlError::config(format!("lookback of {days} days underflows from '{date}'"))
+        })?;
     Ok(shifted.format("%Y-%m-%d").to_string())
 }
 
@@ -977,12 +1031,23 @@ async fn run_transfer_api(
     // survives include/exclude; keyed on the source name, unaffected by rename).
     let path_by_name: std::collections::HashMap<&str, &str> = cols
         .iter()
-        .map(|c| (c.name.as_str(), c.path.as_deref().unwrap_or(c.name.as_str())))
+        .map(|c| {
+            (
+                c.name.as_str(),
+                c.path.as_deref().unwrap_or(c.name.as_str()),
+            )
+        })
         .collect();
     let lookups: Vec<String> = plan
         .source_columns
         .iter()
-        .map(|n| path_by_name.get(n.as_str()).copied().unwrap_or(n.as_str()).to_string())
+        .map(|n| {
+            path_by_name
+                .get(n.as_str())
+                .copied()
+                .unwrap_or(n.as_str())
+                .to_string()
+        })
         .collect();
 
     // Incremental and append both resume from a persisted date cursor (append
@@ -1301,9 +1366,12 @@ fn build_chunk_plan(
              and resume on the raw column value, not a transformed one"
         )));
     }
-    let col = source_cols.iter().find(|c| c.name == keyset_col).ok_or_else(|| {
-        EtlError::config(format!("keyset column '{keyset_col}' not found in source"))
-    })?;
+    let col = source_cols
+        .iter()
+        .find(|c| c.name == keyset_col)
+        .ok_or_else(|| {
+            EtlError::config(format!("keyset column '{keyset_col}' not found in source"))
+        })?;
     if !matches!(
         col.arrow,
         DataType::Int16 | DataType::Int32 | DataType::Int64 | DataType::UInt32
@@ -1321,7 +1389,14 @@ fn build_chunk_plan(
              source_table with a NOT NULL, unique integer key"
         )));
     }
-    Ok(ChunkPlan { limit, keyset_col, keyset_idx, committed, effective_upper, start_cursor })
+    Ok(ChunkPlan {
+        limit,
+        keyset_col,
+        keyset_idx,
+        committed,
+        effective_upper,
+        start_cursor,
+    })
 }
 
 /// Read the keyset column's value at the LAST row of `batch` (rows arrive in
@@ -1373,19 +1448,30 @@ async fn transfer_keyset_postgres(
     let client = source.connect().await?;
     let col_quoted = quote_pg(&chunk.keyset_col);
     let mut cursor = chunk.start_cursor.clone();
-    let partition = Partition { label: "keyset".into(), predicate: None };
-    let schema = CopyDecoder::with_batch_bytes(&plan.dest_columns, cfg.batch_rows, cfg.batch_bytes)?.schema();
+    let partition = Partition {
+        label: "keyset".into(),
+        predicate: None,
+    };
+    let schema =
+        CopyDecoder::with_batch_bytes(&plan.dest_columns, cfg.batch_rows, cfg.batch_bytes)?
+            .schema();
     let mut archive_writer = match &ctx.archive {
         Some(info) => Some(info.writer_for("keyset", schema.clone())?),
         None => None,
     };
     tracing::info!(
         "keyset chunked read starting on '{}' (chunk_rows={}, resume_cursor={:?})",
-        chunk.keyset_col, chunk.limit, cursor
+        chunk.keyset_col,
+        chunk.limit,
+        cursor
     );
 
     loop {
-        let keyset = Keyset { col_quoted: col_quoted.clone(), cursor: cursor.clone(), limit: chunk.limit };
+        let keyset = Keyset {
+            col_quoted: col_quoted.clone(),
+            cursor: cursor.clone(),
+            limit: chunk.limit,
+        };
         let copy_sql = source.copy_sql(
             &plan.source_columns,
             &plan.source_select_exprs,
@@ -1398,7 +1484,8 @@ async fn transfer_keyset_postgres(
         tracing::debug!("keyset chunk: {copy_sql}");
         let stream = source.copy_stream(&client, &copy_sql).await?;
         futures::pin_mut!(stream);
-        let mut decoder = CopyDecoder::with_batch_bytes(&plan.dest_columns, cfg.batch_rows, cfg.batch_bytes)?;
+        let mut decoder =
+            CopyDecoder::with_batch_bytes(&plan.dest_columns, cfg.batch_rows, cfg.batch_bytes)?;
         let mut sends: JoinSet<Result<()>> = JoinSet::new();
         let mut cursor_candidate: Option<i128> = None;
 
@@ -1420,7 +1507,9 @@ async fn transfer_keyset_postgres(
             reap(&mut sends, false).await?;
         }
         if !decoder.saw_trailer() {
-            return Err(EtlError::decode("keyset COPY chunk ended without a trailer".to_string()));
+            return Err(EtlError::decode(
+                "keyset COPY chunk ended without a trailer".to_string(),
+            ));
         }
         if let Some(batch) = decoder.finish()? {
             if let Some(k) = last_int_key(&batch, chunk.keyset_idx)? {
@@ -1436,7 +1525,9 @@ async fn transfer_keyset_postgres(
         reap(&mut sends, true).await?;
 
         let rows_this_chunk = decoder.rows_total;
-        ctx.counters.rows_read.fetch_add(rows_this_chunk, Ordering::Relaxed);
+        ctx.counters
+            .rows_read
+            .fetch_add(rows_this_chunk, Ordering::Relaxed);
         warn_coerced_dates("keyset read", decoder.invalid_dates_total);
         warn_coerced_decimals("keyset read", decoder.invalid_decimals_total);
 
@@ -1472,7 +1563,10 @@ async fn transfer_keyset_postgres(
     if let Some(w) = archive_writer.take() {
         w.close().await?;
     }
-    tracing::info!("keyset chunked read complete: {} rows read", ctx.counters.rows_read.load(Ordering::Relaxed));
+    tracing::info!(
+        "keyset chunked read complete: {} rows read",
+        ctx.counters.rows_read.load(Ordering::Relaxed)
+    );
     Ok(())
 }
 
@@ -1489,7 +1583,17 @@ async fn transfer_partition_postgres(
     chunk: Option<&ChunkPlan>,
 ) -> Result<()> {
     if let Some(cp) = chunk {
-        return transfer_keyset_postgres(source, plan, cfg, ctx, base_table, base_query, extra_filter, cp).await;
+        return transfer_keyset_postgres(
+            source,
+            plan,
+            cfg,
+            ctx,
+            base_table,
+            base_query,
+            extra_filter,
+            cp,
+        )
+        .await;
     }
     tracing::info!("partition '{}' starting", partition.label);
     let client = source.connect().await?;
@@ -1507,7 +1611,8 @@ async fn transfer_partition_postgres(
     let stream = source.copy_stream(&client, &copy_sql).await?;
     futures::pin_mut!(stream);
 
-    let mut decoder = CopyDecoder::with_batch_bytes(&plan.dest_columns, cfg.batch_rows, cfg.batch_bytes)?;
+    let mut decoder =
+        CopyDecoder::with_batch_bytes(&plan.dest_columns, cfg.batch_rows, cfg.batch_bytes)?;
     let schema = decoder.schema();
     let mut sends: JoinSet<Result<()>> = JoinSet::new();
     let mut archive_writer = match &ctx.archive {
@@ -1553,9 +1658,19 @@ async fn transfer_partition_postgres(
         .rows_read
         .fetch_add(decoder.rows_total, Ordering::Relaxed);
     emit_progress(&ctx.counters, &ctx.progress, ctx.started);
-    tracing::info!("partition '{}' complete: {} rows", partition.label, decoder.rows_total);
-    warn_coerced_dates(&format!("partition '{}'", partition.label), decoder.invalid_dates_total);
-    warn_coerced_decimals(&format!("partition '{}'", partition.label), decoder.invalid_decimals_total);
+    tracing::info!(
+        "partition '{}' complete: {} rows",
+        partition.label,
+        decoder.rows_total
+    );
+    warn_coerced_dates(
+        &format!("partition '{}'", partition.label),
+        decoder.invalid_dates_total,
+    );
+    warn_coerced_decimals(
+        &format!("partition '{}'", partition.label),
+        decoder.invalid_decimals_total,
+    );
     Ok(())
 }
 
@@ -1577,19 +1692,30 @@ async fn transfer_keyset_mysql(
     let mut conn = source.connect().await?;
     let col_quoted = quote_my(&chunk.keyset_col);
     let mut cursor = chunk.start_cursor.clone();
-    let partition = Partition { label: "keyset".into(), predicate: None };
-    let schema = MySqlBatcher::with_batch_bytes(&plan.dest_columns, cfg.batch_rows, cfg.batch_bytes)?.schema();
+    let partition = Partition {
+        label: "keyset".into(),
+        predicate: None,
+    };
+    let schema =
+        MySqlBatcher::with_batch_bytes(&plan.dest_columns, cfg.batch_rows, cfg.batch_bytes)?
+            .schema();
     let mut archive_writer = match &ctx.archive {
         Some(info) => Some(info.writer_for("keyset", schema.clone())?),
         None => None,
     };
     tracing::info!(
         "keyset chunked read starting on '{}' (chunk_rows={}, resume_cursor={:?})",
-        chunk.keyset_col, chunk.limit, cursor
+        chunk.keyset_col,
+        chunk.limit,
+        cursor
     );
 
     loop {
-        let keyset = Keyset { col_quoted: col_quoted.clone(), cursor: cursor.clone(), limit: chunk.limit };
+        let keyset = Keyset {
+            col_quoted: col_quoted.clone(),
+            cursor: cursor.clone(),
+            limit: chunk.limit,
+        };
         let select_sql = source.select_sql(
             &plan.source_columns,
             &plan.source_select_exprs,
@@ -1600,7 +1726,8 @@ async fn transfer_keyset_mysql(
             Some(keyset),
         );
         tracing::debug!("keyset chunk: {select_sql}");
-        let mut batcher = MySqlBatcher::with_batch_bytes(&plan.dest_columns, cfg.batch_rows, cfg.batch_bytes)?;
+        let mut batcher =
+            MySqlBatcher::with_batch_bytes(&plan.dest_columns, cfg.batch_rows, cfg.batch_bytes)?;
         let mut sends: JoinSet<Result<()>> = JoinSet::new();
         let mut cursor_candidate: Option<i128> = None;
 
@@ -1648,7 +1775,9 @@ async fn transfer_keyset_mysql(
         reap(&mut sends, true).await?;
 
         let rows_this_chunk = batcher.rows_total;
-        ctx.counters.rows_read.fetch_add(rows_this_chunk, Ordering::Relaxed);
+        ctx.counters
+            .rows_read
+            .fetch_add(rows_this_chunk, Ordering::Relaxed);
         warn_coerced_dates("keyset read", batcher.invalid_dates_total);
         warn_coerced_decimals("keyset read", batcher.invalid_decimals_total);
 
@@ -1682,7 +1811,10 @@ async fn transfer_keyset_mysql(
     if let Some(w) = archive_writer.take() {
         w.close().await?;
     }
-    tracing::info!("keyset chunked read complete: {} rows read", ctx.counters.rows_read.load(Ordering::Relaxed));
+    tracing::info!(
+        "keyset chunked read complete: {} rows read",
+        ctx.counters.rows_read.load(Ordering::Relaxed)
+    );
     Ok(())
 }
 
@@ -1699,7 +1831,17 @@ async fn transfer_partition_mysql(
     chunk: Option<&ChunkPlan>,
 ) -> Result<()> {
     if let Some(cp) = chunk {
-        return transfer_keyset_mysql(source, plan, cfg, ctx, base_table, base_query, extra_filter, cp).await;
+        return transfer_keyset_mysql(
+            source,
+            plan,
+            cfg,
+            ctx,
+            base_table,
+            base_query,
+            extra_filter,
+            cp,
+        )
+        .await;
     }
     tracing::info!("partition '{}' starting", partition.label);
     let mut conn = source.connect().await?;
@@ -1714,7 +1856,8 @@ async fn transfer_partition_mysql(
     );
     tracing::debug!("partition {}: {select_sql}", partition.label);
 
-    let mut batcher = MySqlBatcher::with_batch_bytes(&plan.dest_columns, cfg.batch_rows, cfg.batch_bytes)?;
+    let mut batcher =
+        MySqlBatcher::with_batch_bytes(&plan.dest_columns, cfg.batch_rows, cfg.batch_bytes)?;
     let schema = batcher.schema();
     let mut sends: JoinSet<Result<()>> = JoinSet::new();
     let mut archive_writer = match &ctx.archive {
@@ -1750,8 +1893,8 @@ async fn transfer_partition_mysql(
             }
             ctx.spawn_upload(&mut sends, schema.clone(), batch).await;
             reap(&mut sends, false).await?; // surface any upload error promptly
-            // Pace the read: pausing before fetching more rows applies
-            // backpressure to the streaming result set, slowing the scan.
+                                            // Pace the read: pausing before fetching more rows applies
+                                            // backpressure to the streaming result set, slowing the scan.
             if let Some(t) = &ctx.throttle {
                 t.acquire(rows).await;
             }
@@ -1772,9 +1915,19 @@ async fn transfer_partition_mysql(
         .rows_read
         .fetch_add(batcher.rows_total, Ordering::Relaxed);
     emit_progress(&ctx.counters, &ctx.progress, ctx.started);
-    tracing::info!("partition '{}' complete: {} rows", partition.label, batcher.rows_total);
-    warn_coerced_dates(&format!("partition '{}'", partition.label), batcher.invalid_dates_total);
-    warn_coerced_decimals(&format!("partition '{}'", partition.label), batcher.invalid_decimals_total);
+    tracing::info!(
+        "partition '{}' complete: {} rows",
+        partition.label,
+        batcher.rows_total
+    );
+    warn_coerced_dates(
+        &format!("partition '{}'", partition.label),
+        batcher.invalid_dates_total,
+    );
+    warn_coerced_decimals(
+        &format!("partition '{}'", partition.label),
+        batcher.invalid_decimals_total,
+    );
     Ok(())
 }
 
@@ -1834,7 +1987,11 @@ fn ensure_watermark_column(watermark: &str, source_cols: &[ColumnType]) -> Resul
 /// columns. Reuses [`crate::types::may_coerce_to_null`]'s Date32/Timestamp
 /// check as the "is this temporal" predicate — same two types this crate
 /// already treats as its one temporal family.
-fn ensure_lookback_compatible(watermark: &str, lookback_seconds: u64, source_cols: &[ColumnType]) -> Result<()> {
+fn ensure_lookback_compatible(
+    watermark: &str,
+    lookback_seconds: u64,
+    source_cols: &[ColumnType],
+) -> Result<()> {
     if lookback_seconds == 0 {
         return Ok(());
     }
@@ -1887,8 +2044,12 @@ async fn prepare_target(
             // Destination must exist for the atomic swap; create it empty if allowed.
             if !sink.table_exists(&cfg.dest_table).await? {
                 if cfg.create_if_missing {
-                    tracing::info!("destination table '{}' does not exist; creating it", cfg.dest_table);
-                    sink.create_table(&cfg.dest_table, dest_columns, cfg).await?;
+                    tracing::info!(
+                        "destination table '{}' does not exist; creating it",
+                        cfg.dest_table
+                    );
+                    sink.create_table(&cfg.dest_table, dest_columns, cfg)
+                        .await?;
                 } else {
                     return Err(EtlError::config(format!(
                         "destination table {} does not exist and create_if_missing=false",
@@ -1901,11 +2062,15 @@ async fn prepare_target(
                 // columns (BigQuery INSERT...SELECT). ClickHouse's swap recreates
                 // the table from staging, so drift is absorbed transparently.
                 if cfg.evolve_schema && sink.full_refresh_references_dest_columns() {
-                    let added = sink.add_missing_columns(&cfg.dest_table, dest_columns, cfg).await?;
+                    let added = sink
+                        .add_missing_columns(&cfg.dest_table, dest_columns, cfg)
+                        .await?;
                     if !added.is_empty() {
                         tracing::info!(
                             "evolve_schema: added {} column(s) to '{}': {}",
-                            added.len(), cfg.dest_table, added.join(", ")
+                            added.len(),
+                            cfg.dest_table,
+                            added.join(", ")
                         );
                     }
                 }
@@ -1936,8 +2101,12 @@ async fn prepare_target(
 
             if !sink.table_exists(&cfg.dest_table).await? {
                 if cfg.create_if_missing {
-                    tracing::info!("destination table '{}' does not exist; creating it", cfg.dest_table);
-                    sink.create_table(&cfg.dest_table, dest_columns, cfg).await?;
+                    tracing::info!(
+                        "destination table '{}' does not exist; creating it",
+                        cfg.dest_table
+                    );
+                    sink.create_table(&cfg.dest_table, dest_columns, cfg)
+                        .await?;
                 } else {
                     return Err(EtlError::config(format!(
                         "destination table {} does not exist and create_if_missing=false",
@@ -1950,11 +2119,15 @@ async fn prepare_target(
                 // the dest, and BigQuery's MERGE references its columns — a new
                 // source column would hard-error on either without this.
                 if cfg.evolve_schema {
-                    let added = sink.add_missing_columns(&cfg.dest_table, dest_columns, cfg).await?;
+                    let added = sink
+                        .add_missing_columns(&cfg.dest_table, dest_columns, cfg)
+                        .await?;
                     if !added.is_empty() {
                         tracing::info!(
                             "evolve_schema: added {} column(s) to '{}': {}",
-                            added.len(), cfg.dest_table, added.join(", ")
+                            added.len(),
+                            cfg.dest_table,
+                            added.join(", ")
                         );
                     }
                 }
@@ -1976,8 +2149,12 @@ async fn prepare_target(
             // table so the resume cursor can be persisted.
             if !sink.table_exists(&cfg.dest_table).await? {
                 if cfg.create_if_missing {
-                    tracing::info!("destination table '{}' does not exist; creating it", cfg.dest_table);
-                    sink.create_table(&cfg.dest_table, dest_columns, cfg).await?;
+                    tracing::info!(
+                        "destination table '{}' does not exist; creating it",
+                        cfg.dest_table
+                    );
+                    sink.create_table(&cfg.dest_table, dest_columns, cfg)
+                        .await?;
                 } else {
                     return Err(EtlError::config(format!(
                         "destination table {} does not exist and create_if_missing=false",
@@ -1985,11 +2162,15 @@ async fn prepare_target(
                     )));
                 }
             } else if cfg.evolve_schema {
-                let added = sink.add_missing_columns(&cfg.dest_table, dest_columns, cfg).await?;
+                let added = sink
+                    .add_missing_columns(&cfg.dest_table, dest_columns, cfg)
+                    .await?;
                 if !added.is_empty() {
                     tracing::info!(
                         "evolve_schema: added {} column(s) to '{}': {}",
-                        added.len(), cfg.dest_table, added.join(", ")
+                        added.len(),
+                        cfg.dest_table,
+                        added.join(", ")
                     );
                 }
             }
@@ -2118,7 +2299,9 @@ fn staging_name(dest: &str, run_id: &str) -> String {
 /// reused across runs (including seconds-apart retries) — nanosecond wall
 /// clock, matching `sink::bigquery`'s `unique_job_id` idiom.
 fn new_run_id() -> String {
-    time::OffsetDateTime::now_utc().unix_timestamp_nanos().to_string()
+    time::OffsetDateTime::now_utc()
+        .unix_timestamp_nanos()
+        .to_string()
 }
 
 /// Best-effort drop of a per-run staging table after a failed transfer. A
@@ -2209,7 +2392,11 @@ fn build_watermark_filter_bigquery(
         .find(|c| c.name == watermark)
         .and_then(|c| arrow_to_bigquery_type(&c.arrow));
     let lower = last.map(|l| {
-        let lb_type = if lookback_seconds > 0 { bq_type.clone() } else { None };
+        let lb_type = if lookback_seconds > 0 {
+            bq_type.clone()
+        } else {
+            None
+        };
         lookback_lower_bound_bigquery(l, lookback_seconds, lb_type)
     });
     let upper = snapshot_max.map(|m| bigquery_typed_upper_bound(m, bq_type));
@@ -2250,7 +2437,9 @@ fn bq_cast_type_name(t: &TableFieldType) -> &'static str {
         TableFieldType::Timestamp => "TIMESTAMP",
         TableFieldType::Time => "TIME",
         TableFieldType::Numeric => "NUMERIC",
-        TableFieldType::Bignumeric | TableFieldType::Decimal | TableFieldType::Bigdecimal => "BIGNUMERIC",
+        TableFieldType::Bignumeric | TableFieldType::Decimal | TableFieldType::Bigdecimal => {
+            "BIGNUMERIC"
+        }
         TableFieldType::String
         | TableFieldType::Json
         | TableFieldType::Record
@@ -2284,14 +2473,21 @@ fn lookback_lower_bound_mysql(last: &str, lookback_seconds: u64) -> String {
 /// against a `DATE` watermark rounds *up* to whole days via `div_ceil` —
 /// documented behavior, not silently wrong (a 1-hour lookback on a DATE
 /// column re-includes the whole prior day, not nothing).
-fn lookback_lower_bound_bigquery(last: &str, lookback_seconds: u64, bq_type: Option<TableFieldType>) -> String {
+fn lookback_lower_bound_bigquery(
+    last: &str,
+    lookback_seconds: u64,
+    bq_type: Option<TableFieldType>,
+) -> String {
     let l = escape_bigquery_string(last);
     if lookback_seconds == 0 {
         return format!("'{l}'");
     }
     match bq_type.expect("ensure_lookback_compatible already validated a temporal watermark type") {
         TableFieldType::Date => {
-            format!("DATE_SUB(DATE '{l}', INTERVAL {} DAY)", lookback_seconds.div_ceil(86400))
+            format!(
+                "DATE_SUB(DATE '{l}', INTERVAL {} DAY)",
+                lookback_seconds.div_ceil(86400)
+            )
         }
         TableFieldType::Datetime => {
             format!("DATETIME_SUB(DATETIME '{l}', INTERVAL {lookback_seconds} SECOND)")
@@ -2306,7 +2502,11 @@ fn lookback_lower_bound_bigquery(last: &str, lookback_seconds: u64, bq_type: Opt
     }
 }
 
-fn build_watermark_filter(col: &str, lower_bound: Option<String>, upper_bound: Option<String>) -> Option<String> {
+fn build_watermark_filter(
+    col: &str,
+    lower_bound: Option<String>,
+    upper_bound: Option<String>,
+) -> Option<String> {
     let mut clauses = Vec::new();
     if let Some(lb) = lower_bound {
         clauses.push(format!("{col} > {lb}"));
@@ -2351,7 +2551,10 @@ mod tests {
         assert_eq!(seed_value(&WatermarkSeed::None, Some("2026-01-01")), None);
         // Explicit floor is used verbatim.
         assert_eq!(
-            seed_value(&WatermarkSeed::Value("2026-01-01".into()), Some("2026-06-01")),
+            seed_value(
+                &WatermarkSeed::Value("2026-01-01".into()),
+                Some("2026-06-01")
+            ),
             Some("2026-01-01".to_string())
         );
         // CurrentMax seeds to the source's snapshot max (skip the first pull).
@@ -2443,8 +2646,14 @@ mod tests {
         let msg = ensure_watermark_column("created_date", &cols)
             .unwrap_err()
             .to_string();
-        assert!(msg.contains("created_date"), "names the missing column: {msg}");
-        assert!(msg.contains("id") && msg.contains("name"), "lists available: {msg}");
+        assert!(
+            msg.contains("created_date"),
+            "names the missing column: {msg}"
+        );
+        assert!(
+            msg.contains("id") && msg.contains("name"),
+            "lists available: {msg}"
+        );
     }
 
     #[test]
@@ -2494,8 +2703,17 @@ mod tests {
         // one isn't byte-identical to the plain-quoted pg/mysql shape above.
         let cols = vec![col_typed("write_date", DataType::Date32)];
         assert_eq!(
-            build_watermark_filter_bigquery("write_date", Some("2024-01-01"), Some("2024-06-01"), 0, &cols),
-            Some("`write_date` > '2024-01-01' AND `write_date` <= CAST('2024-06-01' AS DATE)".to_string())
+            build_watermark_filter_bigquery(
+                "write_date",
+                Some("2024-01-01"),
+                Some("2024-06-01"),
+                0,
+                &cols
+            ),
+            Some(
+                "`write_date` > '2024-01-01' AND `write_date` <= CAST('2024-06-01' AS DATE)"
+                    .to_string()
+            )
         );
     }
 
@@ -2508,7 +2726,8 @@ mod tests {
         // against real BigQuery in the report. Every plain (non-lookback)
         // incremental sync with an id-based watermark hit this on every run.
         let cols = vec![col_typed("uor_id", DataType::Int64)];
-        let f = build_watermark_filter_bigquery("uor_id", Some("100"), Some("500"), 0, &cols).unwrap();
+        let f =
+            build_watermark_filter_bigquery("uor_id", Some("100"), Some("500"), 0, &cols).unwrap();
         assert_eq!(f, "`uor_id` > '100' AND `uor_id` <= CAST('500' AS INT64)");
     }
 
@@ -2534,17 +2753,23 @@ mod tests {
 
     #[test]
     fn watermark_filter_pg_widens_lower_bound_with_lookback() {
-        let f = build_watermark_filter_pg("write_date", Some("2024-06-10"), Some("2024-06-15"), 3600).unwrap();
+        let f =
+            build_watermark_filter_pg("write_date", Some("2024-06-10"), Some("2024-06-15"), 3600)
+                .unwrap();
         assert!(
             f.contains("'2024-06-10'::timestamp - interval '3600 seconds'"),
             "got: {f}"
         );
-        assert!(f.contains("<= '2024-06-15'"), "upper bound stays exact: {f}");
+        assert!(
+            f.contains("<= '2024-06-15'"),
+            "upper bound stays exact: {f}"
+        );
     }
 
     #[test]
     fn watermark_filter_mysql_widens_lower_bound_with_lookback() {
-        let f = build_watermark_filter_mysql("write_date", Some("2024-06-10 00:00:00"), None, 3600).unwrap();
+        let f = build_watermark_filter_mysql("write_date", Some("2024-06-10 00:00:00"), None, 3600)
+            .unwrap();
         assert!(
             f.contains("CAST('2024-06-10 00:00:00' AS DATETIME) - INTERVAL 3600 SECOND"),
             "got: {f}"
@@ -2554,15 +2779,25 @@ mod tests {
     #[test]
     fn watermark_filter_bigquery_dispatches_by_resolved_type() {
         let date_cols = vec![col_typed("d", DataType::Date32)];
-        let f = build_watermark_filter_bigquery("d", Some("2024-06-10"), None, 3600, &date_cols).unwrap();
-        assert!(f.contains("DATE_SUB(DATE '2024-06-10', INTERVAL 1 DAY)"), "got: {f}");
+        let f = build_watermark_filter_bigquery("d", Some("2024-06-10"), None, 3600, &date_cols)
+            .unwrap();
+        assert!(
+            f.contains("DATE_SUB(DATE '2024-06-10', INTERVAL 1 DAY)"),
+            "got: {f}"
+        );
 
         let datetime_cols = vec![col_typed(
             "dt",
             DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
         )];
-        let f = build_watermark_filter_bigquery("dt", Some("2024-06-10 00:00:00"), None, 3600, &datetime_cols)
-            .unwrap();
+        let f = build_watermark_filter_bigquery(
+            "dt",
+            Some("2024-06-10 00:00:00"),
+            None,
+            3600,
+            &datetime_cols,
+        )
+        .unwrap();
         assert!(
             f.contains("DATETIME_SUB(DATETIME '2024-06-10 00:00:00', INTERVAL 3600 SECOND)"),
             "got: {f}"
@@ -2572,7 +2807,14 @@ mod tests {
             "ts",
             DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())),
         )];
-        let f = build_watermark_filter_bigquery("ts", Some("2024-06-10 00:00:00"), None, 3600, &ts_cols).unwrap();
+        let f = build_watermark_filter_bigquery(
+            "ts",
+            Some("2024-06-10 00:00:00"),
+            None,
+            3600,
+            &ts_cols,
+        )
+        .unwrap();
         assert!(
             f.contains("TIMESTAMP_SUB(TIMESTAMP '2024-06-10 00:00:00', INTERVAL 3600 SECOND)"),
             "got: {f}"
@@ -2612,15 +2854,29 @@ mod tests {
     }
 
     /// Minimal cfg + plan + source_cols for build_chunk_plan gate tests.
-    fn chunk_inputs(keyset: &str, arrow: DataType, nullable: bool) -> (TransferConfig, SelectPlan, Vec<ColumnType>) {
+    fn chunk_inputs(
+        keyset: &str,
+        arrow: DataType,
+        nullable: bool,
+    ) -> (TransferConfig, SelectPlan, Vec<ColumnType>) {
         let mut cfg = crate::config::default_test_config();
         cfg.mode = SyncMode::Incremental;
         cfg.watermark = Some("wm".into());
         cfg.key = vec![keyset.to_string()];
         cfg.chunk_rows = Some(1000);
         let src = vec![
-            ColumnType { name: keyset.into(), type_id: 0, nullable, arrow: arrow.clone(), clickhouse_inner: "x".into(), arbitrary_precision_decimal: false },
-            col_typed("wm", DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into()))),
+            ColumnType {
+                name: keyset.into(),
+                type_id: 0,
+                nullable,
+                arrow: arrow.clone(),
+                clickhouse_inner: "x".into(),
+                arbitrary_precision_decimal: false,
+            },
+            col_typed(
+                "wm",
+                DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())),
+            ),
         ];
         let plan = SelectPlan {
             source_columns: vec![keyset.to_string(), "wm".to_string()],
@@ -2646,7 +2902,11 @@ mod tests {
             passcode: "p".into(),
             event_name: "App Launched".into(),
             batch_size: 0,
-            columns: vec![ApiColumn { name: "ts".into(), bq_type: "TIMESTAMP".into(), path: None }],
+            columns: vec![ApiColumn {
+                name: "ts".into(),
+                bq_type: "TIMESTAMP".into(),
+                path: None,
+            }],
             from_date: None,
             to_date: None,
             lookback_days: 0,
@@ -2657,12 +2917,21 @@ mod tests {
     fn api_dest_gate_requires_bigquery() {
         let src = ct_source();
         let ch = DestinationConfig::ClickHouse(crate::config::ClickHouseConfig {
-            url: "http://x".into(), database: "d".into(), user: "u".into(),
-            password: "".into(), compression: crate::config::Compression::None, s3_archive: None,
+            url: "http://x".into(),
+            database: "d".into(),
+            user: "u".into(),
+            password: "".into(),
+            compression: crate::config::Compression::None,
+            s3_archive: None,
         });
-        assert!(ensure_api_dest_supported(&src, &ch).unwrap_err().to_string().contains("BigQuery"));
+        assert!(ensure_api_dest_supported(&src, &ch)
+            .unwrap_err()
+            .to_string()
+            .contains("BigQuery"));
         let bq = DestinationConfig::BigQuery(crate::config::BigQueryDestConfig {
-            project_id: None, credentials_file: None, dataset_id: "ds".into(),
+            project_id: None,
+            credentials_file: None,
+            dataset_id: "ds".into(),
             write_method: crate::config::BigQueryWriteMethod::InsertAll,
         });
         assert!(ensure_api_dest_supported(&src, &bq).is_ok());
@@ -2674,13 +2943,19 @@ mod tests {
         let mut src = ct_source();
         let mut cfg = crate::config::default_test_config();
         cfg.mode = SyncMode::Full;
-        assert!(derive_api_window(&cfg, &src, None).is_err(), "full needs from_date");
+        assert!(
+            derive_api_window(&cfg, &src, None).is_err(),
+            "full needs from_date"
+        );
         if let SourceConfig::CleverTap(c) = &mut src {
             c.from_date = Some("2026-07-01".into());
             c.to_date = Some("2026-07-10".into());
         }
         let (from, to, wm) = derive_api_window(&cfg, &src, None).unwrap();
-        assert_eq!((from.as_str(), to.as_str(), wm), ("2026-07-01", "2026-07-10", None));
+        assert_eq!(
+            (from.as_str(), to.as_str(), wm),
+            ("2026-07-01", "2026-07-10", None)
+        );
         // Incremental: committed cursor wins as `from`; window end is persisted.
         cfg.mode = SyncMode::Incremental;
         let (from, _to, wm) = derive_api_window(&cfg, &src, Some("2026-07-05".into())).unwrap();
@@ -2709,7 +2984,10 @@ mod tests {
         assert_eq!(from, "2026-07-01", "clamped to from_date floor");
         // First run (no committed cursor): lookback does NOT apply.
         let (from, _to, _) = derive_api_window(&cfg, &src, None).unwrap();
-        assert_eq!(from, "2026-07-01", "first run starts at the floor, no lookback");
+        assert_eq!(
+            from, "2026-07-01",
+            "first run starts at the floor, no lookback"
+        );
     }
 
     #[test]
@@ -2732,13 +3010,23 @@ mod tests {
     fn build_chunk_plan_rejects_nullable_non_integer_and_transformed_keys() {
         // Nullable key (NULLs silently skipped) -> reject.
         let (cfg, plan, src) = chunk_inputs("id", DataType::Int64, true);
-        assert!(build_chunk_plan(&cfg, &plan, &src, 1000, None, None, None).unwrap_err().to_string().contains("NOT NULL"));
+        assert!(build_chunk_plan(&cfg, &plan, &src, 1000, None, None, None)
+            .unwrap_err()
+            .to_string()
+            .contains("NOT NULL"));
         // Non-integer key -> reject.
         let (cfg, plan, src) = chunk_inputs("id", DataType::Utf8, false);
-        assert!(build_chunk_plan(&cfg, &plan, &src, 1000, None, None, None).unwrap_err().to_string().contains("integer"));
+        assert!(build_chunk_plan(&cfg, &plan, &src, 1000, None, None, None)
+            .unwrap_err()
+            .to_string()
+            .contains("integer"));
         // Transformed key (decoded value != raw column) -> reject.
         let (mut cfg, plan, src) = chunk_inputs("id", DataType::Int64, false);
-        cfg.column_transforms = std::collections::HashMap::from([("id".to_string(), "id + 1".to_string())]);
-        assert!(build_chunk_plan(&cfg, &plan, &src, 1000, None, None, None).unwrap_err().to_string().contains("column_transforms"));
+        cfg.column_transforms =
+            std::collections::HashMap::from([("id".to_string(), "id + 1".to_string())]);
+        assert!(build_chunk_plan(&cfg, &plan, &src, 1000, None, None, None)
+            .unwrap_err()
+            .to_string()
+            .contains("column_transforms"));
     }
 }

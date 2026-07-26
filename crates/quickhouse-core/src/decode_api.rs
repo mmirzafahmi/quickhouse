@@ -72,7 +72,10 @@ pub fn resolve_api_columns(cols: &[ApiColumn]) -> Result<Vec<ColumnType>> {
         }
         let ft = parse_bq_type_name(&c.name, &c.bq_type)?;
         let (type_id, arrow, ch_inner) = map_type(&ft).ok_or_else(|| {
-            EtlError::config(format!("column '{}': type '{}' is not supported", c.name, c.bq_type))
+            EtlError::config(format!(
+                "column '{}': type '{}' is not supported",
+                c.name, c.bq_type
+            ))
         })?;
         // Exact decimal for NUMERIC (parity with the DB sources' NUMERIC path).
         let (arrow, apd) = match type_id {
@@ -95,7 +98,9 @@ pub fn resolve_api_columns(cols: &[ApiColumn]) -> Result<Vec<ColumnType>> {
 /// The canonical BigQuery type name for a declared column — used to seed
 /// `type_overrides` so the destination table gets the exact declared type.
 pub fn canonical_declared_type(c: &ApiColumn) -> Result<&'static str> {
-    Ok(canonical_bq_type_name(&parse_bq_type_name(&c.name, &c.bq_type)?))
+    Ok(canonical_bq_type_name(&parse_bq_type_name(
+        &c.name, &c.bq_type,
+    )?))
 }
 
 enum ColBuilder {
@@ -121,9 +126,11 @@ impl ColBuilder {
             DataType::Timestamp(TimeUnit::Microsecond, tz) => {
                 ColBuilder::Ts(TimestampMicrosecondBuilder::new(), tz.clone())
             }
-            DataType::Decimal128(p, s) => {
-                ColBuilder::Decimal128(Decimal128Builder::new().with_precision_and_scale(*p, *s)?, *p, *s)
-            }
+            DataType::Decimal128(p, s) => ColBuilder::Decimal128(
+                Decimal128Builder::new().with_precision_and_scale(*p, *s)?,
+                *p,
+                *s,
+            ),
             other => {
                 return Err(EtlError::internal(format!(
                     "no API column builder for Arrow type {other:?}"
@@ -265,24 +272,26 @@ impl ColBuilder {
                 // Untrusted source: a parse error nulls the cell (unlike
                 // decode_bigquery, which trusts BigQuery's own text and errors).
                 match parse_decimal_text(s.trim()) {
-                    Ok(DecimalText::Ok { negative, magnitude, scale }) => {
-                        match rescale_mantissa(magnitude, scale, *s2 as i32) {
-                            Some(m) => {
-                                let signed = if negative { -m } else { m };
-                                if Decimal128Type::is_valid_decimal_precision(signed, *p) {
-                                    b.append_value(signed);
-                                    (n, ApiCoercion::None)
-                                } else {
-                                    b.append_null();
-                                    (n, ApiCoercion::Decimal)
-                                }
-                            }
-                            None => {
+                    Ok(DecimalText::Ok {
+                        negative,
+                        magnitude,
+                        scale,
+                    }) => match rescale_mantissa(magnitude, scale, *s2 as i32) {
+                        Some(m) => {
+                            let signed = if negative { -m } else { m };
+                            if Decimal128Type::is_valid_decimal_precision(signed, *p) {
+                                b.append_value(signed);
+                                (n, ApiCoercion::None)
+                            } else {
                                 b.append_null();
                                 (n, ApiCoercion::Decimal)
                             }
                         }
-                    }
+                        None => {
+                            b.append_null();
+                            (n, ApiCoercion::Decimal)
+                        }
+                    },
                     Ok(DecimalText::MagnitudeOverflow) | Err(_) => {
                         b.append_null();
                         (n, ApiCoercion::Decimal)
@@ -416,7 +425,12 @@ pub struct ApiBatcher {
 impl ApiBatcher {
     /// `dest_columns` is the resolved schema; `lookups[i]` is the dotted source
     /// path for column `i` (aligned by index).
-    pub fn new(dest_columns: &[ColumnType], lookups: &[String], batch_rows: usize, batch_bytes: usize) -> Result<Self> {
+    pub fn new(
+        dest_columns: &[ColumnType],
+        lookups: &[String],
+        batch_rows: usize,
+        batch_bytes: usize,
+    ) -> Result<Self> {
         let fields: Vec<Field> = dest_columns
             .iter()
             .map(|c| Field::new(&c.name, c.arrow.clone(), true))
@@ -462,7 +476,9 @@ impl ApiBatcher {
     pub fn fully_coerced_temporal_columns(&self) -> Vec<(String, u64, String)> {
         (0..self.col_temporal.len())
             .filter(|&i| {
-                self.col_temporal[i] && self.col_attempted[i] > 0 && self.col_coerced_null[i] == self.col_attempted[i]
+                self.col_temporal[i]
+                    && self.col_attempted[i] > 0
+                    && self.col_coerced_null[i] == self.col_attempted[i]
             })
             .map(|i| {
                 (
@@ -539,17 +555,36 @@ mod tests {
 
     fn cols() -> Vec<ApiColumn> {
         vec![
-            ApiColumn { name: "id".into(), bq_type: "INTEGER".into(), path: None },
-            ApiColumn { name: "email".into(), bq_type: "STRING".into(), path: Some("profile.email".into()) },
-            ApiColumn { name: "amount".into(), bq_type: "NUMERIC".into(), path: Some("event_props.amount".into()) },
-            ApiColumn { name: "ts".into(), bq_type: "TIMESTAMP".into(), path: None },
+            ApiColumn {
+                name: "id".into(),
+                bq_type: "INTEGER".into(),
+                path: None,
+            },
+            ApiColumn {
+                name: "email".into(),
+                bq_type: "STRING".into(),
+                path: Some("profile.email".into()),
+            },
+            ApiColumn {
+                name: "amount".into(),
+                bq_type: "NUMERIC".into(),
+                path: Some("event_props.amount".into()),
+            },
+            ApiColumn {
+                name: "ts".into(),
+                bq_type: "TIMESTAMP".into(),
+                path: None,
+            },
         ]
     }
 
     fn batcher() -> (ApiBatcher, Vec<ColumnType>) {
         let cs = cols();
         let dest = resolve_api_columns(&cs).unwrap();
-        let lookups: Vec<String> = cs.iter().map(|c| c.path.clone().unwrap_or_else(|| c.name.clone())).collect();
+        let lookups: Vec<String> = cs
+            .iter()
+            .map(|c| c.path.clone().unwrap_or_else(|| c.name.clone()))
+            .collect();
         (ApiBatcher::new(&dest, &lookups, 10, 0).unwrap(), dest)
     }
 
@@ -557,20 +592,42 @@ mod tests {
     fn resolver_maps_declared_types_and_forces_numeric_decimal() {
         let dest = resolve_api_columns(&cols()).unwrap();
         assert_eq!(dest[0].arrow, DataType::Int64);
-        assert_eq!(dest[2].arrow, DataType::Decimal128(38, 9), "NUMERIC -> exact Decimal128(38,9)");
+        assert_eq!(
+            dest[2].arrow,
+            DataType::Decimal128(38, 9),
+            "NUMERIC -> exact Decimal128(38,9)"
+        );
         assert!(dest[2].arbitrary_precision_decimal);
-        assert!(dest.iter().all(|c| c.nullable), "every declared column is nullable");
+        assert!(
+            dest.iter().all(|c| c.nullable),
+            "every declared column is nullable"
+        );
     }
 
     #[test]
     fn resolver_rejects_empty_dup_and_unknown() {
         assert!(resolve_api_columns(&[]).is_err());
         let dup = vec![
-            ApiColumn { name: "a".into(), bq_type: "STRING".into(), path: None },
-            ApiColumn { name: "a".into(), bq_type: "STRING".into(), path: None },
+            ApiColumn {
+                name: "a".into(),
+                bq_type: "STRING".into(),
+                path: None,
+            },
+            ApiColumn {
+                name: "a".into(),
+                bq_type: "STRING".into(),
+                path: None,
+            },
         ];
-        assert!(resolve_api_columns(&dup).unwrap_err().to_string().contains("duplicate"));
-        let bad = vec![ApiColumn { name: "x".into(), bq_type: "RECORD".into(), path: None }];
+        assert!(resolve_api_columns(&dup)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate"));
+        let bad = vec![ApiColumn {
+            name: "x".into(),
+            bq_type: "RECORD".into(),
+            path: None,
+        }];
         assert!(resolve_api_columns(&bad).is_err());
     }
 
@@ -589,17 +646,40 @@ mod tests {
         assert!(b.append_record(&r2).unwrap().is_none());
         let batch = b.finish().unwrap().unwrap();
         assert_eq!(batch.num_rows(), 2);
-        let ids = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         assert_eq!(ids.value(0), 5);
         assert!(ids.is_null(1), "unparseable int -> null");
         assert_eq!(b.invalid_scalars_total, 1);
-        let email = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        let email = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
         assert_eq!(email.value(0), "a@b.co");
-        assert!(email.is_null(1), "missing dotted path -> null (not counted)");
-        let amt = batch.column(2).as_any().downcast_ref::<Decimal128Array>().unwrap();
+        assert!(
+            email.is_null(1),
+            "missing dotted path -> null (not counted)"
+        );
+        let amt = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .unwrap();
         assert_eq!(amt.value(0), 12_500_000_000, "12.50 @ scale 9 exact");
-        let ts = batch.column(3).as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap();
-        assert_eq!(ts.value(0), 1_700_000_000_000_000, "epoch SECONDS -> micros *1e6");
+        let ts = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(
+            ts.value(0),
+            1_700_000_000_000_000,
+            "epoch SECONDS -> micros *1e6"
+        );
         assert!(ts.is_null(1));
     }
 
@@ -613,7 +693,11 @@ mod tests {
             .timestamp_micros();
         // The 0.6.0 regression value: CleverTap sg1 `ts` = 14-digit yyyyMMddHHmmSS.
         // Previously overflowed (`* 1e6`) -> None -> silent NULL; now parsed.
-        assert_eq!(parse_ts_micros("20260722193602"), Some(expected), "packed civil ts");
+        assert_eq!(
+            parse_ts_micros("20260722193602"),
+            Some(expected),
+            "packed civil ts"
+        );
         // Same instant via the civil-string and RFC3339 forms.
         assert_eq!(parse_ts_micros("2026-07-22 19:36:02"), Some(expected));
         assert_eq!(parse_ts_micros("2026-07-22T19:36:02Z"), Some(expected));
@@ -631,7 +715,11 @@ mod tests {
         let days = d.signed_duration_since(epoch).num_days() as i32;
         assert_eq!(parse_date_days("2026-07-22"), Some(days));
         assert_eq!(parse_date_days("20260722"), Some(days), "packed yyyyMMdd");
-        assert_eq!(parse_date_days("20260722193602"), Some(days), "14-digit -> date part");
+        assert_eq!(
+            parse_date_days("20260722193602"),
+            Some(days),
+            "14-digit -> date part"
+        );
     }
 
     #[test]
@@ -639,24 +727,34 @@ mod tests {
         // The `ts` column (index 3) is declared TIMESTAMP. Feed only unparseable
         // values -> every one coerces to NULL -> flagged as a likely mismatch.
         let (mut b, _) = batcher();
-        b.append_record(&serde_json::json!({"id": 1, "ts": "nope"})).unwrap();
-        b.append_record(&serde_json::json!({"id": 2, "ts": "also-bad"})).unwrap();
+        b.append_record(&serde_json::json!({"id": 1, "ts": "nope"}))
+            .unwrap();
+        b.append_record(&serde_json::json!({"id": 2, "ts": "also-bad"}))
+            .unwrap();
         b.finish().unwrap();
         let flagged = b.fully_coerced_temporal_columns();
         assert_eq!(flagged.len(), 1);
         assert_eq!(flagged[0].0, "ts");
         assert_eq!(flagged[0].1, 2, "both non-empty ts values coerced");
-        assert_eq!(flagged[0].2, "nope", "sample is the first coerced raw value");
+        assert_eq!(
+            flagged[0].2, "nope",
+            "sample is the first coerced raw value"
+        );
     }
 
     #[test]
     fn partial_temporal_coercion_is_not_flagged() {
         // One value parses (the packed form fixed in this release), one doesn't.
         let (mut b, _) = batcher();
-        b.append_record(&serde_json::json!({"id": 1, "ts": "20260722193602"})).unwrap();
-        b.append_record(&serde_json::json!({"id": 2, "ts": "garbage"})).unwrap();
+        b.append_record(&serde_json::json!({"id": 1, "ts": "20260722193602"}))
+            .unwrap();
+        b.append_record(&serde_json::json!({"id": 2, "ts": "garbage"}))
+            .unwrap();
         b.finish().unwrap();
-        assert!(b.fully_coerced_temporal_columns().is_empty(), "not 100% coerced -> no warning");
+        assert!(
+            b.fully_coerced_temporal_columns().is_empty(),
+            "not 100% coerced -> no warning"
+        );
     }
 
     #[test]
@@ -671,11 +769,16 @@ mod tests {
 
     #[test]
     fn numeric_overflow_nulls_and_counts() {
-        let cs = vec![ApiColumn { name: "n".into(), bq_type: "NUMERIC".into(), path: None }];
+        let cs = vec![ApiColumn {
+            name: "n".into(),
+            bq_type: "NUMERIC".into(),
+            path: None,
+        }];
         let dest = resolve_api_columns(&cs).unwrap();
         let mut b = ApiBatcher::new(&dest, &["n".to_string()], 10, 0).unwrap();
         // 30 integer digits > NUMERIC(38,9)'s 29-digit integer capacity.
-        b.append_record(&serde_json::json!({"n": "123456789012345678901234567890"})).unwrap();
+        b.append_record(&serde_json::json!({"n": "123456789012345678901234567890"}))
+            .unwrap();
         b.finish().unwrap();
         assert_eq!(b.invalid_decimals_total, 1);
     }
