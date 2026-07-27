@@ -208,9 +208,19 @@ article a { text-underline-offset: 3px; text-decoration-thickness: 1px; }
 body:has(.qh-hero) .sidebar-drawer,
 body:has(.qh-hero) .toc-drawer { display: none !important; }
 
+.qh-hero-page,
+body:has(.qh-hero) {
+  /* Furo sizes .content from these, so overriding the vars is what actually
+     widens the landing page — a max-width on .content alone loses to Furo's
+     own `width: var(--content-width)`. */
+  --content-width: 1180px;
+  --sidebar-width: 0px;
+  --toc-width: 0px;
+}
+
 .qh-hero-page .content,
 body:has(.qh-hero) .content {
-  max-width: 1180px; margin: 0 auto;
+  max-width: 1180px; width: min(1180px, 100%); margin: 0 auto;
   padding: 0 clamp(20px, 4vw, 60px) 5rem;
 }
 .qh-hero-page .content > article,
