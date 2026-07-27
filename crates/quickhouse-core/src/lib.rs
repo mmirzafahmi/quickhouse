@@ -33,6 +33,7 @@ pub use config::{
     TransferConfig, TransferResult, WatermarkSeed,
 };
 pub use error::{EtlError, Result};
+pub use sink::{build_sink, BigQuerySink, ClickHouseSink, Sink};
 pub use sync::{run_transfer, Progress, ProgressCb};
 
 /// Run a transfer to completion on a dedicated multi-threaded Tokio runtime.

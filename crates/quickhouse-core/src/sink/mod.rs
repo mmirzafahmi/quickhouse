@@ -1,8 +1,10 @@
-//! Destination sinks. [`Sink`] mirrors [`crate::source::Source`]: `sync.rs`
-//! builds one from a [`crate::config::DestinationConfig`] and calls its
-//! (destination-agnostic) methods for DDL, inserts, the full-refresh atomic
-//! swap, and incremental watermark state — the orchestration in `sync.rs`
-//! never needs to know which concrete destination it's talking to.
+//! Destination sinks. The [`Sink`] trait is the destination-agnostic seam:
+//! `sync.rs` builds one from a [`crate::config::DestinationConfig`] via
+//! [`build_sink`] and drives it (DDL, inserts, the full-refresh atomic swap,
+//! incremental watermark state) without knowing the concrete engine. Required
+//! methods every destination must implement; the *capability* methods
+//! (staging-merge, chunk-resume) have safe defaults, so a new destination
+//! implements only what it supports.
 
 pub mod bigquery;
 mod bigquery_proto;
@@ -11,8 +13,11 @@ pub mod clickhouse;
 pub use bigquery::BigQuerySink;
 pub use clickhouse::ClickHouseSink;
 
+use std::sync::Arc;
+
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
+use async_trait::async_trait;
 
 use crate::config::{DestinationConfig, TransferConfig};
 use crate::error::{EtlError, Result};
@@ -70,220 +75,134 @@ impl std::fmt::Display for SendError {
     }
 }
 
-/// Which destination engine to write to. Every method delegates to whichever
-/// concrete sink this instance wraps.
-#[derive(Clone)]
-pub enum Sink {
-    ClickHouse(ClickHouseSink),
-    BigQuery(BigQuerySink),
-}
-
-impl Sink {
-    pub async fn new(dest: DestinationConfig) -> Result<Self> {
-        match dest {
-            DestinationConfig::ClickHouse(cfg) => Ok(Sink::ClickHouse(ClickHouseSink::new(cfg)?)),
-            DestinationConfig::BigQuery(cfg) => Ok(Sink::BigQuery(BigQuerySink::new(cfg).await?)),
-        }
-    }
-
-    pub async fn table_exists(&self, table: &str) -> Result<bool> {
-        match self {
-            Sink::ClickHouse(s) => s.table_exists(table).await,
-            Sink::BigQuery(s) => s.table_exists(table).await,
-        }
-    }
+/// A write destination, driven by `sync.rs` without knowing the concrete
+/// engine. Build one with [`build_sink`]. The methods above the capability
+/// section are required; the capability methods below have safe defaults so a
+/// destination implements only what it supports (e.g. ClickHouse keeps the
+/// default `merge_into`, since it dedups via `ReplacingMergeTree` rather than a
+/// staged MERGE). Object-safe (`Arc<dyn Sink>`) via `#[async_trait]`.
+#[async_trait]
+pub trait Sink: Send + Sync {
+    async fn table_exists(&self, table: &str) -> Result<bool>;
 
     /// Create `table` (auto-generated DDL/schema from `columns` + `cfg`'s
-    /// key/order_by/partition_by/engine — interpreted per destination, see
-    /// `TransferConfig`'s field docs).
-    pub async fn create_table(
+    /// key/order_by/partition_by/engine — interpreted per destination).
+    async fn create_table(
         &self,
         table: &str,
         columns: &[ColumnType],
         cfg: &TransferConfig,
-    ) -> Result<()> {
-        match self {
-            Sink::ClickHouse(s) => s.create_table(table, columns, cfg).await,
-            Sink::BigQuery(s) => s.create_table(table, columns, cfg).await,
-        }
-    }
+    ) -> Result<()>;
 
     /// Insert a group of Arrow batches into `table`. Returns an approximate
-    /// wire-bytes-sent count (post-compression for ClickHouse; JSON payload
-    /// size for BigQuery — an accounting detail, not exact for either).
-    pub async fn insert_batches(
+    /// wire-bytes-sent count (an accounting detail, not exact for either sink).
+    async fn insert_batches(
         &self,
         table: &str,
         schema: SchemaRef,
         batches: &[RecordBatch],
-    ) -> Result<u64> {
-        match self {
-            Sink::ClickHouse(s) => s.insert_batches(table, schema, batches).await,
-            Sink::BigQuery(s) => s.insert_batches(table, schema, batches).await,
-        }
-    }
+    ) -> Result<u64>;
 
-    /// Atomically replace `dest`'s contents with `staging`'s (both must
-    /// exist): ClickHouse's `EXCHANGE TABLES`, or BigQuery's `TRUNCATE` +
-    /// `INSERT ... SELECT` transaction (needs `columns` to build the
-    /// `INSERT`/`SELECT` column list; ClickHouse's swap needs no column list).
-    pub async fn atomic_swap(
-        &self,
-        dest: &str,
-        staging: &str,
-        columns: &[ColumnType],
-    ) -> Result<()> {
-        match self {
-            Sink::ClickHouse(s) => s.exchange_tables(dest, staging).await,
-            Sink::BigQuery(s) => s.atomic_swap(dest, staging, columns).await,
-        }
-    }
+    /// Atomically replace `dest`'s contents with `staging`'s (both must exist).
+    async fn atomic_swap(&self, dest: &str, staging: &str, columns: &[ColumnType]) -> Result<()>;
 
     /// Current committed row count of `table`, or `None` if it doesn't exist.
-    /// Best-effort/diagnostic (BigQuery reads free table metadata; the count may
-    /// lag a streaming buffer) — callers use it for warnings, not correctness.
-    pub async fn current_row_count(&self, table: &str) -> Result<Option<u64>> {
-        match self {
-            Sink::ClickHouse(s) => s.current_row_count(table).await,
-            Sink::BigQuery(s) => s.current_row_count(table).await,
-        }
-    }
+    /// Best-effort/diagnostic — callers use it for warnings, not correctness.
+    async fn current_row_count(&self, table: &str) -> Result<Option<u64>>;
 
-    pub async fn drop_table(&self, table: &str) -> Result<()> {
-        match self {
-            Sink::ClickHouse(s) => s.drop_table(table).await,
-            Sink::BigQuery(s) => s.drop_table(table).await,
-        }
-    }
+    async fn drop_table(&self, table: &str) -> Result<()>;
 
-    /// Create the internal watermark-tracking table (named `state_table`) if it
-    /// doesn't exist yet.
-    pub async fn ensure_state_table(&self, state_table: &str) -> Result<()> {
-        match self {
-            Sink::ClickHouse(s) => s.ensure_state_table(state_table).await,
-            Sink::BigQuery(s) => s.ensure_state_table(state_table).await,
-        }
-    }
+    /// Create the internal watermark-tracking table (named `state_table`).
+    async fn ensure_state_table(&self, state_table: &str) -> Result<()>;
 
-    /// Read the last persisted watermark for this `(source, dest_table)`
-    /// pair; `None` if this is the first incremental run.
-    pub async fn read_last_watermark(&self, cfg: &TransferConfig) -> Result<Option<String>> {
-        match self {
-            Sink::ClickHouse(s) => s.read_last_watermark(cfg).await,
-            Sink::BigQuery(s) => s.read_last_watermark(cfg).await,
-        }
-    }
+    /// Read the last persisted watermark for this `(source, dest_table)` pair;
+    /// `None` if this is the first incremental run.
+    async fn read_last_watermark(&self, cfg: &TransferConfig) -> Result<Option<String>>;
 
     /// Persist a new watermark after a successful incremental run.
-    pub async fn persist_watermark(
+    async fn persist_watermark(
         &self,
         cfg: &TransferConfig,
         watermark: &str,
         rows: u64,
-    ) -> Result<()> {
-        match self {
-            Sink::ClickHouse(s) => s.persist_watermark(cfg, watermark, rows).await,
-            Sink::BigQuery(s) => s.persist_watermark(cfg, watermark, rows).await,
-        }
-    }
-
-    /// Whether this destination needs incremental writes staged (then
-    /// merged) rather than inserted directly into the destination table.
-    /// ClickHouse dedupes lazily at merge time via `ReplacingMergeTree`, so
-    /// direct inserts are fine; BigQuery has no engine-level dedup, so an
-    /// updated source row (same key, newer watermark) would otherwise land
-    /// as a duplicate row — [`Self::merge_into`] is required there instead.
-    /// Pure/no I/O, so callers can check it without an `await`.
-    pub fn requires_staging_for_incremental(&self) -> bool {
-        matches!(self, Sink::BigQuery(_))
-    }
-
-    /// Which destination engine this sink writes to — threaded into
-    /// `transform::plan` for destination-aware type promotion. Pure/no I/O.
-    pub fn dest_kind(&self) -> crate::config::DestKind {
-        match self {
-            Sink::ClickHouse(_) => crate::config::DestKind::ClickHouse,
-            Sink::BigQuery(_) => crate::config::DestKind::BigQuery,
-        }
-    }
-
-    /// Whether a *full-refresh* run's swap references the destination table's
-    /// columns by name (so a schema drift must be evolved before the swap).
-    /// BigQuery swaps via `INSERT ... SELECT` naming each column → yes;
-    /// ClickHouse swaps via `exchange_tables` (the freshly-built staging table
-    /// becomes the destination) → no, drift is absorbed transparently. Pure.
-    pub fn full_refresh_references_dest_columns(&self) -> bool {
-        matches!(self, Sink::BigQuery(_))
-    }
+    ) -> Result<()>;
 
     /// `ALTER TABLE ADD COLUMN` (as Nullable) for every `columns` entry the
-    /// existing destination table lacks; returns the names added. ADD-only —
-    /// never drops or retypes. Opt-in via `TransferConfig::evolve_schema`.
-    pub async fn add_missing_columns(
+    /// existing destination table lacks; returns the names added. ADD-only.
+    async fn add_missing_columns(
         &self,
         table: &str,
         columns: &[ColumnType],
         cfg: &TransferConfig,
-    ) -> Result<Vec<String>> {
-        match self {
-            Sink::ClickHouse(s) => s.add_missing_columns(table, columns, cfg).await,
-            Sink::BigQuery(s) => s.add_missing_columns(table, columns, cfg).await,
-        }
+    ) -> Result<Vec<String>>;
+
+    /// Which destination engine this writes to — threaded into `transform::plan`
+    /// for destination-aware type promotion. Pure/no I/O.
+    fn dest_kind(&self) -> crate::config::DestKind;
+
+    // ---- capability methods (safe defaults; override where supported) ----
+
+    /// Whether incremental writes must be *staged then merged* rather than
+    /// inserted directly. Default `false`: direct inserts (e.g. ClickHouse
+    /// dedups lazily via `ReplacingMergeTree`). A destination with no
+    /// engine-level dedup overrides this to `true` and implements
+    /// [`Self::merge_into`]. Pure/no I/O.
+    fn requires_staging_for_incremental(&self) -> bool {
+        false
     }
 
-    /// Read an in-progress chunk-resume marker `(cursor, upper)`, or `None`.
-    /// ClickHouse-only (chunked reads are gated to a ClickHouse dest); the
-    /// BigQuery arm always returns `None`.
-    pub async fn read_chunk_state(&self, cfg: &TransferConfig) -> Result<Option<(String, String)>> {
-        match self {
-            Sink::ClickHouse(s) => s.read_chunk_state(cfg).await,
-            Sink::BigQuery(_) => Ok(None),
-        }
+    /// Whether a *full-refresh* swap references the destination's columns by
+    /// name (so a schema drift must be evolved before the swap). Default
+    /// `false` (e.g. ClickHouse's `EXCHANGE TABLES` absorbs drift). Pure.
+    fn full_refresh_references_dest_columns(&self) -> bool {
+        false
     }
 
-    /// Persist a per-chunk resume marker. ClickHouse-only; calling it on a
-    /// BigQuery sink is a logic bug (chunked reads never run there).
-    pub async fn persist_chunk_cursor(
+    /// In-progress chunk-resume marker `(cursor, upper)`, or `None`. Default
+    /// `None` — a destination without chunked-read support has nothing to resume.
+    async fn read_chunk_state(&self, _cfg: &TransferConfig) -> Result<Option<(String, String)>> {
+        Ok(None)
+    }
+
+    /// Persist a per-chunk resume marker. Default: unsupported — only a
+    /// destination that actually supports chunked resumable reads is ever asked.
+    async fn persist_chunk_cursor(
         &self,
-        cfg: &TransferConfig,
-        committed: Option<&str>,
-        cursor: &str,
-        upper: &str,
-        rows: u64,
+        _cfg: &TransferConfig,
+        _committed: Option<&str>,
+        _cursor: &str,
+        _upper: &str,
+        _rows: u64,
     ) -> Result<()> {
-        match self {
-            Sink::ClickHouse(s) => s.persist_chunk_cursor(cfg, committed, cursor, upper, rows).await,
-            Sink::BigQuery(_) => Err(EtlError::internal(
-                "persist_chunk_cursor on a BigQuery sink — chunked resumable reads are ClickHouse-only",
-            )),
-        }
+        Err(EtlError::internal(
+            "persist_chunk_cursor: this destination does not support chunked resumable reads",
+        ))
     }
 
-    /// Upsert `staging`'s rows into `dest`, matched on `key`. Only meaningful
-    /// (and only ever called) when [`Self::requires_staging_for_incremental`]
-    /// is `true`; calling it on a destination that doesn't need staging is a
-    /// logic bug, not a real config error, so the ClickHouse arm returns
-    /// [`EtlError::internal`] rather than silently doing nothing or panicking.
-    pub async fn merge_into(
+    /// Upsert `staging`'s rows into `dest`, matched on `key`. Default:
+    /// unsupported — only a destination reporting
+    /// [`Self::requires_staging_for_incremental`] performs a staged MERGE.
+    async fn merge_into(
         &self,
-        dest: &str,
-        staging: &str,
-        key: &[String],
-        columns: &[ColumnType],
-        prune_partition: Option<&str>,
-        delete_stale: bool,
+        _dest: &str,
+        _staging: &str,
+        _key: &[String],
+        _columns: &[ColumnType],
+        _prune_partition: Option<&str>,
+        _delete_stale: bool,
     ) -> Result<()> {
-        match self {
-            Sink::ClickHouse(_) => Err(EtlError::internal(
-                "merge_into called on a ClickHouse sink — unreachable, since ClickHouse never \
-                 reports requires_staging_for_incremental()",
-            )),
-            Sink::BigQuery(s) => {
-                s.merge_into(dest, staging, key, columns, prune_partition, delete_stale)
-                    .await
-            }
-        }
+        Err(EtlError::internal(
+            "merge_into: this destination does not use staged-merge incremental writes",
+        ))
     }
+}
+
+/// Build the concrete sink for `dest`, boxed behind the [`Sink`] trait.
+pub async fn build_sink(dest: DestinationConfig) -> Result<Arc<dyn Sink>> {
+    Ok(match dest {
+        DestinationConfig::ClickHouse(cfg) => Arc::new(ClickHouseSink::new(cfg)?),
+        DestinationConfig::BigQuery(cfg) => Arc::new(BigQuerySink::new(cfg).await?),
+    })
 }
 
 #[cfg(test)]

@@ -9,6 +9,19 @@ any breaking change is called out explicitly.
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-07-27
+
+### Changed
+- Internal refactor: the destination layer is now an object-safe **`Sink` trait**
+  (`#[async_trait]`, dispatched as `Arc<dyn Sink>`) instead of a closed enum.
+  Each built-in destination (ClickHouse, BigQuery) is a trait impl, and the
+  engine-specific capabilities (staged-merge upsert, chunked-resume cursor) are
+  overridable trait methods with safe defaults — so a new destination implements
+  only what it supports. Exported from `quickhouse-core` (`Sink`, `build_sink`)
+  as an extension seam for external Rust crates implementing custom engines.
+  No change to the Python API or to any transfer's behavior (byte-identical;
+  the full existing test suite is unchanged and green).
+
 ## [0.12.0] - 2026-07-27
 
 ### Added

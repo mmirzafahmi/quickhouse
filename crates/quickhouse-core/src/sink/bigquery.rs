@@ -50,10 +50,12 @@ use google_cloud_bigquery::storage_write::AppendRowsRequestBuilder;
 use prost_types::DescriptorProto;
 use serde_json::Value;
 
+use async_trait::async_trait;
+
 use crate::config::{BigQueryDestConfig, BigQueryWriteMethod, TransferConfig};
 use crate::error::{EtlError, Result};
 use crate::sink::bigquery_proto::{build_proto_descriptor, encode_row, resolve_fields};
-use crate::sink::{backoff_delay, SendError, MAX_INSERT_ATTEMPTS};
+use crate::sink::{backoff_delay, SendError, Sink, MAX_INSERT_ATTEMPTS};
 use crate::types::bigquery::arrow_to_bigquery_type;
 use crate::types::ColumnType;
 
@@ -679,6 +681,93 @@ impl BigQuerySink {
             )));
         }
         Ok(job)
+    }
+}
+
+/// Thin delegation to the inherent methods above. BigQuery overrides the
+/// staging/merge capability (no engine-level dedup) and keeps the default
+/// chunk-resume methods (chunked reads are ClickHouse-only, so BigQuery is
+/// never asked to persist a chunk cursor).
+#[async_trait]
+impl Sink for BigQuerySink {
+    async fn table_exists(&self, table: &str) -> Result<bool> {
+        BigQuerySink::table_exists(self, table).await
+    }
+    async fn create_table(
+        &self,
+        table: &str,
+        columns: &[ColumnType],
+        cfg: &TransferConfig,
+    ) -> Result<()> {
+        BigQuerySink::create_table(self, table, columns, cfg).await
+    }
+    async fn insert_batches(
+        &self,
+        table: &str,
+        schema: SchemaRef,
+        batches: &[RecordBatch],
+    ) -> Result<u64> {
+        BigQuerySink::insert_batches(self, table, schema, batches).await
+    }
+    async fn atomic_swap(&self, dest: &str, staging: &str, columns: &[ColumnType]) -> Result<()> {
+        BigQuerySink::atomic_swap(self, dest, staging, columns).await
+    }
+    async fn current_row_count(&self, table: &str) -> Result<Option<u64>> {
+        BigQuerySink::current_row_count(self, table).await
+    }
+    async fn drop_table(&self, table: &str) -> Result<()> {
+        BigQuerySink::drop_table(self, table).await
+    }
+    async fn ensure_state_table(&self, state_table: &str) -> Result<()> {
+        BigQuerySink::ensure_state_table(self, state_table).await
+    }
+    async fn read_last_watermark(&self, cfg: &TransferConfig) -> Result<Option<String>> {
+        BigQuerySink::read_last_watermark(self, cfg).await
+    }
+    async fn persist_watermark(
+        &self,
+        cfg: &TransferConfig,
+        watermark: &str,
+        rows: u64,
+    ) -> Result<()> {
+        BigQuerySink::persist_watermark(self, cfg, watermark, rows).await
+    }
+    async fn add_missing_columns(
+        &self,
+        table: &str,
+        columns: &[ColumnType],
+        cfg: &TransferConfig,
+    ) -> Result<Vec<String>> {
+        BigQuerySink::add_missing_columns(self, table, columns, cfg).await
+    }
+    fn dest_kind(&self) -> crate::config::DestKind {
+        crate::config::DestKind::BigQuery
+    }
+    fn requires_staging_for_incremental(&self) -> bool {
+        true
+    }
+    fn full_refresh_references_dest_columns(&self) -> bool {
+        true
+    }
+    async fn merge_into(
+        &self,
+        dest: &str,
+        staging: &str,
+        key: &[String],
+        columns: &[ColumnType],
+        prune_partition: Option<&str>,
+        delete_stale: bool,
+    ) -> Result<()> {
+        BigQuerySink::merge_into(
+            self,
+            dest,
+            staging,
+            key,
+            columns,
+            prune_partition,
+            delete_stale,
+        )
+        .await
     }
 }
 

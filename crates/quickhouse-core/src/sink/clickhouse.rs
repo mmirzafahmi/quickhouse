@@ -8,11 +8,12 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
+use async_trait::async_trait;
 use reqwest::Client;
 
 use crate::config::{ClickHouseConfig, Compression, TransferConfig};
 use crate::error::{EtlError, Result};
-use crate::sink::{backoff_delay, SendError, MAX_INSERT_ATTEMPTS};
+use crate::sink::{backoff_delay, SendError, Sink, MAX_INSERT_ATTEMPTS};
 use crate::types::ColumnType;
 
 #[derive(Clone)]
@@ -397,6 +398,79 @@ impl ClickHouseSink {
         } else {
             Err(EtlError::clickhouse(format!("HTTP {status}: {text}")))
         }
+    }
+}
+
+/// Thin delegation to the inherent methods above. ClickHouse keeps the default
+/// `merge_into` (unsupported) — it dedups via `ReplacingMergeTree` rather than a
+/// staged MERGE, so `requires_staging_for_incremental` stays `false`.
+#[async_trait]
+impl Sink for ClickHouseSink {
+    async fn table_exists(&self, table: &str) -> Result<bool> {
+        ClickHouseSink::table_exists(self, table).await
+    }
+    async fn create_table(
+        &self,
+        table: &str,
+        columns: &[ColumnType],
+        cfg: &TransferConfig,
+    ) -> Result<()> {
+        ClickHouseSink::create_table(self, table, columns, cfg).await
+    }
+    async fn insert_batches(
+        &self,
+        table: &str,
+        schema: SchemaRef,
+        batches: &[RecordBatch],
+    ) -> Result<u64> {
+        ClickHouseSink::insert_batches(self, table, schema, batches).await
+    }
+    async fn atomic_swap(&self, dest: &str, staging: &str, _columns: &[ColumnType]) -> Result<()> {
+        self.exchange_tables(dest, staging).await
+    }
+    async fn current_row_count(&self, table: &str) -> Result<Option<u64>> {
+        ClickHouseSink::current_row_count(self, table).await
+    }
+    async fn drop_table(&self, table: &str) -> Result<()> {
+        ClickHouseSink::drop_table(self, table).await
+    }
+    async fn ensure_state_table(&self, state_table: &str) -> Result<()> {
+        ClickHouseSink::ensure_state_table(self, state_table).await
+    }
+    async fn read_last_watermark(&self, cfg: &TransferConfig) -> Result<Option<String>> {
+        ClickHouseSink::read_last_watermark(self, cfg).await
+    }
+    async fn persist_watermark(
+        &self,
+        cfg: &TransferConfig,
+        watermark: &str,
+        rows: u64,
+    ) -> Result<()> {
+        ClickHouseSink::persist_watermark(self, cfg, watermark, rows).await
+    }
+    async fn add_missing_columns(
+        &self,
+        table: &str,
+        columns: &[ColumnType],
+        cfg: &TransferConfig,
+    ) -> Result<Vec<String>> {
+        ClickHouseSink::add_missing_columns(self, table, columns, cfg).await
+    }
+    fn dest_kind(&self) -> crate::config::DestKind {
+        crate::config::DestKind::ClickHouse
+    }
+    async fn read_chunk_state(&self, cfg: &TransferConfig) -> Result<Option<(String, String)>> {
+        ClickHouseSink::read_chunk_state(self, cfg).await
+    }
+    async fn persist_chunk_cursor(
+        &self,
+        cfg: &TransferConfig,
+        committed: Option<&str>,
+        cursor: &str,
+        upper: &str,
+        rows: u64,
+    ) -> Result<()> {
+        ClickHouseSink::persist_chunk_cursor(self, cfg, committed, cursor, upper, rows).await
     }
 }
 

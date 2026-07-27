@@ -45,6 +45,7 @@ prost-types.workspace = true
 parquet.workspace = true
 object_store.workspace = true
 csv.workspace = true
+async-trait = "0.1"
 
 [dev-dependencies]
 anyhow.workspace = true

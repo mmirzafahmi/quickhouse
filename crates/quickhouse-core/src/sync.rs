@@ -27,7 +27,7 @@ use crate::decode_bigquery::BigQueryBatcher;
 use crate::decode_mysql::MySqlBatcher;
 use crate::error::{EtlError, Result};
 use crate::memory::MemoryBudget;
-use crate::sink::Sink;
+use crate::sink::{build_sink, Sink};
 use crate::source::appsflyer::AppsFlyerSource;
 use crate::source::clevertap::{CleverTapSource, PageStatus};
 use crate::source::mysql::{quote_my, quote_my_table};
@@ -116,7 +116,7 @@ impl ReadThrottle {
 /// sends against the *same* memory budget and counters.
 #[derive(Clone)]
 struct SendCtx {
-    sink: Sink,
+    sink: Arc<dyn Sink>,
     budget: MemoryBudget,
     target_table: Arc<String>,
     counters: Arc<Counters>,
@@ -166,7 +166,7 @@ impl SendCtx {
 
 /// Static per-run info every partition needs to open its own S3 archive
 /// writer — the S3 client and naming info are shared (built once per
-/// transfer, mirroring `Sink::new`); only the partition label varies.
+/// transfer, mirroring `build_sink`); only the partition label varies.
 struct ArchiveRunInfo {
     store: Arc<dyn ObjectStore>,
     prefix: String,
@@ -347,7 +347,7 @@ async fn run_transfer_impl(
     );
 
     // --- Optional S3 data-lake archival (ClickHouse destinations only). ---
-    // Extracted (and cloned) before `Sink::new(dest)` consumes `dest` below —
+    // Extracted (and cloned) before `build_sink(dest)` consumes `dest` below —
     // in either branch — and built once here so a bad archive config (e.g. a
     // missing bucket) fails fast rather than being discovered mid-transfer.
     let s3_archive_cfg = match &dest {
@@ -373,7 +373,7 @@ async fn run_transfer_impl(
             bq.credentials_file.clone(),
             bq.credentials_json.clone(),
         );
-        let sink = Sink::new(dest).await?;
+        let sink = build_sink(dest).await?;
         return run_transfer_bigquery(&source, sink, cfg, progress, started, archive_info, staging)
             .await;
     }
@@ -382,7 +382,7 @@ async fn run_transfer_impl(
     // fetch into the BigQuery sink — a separate flow from the DB partition
     // machinery. archive is always None (BigQuery-only).
     if source_cfg.is_api() {
-        let sink = Sink::new(dest).await?;
+        let sink = build_sink(dest).await?;
         return run_transfer_api(source_cfg, sink, cfg, progress, started, staging).await;
     }
 
@@ -408,7 +408,7 @@ async fn run_transfer_impl(
             unreachable!("API sources handled via early return above")
         }
     });
-    let sink = Sink::new(dest).await?;
+    let sink = build_sink(dest).await?;
 
     // Keyset resumable reads (MVP) commit per chunk straight into the
     // destination, which only works where incremental inserts directly (no
@@ -685,7 +685,7 @@ async fn run_transfer_impl(
 /// `max_stream_count` hint for server-side parallel preparation.
 async fn run_transfer_bigquery(
     source: &BigQuerySource,
-    sink: Sink,
+    sink: Arc<dyn Sink>,
     cfg: TransferConfig,
     progress: Option<ProgressCb>,
     started: Instant,
@@ -1008,7 +1008,7 @@ fn warn_coerced_scalars(scope: &str, n: u64) {
 /// schema + paginated fetch instead of a DB read.
 async fn run_transfer_api(
     source_cfg: SourceConfig,
-    sink: Sink,
+    sink: Arc<dyn Sink>,
     mut cfg: TransferConfig,
     progress: Option<ProgressCb>,
     started: Instant,
@@ -2047,7 +2047,7 @@ fn emit_progress(counters: &Counters, progress: &Option<ProgressCb>, started: In
 /// destination table itself. Destination-agnostic: `sink.create_table` builds
 /// whichever native DDL/schema the concrete destination needs.
 async fn prepare_target(
-    sink: &Sink,
+    sink: &Arc<dyn Sink>,
     cfg: &TransferConfig,
     dest_columns: &[ColumnType],
     staging: &str,
@@ -2322,7 +2322,7 @@ fn new_run_id() -> String {
 /// failed run would leak its staging table (a full data copy, for
 /// full-refresh). Deliberately swallows its own error (logs a warning) so it
 /// never masks the real transfer error being propagated.
-async fn cleanup_staging(sink: &Sink, staging: &str) {
+async fn cleanup_staging(sink: &Arc<dyn Sink>, staging: &str) {
     if let Err(e) = sink.drop_table(staging).await {
         tracing::warn!("failed to drop staging table '{staging}' after a failed transfer: {e}");
     }
