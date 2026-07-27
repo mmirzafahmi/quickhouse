@@ -4,31 +4,83 @@ sd_hide_title: true
 
 # quickhouse
 
+```{raw} html
 <div class="qh-hero">
-<div class="qh-hero-grid">
-<div>
-<p class="qh-eyebrow">Python API · Rust engine</p>
-<h1 class="qh-headline">Move whole tables<br>in one function call.</h1>
-<p class="qh-lede">PostgreSQL, MySQL, or BigQuery into ClickHouse or BigQuery. Native wire protocols straight into Apache Arrow — no per-row Python, flat memory.</p>
-<div class="qh-install"><span class="cmd"><b>$</b> pip install quickhouse</span><span class="copy">copy</span></div>
-<div class="qh-chips"><span class="qh-chip">wheels, no toolchain</span><span class="qh-chip">py 3.9 – 3.13</span><span class="qh-chip">MIT</span></div>
-<div class="qh-cta"><a class="qh-btn" href="quickstart.html">Quickstart →</a><a class="qh-btn-ghost" href="api.html">API reference</a></div>
-</div>
-<div class="qh-panel">
-<div class="qh-panel-head"><span class="tab on">full refresh</span><span class="tab">incremental</span><span class="tab">CLI</span></div>
-<pre><span class="kw">import</span> quickhouse
+  <div>
+    <p class="qh-eyebrow">Python API · Rust engine</p>
+    <h1 class="qh-title">Move whole tables<br />in one function call.</h1>
+    <p class="qh-lede">PostgreSQL, MySQL, or BigQuery into ClickHouse or BigQuery. Native wire protocols straight into Apache Arrow — no per-row Python, flat memory.</p>
 
-src = quickhouse.<span class="fn">Postgres</span>(<span class="str">"postgresql://user:pw@host:5432/shop"</span>)
-dst = quickhouse.<span class="fn">ClickHouse</span>(<span class="str">"http://localhost:8123"</span>,
-                             database=<span class="str">"analytics"</span>)
+    <div class="qh-install">
+      <code>pip install quickhouse</code>
+      <button type="button" data-clipboard="pip install quickhouse">copy</button>
+    </div>
+    <div class="qh-chips">
+      <span>wheels, no toolchain</span>
+      <span>py 3.9 – 3.13</span>
+      <span>MIT</span>
+    </div>
+    <div class="qh-cta">
+      <a href="quickstart.html">Quickstart →</a>
+      <a class="secondary" href="api.html">API reference</a>
+    </div>
+  </div>
 
-result = quickhouse.<span class="fn">sync</span>(src, dst,
-    dest_table=<span class="str">"orders"</span>, source_table=<span class="str">"orders"</span>,
-    key=[<span class="str">"id"</span>])</pre>
-<div class="qh-output"><div class="em">→ TransferResult</div><div>rows_read=<span class="val">1_000_000</span>&nbsp;&nbsp;rows_written=<span class="val">1_000_000</span></div><div>duration_secs=<span class="em">4.31</span>&nbsp;&nbsp;new_watermark=None</div></div>
+  <div class="qh-panel">
+    <div class="qh-panel__tabs">
+      <nav>
+        <span aria-selected="true">full refresh</span>
+        <span>incremental</span>
+        <span>CLI</span>
+      </nav>
+      <span>copy</span>
+    </div>
+<pre><span class="k">import</span> quickhouse
+
+src = quickhouse.<span class="nc">Postgres</span>(<span class="s">"postgresql://user:pw@host:5432/shop"</span>)
+dst = quickhouse.<span class="nc">ClickHouse</span>(<span class="s">"http://localhost:8123"</span>,
+                             database=<span class="s">"analytics"</span>)
+
+result = quickhouse.<span class="nc">sync</span>(src, dst,
+    dest_table=<span class="s">"orders"</span>, source_table=<span class="s">"orders"</span>,
+    key=[<span class="s">"id"</span>])</pre>
+    <div class="qh-result">
+      <div>→ TransferResult</div>
+      <div>rows_read=<b>1_000_000</b>  rows_written=<b>1_000_000</b></div>
+      <div>duration_secs=<em>4.31</em>  new_watermark=None</div>
+    </div>
+  </div>
 </div>
+
+<div class="qh-cards">
+  <a href="installation.html"><strong>Installation</strong><span>Prebuilt wheels, no Rust toolchain needed.</span></a>
+  <a href="quickstart.html"><strong>Quickstart</strong><span>Your first sync in a dozen lines, full and incremental.</span></a>
+  <a href="guide/sources.html"><strong>User guide</strong><span>Sources, sync modes, type mapping, performance, safety.</span></a>
+  <a href="api.html"><strong>API reference</strong><span>Every <code>sync()</code> argument and descriptor.</span></a>
 </div>
+
+<div class="qh-split">
+  <div>
+    <h2>Supported pairs</h2>
+    <table class="qh-matrix">
+      <thead><tr><th>Source</th><th>ClickHouse</th><th>BigQuery</th></tr></thead>
+      <tbody>
+        <tr><td>PostgreSQL</td><td class="yes">✓</td><td class="yes">✓</td></tr>
+        <tr><td>MySQL</td><td class="yes">✓</td><td class="yes">✓</td></tr>
+        <tr><td>BigQuery</td><td class="yes">✓</td><td class="yes">✓</td></tr>
+        <tr><td>CleverTap</td><td class="yes">✓</td><td class="yes">✓</td></tr>
+        <tr><td>AppsFlyer</td><td class="yes">✓</td><td class="yes">✓</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="qh-why">
+    <h2>Why quickhouse</h2>
+    <p><strong>It's fast.</strong> Rows decode straight off the wire into Arrow, in Rust. Ranges read in parallel; decode overlaps upload.</p>
+    <p><strong>It's safe with messy data.</strong> Atomic swaps, idempotent incrementals, automatic retries on transient blips.</p>
+    <p><strong>Nothing to stand up.</strong> An ordinary Python dependency — no JVM, no Spark, no service.</p>
+  </div>
 </div>
+```
 
 ```{admonition} Status: pre-1.0
 :class: warning
@@ -38,35 +90,6 @@ versions before 1.0. Pin a compatible range (e.g. `quickhouse~=0.12`) and watch
 the [changelog](changelog.md). A few knobs are marked *experimental* — those may
 change without a major bump.
 ```
-
-<div class="qh-features">
-<div class="qh-feature"><div class="t"><a href="installation.html">Installation</a></div><div class="d">Prebuilt wheels, no Rust toolchain needed.</div></div>
-<div class="qh-feature"><div class="t"><a href="quickstart.html">Quickstart</a></div><div class="d">Your first sync in a dozen lines, full and incremental.</div></div>
-<div class="qh-feature"><div class="t"><a href="guide/sources.html">User guide</a></div><div class="d">Sources, sync modes, type mapping, performance, safety.</div></div>
-<div class="qh-feature"><div class="t"><a href="api.html">API reference</a></div><div class="d">Every <code>sync()</code> argument and descriptor.</div></div>
-</div>
-
-## Supported sources and destinations
-
-| Source | → ClickHouse | → BigQuery |
-|---|:--:|:--:|
-| PostgreSQL | ● | ● |
-| MySQL | ● | ● |
-| BigQuery | ● | ● |
-| CleverTap (HTTP API) | ● | ● |
-| AppsFlyer (HTTP API) | ● | ● |
-
-ClickHouse is a destination only; BigQuery is both a source and a destination.
-
-## Why quickhouse
-
-<ul class="qh-why">
-<li><b>It's fast.</b> Rows decode straight off the wire into Arrow, in Rust — no per-row Python, no intermediate DataFrame. Ranges read in parallel; decode overlaps upload. Hundreds of thousands of rows/sec with peak memory flat under ~180&nbsp;MB.</li>
-<li><b>It's one function call.</b> <a href="api.html#quickhouse.sync"><code>sync()</code></a> replaces the cursor loop, manual batching, retry logic, and <code>CREATE TABLE</code> you'd otherwise write by hand.</li>
-<li><b>It's safe with messy data.</b> Atomic full-refresh swaps, idempotent incrementals, automatic retries on transient blips; MySQL zero-dates coerce to <code>NULL</code> with a warning instead of aborting.</li>
-<li><b>It's gentle on a small database.</b> <code>read_max_rows_per_sec</code> paces the read, and the scan itself backs off since streaming results only produce as fast as the client consumes.</li>
-<li><b>Nothing to stand up.</b> An ordinary Python dependency — no JVM, no Spark cluster, no separate service.</li>
-</ul>
 
 ## When to use quickhouse
 

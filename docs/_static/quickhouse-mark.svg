@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" role="img" aria-label="quickhouse">
+  <!-- Console mark: two sharp chevrons — teal over gold. Small square bullet. -->
+  <polyline points="3,13 12,4 21,13" fill="none" stroke="#0b8f74" stroke-width="3.4" stroke-linecap="square" stroke-linejoin="miter"/>
+  <polyline points="3,21 12,12 21,21" fill="none" stroke="#d4b400" stroke-width="3.4" stroke-linecap="square" stroke-linejoin="miter"/>
+</svg>

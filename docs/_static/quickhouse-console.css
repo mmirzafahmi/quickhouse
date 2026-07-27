@@ -1,0 +1,519 @@
+/* ==========================================================================
+   quickhouse — "Console" theme for Furo
+   Drop-in: docs/_static/quickhouse-console.css
+   Registered via html_css_files in conf.py (see conf-snippet.py).
+
+   Furo already renders the shell (sidebar, TOC, search, light/dark toggle).
+   This file re-skins it and adds the landing-page components.
+   Nothing here fights Furo's layout — only its tokens and a few blocks.
+   ========================================================================== */
+
+@import url("https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap");
+
+/* --------------------------------------------------------------------------
+   1. Tokens — Furo reads these; both schemes stay in lockstep.
+   -------------------------------------------------------------------------- */
+
+body {
+  --font-stack: "Space Grotesk", -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif;
+  --font-stack--monospace: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --qh-radius: 8px;
+  --qh-radius-lg: 10px;
+
+  /* light scheme */
+  --color-brand-primary: #0b8f74;
+  --color-brand-content: #0b8f74;
+  --color-brand-visited: #0b8f74;
+
+  --color-background-primary: #fcfdfc;
+  --color-background-secondary: #f9fbfa;
+  --color-background-hover: #f1f5f3;
+  --color-background-border: #e4eae7;
+
+  --color-foreground-primary: #0f1614;
+  --color-foreground-secondary: #3d4b45;
+  --color-foreground-muted: #66776f;
+  --color-foreground-border: #e4eae7;
+
+  --color-code-background: #ffffff;
+  --color-code-foreground: #26332e;
+  --color-inline-code-background: #eef5f2;
+
+  --qh-neon: #2ee6b0;          /* fills only — never text on light */
+  --qh-accent: #0b8f74;        /* readable accent */
+  --qh-warn: #8a6d10;
+  --qh-warn-bg: #fdf8e6;
+  --qh-warn-border: #e6d9a8;
+  --qh-panel: #f7faf9;
+  --qh-panel-head: #eff4f2;
+  --qh-rule: #e4eae7;
+  --qh-rule-soft: #eef2f0;
+
+  /* syntax */
+  --qh-syn-keyword: #8a978f;
+  --qh-syn-name: #a06b00;
+  --qh-syn-string: #0b8f74;
+  --qh-syn-literal: #6d5ae0;
+  --qh-syn-comment: #8a978f;
+}
+
+body[data-theme="dark"] {
+  --color-brand-primary: #2ee6b0;
+  --color-brand-content: #2ee6b0;
+  --color-brand-visited: #2ee6b0;
+
+  --color-background-primary: #0b100f;
+  --color-background-secondary: #0f1614;
+  --color-background-hover: #131c19;
+  --color-background-border: #1e2a26;
+
+  --color-foreground-primary: #e4efea;
+  --color-foreground-secondary: #a8bab3;
+  --color-foreground-muted: #7f918b;
+  --color-foreground-border: #1e2a26;
+
+  --color-code-background: #0f1614;
+  --color-code-foreground: #d5e5df;
+  --color-inline-code-background: #12201b;
+
+  --qh-neon: #2ee6b0;
+  --qh-accent: #2ee6b0;
+  --qh-warn: #ffe94a;
+  --qh-warn-bg: #17170c;
+  --qh-warn-border: #3d3714;
+  --qh-panel: #0f1614;
+  --qh-panel-head: #131c19;
+  --qh-rule: #1e2a26;
+  --qh-rule-soft: #141d1a;
+
+  --qh-syn-keyword: #7f918b;
+  --qh-syn-name: #ffe94a;
+  --qh-syn-string: #2ee6b0;
+  --qh-syn-literal: #7fa8ff;
+  --qh-syn-comment: #5f6f69;
+}
+
+@media (prefers-color-scheme: dark) {
+  body:not([data-theme="light"]) {
+    --color-brand-primary: #2ee6b0;
+    --color-brand-content: #2ee6b0;
+    --color-brand-visited: #2ee6b0;
+
+    --color-background-primary: #0b100f;
+    --color-background-secondary: #0f1614;
+    --color-background-hover: #131c19;
+    --color-background-border: #1e2a26;
+
+    --color-foreground-primary: #e4efea;
+    --color-foreground-secondary: #a8bab3;
+    --color-foreground-muted: #7f918b;
+    --color-foreground-border: #1e2a26;
+
+    --color-code-background: #0f1614;
+    --color-code-foreground: #d5e5df;
+    --color-inline-code-background: #12201b;
+
+    --qh-neon: #2ee6b0;
+    --qh-accent: #2ee6b0;
+    --qh-warn: #ffe94a;
+    --qh-warn-bg: #17170c;
+    --qh-warn-border: #3d3714;
+    --qh-panel: #0f1614;
+    --qh-panel-head: #131c19;
+    --qh-rule: #1e2a26;
+    --qh-rule-soft: #141d1a;
+
+    --qh-syn-keyword: #7f918b;
+    --qh-syn-name: #ffe94a;
+    --qh-syn-string: #2ee6b0;
+    --qh-syn-literal: #7fa8ff;
+    --qh-syn-comment: #5f6f69;
+  }
+}
+
+/* --------------------------------------------------------------------------
+   2. Top nav — injected by _templates/page.html, sits above Furo's own
+      header row. Furo's built-in mobile header (icons/hamburger) stays
+      put below it; this bar is the desktop brand strip from the mockup.
+   -------------------------------------------------------------------------- */
+
+.qh-topnav {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1.5rem;
+  height: 62px;
+  padding: 0 2rem;
+  background: var(--color-background-primary);
+  border-bottom: 1px solid var(--qh-rule);
+  font-family: var(--font-stack);
+  position: sticky;
+  top: 0;
+  z-index: 20;
+}
+.qh-topnav__brand {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  text-decoration: none;
+  color: var(--color-foreground-primary);
+  font-size: 1.05rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+.qh-topnav__mark { width: 22px; height: 22px; }
+.qh-topnav__version {
+  font-family: var(--font-stack--monospace);
+  font-size: 0.68rem;
+  font-weight: 400;
+  color: var(--color-foreground-muted);
+  border: 1px solid var(--qh-rule);
+  border-radius: 4px;
+  padding: 0.05rem 0.35rem;
+}
+.qh-topnav__links { display: flex; gap: 1.6rem; }
+.qh-topnav__links a {
+  font-size: 0.92rem;
+  color: var(--color-foreground-secondary);
+  text-decoration: none;
+}
+.qh-topnav__links a:hover { color: var(--color-foreground-primary); }
+.qh-topnav__right { display: flex; align-items: center; gap: 1.1rem; }
+.qh-topnav__search {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  font-family: var(--font-stack--monospace);
+  font-size: 0.78rem;
+  color: var(--color-foreground-muted);
+  background: transparent;
+  border: 1px solid var(--qh-rule);
+  border-radius: 6px;
+  padding: 0.32rem 0.7rem;
+  cursor: pointer;
+}
+.qh-topnav__kbd {
+  font-size: 0.68rem;
+  border: 1px solid var(--qh-rule);
+  border-radius: 3px;
+  padding: 0 0.3rem;
+}
+.qh-topnav__gh { font-size: 0.9rem; color: var(--color-foreground-secondary); text-decoration: none; }
+.qh-topnav__gh:hover { color: var(--color-foreground-primary); }
+@media (max-width: 67em) { .qh-topnav__links { display: none; } }
+
+/* Furo's own header row (mobile toggle + icons) sits right under ours —
+   give it the same background so there's no seam. */
+.mobile-header { top: 62px; background: var(--color-background-primary); border-bottom: 1px solid var(--qh-rule); }
+@media (min-width: 82em) {
+  .mobile-header { display: none; }
+}
+
+/* --------------------------------------------------------------------------
+   3. Shell — sidebar, headings, code, tables
+   -------------------------------------------------------------------------- */
+
+.sidebar-drawer { border-right: 1px solid var(--qh-rule); }
+.sidebar-brand-text { font-size: 1.05rem; font-weight: 600; letter-spacing: -0.01em; }
+.sidebar-logo { max-width: 40px; }          /* the mark is a bullet, not a billboard */
+.sidebar-logo-container { margin: 0 0 0.5rem; }
+
+.sidebar-tree .caption {
+  font-family: var(--font-stack--monospace);
+  font-size: 0.68rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--color-foreground-muted);
+}
+.sidebar-tree .reference { font-size: 0.9rem; }
+.sidebar-tree .current-page > .reference { font-weight: 600; color: var(--qh-accent); }
+
+.sidebar-search {
+  border-radius: var(--qh-radius);
+  border: 1px solid var(--qh-rule);
+  background: var(--color-background-primary);
+}
+
+h1, h2, h3, h4 { font-weight: 700; letter-spacing: -0.02em; }
+h1 { font-size: 2.4rem; line-height: 1.08; }
+h2 { font-size: 1.5rem; margin-top: 2.2em; }
+article p { line-height: 1.65; text-wrap: pretty; }
+
+/* code blocks: flat panel, hairline rule, mono tabs */
+.highlight {
+  border: 1px solid var(--qh-rule);
+  border-radius: var(--qh-radius);
+  background: var(--color-code-background);
+}
+.highlight pre { padding: 1rem 1.15rem; font-size: 0.82rem; line-height: 1.8; }
+code.literal {
+  border: 0;
+  background: var(--color-inline-code-background);
+  color: var(--qh-accent);
+  padding: 0.1em 0.4em;
+  border-radius: 4px;
+}
+
+table.docutils { border: 0; border-top: 1px solid var(--color-foreground-primary); }
+table.docutils th {
+  font-family: var(--font-stack--monospace);
+  font-size: 0.68rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--color-foreground-muted);
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid var(--qh-rule);
+}
+table.docutils td { border: 0; border-bottom: 1px solid var(--qh-rule-soft); }
+
+/* --------------------------------------------------------------------------
+   3. API reference — signature card + parameter rows
+   -------------------------------------------------------------------------- */
+
+dl.py > dt {
+  background: var(--qh-panel);
+  border: 1px solid var(--qh-rule);
+  border-left: 3px solid var(--qh-accent);
+  border-radius: var(--qh-radius);
+  padding: 0.75rem 1rem;
+  font-family: var(--font-stack--monospace);
+  font-size: 0.82rem;
+  line-height: 1.75;
+}
+dl.py .sig-name { color: var(--qh-syn-name); font-weight: 700; }
+dl.py .sig-param .n { color: var(--color-foreground-primary); }
+dl.py .sig-param .default_value { color: var(--qh-syn-literal); }
+dl.py dd { border-left: 1px solid var(--qh-rule); margin-left: 0.4rem; padding-left: 1.4rem; }
+
+dl.field-list > dt {                         /* "Parameters:" / "Return type:" */
+  font-family: var(--font-stack--monospace);
+  font-size: 0.68rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--color-foreground-muted);
+  background: transparent;
+  padding-left: 0;
+}
+dl.field-list > dd ul.simple > li { border-top: 1px solid var(--qh-rule); padding: 0.6rem 0; }
+dl.field-list > dd ul.simple { padding-left: 0; list-style: none; }
+
+/* mark experimental params: :param chunk_rows: ... with **exp** badge in source,
+   or wrap the term in <span class="qh-exp">exp</span> */
+.qh-exp {
+  font-family: var(--font-stack--monospace);
+  font-size: 0.62rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--qh-warn);
+  border: 1px solid var(--qh-warn-border);
+  background: var(--qh-warn-bg);
+  border-radius: 3px;
+  padding: 0.05em 0.35em;
+  vertical-align: 0.15em;
+}
+
+/* --------------------------------------------------------------------------
+   4. Landing page — the hero block from index.md
+   -------------------------------------------------------------------------- */
+
+/* the landing gets more room and loses the duplicate H1 */
+body:has(.qh-hero) { --content-width: 62rem; }
+body:has(.qh-hero) article > h1:first-child,
+body:has(.qh-hero) section > h1:first-child { display: none; }
+
+.qh-hero {
+  display: grid;
+  grid-template-columns: 1.05fr 1fr;
+  gap: 3.5rem;
+  align-items: start;
+  margin: 0 0 2.5rem;
+}
+@media (max-width: 82em) { .qh-hero { grid-template-columns: 1fr; gap: 2rem; } }
+
+.qh-eyebrow {
+  font-family: var(--font-stack--monospace);
+  font-size: 0.72rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--qh-accent);
+  margin: 0 0 1.1rem;
+}
+.qh-hero h1.qh-title {
+  display: block;
+  font-size: 3.1rem;
+  line-height: 1.05;
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  margin: 0 0 1rem;
+}
+.qh-lede {
+  font-size: 1.08rem;
+  line-height: 1.6;
+  color: var(--color-foreground-secondary);
+  max-width: 44ch;
+  margin: 0 0 1.75rem;
+}
+
+.qh-install {
+  display: flex;
+  align-items: stretch;
+  border: 1px solid var(--qh-accent);
+  border-radius: var(--qh-radius);
+  overflow: hidden;
+  max-width: 430px;
+  margin: 0 0 0.85rem;
+}
+.qh-install code {
+  flex: 1;
+  font-family: var(--font-stack--monospace);
+  font-size: 0.88rem;
+  padding: 0.72rem 1rem;
+  background: var(--color-code-background);
+  color: var(--color-foreground-primary);
+  border: 0;
+}
+.qh-install code::before { content: "$ "; color: var(--qh-accent); }
+.qh-install button {
+  font-family: var(--font-stack--monospace);
+  font-size: 0.74rem;
+  font-weight: 600;
+  padding: 0 1rem;
+  background: var(--qh-neon);
+  color: #04120e;
+  border: 0;
+  cursor: pointer;
+}
+
+.qh-chips { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 0 0 2rem; }
+.qh-chips span {
+  font-family: var(--font-stack--monospace);
+  font-size: 0.7rem;
+  color: var(--color-foreground-muted);
+  border: 1px solid var(--qh-rule);
+  border-radius: 4px;
+  padding: 0.2rem 0.5rem;
+}
+
+.qh-cta { display: flex; gap: 0.75rem; }
+.qh-cta a {
+  font-size: 0.9rem;
+  font-weight: 600;
+  border-radius: 7px;
+  padding: 0.6rem 1.25rem;
+  text-decoration: none;
+  background: var(--color-foreground-primary);
+  color: var(--color-background-primary);
+}
+.qh-cta a.secondary {
+  background: transparent;
+  color: var(--color-foreground-secondary);
+  border: 1px solid var(--qh-rule);
+  font-weight: 500;
+}
+.qh-cta a:hover { opacity: 0.88; }
+
+/* code panel with tabs + result pane */
+.qh-panel {
+  border: 1px solid var(--qh-rule);
+  border-radius: var(--qh-radius-lg);
+  overflow: hidden;
+  background: var(--qh-panel);
+}
+.qh-panel__tabs {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  background: var(--qh-panel-head);
+  border-bottom: 1px solid var(--qh-rule);
+  padding: 0.55rem 0.9rem;
+  font-family: var(--font-stack--monospace);
+  font-size: 0.74rem;
+  color: var(--color-foreground-muted);
+}
+.qh-panel__tabs nav { display: flex; gap: 1rem; }
+.qh-panel__tabs [aria-selected="true"] {
+  color: var(--qh-accent);
+  border-bottom: 1px solid var(--qh-accent);
+  padding-bottom: 3px;
+}
+.qh-panel .highlight { border: 0; border-radius: 0; }
+.qh-panel pre {
+  margin: 0;
+  padding: 1.1rem 1.25rem;
+  font-family: var(--font-stack--monospace);
+  font-size: 0.8rem;
+  line-height: 1.85;
+  background: var(--color-code-background);
+  color: var(--color-code-foreground);
+  overflow-x: auto;
+}
+.qh-result {
+  border-top: 1px solid var(--qh-rule);
+  background: var(--qh-panel-head);
+  padding: 0.9rem 1.25rem;
+  font-family: var(--font-stack--monospace);
+  font-size: 0.76rem;
+  line-height: 1.8;
+  color: var(--color-foreground-muted);
+}
+.qh-result b { color: var(--color-foreground-primary); font-weight: 500; }
+.qh-result em { color: var(--qh-accent); font-style: normal; font-weight: 500; }
+
+/* hand-marked syntax inside .qh-panel pre (no pygments in raw HTML) */
+.qh-panel .k  { color: var(--qh-syn-keyword); }
+.qh-panel .nc { color: var(--qh-syn-name); }
+.qh-panel .s  { color: var(--qh-syn-string); }
+.qh-panel .m  { color: var(--qh-syn-literal); }
+.qh-panel .c  { color: var(--qh-syn-comment); }
+
+/* four route cards under the hero */
+.qh-cards {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 1.75rem;
+  border-top: 1px solid var(--qh-rule);
+  padding-top: 2rem;
+  margin-bottom: 2rem;
+}
+@media (max-width: 82em) { .qh-cards { grid-template-columns: repeat(2, 1fr); } }
+.qh-cards a { text-decoration: none; }
+.qh-cards strong { display: block; font-size: 0.98rem; margin-bottom: 0.4rem; color: var(--color-foreground-primary); }
+.qh-cards span { font-size: 0.88rem; line-height: 1.55; color: var(--color-foreground-muted); }
+
+/* support matrix + why, side by side */
+.qh-split {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 3.5rem;
+  border-top: 1px solid var(--qh-rule);
+  padding-top: 1.9rem;
+}
+@media (max-width: 82em) { .qh-split { grid-template-columns: 1fr; gap: 2rem; } }
+.qh-split h2 {
+  font-family: var(--font-stack--monospace);
+  font-size: 0.72rem;
+  font-weight: 400;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--color-foreground-muted);
+  margin: 0 0 1rem;
+}
+.qh-matrix { width: 100%; border-collapse: collapse; }
+.qh-matrix th {
+  font-family: var(--font-stack--monospace);
+  font-size: 0.66rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--color-foreground-muted);
+  text-align: left;
+  font-weight: 400;
+  padding-bottom: 0.55rem;
+  border-bottom: 1px solid var(--qh-rule);
+}
+.qh-matrix td { font-size: 0.9rem; padding: 0.55rem 0; border-bottom: 1px solid var(--qh-rule-soft); }
+.qh-matrix td.yes { color: var(--qh-accent); }
+.qh-why p { font-size: 0.9rem; line-height: 1.55; color: var(--color-foreground-secondary); margin: 0 0 0.8rem; }
+.qh-why strong { color: var(--color-foreground-primary); }
