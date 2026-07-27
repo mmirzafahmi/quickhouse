@@ -517,3 +517,40 @@ body:has(.qh-hero) section > h1:first-child { display: none; }
 .qh-matrix td.yes { color: var(--qh-accent); }
 .qh-why p { font-size: 0.9rem; line-height: 1.55; color: var(--color-foreground-secondary); margin: 0 0 0.8rem; }
 .qh-why strong { color: var(--color-foreground-primary); }
+
+/* --------------------------------------------------------------------------
+   5. Mode cards — optional summary trio on guide/sync-modes (.qh-modes).
+      Added per the handoff's "say the word and I'll add .qh-modes" note;
+      the current mode's card is accent-bordered.
+   -------------------------------------------------------------------------- */
+
+.qh-modes {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 0.9rem;
+  margin: 1.5rem 0 2.2rem;
+}
+@media (max-width: 52em) { .qh-modes { grid-template-columns: 1fr; } }
+
+.qh-mode {
+  display: block;
+  border: 1px solid var(--qh-rule);
+  border-radius: var(--qh-radius);
+  padding: 0.85rem 1rem;
+  background: var(--qh-panel);
+  text-decoration: none;
+  transition: border-color 0.15s ease;
+}
+.qh-mode:hover { border-color: var(--qh-accent); }
+.qh-mode--current {
+  border-color: var(--qh-accent);
+  background: var(--qh-panel);                                   /* fallback */
+  background: color-mix(in srgb, var(--qh-accent) 8%, var(--qh-panel));
+}
+.qh-mode__name {
+  font-family: var(--font-stack--monospace);
+  font-size: 0.82rem;
+  color: var(--qh-accent);
+  margin-bottom: 0.35rem;
+}
+.qh-mode__desc { font-size: 0.85rem; line-height: 1.5; color: var(--color-foreground-secondary); }

@@ -2,6 +2,23 @@
 
 `sync()` runs in one of three modes, chosen with `mode=`.
 
+```{raw} html
+<div class="qh-modes">
+  <a class="qh-mode" href="#full-refresh">
+    <div class="qh-mode__name">full</div>
+    <div class="qh-mode__desc">Reload the whole table, swap it in atomically. The default.</div>
+  </a>
+  <a class="qh-mode qh-mode--current" href="#incremental">
+    <div class="qh-mode__name">incremental</div>
+    <div class="qh-mode__desc">Only rows past the watermark. Idempotent; dedup on <code>key</code>.</div>
+  </a>
+  <a class="qh-mode" href="#append-bronze-landing">
+    <div class="qh-mode__name">append</div>
+    <div class="qh-mode__desc">Bronze landing for HTTP sources — no staging, no dedup.</div>
+  </a>
+</div>
+```
+
 ## Full refresh
 
 `mode="full"` (the default) reloads the whole table into a staging table, then
