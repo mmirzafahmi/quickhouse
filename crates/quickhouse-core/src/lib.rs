@@ -28,9 +28,9 @@ pub mod types;
 
 pub use config::{
     ApiColumn, AppsFlyerConfig, BigQueryConfig, BigQueryDestConfig, BigQueryWriteMethod,
-    CleverTapConfig, ClickHouseConfig, Compression, DestinationConfig, MySqlConfig,
-    ParquetCompression, PostgresConfig, S3ArchiveConfig, SourceConfig, SyncMode, TransferConfig,
-    TransferResult, WatermarkSeed,
+    CleverTapConfig, ClickHouseConfig, Compression, DestinationConfig, HttpApiConfig, HttpFormat,
+    MySqlConfig, ParquetCompression, PostgresConfig, S3ArchiveConfig, SourceConfig, SyncMode,
+    TransferConfig, TransferResult, WatermarkSeed,
 };
 pub use error::{EtlError, Result};
 pub use sync::{run_transfer, Progress, ProgressCb};

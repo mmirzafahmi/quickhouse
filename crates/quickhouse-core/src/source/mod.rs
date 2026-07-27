@@ -1,6 +1,7 @@
 pub mod appsflyer;
 pub mod bigquery;
 pub mod clevertap;
+pub mod http_api;
 pub mod mysql;
 pub mod postgres;
 

@@ -404,7 +404,7 @@ async fn run_transfer_impl(
             my.client_key_file.clone(),
         )),
         SourceConfig::BigQuery(_) => unreachable!("handled via early return above"),
-        SourceConfig::CleverTap(_) | SourceConfig::AppsFlyer(_) => {
+        SourceConfig::CleverTap(_) | SourceConfig::AppsFlyer(_) | SourceConfig::HttpApi(_) => {
             unreachable!("API sources handled via early return above")
         }
     });
@@ -898,6 +898,7 @@ fn api_columns_of(source_cfg: &SourceConfig) -> &[ApiColumn] {
     match source_cfg {
         SourceConfig::CleverTap(c) => &c.columns,
         SourceConfig::AppsFlyer(a) => &a.columns,
+        SourceConfig::HttpApi(h) => &h.columns,
         _ => &[],
     }
 }
@@ -906,6 +907,7 @@ fn api_source_window(source_cfg: &SourceConfig) -> (Option<&str>, Option<&str>) 
     match source_cfg {
         SourceConfig::CleverTap(c) => (c.from_date.as_deref(), c.to_date.as_deref()),
         SourceConfig::AppsFlyer(a) => (a.from_date.as_deref(), a.to_date.as_deref()),
+        SourceConfig::HttpApi(h) => (h.from_date.as_deref(), h.to_date.as_deref()),
         _ => (None, None),
     }
 }
@@ -927,6 +929,7 @@ fn api_lookback_days(source_cfg: &SourceConfig) -> u32 {
     match source_cfg {
         SourceConfig::CleverTap(c) => c.lookback_days,
         SourceConfig::AppsFlyer(a) => a.lookback_days,
+        SourceConfig::HttpApi(h) => h.lookback_days,
         _ => 0,
     }
 }
@@ -1114,6 +1117,16 @@ async fn run_transfer_api(
             }
             SourceConfig::AppsFlyer(a) => {
                 let src = AppsFlyerSource::new(a)?;
+                let records = src.fetch_records(&from, &to, &lookups).await?;
+                for rec in &records {
+                    if let Some(b) = batcher.append_record(rec)? {
+                        ctx.spawn_upload(&mut sends, schema.clone(), b).await;
+                        reap(&mut sends, false).await?;
+                    }
+                }
+            }
+            SourceConfig::HttpApi(h) => {
+                let src = crate::source::http_api::HttpApiSource::new(h)?;
                 let records = src.fetch_records(&from, &to, &lookups).await?;
                 for rec in &records {
                     if let Some(b) = batcher.append_record(rec)? {

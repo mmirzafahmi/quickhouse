@@ -120,6 +120,44 @@ pub struct AppsFlyerConfig {
     pub lookback_days: u32,
 }
 
+/// Response body shape for a generic [`HttpApiConfig`] source.
+#[derive(Debug, Clone)]
+pub enum HttpFormat {
+    /// A JSON body. `records_path` is a dotted path to the array of record
+    /// objects (e.g. `"data.rows"`); `None` means the body itself is the array
+    /// (or a single object, treated as one record).
+    Json { records_path: Option<String> },
+    /// A CSV body (header row + data rows), parsed like the AppsFlyer report.
+    Csv,
+}
+
+/// Read from a generic HTTP/REST or CSV endpoint. Auth is whatever `headers`
+/// you supply (e.g. an `Authorization` header). The `{from}` and `{to}` tokens
+/// in `url` and `body` are replaced with the window's date bounds.
+#[derive(Debug, Clone)]
+pub struct HttpApiConfig {
+    pub url: String,
+    /// `"GET"` (default) or `"POST"`.
+    pub method: String,
+    pub headers: HashMap<String, String>,
+    /// Request body (for `POST`); `{from}`/`{to}` are substituted. `None` = none.
+    pub body: Option<String>,
+    pub format: HttpFormat,
+    /// Cursor pagination: a dotted path to the next-cursor value in the response
+    /// and the query-param name to send it back as. Both set ⇒ keep paging until
+    /// the cursor is absent/empty; `None` ⇒ a single request.
+    pub next_cursor_path: Option<String>,
+    pub cursor_param: Option<String>,
+    /// Stable identity for this source's incremental cursor in the state table
+    /// (there's no `source_table`); defaults to the `url` when unset.
+    pub state_id: Option<String>,
+    pub columns: Vec<ApiColumn>,
+    pub from_date: Option<String>,
+    pub to_date: Option<String>,
+    /// See [`CleverTapConfig::lookback_days`].
+    pub lookback_days: u32,
+}
+
 /// Which engine/API to read from.
 #[derive(Debug, Clone)]
 pub enum SourceConfig {
@@ -128,6 +166,7 @@ pub enum SourceConfig {
     BigQuery(BigQueryConfig),
     CleverTap(CleverTapConfig),
     AppsFlyer(AppsFlyerConfig),
+    HttpApi(HttpApiConfig),
 }
 
 impl SourceConfig {
@@ -141,6 +180,7 @@ impl SourceConfig {
             SourceConfig::BigQuery(_) => "bigquery",
             SourceConfig::CleverTap(_) => "clevertap",
             SourceConfig::AppsFlyer(_) => "appsflyer",
+            SourceConfig::HttpApi(_) => "http",
         }
     }
 
@@ -150,7 +190,7 @@ impl SourceConfig {
     pub fn is_api(&self) -> bool {
         matches!(
             self,
-            SourceConfig::CleverTap(_) | SourceConfig::AppsFlyer(_)
+            SourceConfig::CleverTap(_) | SourceConfig::AppsFlyer(_) | SourceConfig::HttpApi(_)
         )
     }
 
@@ -161,6 +201,11 @@ impl SourceConfig {
         match self {
             SourceConfig::CleverTap(c) => Some(format!("clevertap:{}", c.event_name)),
             SourceConfig::AppsFlyer(a) => Some(format!("appsflyer:{}:{}", a.app_id, a.report_type)),
+            SourceConfig::HttpApi(h) => Some(
+                h.state_id
+                    .clone()
+                    .unwrap_or_else(|| format!("http:{}", h.url)),
+            ),
             _ => None,
         }
     }
