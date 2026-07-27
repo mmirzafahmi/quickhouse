@@ -13,7 +13,7 @@
 
 use mysql_async::consts::{ColumnFlags, ColumnType as MyType};
 use mysql_async::prelude::*;
-use mysql_async::{Conn, Opts, OptsBuilder, SslOpts, Value};
+use mysql_async::{ClientIdentity, Conn, Opts, OptsBuilder, SslOpts, Value};
 
 use crate::error::{EtlError, Result};
 use crate::source::Keyset;
@@ -33,14 +33,35 @@ mod type_code {
     pub const INT24: u32 = 9;
 }
 
-fn build_opts(dsn: &str, ca_cert_file: Option<&str>, require_tls: bool) -> Result<Opts> {
+fn build_opts(
+    dsn: &str,
+    ca_cert_file: Option<&str>,
+    require_tls: bool,
+    client_cert_file: Option<&str>,
+    client_key_file: Option<&str>,
+) -> Result<Opts> {
+    let has_client_auth = match (client_cert_file, client_key_file) {
+        (Some(_), Some(_)) => true,
+        (None, None) => false,
+        _ => {
+            return Err(EtlError::config(
+                "client_cert_file and client_key_file must be provided together for mTLS",
+            ))
+        }
+    };
     let base =
         Opts::from_url(dsn).map_err(|e| EtlError::config(format!("invalid MySQL DSN: {e}")))?;
     let mut builder = OptsBuilder::from_opts(base);
-    if require_tls || ca_cert_file.is_some() {
+    if require_tls || ca_cert_file.is_some() || has_client_auth {
         let mut ssl_opts = SslOpts::default();
         if let Some(path) = ca_cert_file {
             ssl_opts = ssl_opts.with_root_certs(vec![std::path::PathBuf::from(path).into()]);
+        }
+        if let (Some(cert), Some(key)) = (client_cert_file, client_key_file) {
+            ssl_opts = ssl_opts.with_client_identity(Some(ClientIdentity::new(
+                std::path::PathBuf::from(cert).into(),
+                std::path::PathBuf::from(key).into(),
+            )));
         }
         builder = builder.ssl_opts(Some(ssl_opts));
     }
@@ -52,26 +73,39 @@ pub struct MySqlSource {
     statement_timeout_secs: u64,
     ca_cert_file: Option<String>,
     require_tls: bool,
+    client_cert_file: Option<String>,
+    client_key_file: Option<String>,
 }
 
 impl MySqlSource {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         dsn: impl Into<String>,
         statement_timeout_secs: u64,
         ca_cert_file: Option<String>,
         require_tls: bool,
+        client_cert_file: Option<String>,
+        client_key_file: Option<String>,
     ) -> Self {
         Self {
             dsn: dsn.into(),
             statement_timeout_secs,
             ca_cert_file,
             require_tls,
+            client_cert_file,
+            client_key_file,
         }
     }
 
     /// Open a fresh connection. Each parallel query stream should use its own.
     pub async fn connect(&self) -> Result<Conn> {
-        let opts = build_opts(&self.dsn, self.ca_cert_file.as_deref(), self.require_tls)?;
+        let opts = build_opts(
+            &self.dsn,
+            self.ca_cert_file.as_deref(),
+            self.require_tls,
+            self.client_cert_file.as_deref(),
+            self.client_key_file.as_deref(),
+        )?;
         let mut conn = Conn::new(opts)
             .await
             .map_err(|e| EtlError::from(e).context("connecting to mysql"))?;
@@ -316,8 +350,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn build_opts_requires_client_cert_and_key_together() {
+        let err = build_opts("mysql://u@h/db", None, false, Some("/x/cert.pem"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must be provided together"), "{err}");
+        // Neither is fine (plain, no client auth).
+        assert!(build_opts("mysql://u@h/db", None, false, None, None).is_ok());
+    }
+
+    #[test]
     fn select_sql_with_table_and_filters() {
-        let src = MySqlSource::new("mysql://x", 0, None, false);
+        let src = MySqlSource::new("mysql://x", 0, None, false, None, None);
         let part = Partition {
             label: "r0".into(),
             predicate: Some("`id` >= 1 AND `id` <= 100".into()),
@@ -340,7 +384,7 @@ mod tests {
 
     #[test]
     fn select_sql_with_query() {
-        let src = MySqlSource::new("mysql://x", 0, None, false);
+        let src = MySqlSource::new("mysql://x", 0, None, false, None, None);
         let part = Partition {
             label: "all".into(),
             predicate: None,
@@ -359,7 +403,7 @@ mod tests {
 
     #[test]
     fn select_sql_transform_and_keyset() {
-        let src = MySqlSource::new("mysql://x", 0, None, false);
+        let src = MySqlSource::new("mysql://x", 0, None, false, None, None);
         let part = Partition {
             label: "all".into(),
             predicate: None,

@@ -14,6 +14,12 @@ pub struct PostgresConfig {
     /// regional bundle), trusted in addition to the public webpki-roots store.
     /// Needed whenever the server's certificate doesn't chain to a public CA.
     pub ca_cert_file: Option<String>,
+    /// mTLS (client-certificate auth): path to the client certificate chain
+    /// (PEM). Must be set together with `client_key_file`.
+    pub client_cert_file: Option<String>,
+    /// mTLS: path to the client private key (PEM). Must be set together with
+    /// `client_cert_file`.
+    pub client_key_file: Option<String>,
 }
 
 /// Where to read from, when the source is MySQL (e.g. AWS RDS for MySQL).
@@ -29,6 +35,12 @@ pub struct MySqlConfig {
     /// Require TLS for the connection (MySQL has no `sslmode` DSN parameter
     /// convention like libpq, so this is explicit).
     pub require_tls: bool,
+    /// mTLS (client-certificate auth): path to the client certificate chain
+    /// (DER or PEM). Must be set together with `client_key_file`.
+    pub client_cert_file: Option<String>,
+    /// mTLS: path to the client private key (DER or PEM). Must be set together
+    /// with `client_cert_file`.
+    pub client_key_file: Option<String>,
 }
 
 /// Where to read from, when the source is Google BigQuery.

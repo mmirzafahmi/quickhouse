@@ -12,6 +12,7 @@
 
 use bytes::Bytes;
 use futures::Stream;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ClientConfig, RootCertStore};
 use tokio_postgres::Client;
 use tokio_postgres_rustls::MakeRustlsConnect;
@@ -40,7 +41,45 @@ fn load_extra_ca_certs(roots: &mut RootCertStore, path: &str) -> Result<()> {
     Ok(())
 }
 
-fn tls_connector(ca_cert_file: Option<&str>) -> Result<MakeRustlsConnect> {
+/// Load a client certificate chain + private key (both PEM) for mTLS.
+fn load_client_identity(
+    cert_path: &str,
+    key_path: &str,
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+    let cert_file = std::fs::File::open(cert_path)
+        .map_err(|e| EtlError::config(format!("failed to open client_cert_file '{cert_path}': {e}")))?;
+    let certs = rustls_pemfile::certs(&mut std::io::BufReader::new(cert_file))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| EtlError::config(format!("failed to parse client_cert_file '{cert_path}': {e}")))?;
+    if certs.is_empty() {
+        return Err(EtlError::config(format!(
+            "client_cert_file '{cert_path}' contained no PEM certificates"
+        )));
+    }
+    let key_file = std::fs::File::open(key_path)
+        .map_err(|e| EtlError::config(format!("failed to open client_key_file '{key_path}': {e}")))?;
+    let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(key_file))
+        .map_err(|e| EtlError::config(format!("failed to parse client_key_file '{key_path}': {e}")))?
+        .ok_or_else(|| EtlError::config(format!("client_key_file '{key_path}' contained no private key")))?;
+    Ok((certs, key))
+}
+
+fn tls_connector(
+    ca_cert_file: Option<&str>,
+    client_cert_file: Option<&str>,
+    client_key_file: Option<&str>,
+) -> Result<MakeRustlsConnect> {
+    // Validate the mTLS pair up front (a pure config check, before touching the
+    // crypto provider): both files, or neither.
+    let client_auth = match (client_cert_file, client_key_file) {
+        (Some(cert), Some(key)) => Some((cert, key)),
+        (None, None) => None,
+        _ => {
+            return Err(EtlError::config(
+                "client_cert_file and client_key_file must be provided together for mTLS",
+            ))
+        }
+    };
     // The process-wide rustls CryptoProvider is installed once, centrally,
     // in sync::run_transfer() — see its doc comment — so every source
     // (including this one) can assume it's already selected by the time
@@ -50,9 +89,16 @@ fn tls_connector(ca_cert_file: Option<&str>) -> Result<MakeRustlsConnect> {
     if let Some(path) = ca_cert_file {
         load_extra_ca_certs(&mut roots, path)?;
     }
-    let config = ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+    let builder = ClientConfig::builder().with_root_certificates(roots);
+    let config = match client_auth {
+        Some((cert, key)) => {
+            let (chain, key_der) = load_client_identity(cert, key)?;
+            builder
+                .with_client_auth_cert(chain, key_der)
+                .map_err(|e| EtlError::config(format!("invalid client certificate/key for mTLS: {e}")))?
+        }
+        None => builder.with_no_client_auth(),
+    };
     Ok(MakeRustlsConnect::new(config))
 }
 
@@ -68,27 +114,38 @@ pub struct PgSource {
     dsn: String,
     statement_timeout_secs: u64,
     ca_cert_file: Option<String>,
+    client_cert_file: Option<String>,
+    client_key_file: Option<String>,
     application_name: String,
 }
 
 impl PgSource {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         dsn: impl Into<String>,
         statement_timeout_secs: u64,
         ca_cert_file: Option<String>,
+        client_cert_file: Option<String>,
+        client_key_file: Option<String>,
         application_name: impl Into<String>,
     ) -> Self {
         Self {
             dsn: dsn.into(),
             statement_timeout_secs,
             ca_cert_file,
+            client_cert_file,
+            client_key_file,
             application_name: application_name.into(),
         }
     }
 
     /// Open a fresh connection. Each parallel COPY stream should use its own.
     pub async fn connect(&self) -> Result<Client> {
-        let tls = tls_connector(self.ca_cert_file.as_deref())?;
+        let tls = tls_connector(
+            self.ca_cert_file.as_deref(),
+            self.client_cert_file.as_deref(),
+            self.client_key_file.as_deref(),
+        )?;
         let (client, connection) = tokio_postgres::connect(&self.dsn, tls).await?;
         // The connection future must be driven for the client to work.
         tokio::spawn(async move {
@@ -428,8 +485,30 @@ OCm3XK2CW4/x+Z55ntrAffyyonL3V3vHIz7fokiz5H+l
     }
 
     #[test]
+    fn tls_connector_requires_client_cert_and_key_together() {
+        // The pair check is a pure config validation (before the crypto
+        // provider is touched), so it holds even in a bare unit test.
+        // `.err().unwrap()` (not `.unwrap_err()`) — the Ok type MakeRustlsConnect
+        // isn't Debug, which `.unwrap_err()` would require.
+        let err = tls_connector(None, Some("/x/cert.pem"), None).err().unwrap().to_string();
+        assert!(err.contains("must be provided together"), "{err}");
+        let err = tls_connector(None, None, Some("/x/key.pem")).err().unwrap().to_string();
+        assert!(err.contains("must be provided together"), "{err}");
+    }
+
+    #[test]
+    fn tls_connector_reports_a_missing_client_cert_file() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let err = tls_connector(None, Some("/no/such/cert.pem"), Some("/no/such/key.pem"))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("client_cert_file"), "{err}");
+    }
+
+    #[test]
     fn copy_sql_with_table_and_filters() {
-        let src = PgSource::new("postgresql://x", 0, None, "quickhouse");
+        let src = PgSource::new("postgresql://x", 0, None, None, None, "quickhouse");
         let part = Partition {
             label: "r0".into(),
             predicate: Some("\"id\" >= 1 AND \"id\" <= 100".into()),
@@ -453,7 +532,7 @@ OCm3XK2CW4/x+Z55ntrAffyyonL3V3vHIz7fokiz5H+l
 
     #[test]
     fn copy_sql_applies_column_transform_expr() {
-        let src = PgSource::new("postgresql://x", 0, None, "quickhouse");
+        let src = PgSource::new("postgresql://x", 0, None, None, None, "quickhouse");
         let part = Partition {
             label: "all".into(),
             predicate: None,
@@ -476,7 +555,7 @@ OCm3XK2CW4/x+Z55ntrAffyyonL3V3vHIz7fokiz5H+l
 
     #[test]
     fn copy_sql_keyset_adds_cursor_and_order_limit() {
-        let src = PgSource::new("postgresql://x", 0, None, "quickhouse");
+        let src = PgSource::new("postgresql://x", 0, None, None, None, "quickhouse");
         let part = Partition {
             label: "all".into(),
             predicate: None,

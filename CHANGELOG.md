@@ -9,6 +9,15 @@ any breaking change is called out explicitly.
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-07-27
+
+### Added
+- mTLS (client-certificate auth) for the PostgreSQL and MySQL sources: set
+  `client_cert_file` + `client_key_file` together on `Postgres`/`MySQL`
+  (Postgres via rustls `with_client_auth_cert`; MySQL via mysql_async
+  `ClientIdentity`). Additive; omitting them keeps the prior no-client-auth
+  behavior. Passing only one is a clear config error.
+
 ## [0.9.0] - 2026-07-27
 
 ### Added
@@ -190,7 +199,8 @@ any breaking change is called out explicitly.
 - Initial release: parallel, bounded-memory PostgreSQL → ClickHouse transfer with
   automatic DDL, full-refresh and incremental modes, and type mapping.
 
-[Unreleased]: https://github.com/mmirzafahmi/quickhouse/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/mmirzafahmi/quickhouse/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/mmirzafahmi/quickhouse/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/mmirzafahmi/quickhouse/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/mmirzafahmi/quickhouse/compare/v0.7.2...v0.8.0
 [0.7.2]: https://github.com/mmirzafahmi/quickhouse/compare/v0.7.1...v0.7.2

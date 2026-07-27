@@ -123,12 +123,14 @@ struct Postgres {
     dsn: String,
     statement_timeout_secs: u64,
     ca_cert_file: Option<String>,
+    client_cert_file: Option<String>,
+    client_key_file: Option<String>,
 }
 
 #[pymethods]
 impl Postgres {
     #[new]
-    #[pyo3(signature = (dsn=None, *, host=None, port=None, user=None, password=None, database=None, statement_timeout_secs=0, ca_cert_file=None))]
+    #[pyo3(signature = (dsn=None, *, host=None, port=None, user=None, password=None, database=None, statement_timeout_secs=0, ca_cert_file=None, client_cert_file=None, client_key_file=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         dsn: Option<String>,
@@ -139,12 +141,16 @@ impl Postgres {
         database: Option<String>,
         statement_timeout_secs: u64,
         ca_cert_file: Option<String>,
+        client_cert_file: Option<String>,
+        client_key_file: Option<String>,
     ) -> PyResult<Self> {
         let dsn = resolve_dsn("postgresql", "Postgres", dsn, host, port, user, password, database)?;
         Ok(Postgres {
             dsn,
             statement_timeout_secs,
             ca_cert_file,
+            client_cert_file,
+            client_key_file,
         })
     }
 
@@ -161,12 +167,14 @@ struct MySQL {
     statement_timeout_secs: u64,
     ca_cert_file: Option<String>,
     require_tls: bool,
+    client_cert_file: Option<String>,
+    client_key_file: Option<String>,
 }
 
 #[pymethods]
 impl MySQL {
     #[new]
-    #[pyo3(signature = (dsn=None, *, host=None, port=None, user=None, password=None, database=None, statement_timeout_secs=0, ca_cert_file=None, require_tls=false))]
+    #[pyo3(signature = (dsn=None, *, host=None, port=None, user=None, password=None, database=None, statement_timeout_secs=0, ca_cert_file=None, require_tls=false, client_cert_file=None, client_key_file=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         dsn: Option<String>,
@@ -178,6 +186,8 @@ impl MySQL {
         statement_timeout_secs: u64,
         ca_cert_file: Option<String>,
         require_tls: bool,
+        client_cert_file: Option<String>,
+        client_key_file: Option<String>,
     ) -> PyResult<Self> {
         let dsn = resolve_dsn("mysql", "MySQL", dsn, host, port, user, password, database)?;
         Ok(MySQL {
@@ -185,6 +195,8 @@ impl MySQL {
             statement_timeout_secs,
             ca_cert_file,
             require_tls,
+            client_cert_file,
+            client_key_file,
         })
     }
 
@@ -443,12 +455,16 @@ impl From<AnySource> for core::SourceConfig {
                 dsn: p.dsn,
                 statement_timeout_secs: p.statement_timeout_secs,
                 ca_cert_file: p.ca_cert_file,
+                client_cert_file: p.client_cert_file,
+                client_key_file: p.client_key_file,
             }),
             AnySource::MySQL(m) => core::SourceConfig::MySql(core::MySqlConfig {
                 dsn: m.dsn,
                 statement_timeout_secs: m.statement_timeout_secs,
                 ca_cert_file: m.ca_cert_file,
                 require_tls: m.require_tls,
+                client_cert_file: m.client_cert_file,
+                client_key_file: m.client_key_file,
             }),
             AnySource::BigQuery(b) => core::SourceConfig::BigQuery(core::BigQueryConfig {
                 project_id: b.project_id,

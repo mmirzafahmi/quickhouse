@@ -395,6 +395,8 @@ async fn run_transfer_impl(
             pg.dsn.clone(),
             pg.statement_timeout_secs,
             pg.ca_cert_file.clone(),
+            pg.client_cert_file.clone(),
+            pg.client_key_file.clone(),
             cfg.application_name.clone(),
         )),
         SourceConfig::MySql(my) => Source::MySql(MySqlSource::new(
@@ -402,6 +404,8 @@ async fn run_transfer_impl(
             my.statement_timeout_secs,
             my.ca_cert_file.clone(),
             my.require_tls,
+            my.client_cert_file.clone(),
+            my.client_key_file.clone(),
         )),
         SourceConfig::BigQuery(_) => unreachable!("handled via early return above"),
         SourceConfig::CleverTap(_) | SourceConfig::AppsFlyer(_) => {

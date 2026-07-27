@@ -36,10 +36,14 @@ class Postgres:
         database: Optional[str] = None,
         statement_timeout_secs: int = 0,
         ca_cert_file: Optional[str] = None,
+        client_cert_file: Optional[str] = None,
+        client_key_file: Optional[str] = None,
     ) -> None:
         """Pass either ``dsn`` or discrete ``host``/``port``/``user``/
         ``password``/``database`` fields (not both). The discrete fields are
-        percent-encoded and assembled into a DSN."""
+        percent-encoded and assembled into a DSN. For mTLS (client-certificate
+        auth), set ``client_cert_file`` and ``client_key_file`` together (both
+        PEM)."""
         ...
 
 class MySQL:
@@ -72,10 +76,14 @@ class MySQL:
         statement_timeout_secs: int = 0,
         ca_cert_file: Optional[str] = None,
         require_tls: bool = False,
+        client_cert_file: Optional[str] = None,
+        client_key_file: Optional[str] = None,
     ) -> None:
         """Pass either ``dsn`` or discrete ``host``/``port``/``user``/
         ``password``/``database`` fields (not both). The discrete fields are
-        percent-encoded and assembled into a DSN."""
+        percent-encoded and assembled into a DSN. For mTLS (client-certificate
+        auth), set ``client_cert_file`` and ``client_key_file`` together (DER or
+        PEM)."""
         ...
 
 class BigQuery:

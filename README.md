@@ -379,11 +379,11 @@ Arrays and composite (`RECORD`/`STRUCT`) types aren't supported yet.
 
 ## Limitations
 
-- **mTLS** (client-certificate auth) isn't supported yet; server TLS is,
-  including an extra CA file via `ca_cert_file=...` for providers like AWS RDS.
-  (Connect with either a DSN string or discrete `host`/`port`/`user`/`password`/
-  `database` fields; BigQuery accepts `credentials_file`, inline
-  `credentials_json`, or ADC.)
+- **Auth**: connect with a DSN string or discrete `host`/`port`/`user`/
+  `password`/`database` fields; add a private CA via `ca_cert_file=...` (e.g. AWS
+  RDS), or client-certificate **mTLS** via `client_cert_file=...` +
+  `client_key_file=...` (Postgres and MySQL). BigQuery accepts `credentials_file`,
+  inline `credentials_json`, or ADC.
 - **Array / composite types** aren't mapped yet.
 - **BigQuery as a source** reads through a single connection — `parallelism`
   becomes a server-side hint rather than true client-side fan-out (a limitation
