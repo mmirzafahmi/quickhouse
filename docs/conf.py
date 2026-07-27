@@ -122,6 +122,7 @@ html_title = f"quickhouse {release}"
 html_static_path = ["_static"]
 templates_path = ["_templates"]     # _templates/page.html adds the Console top nav
 html_css_files = ["quickhouse-console.css"]
+html_js_files = ["quickhouse-console.js"]   # live copy buttons on the hero
 html_favicon = "_static/favicon.svg"
 # Furo renders the syntax itself; the Console theme's tokens (colors, fonts,
 # both schemes) live in _static/quickhouse-console.css as one source of truth.

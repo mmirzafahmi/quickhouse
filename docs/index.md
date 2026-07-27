@@ -29,12 +29,13 @@ sd_hide_title: true
   <div class="qh-panel">
     <div class="qh-panel__tabs">
       <nav>
-        <span aria-selected="true">full refresh</span>
-        <span>incremental</span>
-        <span>CLI</span>
+        <span data-tab="full" aria-selected="true">full refresh</span>
+        <span data-tab="incremental">incremental</span>
+        <span data-tab="cli">CLI</span>
       </nav>
       <span>copy</span>
     </div>
+    <div class="qh-tabpanel" data-panel="full">
 <pre><span class="k">import</span> quickhouse
 
 src = quickhouse.<span class="nc">Postgres</span>(<span class="s">"postgresql://user:pw@host:5432/shop"</span>)
@@ -44,10 +45,46 @@ dst = quickhouse.<span class="nc">ClickHouse</span>(<span class="s">"http://loca
 result = quickhouse.<span class="nc">sync</span>(src, dst,
     dest_table=<span class="s">"orders"</span>, source_table=<span class="s">"orders"</span>,
     key=[<span class="s">"id"</span>])</pre>
-    <div class="qh-result">
-      <div>→ TransferResult</div>
-      <div>rows_read=<b>1_000_000</b>  rows_written=<b>1_000_000</b></div>
-      <div>duration_secs=<em>4.31</em>  new_watermark=None</div>
+      <div class="qh-result">
+        <div>→ TransferResult</div>
+        <div>rows_read=<b>1_000_000</b>  rows_written=<b>1_000_000</b></div>
+        <div>duration_secs=<em>4.31</em>  new_watermark=None</div>
+      </div>
+    </div>
+    <div class="qh-tabpanel" data-panel="incremental" hidden>
+<pre><span class="k">import</span> quickhouse
+
+src = quickhouse.<span class="nc">Postgres</span>(<span class="s">"postgresql://user:pw@host:5432/shop"</span>)
+dst = quickhouse.<span class="nc">ClickHouse</span>(<span class="s">"http://localhost:8123"</span>, database=<span class="s">"analytics"</span>)
+
+result = quickhouse.<span class="nc">sync</span>(src, dst,
+    dest_table=<span class="s">"orders"</span>, source_table=<span class="s">"orders"</span>,
+    mode=<span class="s">"incremental"</span>, watermark=<span class="s">"updated_at"</span>, key=[<span class="s">"id"</span>])</pre>
+      <div class="qh-result">
+        <div>→ TransferResult <span class="c"># only new rows — re-running is a no-op</span></div>
+        <div>rows_read=<b>12_480</b>  rows_written=<b>12_480</b></div>
+        <div>duration_secs=<em>0.19</em>  new_watermark=<b>"2026-07-27T14:30:00Z"</b></div>
+      </div>
+    </div>
+    <div class="qh-tabpanel" data-panel="cli" hidden>
+<pre><span class="c"># job.toml — drive a sync from cron/CI, no Python</span>
+[source]
+type = <span class="s">"postgres"</span>
+dsn  = <span class="s">"${PG_DSN}"</span>
+
+[target]
+type     = <span class="s">"clickhouse"</span>
+url      = <span class="s">"http://localhost:8123"</span>
+database = <span class="s">"analytics"</span>
+
+[sync]
+dest_table   = <span class="s">"orders"</span>
+source_table = <span class="s">"orders"</span>
+key          = [<span class="s">"id"</span>]</pre>
+      <div class="qh-result">
+        <div>$ quickhouse run job.toml</div>
+        <div>→ TransferResult rows_written=<b>1_000_000</b>  duration_secs=<em>4.31</em></div>
+      </div>
     </div>
   </div>
 </div>
