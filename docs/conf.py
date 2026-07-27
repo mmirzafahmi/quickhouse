@@ -121,9 +121,118 @@ html_theme = "furo"
 html_title = f"quickhouse {release}"
 html_static_path = ["_static"]
 html_css_files = ["custom.css"]
+html_favicon = "_static/favicon.svg"
+# Pygments is a fallback only — custom.css overrides the token colors per scheme
+# to match the Console syntax palette exactly.
 pygments_style = "friendly"
-pygments_dark_style = "monokai"
+pygments_dark_style = "github-dark"
+
+# ---------------------------------------------------------------------------
+# "Console" design system — one theme, two schemes (light 2a / dark 1b).
+# Space Grotesk + JetBrains Mono; deep-teal links on light, neon on dark, gold
+# as the secondary. Furo's standard tokens carry structure; the --qh-* tokens
+# carry the Console-specific accents and are consumed by custom.css.
+# ---------------------------------------------------------------------------
+_FONTS = {
+    "--font-stack": "'Space Grotesk', system-ui, -apple-system, sans-serif",
+    "--font-stack--monospace": "'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, monospace",
+}
+
+_LIGHT_VARS = {
+    **_FONTS,
+    # brand / structure
+    "--color-brand-primary": "#0b8f74",
+    "--color-brand-content": "#0b8f74",
+    "--color-brand-visited": "#0b8f74",
+    "--color-background-primary": "#fcfdfc",
+    "--color-background-secondary": "#f7faf9",
+    "--color-background-hover": "#eff4f2",
+    "--color-background-border": "#e4eae7",
+    "--color-foreground-primary": "#0f1614",
+    "--color-foreground-secondary": "#4c5b55",
+    "--color-foreground-muted": "#66776f",
+    "--color-foreground-border": "#d7e0dc",
+    "--color-sidebar-background": "#f9fbfa",
+    "--color-inline-code-background": "#eef4f1",
+    "--color-api-name": "#0b8f74",
+    "--color-api-pre-name": "#a06b00",
+    "--color-highlight-on-target": "rgba(46, 230, 176, 0.20)",
+    "--color-admonition-title--note": "#0b8f74",
+    "--color-admonition-title-background--note": "rgba(46, 230, 176, 0.10)",
+    # Console accents
+    "--qh-neon": "#2ee6b0",
+    "--qh-gold": "#d4b400",
+    "--qh-eyebrow": "#0b8f74",
+    "--qh-ink": "#0f1614",
+    "--qh-muted": "#66776f",
+    "--qh-faint": "#8a978f",
+    "--qh-border": "#e4eae7",
+    "--qh-panel-bg": "#f7faf9",
+    "--qh-code-bg": "#ffffff",
+    "--qh-code-header-bg": "#eff4f2",
+    "--qh-chip-border": "#e0e7e4",
+    "--qh-btn-bg": "#0f1614",
+    "--qh-btn-fg": "#fcfdfc",
+    "--qh-on-neon": "#04120e",
+    "--qh-exp-bg": "#fdf8e6",
+    "--qh-exp-border": "#e6d9a8",
+    "--qh-exp-fg": "#8a6d10",
+    # syntax
+    "--qh-c-name": "#a06b00",
+    "--qh-c-str": "#0b8f74",
+    "--qh-c-kw": "#8a978f",
+    "--qh-c-num": "#6d5ae0",
+    "--qh-c-com": "#8a978f",
+}
+_DARK_VARS = {
+    **_FONTS,
+    "--color-brand-primary": "#2ee6b0",
+    "--color-brand-content": "#2ee6b0",
+    "--color-brand-visited": "#2ee6b0",
+    "--color-background-primary": "#0b100f",
+    "--color-background-secondary": "#12201b",
+    "--color-background-hover": "#1a2422",
+    "--color-background-border": "#24312d",
+    "--color-foreground-primary": "#e4efea",
+    "--color-foreground-secondary": "#9fb2ab",
+    "--color-foreground-muted": "#7f918b",
+    "--color-foreground-border": "#2d3a35",
+    "--color-sidebar-background": "#0e1413",
+    "--color-inline-code-background": "#12201b",
+    "--color-api-name": "#2ee6b0",
+    "--color-api-pre-name": "#ffe94a",
+    "--color-highlight-on-target": "rgba(255, 233, 74, 0.14)",
+    "--color-admonition-title--note": "#2ee6b0",
+    "--color-admonition-title-background--note": "rgba(46, 230, 176, 0.12)",
+    "--qh-neon": "#2ee6b0",
+    "--qh-gold": "#ffe94a",
+    "--qh-eyebrow": "#2ee6b0",
+    "--qh-ink": "#e4efea",
+    "--qh-muted": "#9fb2ab",
+    "--qh-faint": "#7f918b",
+    "--qh-border": "#24312d",
+    "--qh-panel-bg": "#12201b",
+    "--qh-code-bg": "#0f1a17",
+    "--qh-code-header-bg": "#131c19",
+    "--qh-chip-border": "#2d3a35",
+    "--qh-btn-bg": "#2ee6b0",
+    "--qh-btn-fg": "#04120e",
+    "--qh-on-neon": "#04120e",
+    "--qh-exp-bg": "rgba(255, 233, 74, 0.08)",
+    "--qh-exp-border": "#3d3714",
+    "--qh-exp-fg": "#ffe94a",
+    "--qh-c-name": "#ffe94a",
+    "--qh-c-str": "#2ee6b0",
+    "--qh-c-kw": "#7f918b",
+    "--qh-c-num": "#7fa8ff",
+    "--qh-c-com": "#5f6f69",
+}
+
 html_theme_options = {
+    "light_logo": "logo.svg",
+    "dark_logo": "logo-dark.svg",
+    "light_css_variables": _LIGHT_VARS,
+    "dark_css_variables": _DARK_VARS,
     "source_repository": "https://github.com/mmirzafahmi/quickhouse/",
     "source_branch": "main",
     "source_directory": "docs/",
