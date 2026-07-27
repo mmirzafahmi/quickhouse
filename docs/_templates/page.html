@@ -1,16 +1,19 @@
-{# templates/page.html — Console top nav override for Furo
-   Goes to: docs/_templates/page.html
-   Extends Furo's page.html and injects a header bar above its content area.
-   Requires: templates_path = ["_templates"] in conf.py (Sphinx default already
-   includes this if you set it; add it if missing). #}
+{# docs/_templates/page.html — Atlas shell for Furo.
+   Injects the announcement strip + top nav above Furo's content.
+   Requires templates_path = ["_templates"] in conf.py. #}
 {% extends "!page.html" %}
 
 {% block body %}
+<div class="qh-announce">
+  <b>{{ version }}</b>
+  <span class="qh-announce__sep">/</span>
+  <span>incremental sync now resumes from the last watermark</span>
+  <a href="{{ pathto('changelog') }}">read &rarr;</a>
+</div>
 <div class="qh-topnav">
   <a class="qh-topnav__brand" href="{{ pathto(root_doc) }}">
     <img src="{{ pathto('_static/quickhouse-mark.svg', 1) }}" alt="" class="qh-topnav__mark" />
     <span>quickhouse</span>
-    <span class="qh-topnav__version">{{ version }}</span>
   </a>
   <nav class="qh-topnav__links">
     <a href="{{ pathto('guide/sources') }}">Guide</a>
@@ -20,10 +23,11 @@
     <a href="{{ pathto('changelog') }}">Changelog</a>
   </nav>
   <div class="qh-topnav__right">
-    <button type="button" class="qh-topnav__search" onclick="document.querySelector('.sidebar-search')?.focus() || document.querySelector('[name=q]')?.focus()">
-      <span>⌕ Search</span><span class="qh-topnav__kbd">/</span>
+    <button type="button" class="qh-topnav__search"
+            onclick="(document.querySelector('.sidebar-search') || document.querySelector('input[name=q]')).focus()">
+      <span>&#8981; search</span><span>/</span>
     </button>
-    <a href="https://github.com/mmirzafahmi/quickhouse" class="qh-topnav__gh">GitHub ↗</a>
+    <a href="https://github.com/mmirzafahmi/quickhouse" class="qh-topnav__gh">GitHub &#8599;</a>
   </div>
 </div>
 {{ super() }}
