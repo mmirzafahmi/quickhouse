@@ -1,9 +1,7 @@
-/* quickhouse "Console" theme — live hero controls (progressive enhancement).
-   Regular code blocks get their copy button from sphinx-copybutton. This wires
-   the hand-authored hero: the install button, the tab strip
-   (full refresh / incremental / CLI), and the code panel's "copy" label.
-   The authoritative quickhouse-console.css is left untouched — anything visual
-   that CSS can't express (cursor, hidden panels) is set here. */
+/* quickhouse "Console" theme — live hero controls + sync-modes filter
+   (progressive enhancement). Regular code blocks keep sphinx-copybutton.
+   The authoritative quickhouse-console.css is left untouched — anything CSS
+   can't express (cursor, hidden panels/sections) is set here. */
 (function () {
   "use strict";
 
@@ -28,6 +26,7 @@
     }
   }
 
+  // ---- hero code panel: tab strip (full refresh / incremental / CLI) ----
   function selectTab(tab) {
     var panel = tab.closest(".qh-panel");
     if (!panel) return;
@@ -40,8 +39,40 @@
     });
   }
 
+  // ---- sync-modes cards: filter the page to the chosen mode ----
+  // Each card links to a section anchor (#full-refresh, #incremental, ...).
+  // Selecting a card shows that section (and its right-sidebar TOC entry) and
+  // hides the sibling modes'. Sections not referenced by any card (e.g.
+  // "Staging tables") are general and always stay visible.
+  function modeTargets(card) {
+    var href = card.getAttribute("href") || "";
+    if (href.charAt(0) !== "#") return {};
+    var id = decodeURIComponent(href.slice(1));
+    var anchor = document.getElementById(id);
+    var section = anchor ? (anchor.closest("section") || anchor) : null;
+    var tocLink = document.querySelector('.toc-tree a[href="#' + id + '"]');
+    return { section: section, tocItem: tocLink ? tocLink.closest("li") : null };
+  }
+
+  function selectMode(card) {
+    var group = card.closest(".qh-modes");
+    if (!group) return;
+    group.querySelectorAll(".qh-mode").forEach(function (c) {
+      var on = c === card;
+      c.classList.toggle("qh-mode--current", on);
+      c.setAttribute("aria-selected", String(on));
+      var t = modeTargets(c);
+      // toggle both `hidden` and inline display so no theme rule can override it
+      if (t.section) { t.section.hidden = !on; t.section.style.display = on ? "" : "none"; }
+      if (t.tocItem) { t.tocItem.hidden = !on; t.tocItem.style.display = on ? "" : "none"; }
+    });
+  }
+
   // Returns true if the target was one of our controls (so we can preventDefault).
   function activate(target) {
+    var mode = target.closest(".qh-mode");
+    if (mode && mode.closest(".qh-modes")) { selectMode(mode); return true; }
+
     var tab = target.closest("[data-tab]");
     if (tab) { selectTab(tab); return true; }
 
@@ -64,13 +95,13 @@
 
   document.addEventListener("keydown", function (e) {
     if (e.key !== "Enter" && e.key !== " ") return;
-    if (e.target.matches("[data-tab], .qh-panel__tabs > span, [data-clipboard]")) {
+    if (e.target.matches(".qh-mode, [data-tab], .qh-panel__tabs > span, [data-clipboard]")) {
       if (activate(e.target)) e.preventDefault();
     }
   });
 
-  // Make the hand-authored controls read as interactive (keyboard + cursor).
   document.addEventListener("DOMContentLoaded", function () {
+    // hero tab strip + copy label: make them read as interactive
     document
       .querySelectorAll(".qh-panel__tabs [data-tab], .qh-panel__tabs > span")
       .forEach(function (el) {
@@ -78,5 +109,11 @@
         el.setAttribute("role", "button");
         if (!el.hasAttribute("tabindex")) el.setAttribute("tabindex", "0");
       });
+
+    // sync-modes: apply the initial filter (the pre-marked card, else the first)
+    document.querySelectorAll(".qh-modes").forEach(function (group) {
+      var current = group.querySelector(".qh-mode--current") || group.querySelector(".qh-mode");
+      if (current) selectMode(current);
+    });
   });
 })();

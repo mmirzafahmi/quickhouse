@@ -4,11 +4,11 @@
 
 ```{raw} html
 <div class="qh-modes">
-  <a class="qh-mode" href="#full-refresh">
+  <a class="qh-mode qh-mode--current" href="#full-refresh">
     <div class="qh-mode__name">full</div>
     <div class="qh-mode__desc">Reload the whole table, swap it in atomically. The default.</div>
   </a>
-  <a class="qh-mode qh-mode--current" href="#incremental">
+  <a class="qh-mode" href="#incremental">
     <div class="qh-mode__name">incremental</div>
     <div class="qh-mode__desc">Only rows past the watermark. Idempotent; dedup on <code>key</code>.</div>
   </a>
