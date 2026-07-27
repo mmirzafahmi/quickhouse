@@ -137,11 +137,17 @@ impl ClickHouseSink {
     /// doesn't exist yet (`CREATE TABLE IF NOT EXISTS`, so no prior existence
     /// check is needed here, unlike BigQuery's sink).
     pub async fn ensure_state_table(&self, state_table: &str) -> Result<()> {
-        self.execute(&crate::ddl::create_state_table(&self.cfg.database, state_table))
-            .await?;
+        self.execute(&crate::ddl::create_state_table(
+            &self.cfg.database,
+            state_table,
+        ))
+        .await?;
         // Add the chunk-resume columns to a pre-0.5 state table (idempotent).
-        self.execute(&crate::ddl::migrate_state_table(&self.cfg.database, state_table))
-            .await
+        self.execute(&crate::ddl::migrate_state_table(
+            &self.cfg.database,
+            state_table,
+        ))
+        .await
     }
 
     /// Read the last persisted watermark for this `(state_key, dest_table)` pair.

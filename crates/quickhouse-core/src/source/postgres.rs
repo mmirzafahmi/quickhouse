@@ -46,21 +46,35 @@ fn load_client_identity(
     cert_path: &str,
     key_path: &str,
 ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
-    let cert_file = std::fs::File::open(cert_path)
-        .map_err(|e| EtlError::config(format!("failed to open client_cert_file '{cert_path}': {e}")))?;
+    let cert_file = std::fs::File::open(cert_path).map_err(|e| {
+        EtlError::config(format!(
+            "failed to open client_cert_file '{cert_path}': {e}"
+        ))
+    })?;
     let certs = rustls_pemfile::certs(&mut std::io::BufReader::new(cert_file))
         .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| EtlError::config(format!("failed to parse client_cert_file '{cert_path}': {e}")))?;
+        .map_err(|e| {
+            EtlError::config(format!(
+                "failed to parse client_cert_file '{cert_path}': {e}"
+            ))
+        })?;
     if certs.is_empty() {
         return Err(EtlError::config(format!(
             "client_cert_file '{cert_path}' contained no PEM certificates"
         )));
     }
-    let key_file = std::fs::File::open(key_path)
-        .map_err(|e| EtlError::config(format!("failed to open client_key_file '{key_path}': {e}")))?;
+    let key_file = std::fs::File::open(key_path).map_err(|e| {
+        EtlError::config(format!("failed to open client_key_file '{key_path}': {e}"))
+    })?;
     let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(key_file))
-        .map_err(|e| EtlError::config(format!("failed to parse client_key_file '{key_path}': {e}")))?
-        .ok_or_else(|| EtlError::config(format!("client_key_file '{key_path}' contained no private key")))?;
+        .map_err(|e| {
+            EtlError::config(format!("failed to parse client_key_file '{key_path}': {e}"))
+        })?
+        .ok_or_else(|| {
+            EtlError::config(format!(
+                "client_key_file '{key_path}' contained no private key"
+            ))
+        })?;
     Ok((certs, key))
 }
 
@@ -93,9 +107,9 @@ fn tls_connector(
     let config = match client_auth {
         Some((cert, key)) => {
             let (chain, key_der) = load_client_identity(cert, key)?;
-            builder
-                .with_client_auth_cert(chain, key_der)
-                .map_err(|e| EtlError::config(format!("invalid client certificate/key for mTLS: {e}")))?
+            builder.with_client_auth_cert(chain, key_der).map_err(|e| {
+                EtlError::config(format!("invalid client certificate/key for mTLS: {e}"))
+            })?
         }
         None => builder.with_no_client_auth(),
     };
@@ -490,9 +504,15 @@ OCm3XK2CW4/x+Z55ntrAffyyonL3V3vHIz7fokiz5H+l
         // provider is touched), so it holds even in a bare unit test.
         // `.err().unwrap()` (not `.unwrap_err()`) — the Ok type MakeRustlsConnect
         // isn't Debug, which `.unwrap_err()` would require.
-        let err = tls_connector(None, Some("/x/cert.pem"), None).err().unwrap().to_string();
+        let err = tls_connector(None, Some("/x/cert.pem"), None)
+            .err()
+            .unwrap()
+            .to_string();
         assert!(err.contains("must be provided together"), "{err}");
-        let err = tls_connector(None, None, Some("/x/key.pem")).err().unwrap().to_string();
+        let err = tls_connector(None, None, Some("/x/key.pem"))
+            .err()
+            .unwrap()
+            .to_string();
         assert!(err.contains("must be provided together"), "{err}");
     }
 

@@ -144,7 +144,16 @@ impl Postgres {
         client_cert_file: Option<String>,
         client_key_file: Option<String>,
     ) -> PyResult<Self> {
-        let dsn = resolve_dsn("postgresql", "Postgres", dsn, host, port, user, password, database)?;
+        let dsn = resolve_dsn(
+            "postgresql",
+            "Postgres",
+            dsn,
+            host,
+            port,
+            user,
+            password,
+            database,
+        )?;
         Ok(Postgres {
             dsn,
             statement_timeout_secs,

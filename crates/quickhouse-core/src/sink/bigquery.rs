@@ -1441,9 +1441,18 @@ mod tests {
         );
         // A custom state-table name flows through (C1 configurable internals).
         let custom = build_persist_watermark_sql(
-            "proj", "ds", "wh_state", "orders", "orders_dest", "2024-06-01", 1,
+            "proj",
+            "ds",
+            "wh_state",
+            "orders",
+            "orders_dest",
+            "2024-06-01",
+            1,
         );
-        assert!(custom.starts_with("INSERT INTO `proj`.`ds`.`wh_state`"), "{custom}");
+        assert!(
+            custom.starts_with("INSERT INTO `proj`.`ds`.`wh_state`"),
+            "{custom}"
+        );
         assert!(
             sql.contains("VALUES ('orders', 'orders_dest', '2024-06-01', 42, CURRENT_TIMESTAMP())"),
             "{sql}"
@@ -1455,8 +1464,15 @@ mod tests {
         // GoogleSQL doesn't recognize the ANSI doubled-quote escape ('') at
         // all — only a backslash-escaped quote (\') is valid, so this must
         // NOT double the quote like the Postgres/ClickHouse/MySQL sinks do.
-        let sql =
-            build_persist_watermark_sql("p", "d", "_quickhouse_state", "o'brien", "dest", "it's here", 1);
+        let sql = build_persist_watermark_sql(
+            "p",
+            "d",
+            "_quickhouse_state",
+            "o'brien",
+            "dest",
+            "it's here",
+            1,
+        );
         assert!(sql.contains(r"'o\'brien'"), "{sql}");
         assert!(sql.contains(r"'it\'s here'"), "{sql}");
     }
@@ -1466,7 +1482,8 @@ mod tests {
         // Regression test: a trailing backslash must not swallow the
         // literal's closing quote (`'ends_with_backslash\'` is an unclosed
         // string in GoogleSQL) — backslash has to be escaped first.
-        let sql = build_persist_watermark_sql("p", "d", "_quickhouse_state", r"a\b", "dest", "wm", 1);
+        let sql =
+            build_persist_watermark_sql("p", "d", "_quickhouse_state", r"a\b", "dest", "wm", 1);
         assert!(sql.contains(r"'a\\b'"), "{sql}");
     }
 
