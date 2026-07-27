@@ -32,7 +32,7 @@ classifiers = [
 [project.urls]
 Homepage = "https://github.com/mmirzafahmi/quickhouse"
 Repository = "https://github.com/mmirzafahmi/quickhouse"
-Documentation = "https://github.com/mmirzafahmi/quickhouse#readme"
+Documentation = "https://quickhouse.readthedocs.io"
 Changelog = "https://github.com/mmirzafahmi/quickhouse/blob/main/CHANGELOG.md"
 Issues = "https://github.com/mmirzafahmi/quickhouse/issues"
 

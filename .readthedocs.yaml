@@ -1,0 +1,24 @@
+# Read the Docs build configuration.
+# https://docs.readthedocs.io/en/stable/config-file/v2.html
+#
+# The docs do NOT build the Rust extension: docs/conf.py materializes the
+# public API from the .pyi type stub as a pure-Python shim, so the build needs
+# only Python + the Sphinx toolchain. Fast, and no Rust toolchain required.
+version: 2
+
+build:
+  os: ubuntu-24.04
+  tools:
+    python: "3.12"
+
+sphinx:
+  configuration: docs/conf.py
+  fail_on_warning: true
+
+python:
+  install:
+    - requirements: docs/requirements.txt
+
+# Only the HTML site is built. PDF/epub are omitted because the feature-matrix
+# tables use emoji (✅), which the LaTeX/PDF builder can't render without extra
+# font configuration. Add `formats: [pdf, epub]` once that's set up if wanted.

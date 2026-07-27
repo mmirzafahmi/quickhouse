@@ -1,0 +1,9 @@
+# Documentation build dependencies (Read the Docs installs these).
+# The quickhouse package itself is NOT installed: conf.py builds a pure-Python
+# shim from the .pyi stub, so no Rust toolchain or compiled extension is needed.
+sphinx>=7.3
+furo>=2024.5.6
+myst-parser>=3.0
+sphinx-copybutton>=0.5.2
+sphinx-design>=0.6
+linkify-it-py>=2.0

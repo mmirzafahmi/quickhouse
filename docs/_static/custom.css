@@ -1,0 +1,16 @@
+/* quickhouse docs — light touch-ups on top of the Furo theme. */
+
+/* Tighten the feature/grid cards on the landing page. */
+.sd-card {
+  border-radius: 0.5rem;
+}
+
+/* Make the wide parameter tables scroll instead of overflowing on narrow screens. */
+.table-wrapper {
+  overflow-x: auto;
+}
+
+/* Slightly roomier code blocks. */
+div.highlight pre {
+  padding: 0.8rem 1rem;
+}

@@ -23,6 +23,11 @@ python/quickhouse/*.pyd
 python/quickhouse/_quickhouse*.so
 python/quickhouse/_quickhouse*.pyd
 
+# Docs (Sphinx build output + the generated pure-Python shim, see docs/conf.py)
+docs/_build/
+docs/_shim/
+docs/LICENSE
+
 # Editor / OS
 .idea/
 .vscode/
