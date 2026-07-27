@@ -146,13 +146,15 @@ Application Default Credentials. As a **destination** it also takes
 `write_method`: the default `"insert_all"` (simple, proven) or the opt-in
 `"storage_write"` (the gRPC Storage Write API — free and higher-throughput).
 
-### HTTP API sources — CleverTap & AppsFlyer
+### HTTP API sources — CleverTap, AppsFlyer & generic HTTP
 
-These pull directly from the vendor APIs into either destination (BigQuery or
-ClickHouse). API data has no catalog, so you **declare the schema**: each
-column's name, its BigQuery-style type, and — for CleverTap's nested event JSON
-— a dotted path into the record. The declared type drives the destination table;
-the watermark's `from`/`to` date window drives incremental pulls.
+These pull directly from HTTP APIs into either destination (BigQuery or
+ClickHouse): purpose-built `CleverTap` and `AppsFlyer` sources, plus a generic
+`HttpApi` source for any other REST/JSON or CSV endpoint. API data has no
+catalog, so you **declare the schema**: each column's name, its BigQuery-style
+type, and — for nested JSON — a dotted path into the record. The declared type
+drives the destination table; the watermark's `from`/`to` date window drives
+incremental pulls.
 
 ```python
 # CleverTap Data Export API (events) -> BigQuery.
@@ -184,6 +186,21 @@ qh.sync(
     ),
     qh.BigQuery("my-gcp-project", dataset_id="analytics"),
     dest_table="af_installs", mode="full",
+)
+
+# Generic HTTP source — any REST/JSON or CSV endpoint. Auth goes in headers;
+# records_path locates the JSON array; cursor pagination is optional.
+qh.sync(
+    qh.HttpApi(
+        "https://api.example.com/v1/events?since={from}",
+        columns=[("id", "INTEGER"), ("ts", "TIMESTAMP"), ("name", "STRING", "attrs.name")],
+        headers={"Authorization": "Bearer ..."},
+        records_path="data.items",                 # JSON array location
+        next_cursor_path="paging.next", cursor_param="cursor",   # follow the cursor
+        from_date="2026-07-01",
+    ),
+    qh.ClickHouse("http://localhost:8123", database="analytics"),  # or BigQuery
+    dest_table="events", mode="incremental", watermark="ts", key=["id"],
 )
 ```
 

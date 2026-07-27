@@ -446,8 +446,100 @@ impl AppsFlyer {
     }
 }
 
-/// Accepts `Postgres`, `MySQL`, `BigQuery`, `CleverTap`, or `AppsFlyer` as
-/// `sync()`'s `source` argument.
+/// Generic HTTP/REST or CSV API source (BigQuery or ClickHouse destination).
+///
+/// Issues a `GET`/`POST` to `url` with the given `headers` (put auth here), then
+/// parses the response as JSON (`format="json"`, with `records_path` locating
+/// the records array) or CSV (`format="csv"`). `{from}`/`{to}` in `url`/`body`
+/// are replaced with the window dates. For cursor pagination, set
+/// `next_cursor_path` (where the next cursor is in the JSON response) and
+/// `cursor_param` (the query param to send it back as). Declare the output
+/// schema via `columns` (same forms as `CleverTap`).
+#[pyclass]
+#[derive(Clone)]
+struct HttpApi {
+    url: String,
+    method: String,
+    headers: HashMap<String, String>,
+    body: Option<String>,
+    format: core::HttpFormat,
+    next_cursor_path: Option<String>,
+    cursor_param: Option<String>,
+    state_id: Option<String>,
+    columns: Vec<core::ApiColumn>,
+    from_date: Option<String>,
+    to_date: Option<String>,
+    lookback_days: u32,
+}
+
+#[pymethods]
+impl HttpApi {
+    #[new]
+    #[pyo3(signature = (url, columns, *, method="GET".to_string(), headers=None, body=None, format="json".to_string(), records_path=None, next_cursor_path=None, cursor_param=None, state_id=None, from_date=None, to_date=None, lookback_days=0, paths=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        url: String,
+        columns: &Bound<'_, PyAny>,
+        method: String,
+        headers: Option<HashMap<String, String>>,
+        body: Option<String>,
+        format: String,
+        records_path: Option<String>,
+        next_cursor_path: Option<String>,
+        cursor_param: Option<String>,
+        state_id: Option<String>,
+        from_date: Option<String>,
+        to_date: Option<String>,
+        lookback_days: u32,
+        paths: Option<HashMap<String, String>>,
+    ) -> PyResult<Self> {
+        let columns = parse_columns(columns, paths)?;
+        let format = match format.to_ascii_lowercase().as_str() {
+            "json" => core::HttpFormat::Json { records_path },
+            "csv" => core::HttpFormat::Csv,
+            other => {
+                return Err(PyRuntimeError::new_err(format!(
+                    "invalid format {other:?}; expected 'json' or 'csv'"
+                )))
+            }
+        };
+        match (&next_cursor_path, &cursor_param) {
+            (Some(_), Some(_)) | (None, None) => {}
+            _ => {
+                return Err(PyRuntimeError::new_err(
+                    "next_cursor_path and cursor_param must be set together for cursor pagination",
+                ))
+            }
+        }
+        Ok(HttpApi {
+            url,
+            method,
+            headers: headers.unwrap_or_default(),
+            body,
+            format,
+            next_cursor_path,
+            cursor_param,
+            state_id,
+            columns,
+            from_date,
+            to_date,
+            lookback_days,
+        })
+    }
+
+    fn __repr__(&self) -> String {
+        // headers may carry auth — never echo them.
+        format!(
+            "HttpApi(url={:?}, method={:?}, columns={}, headers=***)",
+            self.url,
+            self.method,
+            self.columns.len()
+        )
+    }
+}
+
+/// Accepts `Postgres`, `MySQL`, `BigQuery`, `CleverTap`, `AppsFlyer`, or
+/// `HttpApi` as `sync()`'s `source` argument.
 #[derive(FromPyObject)]
 enum AnySource {
     Postgres(Postgres),
@@ -455,6 +547,7 @@ enum AnySource {
     BigQuery(BigQuery),
     CleverTap(CleverTap),
     AppsFlyer(AppsFlyer),
+    HttpApi(HttpApi),
 }
 
 impl From<AnySource> for core::SourceConfig {
@@ -502,6 +595,20 @@ impl From<AnySource> for core::SourceConfig {
                 from_date: a.from_date,
                 to_date: a.to_date,
                 lookback_days: a.lookback_days,
+            }),
+            AnySource::HttpApi(h) => core::SourceConfig::HttpApi(core::HttpApiConfig {
+                url: h.url,
+                method: h.method,
+                headers: h.headers,
+                body: h.body,
+                format: h.format,
+                next_cursor_path: h.next_cursor_path,
+                cursor_param: h.cursor_param,
+                state_id: h.state_id,
+                columns: h.columns,
+                from_date: h.from_date,
+                to_date: h.to_date,
+                lookback_days: h.lookback_days,
             }),
         }
     }
@@ -963,6 +1070,7 @@ fn _quickhouse(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<BigQuery>()?;
     m.add_class::<CleverTap>()?;
     m.add_class::<AppsFlyer>()?;
+    m.add_class::<HttpApi>()?;
     m.add_class::<ClickHouse>()?;
     m.add_class::<S3Archive>()?;
     m.add_class::<Progress>()?;

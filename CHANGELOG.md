@@ -9,6 +9,18 @@ any breaking change is called out explicitly.
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-07-27
+
+### Added
+- A generic **`HttpApi`** source for arbitrary REST/JSON or CSV endpoints (the
+  config-driven complement to the purpose-built CleverTap/AppsFlyer sources):
+  GET/POST with caller-supplied headers (auth), `{from}`/`{to}` date
+  substitution in the URL/body, JSON (records array at a dotted `records_path`)
+  or CSV bodies, and optional cursor pagination (`next_cursor_path` +
+  `cursor_param`). Writes to BigQuery or ClickHouse; declared-schema columns and
+  the incremental/append/lookback machinery are shared with the other API
+  sources.
+
 ## [0.11.0] - 2026-07-27
 
 ### Added
@@ -208,7 +220,8 @@ any breaking change is called out explicitly.
 - Initial release: parallel, bounded-memory PostgreSQL → ClickHouse transfer with
   automatic DDL, full-refresh and incremental modes, and type mapping.
 
-[Unreleased]: https://github.com/mmirzafahmi/quickhouse/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/mmirzafahmi/quickhouse/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/mmirzafahmi/quickhouse/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/mmirzafahmi/quickhouse/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/mmirzafahmi/quickhouse/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/mmirzafahmi/quickhouse/compare/v0.8.0...v0.9.0

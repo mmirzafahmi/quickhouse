@@ -270,6 +270,66 @@ class AppsFlyer:
         base_url: str = "https://hq1.appsflyer.com",
     ) -> None: ...
 
+class HttpApi:
+    """Generic HTTP/REST or CSV API source. Writes to BigQuery or ClickHouse.
+
+    The config-driven escape hatch for arbitrary endpoints (the ``CleverTap`` /
+    ``AppsFlyer`` classes are purpose-built). Issues a ``GET``/``POST`` to
+    ``url`` with ``headers`` (put auth here — they're never logged or echoed in
+    ``repr``), then parses the response as JSON or CSV.
+
+    Parameters
+    ----------
+    url:
+        Endpoint. ``{from}`` / ``{to}`` are replaced with the window's date
+        bounds (also substituted in ``body``).
+    columns:
+        Declared output schema — same forms as :class:`CleverTap` (``(name,
+        bq_type[, path])`` tuples or a ``{name: bq_type}`` dict; ``paths=`` maps
+        column → dotted path into each record).
+    method:
+        ``"GET"`` (default) or ``"POST"``.
+    headers:
+        Request headers, e.g. ``{"Authorization": "Bearer …"}``.
+    body:
+        Request body for ``POST`` (``{from}``/``{to}`` substituted).
+    format:
+        ``"json"`` (default) or ``"csv"``. For JSON, ``records_path`` is a dotted
+        path to the array of record objects (``None`` = the body itself is the
+        array, or a lone object is one record). CSV is parsed as a header row +
+        data rows.
+    records_path:
+        JSON only — dotted path to the records array (e.g. ``"data.rows"``).
+    next_cursor_path / cursor_param:
+        Cursor pagination (JSON only): the dotted path to the next cursor in the
+        response, and the query-param name to send it back as. Set both to
+        paginate until the cursor is absent; leave both unset for a single
+        request.
+    state_id:
+        Stable identity for the incremental cursor state (defaults to ``url``).
+    from_date / to_date / lookback_days:
+        As for :class:`CleverTap`.
+    """
+
+    def __init__(
+        self,
+        url: str,
+        columns: _ApiColumns,
+        *,
+        method: str = "GET",
+        headers: Optional[Mapping[str, str]] = None,
+        body: Optional[str] = None,
+        format: str = "json",
+        records_path: Optional[str] = None,
+        next_cursor_path: Optional[str] = None,
+        cursor_param: Optional[str] = None,
+        state_id: Optional[str] = None,
+        from_date: Optional[str] = None,
+        to_date: Optional[str] = None,
+        lookback_days: int = 0,
+        paths: Optional[Mapping[str, str]] = None,
+    ) -> None: ...
+
 class ClickHouse:
     """ClickHouse destination connection descriptor.
 
@@ -320,7 +380,7 @@ class TransferResult:
     new_watermark: Optional[str]
 
 def sync(
-    source: Union[Postgres, MySQL, BigQuery, CleverTap, AppsFlyer],
+    source: Union[Postgres, MySQL, BigQuery, CleverTap, AppsFlyer, HttpApi],
     target: Union[ClickHouse, BigQuery],
     dest_table: str,
     *,
