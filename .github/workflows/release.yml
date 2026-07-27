@@ -30,6 +30,18 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.9"
+      # quay.io (host of the manylinux build image) intermittently times out.
+      # Warm the image with a few retries so a transient blip doesn't fail the
+      # whole release; maturin-action's own pull right after then hits cache.
+      - name: Pre-pull manylinux image (retry transient registry errors)
+        run: |
+          image=quay.io/pypa/manylinux2014_x86_64:latest
+          for attempt in 1 2 3 4 5; do
+            if docker pull "$image"; then exit 0; fi
+            echo "::warning::docker pull $image failed (attempt $attempt/5); retrying..."
+            sleep $((attempt * 20))
+          done
+          echo "::error::quay.io unreachable after 5 attempts"; exit 1
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
