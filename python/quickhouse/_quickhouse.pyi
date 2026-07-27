@@ -198,7 +198,7 @@ class S3Archive:
     ) -> None: ...
 
 class CleverTap:
-    """CleverTap Data Export API source (events). **BigQuery destination only.**
+    """CleverTap Data Export API source (events). Writes to BigQuery or ClickHouse.
 
     API responses have no catalog, so you *declare* the output schema via
     ``columns`` (a list of ``(name, bq_type)`` / ``(name, bq_type, path)``

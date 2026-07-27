@@ -237,7 +237,6 @@ fn join_result(res: std::result::Result<Result<()>, tokio::task::JoinError>) -> 
     }
 }
 
-
 struct SourceSetup {
     source_cols: Vec<ColumnType>,
     snapshot_max: Option<String>,
@@ -332,9 +331,6 @@ async fn run_transfer_impl(
     // Drop mode-irrelevant fields (e.g. a watermark passed with mode="full")
     // so the config that runs matches what's effective — see normalize().
     cfg.normalize();
-    // API sources write only to BigQuery — reject any other destination with a
-    // clean config error before any client/archive setup.
-    ensure_api_dest_supported(&source_cfg, &dest)?;
     let started = Instant::now();
 
     let source_label = cfg
@@ -898,17 +894,6 @@ async fn run_transfer_bigquery(
 
 /// API sources write only to BigQuery. Reject any other destination up front
 /// with a clear config error.
-fn ensure_api_dest_supported(source_cfg: &SourceConfig, dest: &DestinationConfig) -> Result<()> {
-    if source_cfg.is_api() && !matches!(dest, DestinationConfig::BigQuery(_)) {
-        return Err(EtlError::config(format!(
-            "the {} source only supports a BigQuery destination (got {})",
-            source_cfg.kind(),
-            dest.kind()
-        )));
-    }
-    Ok(())
-}
-
 fn api_columns_of(source_cfg: &SourceConfig) -> &[ApiColumn] {
     match source_cfg {
         SourceConfig::CleverTap(c) => &c.columns,
@@ -1014,9 +999,10 @@ fn warn_coerced_scalars(scope: &str, n: u64) {
     }
 }
 
-/// Transfer from an HTTP API source (CleverTap/AppsFlyer) into BigQuery.
-/// Mirrors `run_transfer_bigquery`'s staging/swap/merge/watermark tail; only the
-/// read side differs — a declared schema + paginated fetch instead of a DB read.
+/// Transfer from an HTTP API source (CleverTap/AppsFlyer) into any destination
+/// (BigQuery or ClickHouse). Mirrors `run_transfer_bigquery`'s
+/// staging/swap/merge/watermark tail; only the read side differs — a declared
+/// schema + paginated fetch instead of a DB read.
 async fn run_transfer_api(
     source_cfg: SourceConfig,
     sink: Sink,
@@ -1031,7 +1017,13 @@ async fn run_transfer_api(
         cfg.state_key = source_cfg.api_state_identity();
     }
     let cols = api_columns_of(&source_cfg).to_vec();
-    seed_api_type_overrides(&mut cfg, &cols)?;
+    // The declared BigQuery type names only make sense for a BigQuery
+    // destination (they seed its exact DDL type). A ClickHouse destination
+    // instead takes its column types from the resolved Arrow/ClickHouse mapping,
+    // so seeding BigQuery names there would produce invalid DDL — skip it.
+    if matches!(sink.dest_kind(), crate::config::DestKind::BigQuery) {
+        seed_api_type_overrides(&mut cfg, &cols)?;
+    }
     let source_cols = resolve_api_columns(&cols)?;
     let plan: SelectPlan = transform::plan(&source_cols, &cfg, sink.dest_kind())?;
 
@@ -2923,31 +2915,6 @@ mod tests {
             to_date: None,
             lookback_days: 0,
         })
-    }
-
-    #[test]
-    fn api_dest_gate_requires_bigquery() {
-        let src = ct_source();
-        let ch = DestinationConfig::ClickHouse(crate::config::ClickHouseConfig {
-            url: "http://x".into(),
-            database: "d".into(),
-            user: "u".into(),
-            password: "".into(),
-            compression: crate::config::Compression::None,
-            s3_archive: None,
-        });
-        assert!(ensure_api_dest_supported(&src, &ch)
-            .unwrap_err()
-            .to_string()
-            .contains("BigQuery"));
-        let bq = DestinationConfig::BigQuery(crate::config::BigQueryDestConfig {
-            project_id: None,
-            credentials_file: None,
-            credentials_json: None,
-            dataset_id: "ds".into(),
-            write_method: crate::config::BigQueryWriteMethod::InsertAll,
-        });
-        assert!(ensure_api_dest_supported(&src, &bq).is_ok());
     }
 
     #[test]

@@ -45,15 +45,14 @@ source↔destination pairs — quickhouse deliberately supports a focused, fast 
 | PostgreSQL | ✅ | ✅ |
 | MySQL | ✅ | ✅ |
 | BigQuery | ✅ | ✅ |
-| CleverTap (HTTP API) | — | ✅ |
-| AppsFlyer (HTTP API) | — | ✅ |
+| CleverTap (HTTP API) | ✅ | ✅ |
+| AppsFlyer (HTTP API) | ✅ | ✅ |
 
 ClickHouse is a destination only; BigQuery is both a source and a destination.
-The HTTP API sources currently write to BigQuery only. Some knobs are
-engine-specific: `column_transforms` / `read_max_rows_per_sec` apply to the
-PostgreSQL and MySQL sources; `merge_prune_partition_by` / `delete_stale_in_window`
-apply to BigQuery-destination incremental syncs; S3 archival applies to ClickHouse
-destinations.
+Some knobs are engine-specific: `column_transforms` / `read_max_rows_per_sec`
+apply to the PostgreSQL and MySQL sources; `merge_prune_partition_by` /
+`delete_stale_in_window` apply to BigQuery-destination incremental syncs; S3
+archival applies to ClickHouse destinations.
 
 ## Why quickhouse
 
@@ -147,13 +146,13 @@ Application Default Credentials. As a **destination** it also takes
 `write_method`: the default `"insert_all"` (simple, proven) or the opt-in
 `"storage_write"` (the gRPC Storage Write API — free and higher-throughput).
 
-### HTTP API sources — CleverTap & AppsFlyer (BigQuery destination only)
+### HTTP API sources — CleverTap & AppsFlyer
 
-These pull directly from the vendor APIs. API data has no catalog, so you
-**declare the schema**: each column's name, its BigQuery type, and — for
-CleverTap's nested event JSON — a dotted path into the record. The declared
-type drives the destination table; the watermark's `from`/`to` date window
-drives incremental pulls.
+These pull directly from the vendor APIs into either destination (BigQuery or
+ClickHouse). API data has no catalog, so you **declare the schema**: each
+column's name, its BigQuery-style type, and — for CleverTap's nested event JSON
+— a dotted path into the record. The declared type drives the destination table;
+the watermark's `from`/`to` date window drives incremental pulls.
 
 ```python
 # CleverTap Data Export API (events) -> BigQuery.

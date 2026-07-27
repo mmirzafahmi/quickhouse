@@ -9,7 +9,16 @@ any breaking change is called out explicitly.
 
 ## [Unreleased]
 
-## [0.10.0] - 2026-07-27
+## [0.11.0] - 2026-07-27
+
+### Added
+- HTTP API sources (CleverTap, AppsFlyer) can now write to a **ClickHouse**
+  destination, not just BigQuery — the transfer flows through the same `Sink`
+  abstraction. (BigQuery-specific type-name seeding is skipped for ClickHouse,
+  which takes its column types from the resolved Arrow/ClickHouse mapping.)
+
+### Removed
+- The API-source "BigQuery destination only" restriction.
 
 ### Added
 - mTLS (client-certificate auth) for the PostgreSQL and MySQL sources: set
@@ -199,7 +208,8 @@ any breaking change is called out explicitly.
 - Initial release: parallel, bounded-memory PostgreSQL → ClickHouse transfer with
   automatic DDL, full-refresh and incremental modes, and type mapping.
 
-[Unreleased]: https://github.com/mmirzafahmi/quickhouse/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/mmirzafahmi/quickhouse/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/mmirzafahmi/quickhouse/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/mmirzafahmi/quickhouse/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/mmirzafahmi/quickhouse/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/mmirzafahmi/quickhouse/compare/v0.7.2...v0.8.0
