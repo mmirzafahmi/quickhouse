@@ -107,15 +107,6 @@ qh.<span class="n">sync</span>(
 </div>
 ```
 
-```{admonition} Status: pre-1.0
-:class: warning
-quickhouse is used against real production data and is covered by an
-integration test suite, but the Python API may still change between minor
-versions before 1.0. Pin a compatible range (e.g. `quickhouse~=0.12`) and watch
-the [changelog](changelog.md). A few knobs are marked *experimental* — those may
-change without a major bump.
-```
-
 ```{raw} html
 <nav class="qh-index" aria-label="Documentation index">
   <div>
