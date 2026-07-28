@@ -116,18 +116,6 @@ the [changelog](changelog.md). A few knobs are marked *experimental* — those m
 change without a major bump.
 ```
 
-## When to use quickhouse
-
-Reach for it when you want to move whole tables — full refresh or incremental —
-from PostgreSQL/MySQL/BigQuery into ClickHouse or BigQuery, fast, from your own
-Python jobs with almost no setup. It fits cron/Airflow/Dagster tasks and one-off
-backfills well.
-
-Look elsewhere when you need in-warehouse SQL transformations (use **dbt**),
-change-data-capture or streaming (use **Debezium/Kafka**), a large catalog of
-SaaS connectors (use **Airbyte / Fivetran / dlt**), or arbitrary
-source↔destination pairs — quickhouse deliberately supports a focused, fast set.
-
 ```{raw} html
 <nav class="qh-index" aria-label="Documentation index">
   <div>
