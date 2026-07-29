@@ -119,7 +119,8 @@ qh.<span class="n">sync</span>(
   <div>
     <h2>User guide</h2>
     <ul>
-      <li><a href="guide/sources.html">Sources &amp; destinations</a></li>
+      <li><a href="guide/sources.html">Sources</a></li>
+      <li><a href="guide/destinations.html">Destinations</a></li>
       <li><a href="guide/sync-modes.html">Sync modes</a></li>
       <li><a href="guide/type-mapping.html">Type mapping</a></li>
       <li><a href="guide/performance.html">Performance &amp; safety</a></li>
@@ -158,6 +159,7 @@ quickstart
 :caption: User guide
 
 guide/sources
+guide/destinations
 guide/sync-modes
 guide/type-mapping
 guide/performance

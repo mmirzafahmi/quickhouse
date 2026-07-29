@@ -42,9 +42,10 @@ key = ["id"]
 `[target]`
 : `clickhouse`, `bigquery`
 
-Any other key in a table maps straight to the matching constructor argument (see
-[Sources & destinations](guide/sources.md) and the [API reference](api.md)). A
-misspelled or missing key produces a clear config error naming the section.
+Any other key in a table maps straight to the matching constructor argument
+(see [Sources](guide/sources.md), [Destinations](guide/destinations.md), and
+the [API reference](api.md)). A misspelled or missing key produces a clear
+config error naming the section.
 
 The `[sync]` table's keys are exactly the keyword arguments of
 {func}`quickhouse.sync`.

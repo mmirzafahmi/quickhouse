@@ -97,8 +97,10 @@ qh.BigQuery("my-gcp-project", dataset_id="analytics")
 
 ## Where to next
 
-- [Sources & destinations](guide/sources.md) — every connection descriptor, auth,
-  and the HTTP API sources.
+- [Sources](guide/sources.md) — every source connection descriptor, auth, and
+  the HTTP API sources.
+- [Destinations](guide/destinations.md) — ClickHouse and BigQuery, the S3
+  archive, and destination DDL.
 - [Sync modes](guide/sync-modes.md) — full vs. incremental, the watermark cursor,
   and backfills.
 - [API reference](api.md) — the complete `sync()` signature.

@@ -1,22 +1,16 @@
-# Sources & destinations
+# Sources
 
 Every transfer is `sync(source, target, ...)`. A **source** is a `Postgres`,
-`MySQL`, `BigQuery`, `CleverTap`, or `AppsFlyer` connection descriptor; a
-**target** is a `ClickHouse` or `BigQuery` one. The same `BigQuery` class works
-in either role. Everything else about the call is identical regardless of which
-engines you use.
+`MySQL`, `BigQuery`, `CleverTap`, or `AppsFlyer` connection descriptor. The same
+`BigQuery` class also works as a [destination](destinations.md); everything
+else about the call is identical regardless of which engines you use.
 
 ```python
 import quickhouse as qh
 
-# sources
 qh.Postgres("postgresql://user:pw@host:5432/db")
 qh.MySQL("mysql://user:pw@host:3306/db", require_tls=True)
 qh.BigQuery("my-gcp-project")                       # source_table="dataset.table"
-
-# destinations
-qh.ClickHouse("http://host:8123", database="analytics")
-qh.BigQuery("my-gcp-project", dataset_id="analytics")
 ```
 
 For the exact constructor signatures see the [API reference](../api.md).
@@ -58,28 +52,15 @@ qh.Postgres(
 (`credentials_file="key.json"`), inline JSON contents
 (`credentials_json=os.environ["SA_JSON"]`, e.g. from a secrets manager — takes
 precedence over `credentials_file`), or Application Default Credentials (ADC).
+The same credentials work whether `BigQuery` is used as a source or a
+[destination](destinations.md#bigquery-as-a-destination).
 
-## BigQuery as source and destination
+## BigQuery as a source
 
-The one `BigQuery` class serves both roles:
-
-- **As a source:** `source_table` should be `"dataset.table"` or
-  `"project.dataset.table"`. Reads use the BigQuery Storage Read API;
-  `parallelism` becomes a server-side stream-count hint, but rows are consumed
-  on a single client connection (BigQuery parallelizes server-side).
-- **As a destination:** `dataset_id` is **required** (BigQuery's equivalent of
-  ClickHouse's `database`). `write_method` selects how rows are written:
-  `"insert_all"` (default; `tabledata.insertAll`, proven) or `"storage_write"`
-  (the gRPC Storage Write API — free and higher-throughput). Both share the same
-  atomic-swap / MERGE flow; only the row-insert transport differs.
-
-```python
-qh.sync(
-    qh.BigQuery("my-project"),                                    # source
-    qh.BigQuery("my-project", dataset_id="analytics"),           # destination
-    dest_table="orders", source_table="raw.orders",
-)
-```
+`source_table` should be `"dataset.table"` or `"project.dataset.table"`. Reads
+use the BigQuery Storage Read API; `parallelism` becomes a server-side
+stream-count hint, but rows are consumed on a single client connection
+(BigQuery parallelizes server-side).
 
 ## HTTP API sources — CleverTap & AppsFlyer
 
@@ -161,43 +142,3 @@ timezone unless you pass `extra_params={"timezone": "UTC"}`.
 - A full refresh (`mode="full"`, the default) **replaces** the destination;
   since these sources are day/event-scoped, prefer `mode="incremental"` for an
   existing table.
-
-## S3 archive (ClickHouse destinations)
-
-A ClickHouse destination can also archive every synced batch to S3 as a data
-lake — a secondary, best-effort-free backup independent of ClickHouse's own
-retention:
-
-```python
-qh.ClickHouse(
-    "http://host:8123", database="analytics",
-    archive=qh.S3Archive(bucket="my-data-lake", prefix="quickhouse"),
-)
-```
-
-This streams Parquet — one file per parallel partition, never fully buffered in
-memory — to a Hive-style layout directly queryable by Athena, Spark, or DuckDB:
-
-```
-s3://{bucket}/{prefix}/{dest_table}/dt=<date>/run=<id>/part-<partition>.parquet
-```
-
-Credentials fall back to the standard AWS chain (env vars, IAM role) unless
-overridden; pass `endpoint=` for an S3-compatible service like MinIO. A
-persistent upload failure fails the whole `sync()` call, same as a ClickHouse
-insert failure — the archive never silently falls behind. Storage/request costs
-are billed by AWS as usual (free on a self-hosted MinIO).
-
-## Destination DDL
-
-The DDL knobs (`engine`, `partition_by`, `order_by`, `primary_key`, `key`) are
-interpreted per destination:
-
-- **ClickHouse** — they shape the `MergeTree`-family DDL.
-- **BigQuery** — `engine` is ignored; `partition_by` must be a bare
-  `DATE`/`DATETIME`/`TIMESTAMP` column name (not a SQL expression);
-  `order_by`/`key` become clustering columns (at most 4 total).
-
-quickhouse creates the table for you (`create_if_missing=True` by default) with
-a schema derived from the source. See [Type mapping](type-mapping.md) for how
-source types become destination types.
