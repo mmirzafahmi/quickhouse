@@ -169,7 +169,10 @@ qh.<span class="n">sync</span>(
     </div>
   </div>
 
-  <h2>Supported pairs</h2>
+  <div class="qh-flow__head">
+    <h2>Supported pairs</h2>
+    <span class="qh-flow__caption">every source &rarr; either destination</span>
+  </div>
   <div class="qh-flow">
     <div class="qh-flow__col">
       <div class="qh-flow__node">PostgreSQL</div>
@@ -191,11 +194,10 @@ qh.<span class="n">sync</span>(
       <div class="qh-flow__lane" style="--qh-delay:0.75s"></div>
     </div>
     <div class="qh-flow__col">
-      <div class="qh-flow__dest"><b>ClickHouse</b><span>ReplacingMergeTree · atomic swap</span></div>
-      <div class="qh-flow__dest"><b>BigQuery</b><span>single MERGE on key</span></div>
+      <div class="qh-flow__dest" style="--qh-delay:0s"><b>ClickHouse</b><span>ReplacingMergeTree · atomic swap</span></div>
+      <div class="qh-flow__dest" style="--qh-delay:1.3s"><b>BigQuery</b><span>single MERGE on key</span></div>
     </div>
   </div>
-  <p class="qh-hero__meta">Every source moves into either destination.</p>
 </div>
 ```
 
