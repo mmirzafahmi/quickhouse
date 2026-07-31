@@ -134,21 +134,60 @@ impl ClickHouseSink {
         self.execute(&sql).await
     }
 
+    /// `CREATE TABLE new_table AS like_table` — a structure-only clone (engine,
+    /// ORDER BY, PARTITION BY, PRIMARY KEY, per-column nullability, all copied
+    /// verbatim; no data). Used for staging against an *existing* destination
+    /// in both full-refresh (bug report B4: staging must match what's already
+    /// there, not a fresh `CREATE TABLE` regenerated from `cfg`, or a swap
+    /// silently replaces the destination's engine/sort/partition key with
+    /// whatever `cfg` happens to say) and incremental mode ("schema follows
+    /// the destination" applies the same way there — though ClickHouse never
+    /// actually reaches this path for incremental, since it inserts directly
+    /// into the destination rather than staging).
+    pub async fn clone_table_structure(&self, new_table: &str, like_table: &str) -> Result<()> {
+        let db = ident(&self.cfg.database);
+        let sql = format!(
+            "CREATE TABLE {db}.{} AS {db}.{}",
+            ident(new_table),
+            ident(like_table),
+        );
+        tracing::debug!("DDL: {sql}");
+        self.execute(&sql).await
+    }
+
     /// Create the internal `_quickhouse_state` watermark-tracking table if it
     /// doesn't exist yet (`CREATE TABLE IF NOT EXISTS`, so no prior existence
-    /// check is needed here, unlike BigQuery's sink).
+    /// check is needed here, unlike BigQuery's sink), then migrate a pre-0.5
+    /// table to the chunk-resume columns *only if it's actually missing them*.
+    ///
+    /// The migration `ALTER` used to run unconditionally on every call. That is
+    /// a no-op for schema but not for cost: `ADD COLUMN IF NOT EXISTS` on an
+    /// already-present column still bumps a replicated table's metadata version
+    /// each time, so every `sync()` churned a cluster-wide counter and racing
+    /// concurrent syncs aborted with `517 CANNOT_ASSIGN_ALTER`. Probing
+    /// `system.columns` first (the same source the destination-column check
+    /// uses) means the `ALTER` fires at most once per table, and never for a
+    /// 0.5+ table — `create_state_table` already declares both columns.
     pub async fn ensure_state_table(&self, state_table: &str) -> Result<()> {
         self.execute(&crate::ddl::create_state_table(
             &self.cfg.database,
             state_table,
         ))
         .await?;
-        // Add the chunk-resume columns to a pre-0.5 state table (idempotent).
-        self.execute(&crate::ddl::migrate_state_table(
-            &self.cfg.database,
-            state_table,
-        ))
-        .await
+        let sql = format!(
+            "SELECT name FROM system.columns WHERE database = '{}' AND table = '{}'",
+            escape_sql_string(&self.cfg.database),
+            escape_sql_string(state_table),
+        );
+        let existing = self.query_column(&sql).await?;
+        if crate::ddl::state_table_needs_migration(&existing) {
+            self.execute(&crate::ddl::migrate_state_table(
+                &self.cfg.database,
+                state_table,
+            ))
+            .await?;
+        }
+        Ok(())
     }
 
     /// Read the last persisted watermark for this `(state_key, dest_table)` pair.
@@ -390,6 +429,31 @@ impl ClickHouseSink {
         self.execute(&sql).await
     }
 
+    /// Append every row of `staging` into `dest`, column-for-column by name
+    /// (`INSERT INTO dest (cols) SELECT cols FROM staging`). Both tables live in
+    /// the configured database. Named columns (not `SELECT *`) so the copy is
+    /// order-independent. `dest`'s `ReplacingMergeTree` dedups the appended rows
+    /// lazily, exactly as a direct insert of the same rows would.
+    pub async fn insert_select(
+        &self,
+        dest: &str,
+        staging: &str,
+        columns: &[ColumnType],
+    ) -> Result<()> {
+        let cols = columns
+            .iter()
+            .map(|c| ident(&c.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let db = ident(&self.cfg.database);
+        let sql = format!(
+            "INSERT INTO {db}.{} ({cols}) SELECT {cols} FROM {db}.{}",
+            ident(dest),
+            ident(staging)
+        );
+        self.execute(&sql).await
+    }
+
     async fn check(resp: reqwest::Response) -> Result<String> {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
@@ -403,7 +467,9 @@ impl ClickHouseSink {
 
 /// Thin delegation to the inherent methods above. ClickHouse keeps the default
 /// `merge_into` (unsupported) — it dedups via `ReplacingMergeTree` rather than a
-/// staged MERGE, so `requires_staging_for_incremental` stays `false`.
+/// staged MERGE, so `requires_staging_for_incremental` stays `false`. It does
+/// override `insert_select`, used to promote a staging table when an incremental
+/// run stages only to interpose a data-quality gate (see `sync.rs`).
 #[async_trait]
 impl Sink for ClickHouseSink {
     async fn table_exists(&self, table: &str) -> Result<bool> {
@@ -416,6 +482,9 @@ impl Sink for ClickHouseSink {
         cfg: &TransferConfig,
     ) -> Result<()> {
         ClickHouseSink::create_table(self, table, columns, cfg).await
+    }
+    async fn clone_table_structure(&self, new_table: &str, like_table: &str) -> Result<()> {
+        ClickHouseSink::clone_table_structure(self, new_table, like_table).await
     }
     async fn insert_batches(
         &self,
@@ -433,6 +502,9 @@ impl Sink for ClickHouseSink {
     }
     async fn drop_table(&self, table: &str) -> Result<()> {
         ClickHouseSink::drop_table(self, table).await
+    }
+    async fn insert_select(&self, dest: &str, staging: &str, columns: &[ColumnType]) -> Result<()> {
+        ClickHouseSink::insert_select(self, dest, staging, columns).await
     }
     async fn ensure_state_table(&self, state_table: &str) -> Result<()> {
         ClickHouseSink::ensure_state_table(self, state_table).await
@@ -458,6 +530,9 @@ impl Sink for ClickHouseSink {
     }
     fn dest_kind(&self) -> crate::config::DestKind {
         crate::config::DestKind::ClickHouse
+    }
+    fn namespace(&self) -> &str {
+        self.database()
     }
     async fn read_chunk_state(&self, cfg: &TransferConfig) -> Result<Option<(String, String)>> {
         ClickHouseSink::read_chunk_state(self, cfg).await

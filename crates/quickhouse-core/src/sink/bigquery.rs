@@ -22,7 +22,24 @@
 //! for reading `staging` once per full refresh — the same cost the
 //! incremental `MERGE` path already accepts — in exchange for actually being
 //! correct.
+//!
+//! **Write idempotency.** Both write paths retry on a transient failure, and a
+//! transient failure includes the case where the server committed the rows but
+//! the client never saw the ack — so a retry must not be allowed to write them
+//! twice. `insertAll` gets a deterministic per-row `insertId` so BigQuery's own
+//! row-level dedup catches the repeat; the Storage Write path appends at an
+//! explicit offset on a committed stream, which the server rejects as
+//! `ALREADY_EXISTS` rather than re-appending. Independently, the incremental
+//! `MERGE` deduplicates its staging input by `key` (see `build_merge_sql`), so a
+//! duplicate that reaches staging by any route still can't reach the
+//! destination. All three were absent before: `insertId` was `None`, appends
+//! went to the offset-less `_default` stream, and the `MERGE` read staging
+//! directly — the previously-documented claim that "idempotency comes from the
+//! staging + MERGE flow" held only for keys already present in `dest`, and
+//! never for the pure-insert case that a first-time-seen id always is.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use arrow_array::{
@@ -45,7 +62,7 @@ use google_cloud_bigquery::http::table::{
 };
 use google_cloud_bigquery::http::tabledata::insert_all::{InsertAllRequest, Row as InsertRow};
 use google_cloud_bigquery::query::row::Row as QueryRow;
-use google_cloud_bigquery::storage_write::stream::default::DefaultStream;
+use google_cloud_bigquery::storage_write::stream::committed::CommittedStream;
 use google_cloud_bigquery::storage_write::AppendRowsRequestBuilder;
 use prost_types::DescriptorProto;
 use serde_json::Value;
@@ -75,6 +92,14 @@ pub struct BigQuerySink {
     project_id: String,
     dataset_id: String,
     write_method: BigQueryWriteMethod,
+    /// Per-sink token making this sink's `insertId`s distinct from any other
+    /// process/run writing the same table (a nanosecond timestamp, same
+    /// approach as `unique_job_id`).
+    run_token: String,
+    /// Hands out a distinct id-space to each write call, so two concurrent
+    /// partitions can't mint the same `insertId` for different rows. Only ever
+    /// incremented, never reset — a retry reuses the value it already took.
+    insert_id_epoch: Arc<AtomicU64>,
 }
 
 impl BigQuerySink {
@@ -102,6 +127,10 @@ impl BigQuerySink {
             project_id,
             dataset_id: cfg.dataset_id,
             write_method: cfg.write_method,
+            run_token: time::OffsetDateTime::now_utc()
+                .unix_timestamp_nanos()
+                .to_string(),
+            insert_id_epoch: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -157,6 +186,57 @@ impl BigQuerySink {
         Ok(())
     }
 
+    /// `CREATE TABLE new_table LIKE like_table` — a structure-only clone
+    /// (schema, partitioning, clustering; no data, and no row-level SELECT
+    /// the way `CREATE TABLE ... AS SELECT` would run). For **full-refresh**,
+    /// correctness doesn't depend on this for BigQuery specifically
+    /// (`atomic_swap` above already preserves `dest`'s own DDL via TRUNCATE,
+    /// unlike ClickHouse's swap — see the module docs), but a staging table
+    /// built this way still means both destinations share the same "staging
+    /// mirrors dest" contract in `sync::prepare_target` rather than one being
+    /// a special case. For **incremental**, this one *is* load-bearing:
+    /// BigQuery is the only destination whose incremental mode stages at all
+    /// (`requires_staging_for_incremental`), and staging feeds a
+    /// column-to-column `MERGE` — if staging's types were instead rebuilt
+    /// fresh from this run's resolved source schema, they could drift from
+    /// whatever `type_overrides`/`column_transform_types` the destination was
+    /// actually created with on an earlier run.
+    pub async fn clone_table_structure(&self, new_table: &str, like_table: &str) -> Result<()> {
+        let query = format!(
+            "CREATE TABLE `{}`.`{}`.`{}` LIKE `{}`.`{}`.`{}`",
+            self.project_id,
+            self.dataset_id,
+            new_table,
+            self.project_id,
+            self.dataset_id,
+            like_table,
+        );
+        let job = Job {
+            job_reference: JobReference {
+                project_id: self.project_id.clone(),
+                job_id: unique_job_id("clone", new_table),
+                location: None,
+            },
+            configuration: JobConfiguration {
+                job: JobType::Query(JobConfigurationQuery {
+                    query,
+                    use_legacy_sql: Some(false),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let created = self
+            .client
+            .job()
+            .create(&job)
+            .await
+            .map_err(|e| EtlError::other(format!("bigquery clone-table job error: {e}")))?;
+        self.poll_job_until_done(created).await?;
+        Ok(())
+    }
+
     /// Insert Arrow batches, dispatching on the configured write method:
     /// `insertAll` (default) or the Storage Write API (opt-in). Both share the
     /// transient-failure retry/backoff policy of the ClickHouse sink.
@@ -182,15 +262,28 @@ impl BigQuerySink {
         if batches.iter().all(|b| b.num_rows() == 0) {
             return Ok(0);
         }
+        // A distinct id-space for this call, so concurrent partitions never
+        // mint the same `insertId` for different rows.
+        let epoch = self.insert_id_epoch.fetch_add(1, Ordering::Relaxed);
+        let mut row_ordinal = 0u64;
         let mut total_bytes = 0u64;
         for batch in batches {
             let mut start = 0usize;
             while start < batch.num_rows() {
                 let end = (start + INSERT_ALL_MAX_ROWS_PER_REQUEST).min(batch.num_rows());
+                // Give every row a deterministic `insertId`: stable across the
+                // retries of *this* request (so BigQuery's own best-effort
+                // row-level dedup discards a duplicate delivery from a retry
+                // whose original the server had already committed) and distinct
+                // between different rows (so nothing legitimate is dropped).
+                // Previously `None`, which disabled that dedup entirely and
+                // made a lost ack on a committed insert duplicate rows.
                 let rows = (start..end)
                     .map(|r| {
+                        let id = format!("{}-{epoch}-{row_ordinal}", self.run_token);
+                        row_ordinal += 1;
                         batch_row_to_json(batch, r).map(|json| InsertRow {
-                            insert_id: None,
+                            insert_id: Some(id),
                             json: Value::Object(json),
                         })
                     })
@@ -273,10 +366,31 @@ impl BigQuerySink {
     }
 
     /// Insert Arrow batches via the BigQuery Storage Write API (opt-in). Each
-    /// row is protobuf-encoded (see [`super::bigquery_proto`]) and appended to
-    /// the table's `_default` stream — at-least-once, matching insertAll's
-    /// semantics; idempotency for incremental syncs comes from the staging +
-    /// MERGE flow, and for full-refresh from writing to staging then swapping.
+    /// row is protobuf-encoded (see [`super::bigquery_proto`]) and appended with
+    /// an explicit **offset** to a per-call *committed* stream, which is what
+    /// makes the write exactly-once: an append carrying an offset the stream has
+    /// already accepted is rejected as `ALREADY_EXISTS` instead of being written
+    /// a second time, so retrying a request the server had already committed
+    /// (but whose ack was lost) is a no-op rather than a duplicate.
+    ///
+    /// This used to append to the table's `_default` stream, which cannot carry
+    /// offsets — so it was at-least-once at the row level, and a retry after a
+    /// lost ack silently duplicated up to a whole append's worth of rows into
+    /// staging. For an incremental sync those duplicates then reached the
+    /// destination permanently (the `MERGE`'s `WHEN NOT MATCHED THEN INSERT`
+    /// fires per source row, and BigQuery only rejects a *target* row matched
+    /// more than once); for a full refresh they survived the swap. The module
+    /// comment claiming "idempotency comes from the staging + MERGE flow" was
+    /// only ever true for keys already present in the destination — never for
+    /// the pure-insert case.
+    ///
+    /// One stream is created and finalized per call, so offsets are local to
+    /// this call and strictly sequential, and concurrent uploads stay fully
+    /// parallel (each gets its own stream — BigQuery's documented
+    /// one-stream-per-writer pattern) rather than serializing behind a shared
+    /// offset counter. At the default `batch_rows`, that's one stream per
+    /// 100k rows written.
+    ///
     /// Returns the total encoded protobuf bytes sent.
     async fn insert_batches_storage_write(
         &self,
@@ -289,24 +403,28 @@ impl BigQuerySink {
         }
         let fields = resolve_fields(&schema)?;
         let descriptor = build_proto_descriptor(&fields)?;
-        // `_default` is a persistent server-side stream; this fetches its
-        // handle (a lightweight GetWriteStream), created once per call.
+        // An application-created COMMITTED stream: rows are queryable as soon
+        // as they're appended (like `_default`), but unlike `_default` it
+        // accepts an explicit offset, which is the whole basis of the
+        // exactly-once retry behaviour documented above.
         let resource = format!(
             "projects/{}/datasets/{}/tables/{table}",
             self.project_id, self.dataset_id
         );
         let stream = self
             .client
-            .default_storage_writer()
+            .committed_storage_writer()
             .create_write_stream(&resource)
             .await
             .map_err(|e| {
                 EtlError::other(format!(
-                    "bigquery storage-write: open stream for {resource}: {e}"
+                    "bigquery storage-write: open committed stream for {resource}: {e}"
                 ))
             })?;
 
         let mut total_bytes = 0u64;
+        // Next offset to write, in rows, relative to this stream's start.
+        let mut offset = 0i64;
         for batch in batches {
             let mut start = 0usize;
             while start < batch.num_rows() {
@@ -318,14 +436,18 @@ impl BigQuerySink {
                     total_bytes += buf.len() as u64;
                     serialized.push(buf);
                 }
+                let rows_in_append = (end - start) as i64;
 
                 let mut attempt = 0u32;
                 loop {
                     attempt += 1;
                     // Clone per attempt: retries are rare, and the builder
-                    // consumes the row bytes.
+                    // consumes the row bytes. The offset is deliberately NOT
+                    // advanced between attempts — resending the same rows at
+                    // the same offset is exactly what lets the server reject
+                    // the duplicate instead of appending it again.
                     match self
-                        .try_append(&stream, &descriptor, serialized.clone(), table)
+                        .try_append(&stream, &descriptor, serialized.clone(), table, offset)
                         .await
                     {
                         Ok(()) => break,
@@ -347,27 +469,65 @@ impl BigQuerySink {
                         }
                     }
                 }
+                offset += rows_in_append;
                 start = end;
             }
+        }
+        // Close the stream. Not required for the rows to be visible (a
+        // committed stream's appends are queryable immediately), but it releases
+        // the handle instead of leaving it to expire, and it reports back how
+        // many rows the stream actually holds — a free end-to-end check that
+        // the offsets did what they're supposed to.
+        match stream.finalize().await {
+            Ok(row_count) if row_count != offset => tracing::warn!(
+                "bigquery storage-write into {}.{table}: stream finalized with {row_count} row(s) \
+                 but {offset} were appended — offsets may not have deduplicated a retry as \
+                 expected; check the destination for duplicate or missing rows",
+                self.dataset_id
+            ),
+            Ok(_) => {}
+            // A finalize failure loses nothing: every append was already
+            // committed, so this is cleanup, not correctness.
+            Err(e) => tracing::warn!(
+                "bigquery storage-write into {}.{table}: finalizing the write stream failed \
+                 ({e}); rows were already committed, so this is harmless — the stream handle \
+                 will expire on its own",
+                self.dataset_id
+            ),
         }
         Ok(total_bytes)
     }
 
-    /// One `AppendRows` attempt: append the chunk and drain the response
-    /// stream, surfacing both transport failures and in-band append/row errors
-    /// classified for retry (transient) vs. immediate failure (permanent).
+    /// One `AppendRows` attempt: append the chunk at `offset` and drain the
+    /// response stream, surfacing both transport failures and in-band append/row
+    /// errors classified for retry (transient) vs. immediate failure
+    /// (permanent).
+    ///
+    /// `ALREADY_EXISTS` is reported as success, not an error: it's precisely the
+    /// signal that a previous attempt at this offset *did* land (its ack was
+    /// lost in transit), so the rows are committed and re-appending them would
+    /// be the duplication this offset exists to prevent.
     async fn try_append(
         &self,
-        stream: &DefaultStream,
+        stream: &CommittedStream,
         descriptor: &DescriptorProto,
         rows: Vec<Vec<u8>>,
         table: &str,
+        offset: i64,
     ) -> std::result::Result<(), SendError> {
-        let builder = AppendRowsRequestBuilder::new(descriptor.clone(), rows);
-        let mut resp = stream
-            .append_rows(vec![builder])
-            .await
-            .map_err(|s| classify_status(&s, "bigquery storage-write append"))?;
+        let builder = AppendRowsRequestBuilder::new(descriptor.clone(), rows).with_offset(offset);
+        let mut resp = match stream.append_rows(vec![builder]).await {
+            Ok(resp) => resp,
+            Err(s) if s.code() == google_cloud_gax::grpc::Code::AlreadyExists => {
+                tracing::info!(
+                    "bigquery storage-write into {}.{table}: offset {offset} was already \
+                     committed by an earlier attempt; not re-appending",
+                    self.dataset_id
+                );
+                return Ok(());
+            }
+            Err(s) => return Err(classify_status(&s, "bigquery storage-write append")),
+        };
         while let Some(msg) = resp
             .message()
             .await
@@ -389,6 +549,17 @@ impl BigQuerySink {
             if let Some(response) = msg.response {
                 use google_cloud_googleapis::cloud::bigquery::storage::v1::append_rows_response::Response;
                 if let Response::Error(status) = response {
+                    // Same reasoning as the transport-level arm above, for the
+                    // in-band form of the code: these rows are already
+                    // committed at this offset.
+                    if status.code == RPC_CODE_ALREADY_EXISTS {
+                        tracing::info!(
+                            "bigquery storage-write into {}.{table}: offset {offset} was already \
+                             committed by an earlier attempt; not re-appending",
+                            self.dataset_id
+                        );
+                        return Ok(());
+                    }
                     return Err(classify_rpc_status(&status, table, &self.dataset_id));
                 }
             }
@@ -444,6 +615,7 @@ impl BigQuerySink {
     /// naturally idempotent: re-running the same merge (e.g. after a crash,
     /// before the watermark advances) re-applies the same key-matched rows
     /// rather than duplicating them.
+    #[allow(clippy::too_many_arguments)]
     pub async fn merge_into(
         &self,
         dest: &str,
@@ -452,6 +624,7 @@ impl BigQuerySink {
         columns: &[ColumnType],
         prune_partition: Option<&str>,
         delete_stale: bool,
+        dedup_order: Option<&str>,
     ) -> Result<()> {
         let query = build_merge_sql(
             &self.project_id,
@@ -462,6 +635,7 @@ impl BigQuerySink {
             columns,
             prune_partition,
             delete_stale,
+            dedup_order,
         )?;
         let job = Job {
             job_reference: JobReference {
@@ -701,6 +875,9 @@ impl Sink for BigQuerySink {
     ) -> Result<()> {
         BigQuerySink::create_table(self, table, columns, cfg).await
     }
+    async fn clone_table_structure(&self, new_table: &str, like_table: &str) -> Result<()> {
+        BigQuerySink::clone_table_structure(self, new_table, like_table).await
+    }
     async fn insert_batches(
         &self,
         table: &str,
@@ -743,6 +920,9 @@ impl Sink for BigQuerySink {
     fn dest_kind(&self) -> crate::config::DestKind {
         crate::config::DestKind::BigQuery
     }
+    fn namespace(&self) -> &str {
+        &self.dataset_id
+    }
     fn requires_staging_for_incremental(&self) -> bool {
         true
     }
@@ -757,6 +937,7 @@ impl Sink for BigQuerySink {
         columns: &[ColumnType],
         prune_partition: Option<&str>,
         delete_stale: bool,
+        dedup_order: Option<&str>,
     ) -> Result<()> {
         BigQuerySink::merge_into(
             self,
@@ -766,6 +947,7 @@ impl Sink for BigQuerySink {
             columns,
             prune_partition,
             delete_stale,
+            dedup_order,
         )
         .await
     }
@@ -817,6 +999,11 @@ fn classify_status(status: &google_cloud_gax::grpc::Status, context: &str) -> Se
 /// failure). Codes are `google.rpc.Code` integers: INTERNAL(13),
 /// UNAVAILABLE(14), ABORTED(10), RESOURCE_EXHAUSTED(8), DEADLINE_EXCEEDED(4)
 /// are transient; everything else (e.g. INVALID_ARGUMENT(3)) is deterministic.
+/// `google.rpc.Code.ALREADY_EXISTS`. Returned by an `AppendRows` carrying an
+/// offset the stream has already accepted — i.e. proof that an earlier attempt
+/// committed, so it's handled as success rather than classified as an error.
+const RPC_CODE_ALREADY_EXISTS: i32 = 6;
+
 fn classify_rpc_status(
     status: &google_cloud_googleapis::rpc::Status,
     table: &str,
@@ -855,8 +1042,21 @@ fn unique_job_id(prefix: &str, table: &str) -> String {
 /// BigQuery, e.g. https://github.com/trinodb/trino/issues/7784). Backslash
 /// must be escaped first, or a trailing backslash in a value would escape
 /// the literal's closing quote instead of terminating the string.
+///
+/// Newlines and carriage returns must be escaped too: a *quoted* (non-triple)
+/// GoogleSQL literal cannot contain a raw newline — it terminates the literal
+/// mid-string and the statement fails to parse. This matters because the value
+/// interpolated here is `effective_state_key()`, which falls back to the raw
+/// `source_query` text when no explicit `state_key` is set, so a perfectly
+/// ordinary multi-line user query would otherwise break every watermark
+/// read/persist. (The failure is confusingly ordered: `read_last_watermark`
+/// short-circuits to `Ok(None)` while the state table doesn't exist, so run 1
+/// succeeds and only run 2 onward fails.)
 fn escape_sql_string(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('\'', "\\'")
+    s.replace('\\', "\\\\")
+        .replace('\'', "\\'")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
 }
 
 /// Build the `TRUNCATE` + `INSERT ... SELECT` transaction that atomically
@@ -932,6 +1132,7 @@ fn build_merge_sql(
     columns: &[ColumnType],
     prune_partition: Option<&str>,
     delete_stale: bool,
+    dedup_order: Option<&str>,
 ) -> Result<String> {
     if key.is_empty() {
         // Should already be caught by sync.rs's prepare_target validation
@@ -1015,9 +1216,47 @@ fn build_merge_sql(
         ));
     }
 
+    // Deduplicate staging by `key` before merging, keeping one row per key.
+    //
+    // Two reasons this is not optional:
+    //
+    // 1. Both write paths are at-least-once at the row level. A retried append
+    //    whose original attempt the server had already committed leaves the
+    //    same rows in staging twice. `WHEN NOT MATCHED THEN INSERT` fires once
+    //    per unmatched source row, and BigQuery only rejects *target* rows
+    //    matched more than once — so two identical rows for a key not yet in
+    //    the destination were both inserted, permanently duplicating it. No
+    //    later run could repair that: a subsequent merge updates both copies
+    //    identically. (The offset/insert-id work on the write paths makes such
+    //    a duplicate rare; this makes it harmless.)
+    // 2. A source batch legitimately containing two rows for one key (two
+    //    updates inside one watermark window) used to fail the whole MERGE
+    //    with "UPDATE/MERGE must match at most one source row". Keeping the
+    //    highest-watermark row instead mirrors what the ClickHouse sink's
+    //    `ReplacingMergeTree(<watermark>)` does with the same input.
+    //
+    // Ordering: by the watermark descending when there is one, so "last write
+    // wins"; otherwise by the key columns, which are constant within each
+    // partition — an arbitrary but deterministic tie-break, and always valid
+    // SQL (GoogleSQL's ROW_NUMBER needs an ORDER BY).
+    let key_list = key
+        .iter()
+        .map(|k| format!("`{k}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let dedup_order = match dedup_order.filter(|w| columns.iter().any(|c| &c.name == w)) {
+        Some(w) => format!("`{w}` DESC"),
+        None => key_list.clone(),
+    };
+    let using = format!(
+        "(SELECT * EXCEPT (_qh_row_num) FROM (SELECT *, ROW_NUMBER() OVER \
+         (PARTITION BY {key_list} ORDER BY {dedup_order}) AS _qh_row_num \
+         FROM `{project_id}`.`{dataset_id}`.`{staging}`) WHERE _qh_row_num = 1)"
+    );
+
     Ok(format!(
         "MERGE INTO `{project_id}`.`{dataset_id}`.`{dest}` T \
-         USING `{project_id}`.`{dataset_id}`.`{staging}` S \
+         USING {using} S \
          ON {on_clause} {}",
         clauses.join(" "),
     ))
@@ -1282,6 +1521,7 @@ mod tests {
             dest_table: "t".into(),
             mode: crate::config::SyncMode::Full,
             watermark: None,
+            watermark_source_expr: None,
             lookback_seconds: 0,
             key: vec![],
             create_if_missing: true,
@@ -1300,6 +1540,7 @@ mod tests {
             chunk_rows: None,
             retry_max_attempts: 1,
             column_transforms: HashMap::new(),
+            column_transform_types: HashMap::new(),
             evolve_schema: false,
             state_table_name: "_quickhouse_state".into(),
             staging_suffix: "_quickhouse_tmp".into(),
@@ -1311,6 +1552,9 @@ mod tests {
             rename: HashMap::new(),
             include: vec![],
             exclude: vec![],
+            not_null: vec![],
+            tinyint1_as_bool: true,
+            numeric_as_decimal: None,
         }
     }
 
@@ -1577,6 +1821,38 @@ mod tests {
     }
 
     #[test]
+    fn build_persist_watermark_sql_escapes_newlines_in_values() {
+        // Regression test: `source_id` here is `effective_state_key()`, which
+        // defaults to the raw `source_query` text — so an ordinary multi-line
+        // user query lands inside a quoted GoogleSQL literal, which cannot
+        // carry a raw newline (it terminates the literal and the statement
+        // fails to parse). The bug was masked on run 1, because
+        // `read_last_watermark` returns Ok(None) while the state table is
+        // still absent; it surfaced only from run 2 onward, permanently.
+        let multiline = "SELECT \"id\",\n  CAST(\"qty\" AS TEXT)\r\nFROM stock_move";
+        let sql =
+            build_persist_watermark_sql("p", "d", "_quickhouse_state", multiline, "dest", "wm", 1);
+        assert!(
+            !sql.contains('\n') && !sql.contains('\r'),
+            "no raw newline may survive into the literal: {sql:?}"
+        );
+        assert!(sql.contains(r#"CAST("qty" AS TEXT)\r\nFROM"#), "{sql:?}");
+    }
+
+    #[test]
+    fn escape_sql_string_escapes_backslash_before_newline() {
+        // Order matters: escaping the newline first would leave the backslash
+        // of `\n` to be doubled afterwards, producing a literal `\\n` (an
+        // escaped backslash followed by `n`) instead of a newline escape.
+        assert_eq!(escape_sql_string("a\nb"), r"a\nb");
+        assert_eq!(escape_sql_string("a\r\nb"), r"a\r\nb");
+        // A pre-existing literal backslash-n in the text stays distinct from a
+        // real newline: it doubles to `\\n`, which GoogleSQL reads back as the
+        // two characters `\` and `n`, not a newline.
+        assert_eq!(escape_sql_string(r"a\nb"), r"a\\nb");
+    }
+
+    #[test]
     fn build_merge_sql_matches_on_key_and_updates_non_key_columns() {
         let cols = vec![
             col("id", DataType::Int64, false),
@@ -1593,12 +1869,20 @@ mod tests {
             &cols,
             None,
             false,
+            None,
         )
         .unwrap();
 
-        assert!(sql.starts_with(
-            "MERGE INTO `proj`.`ds`.`orders` T USING `proj`.`ds`.`orders_quickhouse_tmp` S"
-        ));
+        assert!(
+            sql.starts_with("MERGE INTO `proj`.`ds`.`orders` T USING "),
+            "{sql}"
+        );
+        // Staging is read through a dedup-by-key subquery, never directly —
+        // see the dedicated dedup tests below for why.
+        assert!(
+            sql.contains("FROM `proj`.`ds`.`orders_quickhouse_tmp`"),
+            "{sql}"
+        );
         assert!(sql.contains("ON T.`id` = S.`id`"));
         // No prune column -> no partition-bound predicate (full-scan, correct default).
         assert!(
@@ -1623,7 +1907,7 @@ mod tests {
             col("b", DataType::Int64, false),
         ];
         let key = vec!["a".to_string(), "b".to_string()];
-        let sql = build_merge_sql("p", "d", "t", "s", &key, &cols, None, false).unwrap();
+        let sql = build_merge_sql("p", "d", "t", "s", &key, &cols, None, false, None).unwrap();
         assert!(sql.contains("ON T.`a` = S.`a` AND T.`b` = S.`b`"));
     }
 
@@ -1648,6 +1932,7 @@ mod tests {
             &cols,
             Some("create_date"),
             false,
+            None,
         )
         .unwrap();
         // The join still matches on the key, AND the destination is bounded to
@@ -1685,6 +1970,7 @@ mod tests {
             &cols,
             Some("create_date"),
             true,
+            None,
         )
         .unwrap();
         // The DELETE is scoped to the SAME staging window as the prune — it must
@@ -1708,7 +1994,7 @@ mod tests {
             col("v", DataType::Int64, true),
         ];
         let key = vec!["id".to_string()];
-        let err = build_merge_sql("p", "d", "t", "s", &key, &cols, None, true)
+        let err = build_merge_sql("p", "d", "t", "s", &key, &cols, None, true, None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("delete_stale"), "{err}");
@@ -1718,7 +2004,7 @@ mod tests {
     fn build_merge_sql_all_columns_are_key_becomes_insert_only() {
         let cols = vec![col("id", DataType::Int64, false)];
         let key = vec!["id".to_string()];
-        let sql = build_merge_sql("p", "d", "t", "s", &key, &cols, None, false).unwrap();
+        let sql = build_merge_sql("p", "d", "t", "s", &key, &cols, None, false, None).unwrap();
         assert!(
             !sql.contains("WHEN MATCHED"),
             "no columns left to update: {sql}"
@@ -1727,9 +2013,94 @@ mod tests {
     }
 
     #[test]
+    fn build_merge_sql_dedups_staging_by_key_newest_first() {
+        // Both write paths are at-least-once per row: a retried append the
+        // server had already committed leaves duplicate rows in staging, and
+        // `WHEN NOT MATCHED THEN INSERT` fires per source row — so a key not
+        // yet in the destination got inserted twice, permanently, with no
+        // later run able to repair it. Deduping in the USING clause makes the
+        // duplicate harmless regardless of which write path produced it.
+        let cols = vec![
+            col("id", DataType::Int64, false),
+            col("write_date", DataType::Utf8, true),
+            col("amount", DataType::Float64, true),
+        ];
+        let key = vec!["id".to_string()];
+        let sql = build_merge_sql(
+            "p",
+            "d",
+            "orders",
+            "orders_tmp",
+            &key,
+            &cols,
+            None,
+            false,
+            Some("write_date"),
+        )
+        .unwrap();
+        assert!(
+            sql.contains(
+                "USING (SELECT * EXCEPT (_qh_row_num) FROM (SELECT *, ROW_NUMBER() OVER \
+                 (PARTITION BY `id` ORDER BY `write_date` DESC) AS _qh_row_num \
+                 FROM `p`.`d`.`orders_tmp`) WHERE _qh_row_num = 1) S"
+            ),
+            "{sql}"
+        );
+        // The merge still behaves the same otherwise.
+        assert!(sql.contains("ON T.`id` = S.`id`"), "{sql}");
+        assert!(sql.contains("WHEN NOT MATCHED THEN INSERT"), "{sql}");
+    }
+
+    #[test]
+    fn build_merge_sql_dedup_falls_back_to_key_order_without_a_watermark() {
+        // GoogleSQL's ROW_NUMBER needs an ORDER BY. With no watermark to order
+        // by, the key columns are constant within each partition — an
+        // arbitrary but deterministic tie-break, which is all a retry-duplicate
+        // (two byte-identical rows) needs.
+        let cols = vec![
+            col("a", DataType::Int64, false),
+            col("b", DataType::Int64, false),
+            col("v", DataType::Int64, true),
+        ];
+        let key = vec!["a".to_string(), "b".to_string()];
+        let sql = build_merge_sql("p", "d", "t", "s", &key, &cols, None, false, None).unwrap();
+        assert!(
+            sql.contains("PARTITION BY `a`, `b` ORDER BY `a`, `b`"),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn build_merge_sql_dedup_ignores_a_watermark_absent_from_staging() {
+        // The watermark is a *source* column name; a rename (or an
+        // include/exclude) can leave it out of the destination/staging columns.
+        // Ordering by a column that isn't there would be a hard SQL error, so
+        // fall back rather than emit invalid SQL.
+        let cols = vec![
+            col("id", DataType::Int64, false),
+            col("v", DataType::Int64, true),
+        ];
+        let key = vec!["id".to_string()];
+        let sql = build_merge_sql(
+            "p",
+            "d",
+            "t",
+            "s",
+            &key,
+            &cols,
+            None,
+            false,
+            Some("not_a_staging_column"),
+        )
+        .unwrap();
+        assert!(!sql.contains("not_a_staging_column"), "{sql}");
+        assert!(sql.contains("PARTITION BY `id` ORDER BY `id`"), "{sql}");
+    }
+
+    #[test]
     fn build_merge_sql_rejects_empty_key() {
         let cols = vec![col("id", DataType::Int64, false)];
-        let err = build_merge_sql("p", "d", "t", "s", &[], &cols, None, false)
+        let err = build_merge_sql("p", "d", "t", "s", &[], &cols, None, false, None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("empty key"), "{err}");

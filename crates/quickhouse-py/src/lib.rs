@@ -818,6 +818,45 @@ impl From<core::Progress> for Progress {
     }
 }
 
+/// Context passed to a `validate=` staged-validation callback: the per-run
+/// staging table (fully loaded, not yet promoted) and where it lives.
+#[pyclass]
+#[derive(Clone)]
+struct StagedInfo {
+    #[pyo3(get)]
+    staging_table: String,
+    #[pyo3(get)]
+    database: String,
+    #[pyo3(get)]
+    dest_kind: String,
+    #[pyo3(get)]
+    rows_written: u64,
+}
+
+#[pymethods]
+impl StagedInfo {
+    fn __repr__(&self) -> String {
+        format!(
+            "StagedInfo(staging_table={:?}, database={:?}, dest_kind={:?}, rows_written={})",
+            self.staging_table, self.database, self.dest_kind, self.rows_written
+        )
+    }
+}
+
+impl StagedInfo {
+    fn from_core(info: &core::StagedInfo) -> Self {
+        StagedInfo {
+            staging_table: info.staging_table.clone(),
+            database: info.database.clone(),
+            dest_kind: match info.dest_kind {
+                core::config::DestKind::ClickHouse => "clickhouse".to_string(),
+                core::config::DestKind::BigQuery => "bigquery".to_string(),
+            },
+            rows_written: info.rows_written,
+        }
+    }
+}
+
 /// Summary returned by `sync`.
 #[pyclass]
 struct TransferResult {
@@ -902,6 +941,7 @@ fn parse_parquet_compression(c: &str) -> PyResult<core::ParquetCompression> {
     state_key=None,
     mode="full".to_string(),
     watermark=None,
+    watermark_source_expr=None,
     lookback_seconds=0,
     seed_watermark=None,
     skip_to_max=false,
@@ -923,6 +963,7 @@ fn parse_parquet_compression(c: &str) -> PyResult<core::ParquetCompression> {
     chunk_rows=None,
     retry_max_attempts=1,
     column_transforms=None,
+    column_transform_types=None,
     evolve_schema=false,
     state_table_name="_quickhouse_state".to_string(),
     staging_suffix="_quickhouse_tmp".to_string(),
@@ -931,7 +972,11 @@ fn parse_parquet_compression(c: &str) -> PyResult<core::ParquetCompression> {
     rename=None,
     include=None,
     exclude=None,
+    not_null=None,
+    tinyint1_as_bool=true,
+    numeric_as_decimal=None,
     on_progress=None,
+    validate=None,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn sync(
@@ -944,6 +989,7 @@ fn sync(
     state_key: Option<String>,
     mode: String,
     watermark: Option<String>,
+    watermark_source_expr: Option<String>,
     lookback_seconds: u64,
     seed_watermark: Option<String>,
     skip_to_max: bool,
@@ -965,6 +1011,7 @@ fn sync(
     chunk_rows: Option<usize>,
     retry_max_attempts: u32,
     column_transforms: Option<HashMap<String, String>>,
+    column_transform_types: Option<HashMap<String, String>>,
     evolve_schema: bool,
     state_table_name: String,
     staging_suffix: String,
@@ -973,7 +1020,11 @@ fn sync(
     rename: Option<HashMap<String, String>>,
     include: Option<Vec<String>>,
     exclude: Option<Vec<String>>,
+    not_null: Option<Vec<String>>,
+    tinyint1_as_bool: bool,
+    numeric_as_decimal: Option<String>,
     on_progress: Option<PyObject>,
+    validate: Option<PyObject>,
 ) -> PyResult<TransferResult> {
     init_logging();
     let source_cfg: core::SourceConfig = source.into();
@@ -997,6 +1048,7 @@ fn sync(
         state_key,
         mode: parse_mode(&mode)?,
         watermark,
+        watermark_source_expr,
         lookback_seconds,
         seed_watermark,
         advance_watermark,
@@ -1017,6 +1069,7 @@ fn sync(
         chunk_rows,
         retry_max_attempts,
         column_transforms: column_transforms.unwrap_or_default(),
+        column_transform_types: column_transform_types.unwrap_or_default(),
         evolve_schema,
         state_table_name,
         staging_suffix,
@@ -1025,6 +1078,9 @@ fn sync(
         rename: rename.unwrap_or_default(),
         include: include.unwrap_or_default(),
         exclude: exclude.unwrap_or_default(),
+        not_null: not_null.unwrap_or_default(),
+        tinyint1_as_bool,
+        numeric_as_decimal,
     };
 
     // Build the progress callback (fires from Tokio worker threads).
@@ -1042,10 +1098,32 @@ fn sync(
         }) as core::ProgressCb
     });
 
-    // Run with the GIL released so Python threads keep moving and the callback
+    // Build the staged-validation gate (fires once, before the swap/merge).
+    // Unlike `on_progress`, a raising callback here is NOT swallowed: it is
+    // turned into a transfer error so the promotion is aborted and staging is
+    // dropped. The Python exception is flattened to its string at the core
+    // boundary (core knows only `EtlError`).
+    let on_staged: Option<core::StagedValidationCb> = validate.map(|cb| {
+        let cb = Arc::new(cb);
+        Arc::new(move |info: &core::StagedInfo| -> core::Result<()> {
+            Python::with_gil(|py| {
+                let arg = StagedInfo::from_core(info);
+                match cb.call1(py, (arg,)) {
+                    Ok(_) => Ok(()),
+                    Err(e) => Err(core::EtlError::other(format!(
+                        "data-quality validation rejected the staged data: {e}"
+                    ))),
+                }
+            })
+        }) as core::StagedValidationCb
+    });
+
+    // Run with the GIL released so Python threads keep moving and the callbacks
     // can re-acquire it without deadlocking.
     let result = py
-        .allow_threads(|| core::run_transfer_blocking(source_cfg, dest_cfg, cfg, progress))
+        .allow_threads(|| {
+            core::run_transfer_blocking(source_cfg, dest_cfg, cfg, progress, on_staged)
+        })
         .map_err(map_err)?;
 
     Ok(TransferResult {
@@ -1074,6 +1152,7 @@ fn _quickhouse(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ClickHouse>()?;
     m.add_class::<S3Archive>()?;
     m.add_class::<Progress>()?;
+    m.add_class::<StagedInfo>()?;
     m.add_class::<TransferResult>()?;
     m.add_function(wrap_pyfunction!(sync, m)?)?;
     m.add_function(wrap_pyfunction!(version, m)?)?;

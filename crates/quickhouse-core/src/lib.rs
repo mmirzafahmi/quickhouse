@@ -34,7 +34,7 @@ pub use config::{
 };
 pub use error::{EtlError, Result};
 pub use sink::{build_sink, BigQuerySink, ClickHouseSink, Sink};
-pub use sync::{run_transfer, Progress, ProgressCb};
+pub use sync::{run_transfer, Progress, ProgressCb, StagedInfo, StagedValidationCb};
 
 /// Run a transfer to completion on a dedicated multi-threaded Tokio runtime.
 ///
@@ -44,10 +44,11 @@ pub fn run_transfer_blocking(
     dest: DestinationConfig,
     cfg: TransferConfig,
     progress: Option<ProgressCb>,
+    on_staged: Option<StagedValidationCb>,
 ) -> Result<TransferResult> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(EtlError::from)?;
-    runtime.block_on(run_transfer(source_cfg, dest, cfg, progress))
+    runtime.block_on(run_transfer(source_cfg, dest, cfg, progress, on_staged))
 }

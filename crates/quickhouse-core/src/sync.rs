@@ -50,6 +50,98 @@ pub struct Progress {
 
 pub type ProgressCb = Arc<dyn Fn(Progress) + Send + Sync>;
 
+/// Context handed to a [`StagedValidationCb`]: the fully-loaded per-run staging
+/// table that is about to be promoted (swapped in for full-refresh, or merged
+/// for incremental), and where it lives. The callback validates this table and
+/// vetoes the promotion by returning `Err`.
+#[derive(Debug, Clone)]
+pub struct StagedInfo {
+    /// Bare name of the staging table (within `database`).
+    pub staging_table: String,
+    /// The ClickHouse database / BigQuery dataset the staging table lives in.
+    pub database: String,
+    /// Which destination engine this staging table is in.
+    pub dest_kind: crate::config::DestKind,
+    /// Rows loaded into staging so far this run (best-effort; the same counter
+    /// the progress callback reports).
+    pub rows_written: u64,
+}
+
+/// A pre-promotion data-quality gate. Fired once, after the per-run staging
+/// table is fully loaded but **before** the atomic swap (full-refresh) or
+/// `MERGE` (incremental). Returning `Err` aborts the promotion: the swap/merge
+/// is skipped, the staging table is dropped by the existing cleanup path, and
+/// the transfer fails with that error — so rejected data never reaches the
+/// destination. Only fired on paths that stage (full-refresh for either
+/// destination, and BigQuery incremental); the PyO3 binding wraps a Python
+/// callback that runs a Great Expectations suite against `staging_table`.
+pub type StagedValidationCb = Arc<dyn Fn(&StagedInfo) -> Result<()> + Send + Sync>;
+
+/// Fire the optional staged-validation gate against the fully-loaded `staging`
+/// table, just before it is promoted. A `None` callback is a no-op (unchanged
+/// behavior). An `Err` from the callback vetoes the promotion — it propagates
+/// out of the transfer's fallible tail, so the swap/merge is skipped and the
+/// existing cleanup path drops `staging`.
+fn run_staged_validation(
+    on_staged: &Option<StagedValidationCb>,
+    sink: &dyn Sink,
+    staging: &str,
+    rows_written: u64,
+) -> Result<()> {
+    let Some(cb) = on_staged else {
+        return Ok(());
+    };
+    tracing::info!("running staged data-quality validation on '{staging}'");
+    cb(&StagedInfo {
+        staging_table: staging.to_string(),
+        database: sink.namespace().to_string(),
+        dest_kind: sink.dest_kind(),
+        rows_written,
+    })?;
+    tracing::info!("staged data-quality validation passed for '{staging}'");
+    Ok(())
+}
+
+/// Promote a fully-loaded staging table into the incremental destination: fire
+/// the optional gate, then either `MERGE` (destinations that stage for a real
+/// keyed upsert — BigQuery) or a plain insert-select (ClickHouse, which stages
+/// only to interpose the gate and lets `ReplacingMergeTree` dedup the promoted
+/// rows lazily, exactly as a direct insert would), then drop staging. Shared by
+/// all three transfer flows. Only called when a staging table was used.
+#[allow(clippy::too_many_arguments)]
+async fn promote_staged_incremental(
+    sink: &dyn Sink,
+    dest_table: &str,
+    staging: &str,
+    key: &[String],
+    columns: &[ColumnType],
+    merge_prune_partition_by: Option<&str>,
+    delete_stale_in_window: bool,
+    on_staged: &Option<StagedValidationCb>,
+    rows_written: u64,
+    dedup_order: Option<&str>,
+) -> Result<()> {
+    run_staged_validation(on_staged, sink, staging, rows_written)?;
+    if sink.requires_staging_for_incremental() {
+        tracing::info!("merging staged incremental rows into '{dest_table}'");
+        sink.merge_into(
+            dest_table,
+            staging,
+            key,
+            columns,
+            merge_prune_partition_by,
+            delete_stale_in_window,
+            dedup_order,
+        )
+        .await?;
+    } else {
+        tracing::info!("inserting validated staged rows into '{dest_table}'");
+        sink.insert_select(dest_table, staging, columns).await?;
+    }
+    sink.drop_table(staging).await?;
+    Ok(())
+}
+
 #[derive(Default)]
 struct Counters {
     rows_read: AtomicU64,
@@ -255,6 +347,7 @@ pub async fn run_transfer(
     dest: DestinationConfig,
     cfg: TransferConfig,
     progress: Option<ProgressCb>,
+    on_staged: Option<StagedValidationCb>,
 ) -> Result<TransferResult> {
     let table_context = format!(
         "{} -> {}",
@@ -268,7 +361,7 @@ pub async fn run_transfer(
     if max_attempts <= 1 {
         // Fast path: byte-identical to the pre-retry behavior — one call, one
         // context wrap, no clones.
-        return run_transfer_impl(source_cfg, dest, cfg, progress)
+        return run_transfer_impl(source_cfg, dest, cfg, progress, on_staged)
             .await
             .map_err(|e| e.context(table_context));
     }
@@ -284,6 +377,7 @@ pub async fn run_transfer(
             dest.clone(),
             cfg.clone(),
             progress.clone(),
+            on_staged.clone(),
         )
         .await;
         match result {
@@ -307,6 +401,7 @@ async fn run_transfer_impl(
     dest: DestinationConfig,
     cfg: TransferConfig,
     progress: Option<ProgressCb>,
+    on_staged: Option<StagedValidationCb>,
 ) -> Result<TransferResult> {
     // Every source (Postgres, MySQL, BigQuery — directly or via reqwest/tonic's
     // own rustls-based transport) eventually needs a process-wide rustls
@@ -331,6 +426,20 @@ async fn run_transfer_impl(
     // Drop mode-irrelevant fields (e.g. a watermark passed with mode="full")
     // so the config that runs matches what's effective — see normalize().
     cfg.normalize();
+
+    // A staged-validation gate needs a staging table to validate before the
+    // promotion. Full-refresh always stages; incremental stages either for its
+    // MERGE (BigQuery) or is forced to stage below (ClickHouse — it would
+    // otherwise insert directly). Append mode is the one path with no staging
+    // option (a bronze-landing direct insert with no dedup), so reject it loudly
+    // up front rather than silently skipping the validation the caller asked for.
+    if on_staged.is_some() && cfg.mode == SyncMode::Append {
+        return Err(EtlError::config(
+            "data-quality validation is not supported for append mode (rows insert \
+             directly with no staging table to gate)",
+        ));
+    }
+
     let started = Instant::now();
 
     let source_label = cfg
@@ -374,8 +483,17 @@ async fn run_transfer_impl(
             bq.credentials_json.clone(),
         );
         let sink = build_sink(dest).await?;
-        return run_transfer_bigquery(&source, sink, cfg, progress, started, archive_info, staging)
-            .await;
+        return run_transfer_bigquery(
+            &source,
+            sink,
+            cfg,
+            progress,
+            on_staged,
+            started,
+            archive_info,
+            staging,
+        )
+        .await;
     }
 
     // HTTP API sources (CleverTap/AppsFlyer): a declared schema + paginated
@@ -383,7 +501,8 @@ async fn run_transfer_impl(
     // machinery. archive is always None (BigQuery-only).
     if source_cfg.is_api() {
         let sink = build_sink(dest).await?;
-        return run_transfer_api(source_cfg, sink, cfg, progress, started, staging).await;
+        return run_transfer_api(source_cfg, sink, cfg, progress, on_staged, started, staging)
+            .await;
     }
 
     let source = Arc::new(match &source_cfg {
@@ -410,6 +529,16 @@ async fn run_transfer_impl(
     });
     let sink = build_sink(dest).await?;
 
+    // A data-quality gate on an incremental sink that would otherwise insert
+    // directly (ClickHouse) forces a staging table so the gate has something to
+    // validate before rows reach the destination; the promoted rows are then
+    // deduped lazily by `ReplacingMergeTree`, exactly as a direct insert. This
+    // is exactly the set of runs `requires_staging_for_incremental()` does NOT
+    // already stage.
+    let force_stage_incremental = on_staged.is_some()
+        && cfg.mode == SyncMode::Incremental
+        && !sink.requires_staging_for_incremental();
+
     // Keyset resumable reads (MVP) commit per chunk straight into the
     // destination, which only works where incremental inserts directly (no
     // staging + swap/merge) — i.e. ClickHouse.
@@ -417,6 +546,15 @@ async fn run_transfer_impl(
         return Err(EtlError::config(
             "chunk_rows (keyset resumable reads) is only supported for a ClickHouse destination \
              in this version",
+        ));
+    }
+    // ...and chunked reads can't be gated: each chunk commits straight into the
+    // destination as it's read, so there is no single staging table to validate.
+    if cfg.chunk_rows.is_some() && force_stage_incremental {
+        return Err(EtlError::config(
+            "data-quality validation (validate=) is not supported together with chunk_rows: \
+             chunked keyset reads commit each chunk directly into the destination, leaving no \
+             single staging table to gate. Drop chunk_rows to validate, or validate downstream.",
         ));
     }
 
@@ -498,15 +636,28 @@ async fn run_transfer_impl(
             effective_upper,
             resume.is_some()
         );
+        let source_expr = cfg.watermark_source_expr.as_deref();
+        if cfg.source_query.is_some() && source_expr.is_none() {
+            tracing::info!(
+                "incremental sync reads via source_query: the watermark filter binds to \
+                 source_query's own '{watermark}' output column. If that column is anything \
+                 other than a bare pass-through of an indexed base-table column (e.g. it's cast \
+                 or otherwise transformed), this predicate cannot use an index and every \
+                 incremental run will full-scan. See watermark_source_expr= to filter on a raw, \
+                 indexed column while source_query still projects a transformed '{watermark}'."
+            );
+        }
         let filter = match source.as_ref() {
             Source::Postgres(_) => build_watermark_filter_pg(
                 watermark,
+                source_expr,
                 last.as_deref(),
                 effective_upper.as_deref(),
                 cfg.lookback_seconds,
             ),
             Source::MySql(_) => build_watermark_filter_mysql(
                 watermark,
+                source_expr,
                 last.as_deref(),
                 effective_upper.as_deref(),
                 cfg.lookback_seconds,
@@ -533,7 +684,14 @@ async fn run_transfer_impl(
     };
 
     // --- Ensure destination / staging tables exist. ---
-    let target_table = prepare_target(&sink, &cfg, &plan.dest_columns, &staging).await?;
+    let target_table = prepare_target(
+        &sink,
+        &cfg,
+        &plan.dest_columns,
+        &staging,
+        force_stage_incremental,
+    )
+    .await?;
     // Whether this run actually created a staging table (vs. inserting straight
     // into the destination, as ClickHouse incremental does) — decides whether
     // the error path below has anything to clean up.
@@ -628,20 +786,37 @@ async fn run_transfer_impl(
             counters.rows_written.load(Ordering::Relaxed)
         );
 
-        // --- Full refresh: atomically swap staging into place. ---
+        // --- Full refresh: validate staging, then atomically swap it into place. ---
         if cfg.mode == SyncMode::Full {
+            run_staged_validation(
+                &on_staged,
+                sink.as_ref(),
+                &staging,
+                counters.rows_written.load(Ordering::Relaxed),
+            )?;
             tracing::info!("swapping staging table into '{}'", cfg.dest_table);
             sink.atomic_swap(&cfg.dest_table, &staging, &plan.dest_columns).await?;
             sink.drop_table(&staging).await?;
         }
 
-        // --- Incremental: merge staged rows into the destination (destinations
-        // with no engine-level dedup), then persist the new watermark. ---
+        // --- Incremental: validate + promote staged rows (MERGE for BigQuery,
+        // insert-select for a gated ClickHouse run; direct-insert runs did not
+        // stage and have nothing to promote), then persist the new watermark. ---
         if cfg.mode == SyncMode::Incremental {
-            if sink.requires_staging_for_incremental() {
-                tracing::info!("merging staged incremental rows into '{}'", cfg.dest_table);
-                sink.merge_into(&cfg.dest_table, &staging, &cfg.key, &plan.dest_columns, cfg.merge_prune_partition_by.as_deref(), cfg.delete_stale_in_window).await?;
-                sink.drop_table(&staging).await?;
+            if used_staging {
+                promote_staged_incremental(
+                    sink.as_ref(),
+                    &cfg.dest_table,
+                    &staging,
+                    &cfg.key,
+                    &plan.dest_columns,
+                    cfg.merge_prune_partition_by.as_deref(),
+                    cfg.delete_stale_in_window,
+                    &on_staged,
+                    counters.rows_written.load(Ordering::Relaxed),
+                    cfg.watermark.as_deref(),
+                )
+                .await?;
             }
             if let Some(w) = &new_watermark {
                 if cfg.advance_watermark {
@@ -683,11 +858,13 @@ async fn run_transfer_impl(
 /// early-return dispatch in [`run_transfer`]) — one read session, drained
 /// sequentially, with `cfg.parallelism` passed through as BigQuery's own
 /// `max_stream_count` hint for server-side parallel preparation.
+#[allow(clippy::too_many_arguments)]
 async fn run_transfer_bigquery(
     source: &BigQuerySource,
     sink: Arc<dyn Sink>,
     cfg: TransferConfig,
     progress: Option<ProgressCb>,
+    on_staged: Option<StagedValidationCb>,
     started: Instant,
     archive_info: Option<Arc<ArchiveRunInfo>>,
     staging: String,
@@ -702,9 +879,22 @@ async fn run_transfer_bigquery(
              transform in a source_query instead",
         ));
     }
+    if !cfg.column_transform_types.is_empty() {
+        return Err(EtlError::config(
+            "column_transform_types is not supported for a BigQuery source (it overrides the \
+             decode type for a column_transforms entry, which is itself unsupported here)",
+        ));
+    }
     if cfg.chunk_rows.is_some() {
         return Err(EtlError::config(
             "chunk_rows (keyset resumable reads) is not supported for a BigQuery source",
+        ));
+    }
+    if cfg.watermark_source_expr.is_some() {
+        return Err(EtlError::config(
+            "watermark_source_expr is not supported for a BigQuery source (its Storage Read API \
+             row_restriction always applies to the resolved table's own columns, not a nested \
+             query, so the full-scan risk it addresses doesn't apply there)",
         ));
     }
     let (client, project_id) = source.connect().await?;
@@ -761,7 +951,21 @@ async fn run_transfer_bigquery(
         (None, None)
     };
 
-    let target_table = prepare_target(&sink, &cfg, &plan.dest_columns, &staging).await?;
+    // Force a staging table for a gated incremental run into a directly-inserting
+    // destination (ClickHouse), so the gate has something to validate (see the
+    // DB flow for the rationale).
+    let force_stage_incremental = on_staged.is_some()
+        && cfg.mode == SyncMode::Incremental
+        && !sink.requires_staging_for_incremental();
+
+    let target_table = prepare_target(
+        &sink,
+        &cfg,
+        &plan.dest_columns,
+        &staging,
+        force_stage_incremental,
+    )
+    .await?;
     let used_staging = target_table != cfg.dest_table;
     let cleanup_sink = sink.clone();
     let cleanup_staging_name = staging.clone();
@@ -844,15 +1048,31 @@ async fn run_transfer_bigquery(
         );
 
         if cfg.mode == SyncMode::Full {
+            run_staged_validation(
+                &on_staged,
+                sink.as_ref(),
+                &staging,
+                counters.rows_written.load(Ordering::Relaxed),
+            )?;
             tracing::info!("swapping staging table into '{}'", cfg.dest_table);
             sink.atomic_swap(&cfg.dest_table, &staging, &plan.dest_columns).await?;
             sink.drop_table(&staging).await?;
         }
         if cfg.mode == SyncMode::Incremental {
-            if sink.requires_staging_for_incremental() {
-                tracing::info!("merging staged incremental rows into '{}'", cfg.dest_table);
-                sink.merge_into(&cfg.dest_table, &staging, &cfg.key, &plan.dest_columns, cfg.merge_prune_partition_by.as_deref(), cfg.delete_stale_in_window).await?;
-                sink.drop_table(&staging).await?;
+            if used_staging {
+                promote_staged_incremental(
+                    sink.as_ref(),
+                    &cfg.dest_table,
+                    &staging,
+                    &cfg.key,
+                    &plan.dest_columns,
+                    cfg.merge_prune_partition_by.as_deref(),
+                    cfg.delete_stale_in_window,
+                    &on_staged,
+                    counters.rows_written.load(Ordering::Relaxed),
+                    cfg.watermark.as_deref(),
+                )
+                .await?;
             }
             if let Some(w) = &new_watermark {
                 if cfg.advance_watermark {
@@ -1011,6 +1231,7 @@ async fn run_transfer_api(
     sink: Arc<dyn Sink>,
     mut cfg: TransferConfig,
     progress: Option<ProgressCb>,
+    on_staged: Option<StagedValidationCb>,
     started: Instant,
     staging: String,
 ) -> Result<TransferResult> {
@@ -1064,7 +1285,22 @@ async fn run_transfer_api(
     };
     let (from, to, new_watermark) = derive_api_window(&cfg, &source_cfg, committed)?;
 
-    let target_table = prepare_target(&sink, &cfg, &plan.dest_columns, &staging).await?;
+    // Force a staging table for a gated incremental run into a directly-inserting
+    // destination (ClickHouse), so the gate has something to validate (see the
+    // DB flow for the rationale). Append mode has no staging option and is
+    // rejected up front when a gate is attached.
+    let force_stage_incremental = on_staged.is_some()
+        && cfg.mode == SyncMode::Incremental
+        && !sink.requires_staging_for_incremental();
+
+    let target_table = prepare_target(
+        &sink,
+        &cfg,
+        &plan.dest_columns,
+        &staging,
+        force_stage_incremental,
+    )
+    .await?;
     let used_staging = target_table != cfg.dest_table;
     let cleanup_sink = sink.clone();
     let cleanup_staging_name = staging.clone();
@@ -1177,23 +1413,31 @@ async fn run_transfer_api(
                     );
                 }
             }
+            run_staged_validation(
+                &on_staged,
+                sink.as_ref(),
+                &staging,
+                counters.rows_written.load(Ordering::Relaxed),
+            )?;
             tracing::info!("swapping staging table into '{}'", cfg.dest_table);
             sink.atomic_swap(&cfg.dest_table, &staging, &plan.dest_columns).await?;
             sink.drop_table(&staging).await?;
         }
         if cfg.mode == SyncMode::Incremental {
-            if sink.requires_staging_for_incremental() {
-                tracing::info!("merging staged incremental rows into '{}'", cfg.dest_table);
-                sink.merge_into(
+            if used_staging {
+                promote_staged_incremental(
+                    sink.as_ref(),
                     &cfg.dest_table,
                     &staging,
                     &cfg.key,
                     &plan.dest_columns,
                     cfg.merge_prune_partition_by.as_deref(),
                     cfg.delete_stale_in_window,
+                    &on_staged,
+                    counters.rows_written.load(Ordering::Relaxed),
+                    cfg.watermark.as_deref(),
                 )
                 .await?;
-                sink.drop_table(&staging).await?;
             }
             if let Some(w) = &new_watermark {
                 if cfg.advance_watermark {
@@ -1252,13 +1496,35 @@ async fn setup_postgres(
     tracing::info!("connecting to postgres...");
     let control = s.connect().await?;
     tracing::debug!("postgres connection established");
-    let schema_probe = match (base_table, base_query) {
-        (Some(t), _) => format!("SELECT * FROM {}", quote_pg_table(t)),
-        (_, Some(q)) => q.to_string(),
-        _ => unreachable!("validated above"),
+    // `source_query` takes precedence over `source_table` — matching
+    // `PgSource::copy_sql`, `PgSource::max_watermark`, and `source_table`'s own
+    // documented contract ("Ignored if `source_query` is set"). The schema probe
+    // used to invert exactly this one decision, so passing *both* resolved the
+    // decode types from the bare table while the data was read from the query.
+    // Postgres's binary `COPY` payload carries no per-field type tag, so the
+    // wire bytes were then decoded against the table's OIDs: a widened field
+    // (say `id::bigint` over an `int4` column) silently lost its value rather
+    // than erroring, since the field readers take a byte-count prefix and
+    // `read_i32` just takes the first 4 big-endian bytes of the 8 sent.
+    //
+    // When both are set the table is ignored for NOT NULL enrichment too, so
+    // "both" behaves identically to "query only": the query may join or
+    // outer-join in ways that make a NOT NULL base column nullable in the
+    // result, and inheriting the table's NOT NULL set would then declare a
+    // non-nullable destination column that real NULLs violate.
+    let (schema_probe, not_null_from) = match (base_table, base_query) {
+        (_, Some(q)) => (q.to_string(), None),
+        (Some(t), None) => (format!("SELECT * FROM {}", quote_pg_table(t)), Some(t)),
+        (None, None) => unreachable!("validated above"),
     };
+    if base_table.is_some() && base_query.is_some() {
+        tracing::warn!(
+            "both source_table and source_query are set; source_table is ignored — \
+             schema and data both come from source_query"
+        );
+    }
     let source_cols = s
-        .resolve_columns(&control, &schema_probe, base_table)
+        .resolve_columns(&control, &schema_probe, not_null_from)
         .await?;
 
     // Only needed for incremental mode (the value is discarded otherwise) —
@@ -1269,7 +1535,26 @@ async fn setup_postgres(
         if let Some(w) = watermark {
             ensure_watermark_column(w, &source_cols)?;
             ensure_lookback_compatible(w, cfg.lookback_seconds, &source_cols)?;
-            s.max_watermark(&control, base_table, base_query, w).await?
+            if watermark_column_nullable(w, &source_cols) {
+                let null_count = s
+                    .count_null_watermark(
+                        &control,
+                        base_table,
+                        base_query,
+                        w,
+                        cfg.watermark_source_expr.as_deref(),
+                    )
+                    .await?;
+                warn_on_null_watermark(w, null_count);
+            }
+            s.max_watermark(
+                &control,
+                base_table,
+                base_query,
+                w,
+                cfg.watermark_source_expr.as_deref(),
+            )
+            .await?
         } else {
             None
         }
@@ -1295,12 +1580,23 @@ async fn setup_mysql(
     tracing::info!("connecting to mysql...");
     let mut control = s.connect().await?;
     tracing::debug!("mysql connection established");
+    // `source_query` wins, matching `MySqlSource::select_sql` and
+    // `source_table`'s documented contract — see the equivalent comment in
+    // `setup_postgres` for the mis-decode this inversion caused.
     let schema_probe = match (base_table, base_query) {
-        (Some(t), _) => format!("SELECT * FROM {}", quote_my_table(t)),
         (_, Some(q)) => q.to_string(),
-        _ => unreachable!("validated above"),
+        (Some(t), None) => format!("SELECT * FROM {}", quote_my_table(t)),
+        (None, None) => unreachable!("validated above"),
     };
-    let source_cols = s.resolve_columns(&mut control, &schema_probe).await?;
+    if base_table.is_some() && base_query.is_some() {
+        tracing::warn!(
+            "both source_table and source_query are set; source_table is ignored — \
+             schema and data both come from source_query"
+        );
+    }
+    let source_cols = s
+        .resolve_columns(&mut control, &schema_probe, cfg.tinyint1_as_bool)
+        .await?;
 
     // Only needed for incremental mode (the value is discarded otherwise) —
     // skip it in full-refresh so a watermark column left set alongside
@@ -1310,8 +1606,26 @@ async fn setup_mysql(
         if let Some(w) = watermark {
             ensure_watermark_column(w, &source_cols)?;
             ensure_lookback_compatible(w, cfg.lookback_seconds, &source_cols)?;
-            s.max_watermark(&mut control, base_table, base_query, w)
-                .await?
+            if watermark_column_nullable(w, &source_cols) {
+                let null_count = s
+                    .count_null_watermark(
+                        &mut control,
+                        base_table,
+                        base_query,
+                        w,
+                        cfg.watermark_source_expr.as_deref(),
+                    )
+                    .await?;
+                warn_on_null_watermark(w, null_count);
+            }
+            s.max_watermark(
+                &mut control,
+                base_table,
+                base_query,
+                w,
+                cfg.watermark_source_expr.as_deref(),
+            )
+            .await?
         } else {
             None
         }
@@ -1793,6 +2107,7 @@ async fn transfer_keyset_mysql(
             .fetch_add(rows_this_chunk, Ordering::Relaxed);
         warn_coerced_dates("keyset read", batcher.invalid_dates_total);
         warn_coerced_decimals("keyset read", batcher.invalid_decimals_total);
+        warn_collapsed_bools("keyset read", batcher.collapsed_bools_total);
 
         if rows_this_chunk == 0 {
             break;
@@ -1941,6 +2256,10 @@ async fn transfer_partition_mysql(
         &format!("partition '{}'", partition.label),
         batcher.invalid_decimals_total,
     );
+    warn_collapsed_bools(
+        &format!("partition '{}'", partition.label),
+        batcher.collapsed_bools_total,
+    );
     Ok(())
 }
 
@@ -1972,6 +2291,26 @@ fn warn_coerced_decimals(scope: &str, n: u64) {
     }
 }
 
+/// Warn (once per partition / read) when a MySQL `tinyint(1)` column carried a
+/// value outside `{0, 1}` and was flattened to a Boolean. Same aggregation
+/// rationale as [`warn_coerced_dates`], but this one signals a *type-mapping*
+/// mistake rather than unrepresentable data: MySQL's `BOOL` is an alias for
+/// `tinyint(1)`, so display width is the only available hint, and a schema that
+/// doesn't follow that convention (Odoo, for one) stores genuine integers there.
+/// Non-zero here means the destination has already lost the difference between
+/// e.g. 2 and 3 — see `TransferConfig::tinyint1_as_bool` for the opt-out.
+fn warn_collapsed_bools(scope: &str, n: u64) {
+    if n > 0 {
+        tracing::warn!(
+            "{scope}: {n} tinyint(1) value(s) outside {{0, 1}} were flattened to a boolean \
+             0/1, losing their original value. MySQL's BOOL is an alias for tinyint(1), so \
+             this column was mapped to Bool from its display width — if it actually holds \
+             small integers, pass tinyint1_as_bool=False to read it as an integer instead \
+             (note: rows already written keep the flattened value; re-sync to repair them)"
+        );
+    }
+}
+
 /// Fail early (before any query touches it) if the incremental `watermark`
 /// column isn't among the resolved source columns. Without this, the watermark
 /// only surfaces deep in the setup as a cryptic driver error — e.g. MySQL 1054
@@ -1990,6 +2329,37 @@ fn ensure_watermark_column(watermark: &str, source_cols: &[ColumnType]) -> Resul
     Err(EtlError::config(format!(
         "watermark column '{watermark}' not found in source; available columns: {available}"
     )))
+}
+
+/// Whether the resolved `watermark` column allows NULL — see
+/// `warn_on_null_watermark` for why this is checked at all.
+fn watermark_column_nullable(watermark: &str, source_cols: &[ColumnType]) -> bool {
+    source_cols
+        .iter()
+        .find(|c| c.name == watermark)
+        .expect("ensure_watermark_column already validated the watermark column exists")
+        .nullable
+}
+
+/// Bug report B3: a `WHERE watermark > x` predicate never matches a NULL
+/// value, so when the watermark column is nullable, rows with a NULL there
+/// are silently excluded from *every* incremental run, forever —
+/// `rows_read` reports the filtered count and the transfer still reports
+/// success. Surface it loudly instead of leaving the table quietly
+/// incomplete (the report's reproduction: 322,318 of 383,500 rows in one
+/// window, 0 errors, 0 warnings, until an independent completeness check
+/// caught it).
+fn warn_on_null_watermark(watermark: &str, null_count: i64) {
+    if null_count > 0 {
+        tracing::warn!(
+            "watermark column '{watermark}' is nullable and {null_count} row(s) currently have a \
+             NULL value there; a `WHERE {watermark} > x` predicate never matches NULL, so these \
+             rows are silently excluded from this and every future incremental run on this \
+             pipeline (this run will still report success). If they need to be synced, \
+             backfill them separately — e.g. a source_query scoped to `{watermark} IS NULL`, or \
+             a one-off mode=\"full\" load."
+        );
+    }
 }
 
 /// Fail early (before any query touches it) if `lookback_seconds` is set but
@@ -2051,11 +2421,17 @@ async fn prepare_target(
     cfg: &TransferConfig,
     dest_columns: &[ColumnType],
     staging: &str,
+    // Stage an *incremental* run that wouldn't otherwise (ClickHouse) so a
+    // data-quality gate has a staging table to validate before rows reach the
+    // destination. No effect on full-refresh (always stages) or on a
+    // destination that already stages for its MERGE (BigQuery).
+    force_stage_incremental: bool,
 ) -> Result<String> {
     match cfg.mode {
         SyncMode::Full => {
             // Destination must exist for the atomic swap; create it empty if allowed.
-            if !sink.table_exists(&cfg.dest_table).await? {
+            let dest_existed = sink.table_exists(&cfg.dest_table).await?;
+            if !dest_existed {
                 if cfg.create_if_missing {
                     tracing::info!(
                         "destination table '{}' does not exist; creating it",
@@ -2073,7 +2449,7 @@ async fn prepare_target(
                 tracing::debug!("destination table '{}' already exists", cfg.dest_table);
                 // Full-refresh only needs to evolve a dest whose swap names its
                 // columns (BigQuery INSERT...SELECT). ClickHouse's swap recreates
-                // the table from staging, so drift is absorbed transparently.
+                // the table from staging, so drift is absorbed there instead (below).
                 if cfg.evolve_schema && sink.full_refresh_references_dest_columns() {
                     let added = sink
                         .add_missing_columns(&cfg.dest_table, dest_columns, cfg)
@@ -2094,7 +2470,35 @@ async fn prepare_target(
             // crashed run's orphan, and — for BigQuery — never enters the
             // "recently deleted/recreated" state that blocks streaming inserts.
             tracing::info!("creating staging table '{staging}'");
-            sink.create_table(staging, dest_columns, cfg).await?;
+            if dest_existed {
+                // Bug report B4: a swap (ClickHouse's EXCHANGE TABLES) makes
+                // staging's structure the new destination, so staging must
+                // mirror the destination's *actual* engine/ORDER BY/PARTITION
+                // BY/nullability — not a fresh CREATE TABLE recomputed from
+                // `cfg`, which silently replaces them the moment `cfg` omits
+                // (or disagrees with) whatever the table already has.
+                sink.clone_table_structure(staging, &cfg.dest_table).await?;
+                // The clone above copies dest's columns as they stood *before*
+                // this function's own evolve_schema step ran (for BigQuery
+                // that step already updated dest, so this is a no-op there;
+                // for ClickHouse, which skips that step above, this is what
+                // actually adds a new source column to staging).
+                if cfg.evolve_schema {
+                    let added = sink.add_missing_columns(staging, dest_columns, cfg).await?;
+                    if !added.is_empty() {
+                        tracing::info!(
+                            "evolve_schema: added {} column(s) to staging '{}': {}",
+                            added.len(),
+                            staging,
+                            added.join(", ")
+                        );
+                    }
+                }
+            } else {
+                // First run for this destination: no existing DDL to preserve,
+                // so build both dest (above) and staging fresh from `cfg`.
+                sink.create_table(staging, dest_columns, cfg).await?;
+            }
             Ok(staging.to_string())
         }
         SyncMode::Incremental => {
@@ -2112,7 +2516,8 @@ async fn prepare_target(
                 ));
             }
 
-            if !sink.table_exists(&cfg.dest_table).await? {
+            let dest_existed = sink.table_exists(&cfg.dest_table).await?;
+            if !dest_existed {
                 if cfg.create_if_missing {
                     tracing::info!(
                         "destination table '{}' does not exist; creating it",
@@ -2147,9 +2552,28 @@ async fn prepare_target(
             }
             sink.ensure_state_table(&cfg.state_table_name).await?;
 
-            if sink.requires_staging_for_incremental() {
-                tracing::info!("creating staging table '{staging}' for incremental merge");
-                sink.create_table(staging, dest_columns, cfg).await?;
+            if sink.requires_staging_for_incremental() || force_stage_incremental {
+                tracing::info!("creating staging table '{staging}' for incremental load");
+                if dest_existed {
+                    // Schema follows the destination here too (same fix as
+                    // full-refresh, bug report B4): staging is only ever a
+                    // transient MERGE source, so it must match what the
+                    // destination *actually* has right now — including any
+                    // `type_overrides`/`column_transform_types` from whatever
+                    // run originally created it, which this run may not have
+                    // repeated — not a fresh `create_table` re-derived from
+                    // this run's `cfg`/source schema, which could silently
+                    // diverge from the destination's real column types and
+                    // break the MERGE's column-to-column assignment. Cloned
+                    // *after* the evolve_schema step above, so a newly added
+                    // column is already present on staging too.
+                    sink.clone_table_structure(staging, &cfg.dest_table).await?;
+                } else {
+                    // First run for this destination: no existing schema to
+                    // follow, so build both dest (above) and staging fresh
+                    // from `cfg`/the resolved source schema.
+                    sink.create_table(staging, dest_columns, cfg).await?;
+                }
                 Ok(staging.to_string())
             } else {
                 Ok(cfg.dest_table.clone())
@@ -2343,11 +2767,14 @@ fn seed_value(seed: &WatermarkSeed, snapshot_max: Option<&str>) -> Option<String
 
 fn build_watermark_filter_pg(
     watermark: &str,
+    source_expr: Option<&str>,
     last: Option<&str>,
     snapshot_max: Option<&str>,
     lookback_seconds: u64,
 ) -> Option<String> {
-    let col = format!("\"{}\"", watermark.replace('"', "\"\""));
+    let col = source_expr
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("\"{}\"", watermark.replace('"', "\"\"")));
     let lower = last.map(|l| lookback_lower_bound_pg(l, lookback_seconds));
     let upper = snapshot_max.map(quote_sql_literal);
     build_watermark_filter(&col, lower, upper)
@@ -2355,13 +2782,17 @@ fn build_watermark_filter_pg(
 
 fn build_watermark_filter_mysql(
     watermark: &str,
+    source_expr: Option<&str>,
     last: Option<&str>,
     snapshot_max: Option<&str>,
     lookback_seconds: u64,
 ) -> Option<String> {
+    let col = source_expr
+        .map(str::to_string)
+        .unwrap_or_else(|| quote_my(watermark));
     let lower = last.map(|l| lookback_lower_bound_mysql(l, lookback_seconds));
     let upper = snapshot_max.map(quote_mysql_literal);
-    build_watermark_filter(&quote_my(watermark), lower, upper)
+    build_watermark_filter(&col, lower, upper)
 }
 
 /// Postgres, under the default `standard_conforming_strings = on`, treats
@@ -2384,15 +2815,21 @@ fn quote_mysql_literal(m: &str) -> String {
 
 /// BigQuery Standard SQL uses the same backtick identifier quoting as MySQL.
 /// `source_cols` resolves the watermark column's BigQuery type, needed for
-/// two independent reasons: (1) the lookback lower bound's `_SUB` function
+/// two independent reasons, both applying to *either* bound regardless of
+/// `lookback_seconds`: (1) the lookback lower bound's `_SUB` function
 /// (DATE/DATETIME/TIMESTAMP each need their own — BigQuery won't implicitly
-/// compare across them), only relevant when `lookback_seconds > 0`
-/// (`ensure_lookback_compatible` has already validated a temporal type by the
-/// time this runs); (2) the upper bound's CAST — BigQuery only implicitly
-/// coerces an untyped STRING literal against DATE/DATETIME/TIME/TIMESTAMP,
-/// NOT against INT64/NUMERIC/FLOAT64/BOOL, so a plain (non-lookback)
-/// incremental sync against a numeric watermark column needs the type
-/// resolved unconditionally, not just when lookback is active.
+/// compare across them) when `lookback_seconds > 0` (`ensure_lookback_compatible`
+/// has already validated a temporal type by the time this runs); (2) the
+/// CAST every literal needs otherwise — BigQuery only implicitly coerces an
+/// untyped STRING literal against DATE/DATETIME/TIME/TIMESTAMP, NOT against
+/// INT64/NUMERIC/FLOAT64/BOOL, so a plain (non-lookback) incremental sync
+/// against a numeric watermark column needs the type resolved
+/// unconditionally, not just when lookback is active. Both bounds share this
+/// unconditionally: the *lower* bound is exactly the persisted cursor from a
+/// prior run, in the same domain as the upper bound, so leaving it
+/// bare-quoted while the upper bound is CAST-typed (as a stale fix here once
+/// did) reintroduces the same `INT64 > STRING` failure one bound over, on
+/// the very first run that has a persisted cursor to compare against.
 fn build_watermark_filter_bigquery(
     watermark: &str,
     last: Option<&str>,
@@ -2404,14 +2841,7 @@ fn build_watermark_filter_bigquery(
         .iter()
         .find(|c| c.name == watermark)
         .and_then(|c| arrow_to_bigquery_type(&c.arrow));
-    let lower = last.map(|l| {
-        let lb_type = if lookback_seconds > 0 {
-            bq_type.clone()
-        } else {
-            None
-        };
-        lookback_lower_bound_bigquery(l, lookback_seconds, lb_type)
-    });
+    let lower = last.map(|l| lookback_lower_bound_bigquery(l, lookback_seconds, bq_type.clone()));
     let upper = snapshot_max.map(|m| bigquery_typed_upper_bound(m, bq_type));
     build_watermark_filter(&quote_my(watermark), lower, upper)
 }
@@ -2434,9 +2864,17 @@ fn bigquery_typed_upper_bound(value: &str, bq_type: Option<TableFieldType>) -> S
 /// well-documented real-world gotcha when porting ANSI-style SQL generation
 /// to BigQuery, e.g. https://github.com/trinodb/trino/issues/7784). Backslash
 /// must be escaped first, same reasoning as `sink/bigquery.rs`'s
-/// `escape_sql_string` (kept in sync with that function deliberately).
+/// `escape_sql_string` (kept in sync with that function deliberately) — as
+/// must newlines/carriage returns, which a quoted (non-triple) GoogleSQL
+/// literal cannot carry raw: an unescaped one terminates the literal early and
+/// the statement fails to parse. See that function's docs for why a raw
+/// newline reaches this code path at all (a multi-line `source_query` becoming
+/// the default state key).
 fn escape_bigquery_string(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('\'', "\\'")
+    s.replace('\\', "\\\\")
+        .replace('\'', "\\'")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
 }
 
 fn bq_cast_type_name(t: &TableFieldType) -> &'static str {
@@ -2486,15 +2924,21 @@ fn lookback_lower_bound_mysql(last: &str, lookback_seconds: u64) -> String {
 /// against a `DATE` watermark rounds *up* to whole days via `div_ceil` —
 /// documented behavior, not silently wrong (a 1-hour lookback on a DATE
 /// column re-includes the whole prior day, not nothing).
+///
+/// With `lookback_seconds == 0`, this is just the lower bound's CAST-typed
+/// literal — the same treatment `bigquery_typed_upper_bound` gives the upper
+/// bound (bug report B2: leaving *this* bound bare-quoted made every
+/// non-lookback incremental sync against a numeric/boolean watermark fail
+/// with `INT64 > STRING` as soon as a cursor was persisted).
 fn lookback_lower_bound_bigquery(
     last: &str,
     lookback_seconds: u64,
     bq_type: Option<TableFieldType>,
 ) -> String {
-    let l = escape_bigquery_string(last);
     if lookback_seconds == 0 {
-        return format!("'{l}'");
+        return bigquery_typed_upper_bound(last, bq_type);
     }
+    let l = escape_bigquery_string(last);
     match bq_type.expect("ensure_lookback_compatible already validated a temporal watermark type") {
         TableFieldType::Date => {
             format!(
@@ -2587,6 +3031,44 @@ mod tests {
     fn throttle_reserve_zero_is_immediate() {
         let t = ReadThrottle::new(1000);
         assert!(t.reserve(0).is_zero());
+    }
+
+    /// `validate=` combined with `chunk_rows` on a ClickHouse incremental sync
+    /// is rejected up front: chunked keyset reads commit each chunk straight
+    /// into the destination, so there's no single staging table to gate. The
+    /// check fires before any network I/O (right after `build_sink`, before the
+    /// source connection), so this test needs no live source or destination.
+    /// (ClickHouse incremental *without* chunk_rows is now supported via forced
+    /// staging — covered by the live Python suite.)
+    #[tokio::test]
+    async fn validate_with_chunk_rows_is_rejected_up_front() {
+        let mut cfg = crate::config::default_test_config();
+        cfg.mode = SyncMode::Incremental;
+        cfg.watermark = Some("ts".into());
+        cfg.key = vec!["id".into()];
+        cfg.chunk_rows = Some(1000);
+        let src = SourceConfig::Postgres(crate::config::PostgresConfig {
+            dsn: "postgresql://user:pw@127.0.0.1:1/db".into(),
+            statement_timeout_secs: 0,
+            ca_cert_file: None,
+            client_cert_file: None,
+            client_key_file: None,
+        });
+        let dst = DestinationConfig::ClickHouse(crate::config::ClickHouseConfig {
+            url: "http://127.0.0.1:1".into(),
+            database: "default".into(),
+            user: "default".into(),
+            password: String::new(),
+            compression: crate::config::Compression::None,
+            s3_archive: None,
+        });
+        let cb: StagedValidationCb = Arc::new(|_info: &StagedInfo| Ok(()));
+        let err = run_transfer_impl(src, dst, cfg, None, Some(cb))
+            .await
+            .expect_err("validate= together with chunk_rows must be rejected")
+            .to_string();
+        assert!(err.contains("chunk_rows"), "got: {err}");
+        assert!(err.contains("validate="), "got: {err}");
     }
 
     #[test]
@@ -2707,16 +3189,28 @@ mod tests {
         // Regression guard: lookback_seconds=0 must produce byte-identical
         // SQL to the pre-lookback filter.
         assert_eq!(
-            build_watermark_filter_pg("write_date", Some("2024-01-01"), Some("2024-06-01"), 0),
+            build_watermark_filter_pg(
+                "write_date",
+                None,
+                Some("2024-01-01"),
+                Some("2024-06-01"),
+                0
+            ),
             Some("\"write_date\" > '2024-01-01' AND \"write_date\" <= '2024-06-01'".to_string())
         );
         assert_eq!(
-            build_watermark_filter_mysql("write_date", Some("2024-01-01"), Some("2024-06-01"), 0),
+            build_watermark_filter_mysql(
+                "write_date",
+                None,
+                Some("2024-01-01"),
+                Some("2024-06-01"),
+                0
+            ),
             Some("`write_date` > '2024-01-01' AND `write_date` <= '2024-06-01'".to_string())
         );
-        // BigQuery's upper bound is CAST-typed regardless of lookback state
-        // (a separate, unconditional fix — see
-        // watermark_filter_bigquery_casts_numeric_upper_bound below), so this
+        // BigQuery's bounds are CAST-typed regardless of lookback state (a
+        // separate, unconditional fix — see
+        // watermark_filter_bigquery_casts_both_bounds_by_type below), so this
         // one isn't byte-identical to the plain-quoted pg/mysql shape above.
         let cols = vec![col_typed("write_date", DataType::Date32)];
         assert_eq!(
@@ -2728,24 +3222,73 @@ mod tests {
                 &cols
             ),
             Some(
-                "`write_date` > '2024-01-01' AND `write_date` <= CAST('2024-06-01' AS DATE)"
+                "`write_date` > CAST('2024-01-01' AS DATE) AND \
+                 `write_date` <= CAST('2024-06-01' AS DATE)"
                     .to_string()
             )
         );
     }
 
     #[test]
-    fn watermark_filter_bigquery_casts_numeric_upper_bound() {
-        // Regression test (bug report): a numeric (INT64) watermark column's
-        // upper bound was always emitted as a bare quoted STRING literal,
-        // which BigQuery rejects for INT64 with "No matching signature for
-        // operator <= for argument types: INT64, STRING" — reproduced live
-        // against real BigQuery in the report. Every plain (non-lookback)
-        // incremental sync with an id-based watermark hit this on every run.
+    fn watermark_filter_source_expr_overrides_the_bare_column() {
+        // Regression test (bug report B1): with `source_query`, the generated
+        // read is `SELECT ... FROM (<source_query>) AS _src WHERE <watermark>
+        // > $1` — if source_query computes `watermark` via a transform (a
+        // cast, a timezone shift, ...) rather than a bare pass-through of an
+        // indexed base column, that WHERE binds to the *computed* value, so
+        // no index on the base table can serve it (full scan on every
+        // incremental run, confirmed live via EXPLAIN in the report).
+        // `watermark_source_expr` lets the filter target a different
+        // expression (typically a second, untransformed pass-through column
+        // projected by source_query) while `watermark`'s own output keeps
+        // emitting the transformed value.
+        assert_eq!(
+            build_watermark_filter_pg(
+                "write_date",
+                Some("\"write_date_raw\""),
+                Some("2024-01-01"),
+                Some("2024-06-01"),
+                0
+            ),
+            Some(
+                "\"write_date_raw\" > '2024-01-01' AND \"write_date_raw\" <= '2024-06-01'"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            build_watermark_filter_mysql(
+                "write_date",
+                Some("`write_date_raw`"),
+                Some("2024-01-01"),
+                Some("2024-06-01"),
+                0
+            ),
+            Some(
+                "`write_date_raw` > '2024-01-01' AND `write_date_raw` <= '2024-06-01'".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn watermark_filter_bigquery_casts_both_bounds_by_type() {
+        // Regression test (bug report B2): a numeric (INT64) watermark
+        // column's *upper* bound (this run's fresh snapshot max) was CAST-typed,
+        // but its *lower* bound (the persisted cursor from the prior run) was
+        // still emitted as a bare quoted STRING literal — BigQuery rejects
+        // comparing that against INT64 with "No matching signature for
+        // operator > for argument types: INT64, STRING", reproduced live
+        // against real BigQuery in the report. Since the lower bound is only
+        // populated once a cursor exists, this passed on a table's very first
+        // incremental run and failed on every run after — every plain
+        // (non-lookback) incremental sync with a numeric watermark, on the
+        // second run onward.
         let cols = vec![col_typed("uor_id", DataType::Int64)];
         let f =
             build_watermark_filter_bigquery("uor_id", Some("100"), Some("500"), 0, &cols).unwrap();
-        assert_eq!(f, "`uor_id` > '100' AND `uor_id` <= CAST('500' AS INT64)");
+        assert_eq!(
+            f,
+            "`uor_id` > CAST('100' AS INT64) AND `uor_id` <= CAST('500' AS INT64)"
+        );
     }
 
     #[test]
@@ -2760,19 +3303,35 @@ mod tests {
     }
 
     #[test]
+    fn watermark_filter_bigquery_escapes_newlines() {
+        // A quoted GoogleSQL literal cannot carry a raw newline — it ends the
+        // literal early and the whole predicate fails to parse. Kept in sync
+        // with sink/bigquery.rs's `escape_sql_string` test of the same name.
+        let cols = vec![col_typed("note", DataType::Utf8)];
+        let f = build_watermark_filter_bigquery("note", None, Some("a\nb\r\nc"), 0, &cols).unwrap();
+        assert_eq!(f, r"`note` <= CAST('a\nb\r\nc' AS STRING)");
+        assert!(!f.contains('\n') && !f.contains('\r'), "{f:?}");
+    }
+
+    #[test]
     fn watermark_filter_mysql_escapes_backslash_before_quote() {
         // Regression test: MySQL (unlike Postgres) treats backslash as an
         // active string-literal escape by default, so the same
         // trailing-backslash-swallows-the-quote failure mode applies here.
-        let f = build_watermark_filter_mysql("note", None, Some(r"a'b\"), 0).unwrap();
+        let f = build_watermark_filter_mysql("note", None, None, Some(r"a'b\"), 0).unwrap();
         assert_eq!(f, r"`note` <= 'a''b\\'");
     }
 
     #[test]
     fn watermark_filter_pg_widens_lower_bound_with_lookback() {
-        let f =
-            build_watermark_filter_pg("write_date", Some("2024-06-10"), Some("2024-06-15"), 3600)
-                .unwrap();
+        let f = build_watermark_filter_pg(
+            "write_date",
+            None,
+            Some("2024-06-10"),
+            Some("2024-06-15"),
+            3600,
+        )
+        .unwrap();
         assert!(
             f.contains("'2024-06-10'::timestamp - interval '3600 seconds'"),
             "got: {f}"
@@ -2785,8 +3344,14 @@ mod tests {
 
     #[test]
     fn watermark_filter_mysql_widens_lower_bound_with_lookback() {
-        let f = build_watermark_filter_mysql("write_date", Some("2024-06-10 00:00:00"), None, 3600)
-            .unwrap();
+        let f = build_watermark_filter_mysql(
+            "write_date",
+            None,
+            Some("2024-06-10 00:00:00"),
+            None,
+            3600,
+        )
+        .unwrap();
         assert!(
             f.contains("CAST('2024-06-10 00:00:00' AS DATETIME) - INTERVAL 3600 SECOND"),
             "got: {f}"

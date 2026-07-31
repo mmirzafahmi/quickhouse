@@ -378,27 +378,63 @@ impl PgSource {
     }
 
     /// Read the current max watermark value as text (for incremental sync).
+    ///
+    /// `source_expr`, when set, replaces the bare `watermark` column in this
+    /// probe (a raw SQL expression, e.g. a pass-through alias projected by
+    /// `source_query` for the underlying indexed column) — see
+    /// `TransferConfig::watermark_source_expr`. Kept in lockstep with the
+    /// incremental filter (`build_watermark_filter_pg`) so both compare the
+    /// same domain.
     pub async fn max_watermark(
         &self,
         client: &Client,
         from_table: Option<&str>,
         base_query: Option<&str>,
         watermark: &str,
+        source_expr: Option<&str>,
     ) -> Result<Option<String>> {
+        let w = source_expr
+            .map(str::to_string)
+            .unwrap_or_else(|| quote_pg(watermark));
         let sql = if let Some(q) = base_query {
-            format!(
-                "SELECT max({w})::text FROM ({q}) AS _src",
-                w = quote_pg(watermark)
-            )
+            format!("SELECT max({w})::text FROM ({q}) AS _src")
         } else {
             format!(
                 "SELECT max({w})::text FROM {t}",
-                w = quote_pg(watermark),
                 t = quote_pg_table(from_table.expect("table required"))
             )
         };
         let row = client.query_one(&sql, &[]).await?;
         Ok(row.get::<_, Option<String>>(0))
+    }
+
+    /// Count rows whose watermark value is NULL. A `WHERE wm > x` predicate
+    /// never matches NULL, so a nullable watermark column silently excludes
+    /// these rows from every incremental run, forever — callers use this to
+    /// warn instead of finishing "clean" while quietly skipping them. Same
+    /// `source_expr` override as `max_watermark`/the incremental filter,
+    /// so the count reflects the column actually being filtered on.
+    pub async fn count_null_watermark(
+        &self,
+        client: &Client,
+        from_table: Option<&str>,
+        base_query: Option<&str>,
+        watermark: &str,
+        source_expr: Option<&str>,
+    ) -> Result<i64> {
+        let w = source_expr
+            .map(str::to_string)
+            .unwrap_or_else(|| quote_pg(watermark));
+        let sql = if let Some(q) = base_query {
+            format!("SELECT count(*) FROM ({q}) AS _src WHERE {w} IS NULL")
+        } else {
+            format!(
+                "SELECT count(*) FROM {t} WHERE {w} IS NULL",
+                t = quote_pg_table(from_table.expect("table required"))
+            )
+        };
+        let row = client.query_one(&sql, &[]).await?;
+        Ok(row.get::<_, i64>(0))
     }
 }
 

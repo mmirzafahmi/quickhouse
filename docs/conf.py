@@ -43,8 +43,9 @@ def _build_shim() -> pathlib.Path:
     pkg.mkdir(parents=True)
 
     # The pure-Python modules import cleanly as-is (progress.py imports tqdm
-    # lazily, inside the function), so copy them verbatim.
-    for name in ("__init__.py", "progress.py", "py.typed"):
+    # lazily inside the function; quality.py imports great-expectations lazily
+    # inside Validation.__call__), so copy them verbatim.
+    for name in ("__init__.py", "progress.py", "quality.py", "py.typed"):
         shutil.copy(PKG_SRC / name, pkg / name)
 
     # Turn the type stub into a real, importable module. The stub only

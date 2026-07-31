@@ -345,6 +345,9 @@ impl BigQueryBatcher {
                 Coercion::None => {}
                 Coercion::DateRange => self.invalid_dates_total += 1,
                 Coercion::DecimalOverflow => self.invalid_decimals_total += 1,
+                // MySQL-only (a tinyint(1) display-width inference); BigQuery
+                // has a real BOOL type, so nothing is inferred here.
+                Coercion::BoolCollapse => {}
             }
         }
         self.rows_in_batch += 1;

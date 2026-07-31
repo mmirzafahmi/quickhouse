@@ -56,6 +56,7 @@ from ._quickhouse import (
     version,
 )
 from .progress import progress_bar
+from .quality import Validation, ValidationFailed
 
 __all__ = [
     "Postgres",
@@ -68,6 +69,8 @@ __all__ = [
     "S3Archive",
     "Progress",
     "TransferResult",
+    "Validation",
+    "ValidationFailed",
     "sync",
     "version",
     "__version__",

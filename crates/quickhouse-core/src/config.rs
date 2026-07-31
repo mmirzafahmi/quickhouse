@@ -396,7 +396,33 @@ pub struct TransferConfig {
     pub mode: SyncMode,
 
     /// Column used for the incremental high-water mark (required for Incremental).
+    /// `WHERE watermark > x` never matches a NULL value, so if this column is
+    /// nullable, rows with a NULL watermark are silently excluded from every
+    /// incremental run, forever (the transfer still reports success). A
+    /// Postgres/MySQL source warns once per run (with the count) when this is
+    /// detected — see `sync::warn_on_null_watermark`.
     pub watermark: Option<String>,
+    /// Postgres/MySQL only: a raw SQL expression used in place of `watermark`
+    /// when building the incremental filter and the boundary-max probe (the
+    /// projected `watermark` output is left untouched). `None` (default) uses
+    /// `watermark` itself, byte-identical to before.
+    ///
+    /// **Why this exists.** With `source_query`, the generated read is `SELECT
+    /// ... FROM (<source_query>) AS _src WHERE <watermark> > $1` — an outer
+    /// wrapper around whatever `source_query` projects. If `source_query`
+    /// computes `watermark` from an expression (a cast, a timezone shift, a
+    /// concatenation — anything other than a bare pass-through of an indexed
+    /// base-table column), the filter binds to that *computed* value, not the
+    /// underlying column, so no index on the base table can serve it — a full
+    /// scan on every incremental run regardless of table size. Have
+    /// `source_query` additionally project the raw, indexed column under a
+    /// second name (e.g. `write_date AS write_date_raw`) and set
+    /// `watermark_source_expr="write_date_raw"`: the filter and probe then
+    /// bind to that bare pass-through column (which Postgres/MySQL can push
+    /// down to the index), while `watermark`'s own projection keeps emitting
+    /// the transformed value used everywhere else (DDL, dest column, persisted
+    /// cursor comparison domain).
+    pub watermark_source_expr: Option<String>,
     /// Widen the tracked watermark's lower bound by this many seconds before
     /// filtering, so a run re-includes a trailing window of already-synced
     /// rows (catches late-arriving/edited rows that don't monotonically bump
@@ -533,10 +559,39 @@ pub struct TransferConfig {
     /// combine with `type_overrides` if the destination type must change too.
     /// Not supported for a BigQuery source (use `source_query` there).
     pub column_transforms: HashMap<String, String>,
+    /// Declares the Arrow decode type a `column_transforms` entry's SQL
+    /// actually produces on the wire (source column name -> one of
+    /// `"Boolean"`, `"Int16"`, `"Int32"`, `"Int64"`, `"UInt32"`, `"Float32"`,
+    /// `"Float64"`, `"Utf8"`, `"Binary"`, `"Date32"`). Requires a matching
+    /// `column_transforms` entry for the same column — a config error
+    /// otherwise.
+    ///
+    /// **Why this exists (bug report B6).** `column_transforms`' own doc
+    /// says "changes the value, not the resolved type — pair it with
+    /// `type_overrides` if the type must change too", but that pairing
+    /// doesn't actually work: `type_overrides` only changes the *declared
+    /// destination* type string, not what this crate decodes the source's
+    /// binary wire data as (still the untransformed source column's own
+    /// type). So `column_transforms={"active": "CAST(active AS TEXT)"}`
+    /// with `type_overrides={"active": "STRING"}` still decodes the wire
+    /// bytes as the original `bool`, corrupting values (or, downstream,
+    /// erroring as a bool-vs-STRING proto/type mismatch). Set
+    /// `column_transform_types={"active": "Utf8"}` alongside the transform
+    /// to fix the decode side too. A datetime or decimal type change should
+    /// still go through `type_overrides`, which already carries the extra
+    /// timezone/precision info those need and isn't affected by this field.
+    pub column_transform_types: HashMap<String, String>,
     /// Opt-in schema evolution: when the source has a column the existing
     /// destination table lacks, `ALTER TABLE ADD COLUMN` (as Nullable) instead
     /// of hard-erroring. `false` (default) preserves today's behavior. Never
     /// drops or retypes a column.
+    ///
+    /// Full-refresh against an *existing* destination now also needs this to
+    /// pick up a genuinely new source column (fixed alongside bug report B4:
+    /// full-refresh staging mirrors the destination's actual DDL instead of
+    /// silently rebuilding it from `cfg`, so a new column is no longer added
+    /// to staging for free the way it used to be — it's evolved in, same as
+    /// incremental).
     pub evolve_schema: bool,
 
     // ---- 0.9.0 block (configurable internal names; defaults preserve prior behavior) ----
@@ -565,6 +620,70 @@ pub struct TransferConfig {
     pub include: Vec<String>,
     /// Source columns to drop.
     pub exclude: Vec<String>,
+    /// Destination (post-rename) column names to force `NOT NULL` in
+    /// generated DDL, regardless of the source's own resolved nullability.
+    ///
+    /// **Why this exists (bug report B5).** Nullability is otherwise always
+    /// taken from the source: a `key`/`order_by`/`primary_key` column is
+    /// already forced non-nullable (ClickHouse rejects a nullable sort key
+    /// outright), but a column used only in `partition_by`'s expression
+    /// (e.g. `toYYYYMM(create_date)`) isn't covered by that check, so if the
+    /// source reports it nullable — e.g. every BigQuery column not
+    /// explicitly declared `REQUIRED` — the generated `Nullable(...)`
+    /// partition key is then rejected by ClickHouse
+    /// (`allow_nullable_key` is off by default). List such columns here.
+    /// Only affects DDL generated *from scratch* (a table created fresh) —
+    /// full-refresh against an *existing* destination now clones its actual
+    /// DDL/nullability instead of regenerating it (see `Sink::clone_table_structure`),
+    /// so this has nothing to add there.
+    pub not_null: Vec<String>,
+    /// Default destination type for **every** arbitrary-precision decimal
+    /// column (PostgreSQL `numeric`, MySQL `DECIMAL`/`NEWDECIMAL`, BigQuery
+    /// `NUMERIC`) that has no `type_overrides` entry of its own — e.g.
+    /// `"Decimal(38, 9)"`. `None` (default) keeps the historical `Float64`
+    /// mapping.
+    ///
+    /// **Why this exists (bug report B7b).** Those source types are exact
+    /// decimals with no `f64` equivalent, so the default mapping round-trips
+    /// them through IEEE-754 and reproduces the result: a stored `32.9` can
+    /// arrive as `32.89999999999999`. Confirmed in production — 2,457 of
+    /// 179,478 sampled rows of one Odoo `numeric` column already carry exactly
+    /// this noise, and 7 of 734,047 rows of another.
+    ///
+    /// Exact decoding was always reachable per column
+    /// (`type_overrides={col: "Decimal(P,S)"}`), which is the problem: it has to
+    /// be remembered for every affected column in every table, and forgetting it
+    /// is silent. Setting this once covers them all.
+    ///
+    /// Not the default, because it changes the *destination column type*:
+    /// against a table that already exists with a `Float64`/`FLOAT64` column,
+    /// switching the decode type to `Decimal128` would mean writing a decimal
+    /// into a float column. Choose the precision and scale deliberately —
+    /// a value that doesn't fit is coerced to NULL (counted and warned about,
+    /// see `warn_coerced_decimals`), so pick a scale that covers the column's
+    /// real range. P > 38 needs `Decimal256`, which isn't supported yet.
+    pub numeric_as_decimal: Option<String>,
+    /// MySQL only: whether a `tinyint(1)` column is mapped to Boolean
+    /// (`Bool`/`BOOL`) rather than a small integer. Default `true`.
+    ///
+    /// **Why this exists (bug report B8).** MySQL doesn't have a boolean type;
+    /// `BOOL` is an alias for `tinyint(1)`, so the *display width* of 1 is the
+    /// only signal that a `tinyint` was meant as a flag. That convention holds
+    /// for Rails/PHP-style ORMs, and this crate followed it unconditionally —
+    /// but it does not hold universally: Odoo, for one, declares genuinely
+    /// integer columns as `tinyint(1)`. For those, every non-zero value
+    /// (`2`, `3`, `-5`, ...) decoded to `true` and landed as `1`, silently
+    /// destroying the distinction between them — a real production incident.
+    ///
+    /// `type_overrides` can't repair this: it changes only the *declared
+    /// destination* type, while the value is already flattened by the Boolean
+    /// Arrow builder before that type is relevant. Set this to `false` to
+    /// decode such columns as the integers they are (`Int8`, or `UInt8` when
+    /// the column is UNSIGNED). Rows that were *already* written as
+    /// `true`/`false` keep whatever the destination stored; only future reads
+    /// change. When left `true`, any value outside `{0, 1}` is counted and
+    /// warned about at the end of the read rather than passing unnoticed.
+    pub tinyint1_as_bool: bool,
 }
 
 impl TransferConfig {
@@ -589,6 +708,7 @@ impl TransferConfig {
     pub fn normalize(&mut self) {
         if self.mode == SyncMode::Full {
             self.watermark = None;
+            self.watermark_source_expr = None;
             // The seed only meaningfully floors an incremental cursor; a
             // full refresh has none, so clear it (mirrors `watermark`).
             self.seed_watermark = WatermarkSeed::None;
@@ -642,6 +762,12 @@ impl TransferConfig {
             if !self.column_transforms.is_empty() {
                 return Err(EtlError::config(
                     "column_transforms is not supported for an API source (declare the columns instead)",
+                ));
+            }
+            if !self.column_transform_types.is_empty() {
+                return Err(EtlError::config(
+                    "column_transform_types is not supported for an API source (it overrides the \
+                     decode type for a column_transforms entry, which is itself unsupported here)",
                 ));
             }
             if self.chunk_rows.is_some() {
@@ -767,6 +893,7 @@ pub(crate) fn default_test_config() -> TransferConfig {
         state_key: None,
         mode: SyncMode::Full,
         watermark: None,
+        watermark_source_expr: None,
         lookback_seconds: 0,
         seed_watermark: WatermarkSeed::None,
         advance_watermark: true,
@@ -787,6 +914,7 @@ pub(crate) fn default_test_config() -> TransferConfig {
         chunk_rows: None,
         retry_max_attempts: 1,
         column_transforms: HashMap::new(),
+        column_transform_types: HashMap::new(),
         evolve_schema: false,
         state_table_name: "_quickhouse_state".into(),
         staging_suffix: "_quickhouse_tmp".into(),
@@ -795,6 +923,9 @@ pub(crate) fn default_test_config() -> TransferConfig {
         rename: HashMap::new(),
         include: vec![],
         exclude: vec![],
+        not_null: vec![],
+        tinyint1_as_bool: true,
+        numeric_as_decimal: None,
     }
 }
 
@@ -810,6 +941,7 @@ mod tests {
             state_key: None,
             mode,
             watermark: watermark.map(str::to_string),
+            watermark_source_expr: None,
             lookback_seconds: 0,
             seed_watermark: WatermarkSeed::None,
             advance_watermark: true,
@@ -830,6 +962,7 @@ mod tests {
             chunk_rows: None,
             retry_max_attempts: 1,
             column_transforms: HashMap::new(),
+            column_transform_types: HashMap::new(),
             evolve_schema: false,
             state_table_name: "_quickhouse_state".into(),
             staging_suffix: "_quickhouse_tmp".into(),
@@ -838,6 +971,9 @@ mod tests {
             rename: HashMap::new(),
             include: vec![],
             exclude: vec![],
+            not_null: vec![],
+            tinyint1_as_bool: true,
+            numeric_as_decimal: None,
         }
     }
 

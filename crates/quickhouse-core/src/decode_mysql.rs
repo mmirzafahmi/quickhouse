@@ -130,10 +130,30 @@ impl ColBuilder {
         }
         let mut coercion = Coercion::None;
         match (self, value) {
-            (ColBuilder::Bool(b), Value::Int(i)) => b.append_value(i != 0),
-            (ColBuilder::Bool(b), Value::UInt(u)) => b.append_value(u != 0),
+            // A Boolean builder here means `types.rs` inferred Bool from
+            // MySQL's `tinyint(1)` *display width* — a convention Rails/PHP
+            // ORMs follow but plenty of schemas (Odoo, for one) do not, where
+            // a `tinyint(1)` holds genuine small integers. Flag any value
+            // outside {0, 1} so the caller can report that the distinction
+            // between e.g. 2 and 3 was flattened, instead of losing it in
+            // silence. `tinyint1_as_bool=False` opts out of the mapping.
+            (ColBuilder::Bool(b), Value::Int(i)) => {
+                b.append_value(i != 0);
+                if i != 0 && i != 1 {
+                    coercion = Coercion::BoolCollapse;
+                }
+            }
+            (ColBuilder::Bool(b), Value::UInt(u)) => {
+                b.append_value(u != 0);
+                if u != 0 && u != 1 {
+                    coercion = Coercion::BoolCollapse;
+                }
+            }
             (ColBuilder::Bool(b), Value::Bytes(v)) => {
-                b.append_value(v.first().map(|&x| x != 0).unwrap_or(false))
+                b.append_value(v.first().map(|&x| x != 0).unwrap_or(false));
+                if v.first().is_some_and(|&x| x != 0 && x != 1) {
+                    coercion = Coercion::BoolCollapse;
+                }
             }
             (ColBuilder::I8(b), Value::Int(i)) => b.append_value(i as i8),
             (ColBuilder::I8(b), Value::UInt(u)) => b.append_value(u as i8),
@@ -308,6 +328,11 @@ pub struct MySqlBatcher {
     /// overflowed a `Decimal(P,S)` override's precision (see
     /// `ColBuilder::append_value`'s `Decimal128` arm).
     pub invalid_decimals_total: u64,
+    /// Count of `tinyint(1)` values outside `{0, 1}` flattened to a Boolean
+    /// (see `ColBuilder::append_value`'s `Bool` arms). Non-zero means the
+    /// display-width Boolean inference was wrong for this table and real
+    /// integer values were lost — pass `tinyint1_as_bool=False` to keep them.
+    pub collapsed_bools_total: u64,
 }
 
 impl MySqlBatcher {
@@ -338,6 +363,7 @@ impl MySqlBatcher {
             rows_total: 0,
             invalid_dates_total: 0,
             invalid_decimals_total: 0,
+            collapsed_bools_total: 0,
         })
     }
 
@@ -367,6 +393,7 @@ impl MySqlBatcher {
                 Coercion::None => {}
                 Coercion::DateRange => self.invalid_dates_total += 1,
                 Coercion::DecimalOverflow => self.invalid_decimals_total += 1,
+                Coercion::BoolCollapse => self.collapsed_bools_total += 1,
             }
         }
         self.rows_in_batch += 1;
@@ -434,6 +461,50 @@ mod tests {
         assert_eq!(arr.value(2), "838:59:59"); // 34*24 + 22 = 838 hours
         assert_eq!(arr.value(3), "01:02:03.500000");
         assert!(arr.is_null(4));
+    }
+
+    #[test]
+    fn bool_builder_flags_tinyint1_values_outside_zero_and_one() {
+        // Regression test for the production incident: a `tinyint(1)` holding
+        // genuine small integers is mapped to Bool from its display width, and
+        // every non-zero value collapses to `true`. The collapse itself is
+        // preserved (changing it silently would be its own data change) but it
+        // must now be *reported*, so a caller can see the distinction was lost.
+        let mut b = ColBuilder::new(&DataType::Boolean).unwrap();
+        // Genuine booleans: no coercion reported.
+        assert_eq!(b.append_value(Value::Int(0)).unwrap(), Coercion::None);
+        assert_eq!(b.append_value(Value::Int(1)).unwrap(), Coercion::None);
+        assert_eq!(b.append_value(Value::NULL).unwrap(), Coercion::None);
+        // Real tier values 2 and 3 both become `true` — flagged.
+        assert_eq!(
+            b.append_value(Value::Int(2)).unwrap(),
+            Coercion::BoolCollapse
+        );
+        assert_eq!(
+            b.append_value(Value::Int(3)).unwrap(),
+            Coercion::BoolCollapse
+        );
+        // Negative and unsigned paths are flagged the same way.
+        assert_eq!(
+            b.append_value(Value::Int(-5)).unwrap(),
+            Coercion::BoolCollapse
+        );
+        assert_eq!(
+            b.append_value(Value::UInt(7)).unwrap(),
+            Coercion::BoolCollapse
+        );
+        assert_eq!(b.append_value(Value::UInt(1)).unwrap(), Coercion::None);
+
+        let arr = b.finish();
+        let arr = arr
+            .as_any()
+            .downcast_ref::<arrow_array::BooleanArray>()
+            .unwrap();
+        assert!(!arr.value(0));
+        assert!(arr.value(1));
+        assert!(arr.is_null(2));
+        // The lossy part, pinned deliberately: 2, 3 and -5 are indistinguishable.
+        assert!(arr.value(3) && arr.value(4) && arr.value(5));
     }
 
     #[test]

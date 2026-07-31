@@ -161,16 +161,23 @@ pub(crate) fn parse_decimal_text(s: &str) -> Result<DecimalText> {
     })
 }
 
-/// Which kind of otherwise-valid value a decoder coerced to NULL instead of
-/// erroring or corrupting the whole transfer — returned by each decoder's
-/// per-value append method instead of a bare bool, so the caller bumps the
-/// counter (and logs the message) matching the actual reason, instead of
-/// conflating date-range and decimal-precision coercions under one count.
+/// Which kind of lossy coercion a decoder applied to an otherwise-valid value
+/// instead of erroring or corrupting the whole transfer — returned by each
+/// decoder's per-value append method instead of a bare bool, so the caller bumps
+/// the counter (and logs the message) matching the actual reason, instead of
+/// conflating distinct coercions under one count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Coercion {
     None,
+    /// Coerced to NULL: unrepresentable or out-of-range date/datetime.
     DateRange,
+    /// Coerced to NULL: exceeded a declared `Decimal(P,S)`, or NaN/Infinity.
     DecimalOverflow,
+    /// *Not* a NULL coercion — a MySQL `tinyint(1)` value outside `{0, 1}`
+    /// flattened to a Boolean, losing the distinction between e.g. 2 and 3.
+    /// Only the MySQL decoder produces this (it's the only source whose type
+    /// mapping infers Boolean from a display width rather than a real type).
+    BoolCollapse,
 }
 
 #[cfg(test)]

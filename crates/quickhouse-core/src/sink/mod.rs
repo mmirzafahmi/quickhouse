@@ -94,6 +94,24 @@ pub trait Sink: Send + Sync {
         cfg: &TransferConfig,
     ) -> Result<()>;
 
+    /// `CREATE TABLE new_table AS/LIKE like_table` — a structure-only clone
+    /// (engine/ORDER BY/PARTITION BY/nullability, not data). Used for staging
+    /// against an *already-existing* destination — both full-refresh and
+    /// incremental (when the destination requires staging for its MERGE) —
+    /// since staging must match what's actually there, not a fresh
+    /// `create_table` rebuilt from `cfg`/the resolved source schema. For
+    /// full-refresh this matters because a destination whose swap adopts
+    /// staging's own DDL (ClickHouse's `EXCHANGE TABLES`) would otherwise
+    /// silently replace the destination's engine/sort/partition key with
+    /// whatever `cfg` says (or its defaults, if `cfg` leaves them unset). For
+    /// incremental it matters because staging feeds a column-to-column MERGE:
+    /// if the destination's actual column types (e.g. from a `type_overrides`/
+    /// `column_transform_types` set on whatever run originally created it,
+    /// and not necessarily repeated on this one) differ from a fresh
+    /// `create_table`'s source-derived types, the MERGE's assignments can
+    /// mismatch. See `sync::prepare_target`.
+    async fn clone_table_structure(&self, new_table: &str, like_table: &str) -> Result<()>;
+
     /// Insert a group of Arrow batches into `table`. Returns an approximate
     /// wire-bytes-sent count (an accounting detail, not exact for either sink).
     async fn insert_batches(
@@ -140,6 +158,11 @@ pub trait Sink: Send + Sync {
     /// for destination-aware type promotion. Pure/no I/O.
     fn dest_kind(&self) -> crate::config::DestKind;
 
+    /// The namespace tables live in: the ClickHouse `database` or the BigQuery
+    /// `dataset`. Reported to a staged-validation callback so it can address the
+    /// per-run staging table. Pure/no I/O.
+    fn namespace(&self) -> &str;
+
     // ---- capability methods (safe defaults; override where supported) ----
 
     /// Whether incremental writes must be *staged then merged* rather than
@@ -182,6 +205,10 @@ pub trait Sink: Send + Sync {
     /// Upsert `staging`'s rows into `dest`, matched on `key`. Default:
     /// unsupported — only a destination reporting
     /// [`Self::requires_staging_for_incremental`] performs a staged MERGE.
+    /// `dedup_order` names the column that breaks ties when `staging` holds
+    /// more than one row for a key — the watermark, so the newest row wins.
+    /// Deduplication itself is not optional; see `build_merge_sql`.
+    #[allow(clippy::too_many_arguments)]
     async fn merge_into(
         &self,
         _dest: &str,
@@ -190,9 +217,29 @@ pub trait Sink: Send + Sync {
         _columns: &[ColumnType],
         _prune_partition: Option<&str>,
         _delete_stale: bool,
+        _dedup_order: Option<&str>,
     ) -> Result<()> {
         Err(EtlError::internal(
             "merge_into: this destination does not use staged-merge incremental writes",
+        ))
+    }
+
+    /// Append all of `staging`'s rows into `dest` by column name
+    /// (`INSERT INTO dest (cols) SELECT cols FROM staging`). Used to promote a
+    /// staged incremental load when the run stages *only* to interpose a
+    /// data-quality gate on a destination that would otherwise insert directly
+    /// (ClickHouse — its `ReplacingMergeTree` still dedups the appended rows
+    /// lazily, exactly as a direct insert would). Default: unsupported — a
+    /// destination that stages for a real `MERGE` uses [`Self::merge_into`]
+    /// instead, and one that never stages incremental writes never calls this.
+    async fn insert_select(
+        &self,
+        _dest: &str,
+        _staging: &str,
+        _columns: &[ColumnType],
+    ) -> Result<()> {
+        Err(EtlError::internal(
+            "insert_select: this destination does not support staged insert-select promotion",
         ))
     }
 }

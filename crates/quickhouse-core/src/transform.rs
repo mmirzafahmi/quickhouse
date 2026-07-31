@@ -10,7 +10,9 @@
 //! source column overridden to `"Decimal(P, S)"` (`P <= 38`) also gets its
 //! Arrow type promoted to `Decimal128(P, S)` here, so the decoder can decode
 //! it exactly instead of through a lossy `Float64` round-trip — see
-//! `decimal.rs`.
+//! `decimal.rs`. `numeric_as_decimal` supplies that same override for every
+//! arbitrary-precision decimal column at once, for when the point is to stop
+//! losing precision generally rather than on one known column.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -65,6 +67,28 @@ fn extract_quoted_tz(s: &str) -> Option<Arc<str>> {
     let rest = &s[start + 1..];
     let end = rest.find('\'')?;
     Some(Arc::from(&rest[..end]))
+}
+
+/// Parse a `column_transform_types` value into the Arrow decode type it
+/// names. Deliberately only the parameterless variants `decode.rs`'s
+/// `ColBuilder` supports outright — `Timestamp`/`Decimal128` need extra
+/// timezone/precision info that `type_overrides` (via `datetime_override_tz`/
+/// `resolve_decimal_promotion` above) already resolves, so a type change
+/// involving either still goes through that path instead.
+fn parse_column_transform_type(name: &str) -> Option<DataType> {
+    match name {
+        "Boolean" | "Bool" => Some(DataType::Boolean),
+        "Int16" => Some(DataType::Int16),
+        "Int32" => Some(DataType::Int32),
+        "Int64" => Some(DataType::Int64),
+        "UInt32" => Some(DataType::UInt32),
+        "Float32" => Some(DataType::Float32),
+        "Float64" => Some(DataType::Float64),
+        "Utf8" | "String" | "Text" => Some(DataType::Utf8),
+        "Binary" => Some(DataType::Binary),
+        "Date32" | "Date" => Some(DataType::Date32),
+        _ => None,
+    }
 }
 
 /// Decide whether an arbitrary-precision decimal column (default `Float64`)
@@ -160,18 +184,39 @@ pub fn plan(
         }
     }
 
+    // `column_transform_types` only makes sense paired with a value
+    // transform that actually changes the wire shape (bug report B6) —
+    // without one, it would just misdecode a column whose wire bytes still
+    // match its ordinary resolved type.
+    for col in cfg.column_transform_types.keys() {
+        if !cfg.column_transforms.contains_key(col) {
+            return Err(EtlError::config(format!(
+                "column_transform_types['{col}'] has no matching column_transforms['{col}'] \
+                 entry — a decode-type override only makes sense paired with a value transform \
+                 that changes what's actually sent on the wire"
+            )));
+        }
+    }
+
     // ClickHouse rejects a Nullable column in ORDER BY / PRIMARY KEY outright.
     // Nullability is normally resolved from the source's NOT NULL constraints,
     // but that resolution only works for a plain table (see
     // PgSource::resolve_columns's `base_table` param); with `source_query`
     // there's no table to check constraints against, so every column
     // defaults to nullable. A business/dedup key should never be null
-    // regardless of how the schema was resolved, so force it here.
+    // regardless of how the schema was resolved, so force it here. `not_null`
+    // (bug report B5) extends this same override to a column that's only
+    // referenced from `partition_by`'s expression — not covered by
+    // key/order_by/primary_key, but ClickHouse rejects a nullable partition
+    // key exactly the same way, and unlike those, `partition_by` is a raw SQL
+    // expression this crate can't reliably reverse-engineer a column name out
+    // of — hence an explicit opt-in list instead.
     let key_columns: HashSet<&str> = cfg
         .key
         .iter()
         .chain(cfg.order_by.iter())
         .chain(cfg.primary_key.iter())
+        .chain(cfg.not_null.iter())
         .map(|s| s.as_str())
         .collect();
 
@@ -195,6 +240,24 @@ pub fn plan(
             .get(&c.name)
             .or_else(|| cfg.type_overrides.get(&dest_name))
             .cloned()
+            // Bug report B7b: an arbitrary-precision decimal (Postgres
+            // `numeric`, MySQL DECIMAL, BigQuery NUMERIC) otherwise decodes
+            // through a lossy `Float64` round-trip, which is how values like
+            // 32.89999999999999 reach a destination that was asked for 32.9.
+            // Exact decoding was already available per column via
+            // `type_overrides={col: "Decimal(P,S)"}` — easy to forget for one
+            // column out of dozens, and forgetting it is silent. This applies
+            // one `Decimal(P,S)` to *every* such column that has no explicit
+            // override of its own, so the safe choice is a single argument
+            // rather than an audit. An explicit `type_overrides` entry still
+            // wins, and everything downstream (P/S validation, the Arrow
+            // promotion below, the overflow-to-NULL warning) is the exact same
+            // code path an override goes through.
+            .or_else(|| {
+                cfg.numeric_as_decimal
+                    .clone()
+                    .filter(|_| c.arbitrary_precision_decimal)
+            })
             .unwrap_or_else(|| c.clickhouse_inner.clone());
         let is_key = key_columns.contains(dest_name.as_str());
         // ClickHouse's ReplacingMergeTree also rejects a Nullable version
@@ -240,7 +303,27 @@ pub fn plan(
         // sink/bigquery.rs::build_table): a BigQuery type name never
         // contains parens or digits, so it can never parse as
         // "Decimal(P,S)" and this branch is simply never taken for that case.
-        let arrow = if c.arbitrary_precision_decimal {
+        let arrow = if let Some(name) = cfg.column_transform_types.get(&c.name) {
+            // Bug report B6: `column_transforms` changes the SQL value but
+            // not the resolved Arrow decode type, and `type_overrides` alone
+            // only changes the DDL type string (not what this crate decodes
+            // the wire bytes as) — so a transform that changes the actual
+            // type (e.g. a bool cast to text) needs an explicit decode-type
+            // override, which is what `column_transform_types` is for.
+            // Takes priority over the decimal/timestamp special-casing below:
+            // those exist for when the source's *own* type needs a decode
+            // adjustment, not a transformed one.
+            parse_column_transform_type(name).ok_or_else(|| {
+                EtlError::config(format!(
+                    "column_transform_types['{}'] = '{name}' is not a recognized decode type \
+                     (expected one of Boolean, Int16, Int32, Int64, UInt32, Float32, Float64, \
+                     Utf8, Binary, Date32 — for a datetime or decimal type change, use \
+                     type_overrides instead, which already carries the timezone/precision info \
+                     those need)",
+                    c.name
+                ))
+            })?
+        } else if c.arbitrary_precision_decimal {
             match resolve_decimal_promotion(&ch_inner, dest_kind, &dest_name)? {
                 Some((p, s)) => DataType::Decimal128(p, s),
                 None => c.arrow.clone(),
@@ -343,6 +426,7 @@ mod tests {
             dest_table: "t".into(),
             mode: crate::config::SyncMode::Full,
             watermark: None,
+            watermark_source_expr: None,
             lookback_seconds: 0,
             key: vec![],
             create_if_missing: true,
@@ -361,6 +445,7 @@ mod tests {
             chunk_rows: None,
             retry_max_attempts: 1,
             column_transforms: HashMap::new(),
+            column_transform_types: HashMap::new(),
             evolve_schema: false,
             state_table_name: "_quickhouse_state".into(),
             staging_suffix: "_quickhouse_tmp".into(),
@@ -372,6 +457,9 @@ mod tests {
             rename: HashMap::new(),
             include: vec![],
             exclude: vec![],
+            not_null: vec![],
+            tinyint1_as_bool: true,
+            numeric_as_decimal: None,
         }
     }
 
@@ -412,6 +500,28 @@ mod tests {
         assert!(
             p.dest_columns[1].nullable,
             "non-key column keeps its resolved nullability"
+        );
+    }
+
+    /// Regression test (bug report B5): a column used only in `partition_by`'s
+    /// expression (e.g. `toYYYYMM(create_date)`) isn't a key/order_by/primary_key
+    /// column, so it wasn't covered by the forced-non-nullable rule above — if
+    /// the source reports it nullable (every BigQuery column not explicitly
+    /// `REQUIRED`), the generated `Nullable(...)` partition key is then
+    /// rejected by ClickHouse. `not_null` is the explicit opt-in fix.
+    #[test]
+    fn not_null_forces_a_partition_only_column_non_nullable() {
+        let src = vec![c("id"), c("create_date")]; // c() always resolves nullable: true
+        let mut cfg = cfg();
+        cfg.not_null = vec!["create_date".into()];
+        let p = plan(&src, &cfg, DestKind::ClickHouse).unwrap();
+        assert!(
+            p.dest_columns[0].nullable,
+            "column not listed in not_null keeps its resolved nullability"
+        );
+        assert!(
+            !p.dest_columns[1].nullable,
+            "not_null column must not be nullable even though it's in no key/order_by/primary_key"
         );
     }
 
@@ -560,6 +670,70 @@ mod tests {
         let src = vec![decimal_col("amount")];
         let p = plan(&src, &cfg(), DestKind::ClickHouse).unwrap();
         assert_eq!(p.dest_columns[0].arrow, DataType::Float64);
+    }
+
+    /// `numeric_as_decimal` is the blanket form of the per-column
+    /// `type_overrides={col: "Decimal(P,S)"}` promotion: the point is that a
+    /// caller shouldn't have to remember one entry per numeric column, because
+    /// forgetting one is silent float-precision loss (confirmed in production:
+    /// 2,457 of 179,478 sampled rows of one Odoo `numeric` column already carry
+    /// `32.89999999999999`-style noise).
+    #[test]
+    fn numeric_as_decimal_promotes_every_arbitrary_precision_column() {
+        let src = vec![
+            decimal_col("quantity"),
+            decimal_col("price_total"),
+            typed_col("id", DataType::Int64, false),
+            typed_col("ratio", DataType::Float64, true),
+        ];
+        let mut cfg = cfg();
+        cfg.numeric_as_decimal = Some("Decimal(38, 9)".to_string());
+        let p = plan(&src, &cfg, DestKind::ClickHouse).unwrap();
+        // Both decimal-sourced columns decode exactly now, with no per-column
+        // configuration at all.
+        assert_eq!(p.dest_columns[0].arrow, DataType::Decimal128(38, 9));
+        assert_eq!(p.dest_columns[0].clickhouse_inner, "Decimal(38, 9)");
+        assert_eq!(p.dest_columns[1].arrow, DataType::Decimal128(38, 9));
+        // Columns that were never arbitrary-precision decimals are untouched —
+        // including a genuine Float64, which must not be swept up by a setting
+        // aimed at exact-decimal source types.
+        assert_eq!(p.dest_columns[2].arrow, DataType::Int64);
+        assert_eq!(p.dest_columns[3].arrow, DataType::Float64);
+        assert!(
+            !p.dest_columns[3].clickhouse_inner.starts_with("Decimal"),
+            "a real float must keep its own destination type: {}",
+            p.dest_columns[3].clickhouse_inner
+        );
+    }
+
+    #[test]
+    fn per_column_type_override_still_wins_over_numeric_as_decimal() {
+        // The blanket default is a floor, not a ceiling: a column that needs a
+        // different scale (or to stay a float, or to land as a String) must
+        // still be settable individually.
+        let src = vec![decimal_col("quantity"), decimal_col("unit_cost")];
+        let mut cfg = cfg();
+        cfg.numeric_as_decimal = Some("Decimal(38, 9)".to_string());
+        cfg.type_overrides = HashMap::from([("unit_cost".to_string(), "String".to_string())]);
+        let p = plan(&src, &cfg, DestKind::ClickHouse).unwrap();
+        assert_eq!(p.dest_columns[0].arrow, DataType::Decimal128(38, 9));
+        // Explicitly overridden: no promotion, DDL string honored as given.
+        assert_eq!(p.dest_columns[1].clickhouse_inner, "String");
+        assert_eq!(p.dest_columns[1].arrow, DataType::Float64);
+    }
+
+    #[test]
+    fn numeric_as_decimal_rejects_an_unusable_precision() {
+        // Same validation an explicit override gets — a bad P/S must fail at
+        // plan() time rather than silently falling back to the lossy mapping
+        // the caller is trying to get away from.
+        let src = vec![decimal_col("quantity")];
+        let mut cfg = cfg();
+        cfg.numeric_as_decimal = Some("Decimal(50, 9)".to_string());
+        let err = plan(&src, &cfg, DestKind::ClickHouse)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Decimal128"), "{err}");
     }
 
     /// Regression guard: a genuine Float64 column (arbitrary_precision_decimal:
@@ -727,6 +901,54 @@ mod tests {
         );
         // The transform changes the VALUE, not the resolved column type.
         assert_eq!(p.dest_columns[1].arrow, DataType::Int32);
+    }
+
+    /// Regression test (bug report B6): `column_transforms` casting a bool
+    /// column to text left `dest_columns[i].arrow` as `Boolean` — decode.rs
+    /// then reads the wire bytes (now text, e.g. "true"/"false") as if they
+    /// were still bool's binary format, and `type_overrides` alone can't fix
+    /// this (it only changes the declared destination type string, not the
+    /// decode type). `column_transform_types` is the explicit fix.
+    #[test]
+    fn column_transform_types_overrides_the_decode_arrow_type() {
+        let src = vec![typed_col("active", DataType::Boolean, true)];
+        let mut cfg = cfg();
+        cfg.column_transforms =
+            HashMap::from([("active".to_string(), "CAST(active AS TEXT)".to_string())]);
+        cfg.column_transform_types = HashMap::from([("active".to_string(), "Utf8".to_string())]);
+        let p = plan(&src, &cfg, DestKind::BigQuery).unwrap();
+        assert_eq!(
+            p.dest_columns[0].arrow,
+            DataType::Utf8,
+            "decode type must follow the transform, not the source's own bool type"
+        );
+    }
+
+    #[test]
+    fn column_transform_types_without_a_matching_transform_errors() {
+        let src = vec![typed_col("active", DataType::Boolean, true)];
+        let mut cfg = cfg();
+        cfg.column_transform_types = HashMap::from([("active".to_string(), "Utf8".to_string())]);
+        let err = plan(&src, &cfg, DestKind::ClickHouse)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("column_transform_types"), "{err}");
+        assert!(err.contains("column_transforms"), "{err}");
+    }
+
+    #[test]
+    fn column_transform_types_rejects_an_unrecognized_type_name() {
+        let src = vec![typed_col("active", DataType::Boolean, true)];
+        let mut cfg = cfg();
+        cfg.column_transforms =
+            HashMap::from([("active".to_string(), "CAST(active AS TEXT)".to_string())]);
+        cfg.column_transform_types =
+            HashMap::from([("active".to_string(), "NotARealType".to_string())]);
+        let err = plan(&src, &cfg, DestKind::ClickHouse)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("NotARealType"), "{err}");
+        assert!(err.contains("active"), "{err}");
     }
 
     #[test]

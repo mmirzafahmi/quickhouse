@@ -370,6 +370,17 @@ class Progress:
     elapsed_secs: float
     rows_per_sec: float
 
+class StagedInfo:
+    """Context passed to a ``sync(validate=...)`` callback: the fully-loaded
+    per-run staging table that is about to be promoted, and where it lives. The
+    batteries-included ``quickhouse.Validation`` consumes this; a custom
+    ``validate`` callable receives the same object."""
+
+    staging_table: str
+    database: str
+    dest_kind: str  # "clickhouse" | "bigquery"
+    rows_written: int
+
 class TransferResult:
     """Summary returned by :func:`sync`."""
 
@@ -389,6 +400,7 @@ def sync(
     state_key: Optional[str] = None,
     mode: str = "full",
     watermark: Optional[str] = None,
+    watermark_source_expr: Optional[str] = None,
     lookback_seconds: int = 0,
     seed_watermark: Optional[str] = None,
     skip_to_max: bool = False,
@@ -410,6 +422,7 @@ def sync(
     chunk_rows: Optional[int] = None,
     retry_max_attempts: int = 1,
     column_transforms: Optional[Mapping[str, str]] = None,
+    column_transform_types: Optional[Mapping[str, str]] = None,
     evolve_schema: bool = False,
     state_table_name: str = "_quickhouse_state",
     staging_suffix: str = "_quickhouse_tmp",
@@ -418,7 +431,11 @@ def sync(
     rename: Optional[Mapping[str, str]] = None,
     include: Optional[Sequence[str]] = None,
     exclude: Optional[Sequence[str]] = None,
+    not_null: Optional[Sequence[str]] = None,
+    tinyint1_as_bool: bool = True,
+    numeric_as_decimal: Optional[str] = None,
     on_progress: Optional[Callable[[Progress], None]] = None,
+    validate: Optional[Callable[[StagedInfo], None]] = None,
 ) -> TransferResult:
     """Transfer one table from PostgreSQL, MySQL, or BigQuery into ClickHouse
     or BigQuery.
@@ -437,6 +454,27 @@ def sync(
     your own consolidation downstream; ``watermark`` drives the resume window
     and ``key`` is not required.
 
+    If ``watermark`` allows NULL and any current row has one, a
+    ``WHERE watermark > x`` predicate never matches it — that row is silently
+    excluded from every incremental run, forever, even though the transfer
+    still reports success. A PostgreSQL/MySQL source logs a warning (with the
+    row count) when this is detected; consider a non-nullable watermark, or a
+    separate backfill of the ``NULL`` rows.
+
+    ``watermark_source_expr`` (PostgreSQL/MySQL sources only) is a raw SQL
+    expression substituted for ``watermark`` when building the incremental
+    filter and the boundary-max probe — the projected ``watermark`` output is
+    left untouched. Needed when ``source_query`` computes ``watermark`` from
+    an expression (a cast, a timezone shift, ...) rather than a bare
+    pass-through of an indexed base-table column: the generated read is
+    ``SELECT ... FROM (<source_query>) AS _src WHERE watermark > $1``, and
+    that predicate binds to whatever ``source_query`` projects as
+    ``watermark`` — if it's computed, no index on the underlying column can
+    serve it, so every incremental run does a full scan regardless of table
+    size. Have ``source_query`` additionally project the raw, indexed column
+    under a second name (e.g. ``write_date AS write_date_raw``) and set
+    ``watermark_source_expr="write_date_raw"``.
+
     **Experimental features** (may change without a major-version bump, and carry
     sharper edges — read their notes before relying on them):
     ``chunk_rows`` (keyset resumable reads; ClickHouse-destination incremental
@@ -445,6 +483,18 @@ def sync(
     ``delete_stale_in_window`` (both can insert duplicate keys or delete history
     if pointed at the wrong column), and ``column_transforms`` (injects raw SQL
     into the source ``SELECT``).
+
+    ``validate`` is a data-quality gate: a ``callable(StagedInfo) -> None`` fired
+    once after the per-run staging table is fully loaded but *before* it is
+    promoted (swap / ``MERGE`` / insert). Raising from it aborts the promotion,
+    drops staging, and fails the transfer — so rejected data never reaches the
+    destination. Pass a :class:`quickhouse.Validation` to run a Great Expectations
+    suite (``pip install quickhouse[quality]``), or any callable that raises to
+    reject. Works in full-refresh and incremental mode into either destination —
+    a ClickHouse incremental sync (which normally inserts directly) is
+    transparently routed through a staging table when a gate is attached, then
+    promoted via ``INSERT … SELECT``. Append mode and ``chunk_rows`` commit
+    directly with no single staging table to gate, so they raise a clear error.
 
     ``lookback_seconds`` widens the tracked watermark's lower bound by this
     many seconds before filtering, so a run re-includes a trailing window of
@@ -504,17 +554,77 @@ def sync(
       transform in the source SELECT (e.g. ``{"amt": "ROUND(amt, 9)"}``,
       ``{"ts": "ts AT TIME ZONE 'UTC'"}``) over ``source_table=`` — so range
       partitioning is preserved (unlike ``source_query=``). It changes the
-      value, not the resolved type (pair with ``type_overrides`` if the type
-      must change too). Not supported for a BigQuery source.
+      value, not the resolved decode type or the declared destination type on
+      its own — pairing it with ``type_overrides`` changes the *declared
+      destination* type string but still not what this crate decodes the
+      wire bytes as. If the transform changes the actual type (e.g. casting a
+      boolean to text), also set ``column_transform_types={col: "<Arrow
+      type>"}`` — one of ``"Boolean"``, ``"Int16"``, ``"Int32"``, ``"Int64"``,
+      ``"UInt32"``, ``"Float32"``, ``"Float64"``, ``"Utf8"``, ``"Binary"``,
+      ``"Date32"`` — so decoding follows the transform instead of the
+      source's own type (a config error if set without a matching
+      ``column_transforms`` entry). A datetime or decimal type change should
+      still go through ``type_overrides`` alone (see below), which already
+      carries the extra timezone/precision info those need. Not supported for
+      a BigQuery source.
     - ``evolve_schema=True`` adds a column to the existing destination (as
       Nullable) when the source has one the destination lacks, instead of
-      hard-erroring. ADD-only — never drops or retypes a column.
+      hard-erroring. ADD-only — never drops or retypes a column. Also needed
+      for ``mode="full"`` against an *existing* destination to pick up a
+      genuinely new source column: full-refresh staging now mirrors the
+      destination's actual DDL (see the note under ``engine``/``order_by``
+      below) rather than silently rebuilding it, so a new column is evolved
+      in rather than included for free.
+    - ``not_null=[...]`` forces these destination (post-``rename``) columns
+      ``NOT NULL`` in DDL generated from scratch, regardless of the source's
+      own resolved nullability. A ``key``/``order_by``/``primary_key`` column
+      is already forced non-nullable (ClickHouse rejects a nullable sort key
+      outright); this covers a column used *only* in ``partition_by``'s
+      expression (e.g. ``toYYYYMM(create_date)``), which isn't otherwise
+      covered — if the source reports it nullable (every BigQuery column not
+      explicitly ``REQUIRED``), the generated ``Nullable(...)`` partition key
+      is then rejected by ClickHouse. Only affects DDL generated *before* a
+      destination table exists — see the ``engine``/``order_by`` note below
+      for how an existing table's nullability is otherwise handled.
+    - ``numeric_as_decimal="Decimal(38, 9)"`` decodes **every**
+      arbitrary-precision decimal source column (PostgreSQL ``numeric``, MySQL
+      ``DECIMAL``, BigQuery ``NUMERIC``) exactly, instead of through the default
+      lossy ``Float64`` round-trip that turns a stored ``32.9`` into
+      ``32.89999999999999``. Equivalent to writing
+      ``type_overrides={col: "Decimal(38, 9)"}`` for each of them, which is the
+      point: one argument instead of an audit, since a column you forget loses
+      precision silently. A per-column ``type_overrides`` entry still wins.
+      Not the default — it changes the destination column type, so against an
+      already-created ``Float64`` column you'd be writing a decimal into a
+      float. Pick the scale for the column's real range: a value that doesn't
+      fit is coerced to ``NULL`` (counted and warned about). ``P > 38`` needs
+      ``Decimal256``, which isn't supported yet.
+    - ``tinyint1_as_bool=False`` (MySQL sources) reads a ``tinyint(1)`` column
+      as the integer it is (``Int8``, or ``UInt8`` when UNSIGNED) rather than as
+      a boolean. MySQL's ``BOOL`` is an alias for ``tinyint(1)``, so display
+      width is the only signal available, and the default follows that
+      convention — but schemas that don't (Odoo, for one) store genuine small
+      integers there, and every non-zero value then lands as ``1``. Left at
+      ``True``, any value outside ``{0, 1}`` is now counted and warned about at
+      the end of the read. ``type_overrides`` cannot fix this after the fact:
+      the value is flattened by the boolean decoder before the destination type
+      matters.
 
     ``engine``/``order_by``/``partition_by``/``primary_key``/``key`` are
     interpreted per destination: for ClickHouse they drive `MergeTree`-family
     DDL as before; for BigQuery, ``engine`` is ignored, ``partition_by`` must
     be a bare date/timestamp column name, and ``order_by``/``key`` become
     clustering columns (at most 4 total — see ``BigQuery``'s doc comment).
+    They only take effect building DDL *from scratch* (the destination table
+    doesn't exist yet). Against an *already-existing* destination, staging
+    (in ``mode="full"``, and in ``mode="incremental"`` for a BigQuery
+    destination, which stages for its ``MERGE``) clones that table's actual
+    engine/``ORDER BY``/``PARTITION BY``/nullability rather than recomputing
+    them from these arguments — so omitting (or disagreeing with) them no
+    longer silently changes an existing table's structure, or drifts staging
+    away from types the table was actually created with. To deliberately
+    change an existing table's DDL, drop it first (or run a manual migration)
+    so quickhouse creates it fresh from these arguments.
 
     Incremental-mode dedup of an updated row (same key, newer watermark)
     differs by destination: ClickHouse dedupes lazily via

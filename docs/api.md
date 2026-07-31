@@ -53,6 +53,17 @@ Connection descriptors accepted as ``sync()``'s ``target`` argument. ``BigQuery`
    :members:
 ```
 
+## Data quality
+
+Optional Great Expectations gate passed to ``sync()``'s ``validate=`` — see the
+[data-quality guide](guide/data-quality.md). Requires `pip install quickhouse[quality]`.
+
+```{eval-rst}
+.. autoclass:: Validation
+
+.. autoexception:: ValidationFailed
+```
+
 ## Helpers
 
 ```{eval-rst}

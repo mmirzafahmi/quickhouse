@@ -593,6 +593,9 @@ impl CopyDecoder {
                         Coercion::None => {}
                         Coercion::DateRange => self.invalid_dates_total += 1,
                         Coercion::DecimalOverflow => self.invalid_decimals_total += 1,
+                        // MySQL-only (a tinyint(1) display-width inference);
+                        // Postgres has a real `bool` type, so no such guess.
+                        Coercion::BoolCollapse => {}
                     }
                 }
             }

@@ -121,10 +121,17 @@ impl MySqlSource {
     }
 
     /// Resolve all output columns of `select_sql` (name, type, nullability).
+    /// `tinyint1_as_bool` controls whether a `tinyint(1)` column maps to Boolean
+    /// (MySQL's `BOOL` is an alias for it, so display width 1 is the only hint
+    /// available) or to its real integer type. See
+    /// [`crate::config::TransferConfig::tinyint1_as_bool`] — the convention
+    /// doesn't hold for every schema, and when it doesn't, genuine integers get
+    /// flattened to 0/1.
     pub async fn resolve_columns(
         &self,
         conn: &mut Conn,
         select_sql: &str,
+        tinyint1_as_bool: bool,
     ) -> Result<Vec<ColumnType>> {
         let stmt = conn
             .prep(select_sql)
@@ -135,7 +142,8 @@ impl MySqlSource {
         for c in stmt.columns() {
             let col_type = c.column_type();
             let is_unsigned = c.flags().contains(ColumnFlags::UNSIGNED_FLAG);
-            let is_tinyint1 = col_type == MyType::MYSQL_TYPE_TINY && c.column_length() == 1;
+            let is_tinyint1 =
+                tinyint1_as_bool && col_type == MyType::MYSQL_TYPE_TINY && c.column_length() == 1;
             // Collation id 63 is `binary` — the only way to tell a real BLOB
             // from a TEXT column, which share the same wire type code. Without
             // this, TEXT columns map to BYTES and fail a MERGE into a BigQuery
@@ -289,22 +297,26 @@ impl MySqlSource {
     }
 
     /// Read the current max watermark value as text (for incremental sync).
+    ///
+    /// `source_expr`, when set, replaces the bare `watermark` column in this
+    /// probe — see `TransferConfig::watermark_source_expr` and
+    /// `build_watermark_filter_mysql`, which this is kept in lockstep with.
     pub async fn max_watermark(
         &self,
         conn: &mut Conn,
         from_table: Option<&str>,
         base_query: Option<&str>,
         watermark: &str,
+        source_expr: Option<&str>,
     ) -> Result<Option<String>> {
+        let w = source_expr
+            .map(str::to_string)
+            .unwrap_or_else(|| quote_my(watermark));
         let sql = if let Some(q) = base_query {
-            format!(
-                "SELECT CAST(MAX({w}) AS CHAR) FROM ({q}) AS _src",
-                w = quote_my(watermark)
-            )
+            format!("SELECT CAST(MAX({w}) AS CHAR) FROM ({q}) AS _src")
         } else {
             format!(
                 "SELECT CAST(MAX({w}) AS CHAR) FROM {t}",
-                w = quote_my(watermark),
                 t = quote_my_table(from_table.expect("table required"))
             )
         };
@@ -316,6 +328,34 @@ impl MySqlSource {
             .await
             .map(|row| row.flatten())
             .map_err(|e| EtlError::from(e).context("reading mysql max watermark"))
+    }
+
+    /// Count rows whose watermark value is NULL — see
+    /// `PgSource::count_null_watermark` for why this matters. Same
+    /// `source_expr` override as `max_watermark`/the incremental filter.
+    pub async fn count_null_watermark(
+        &self,
+        conn: &mut Conn,
+        from_table: Option<&str>,
+        base_query: Option<&str>,
+        watermark: &str,
+        source_expr: Option<&str>,
+    ) -> Result<i64> {
+        let w = source_expr
+            .map(str::to_string)
+            .unwrap_or_else(|| quote_my(watermark));
+        let sql = if let Some(q) = base_query {
+            format!("SELECT count(*) FROM ({q}) AS _src WHERE {w} IS NULL")
+        } else {
+            format!(
+                "SELECT count(*) FROM {t} WHERE {w} IS NULL",
+                t = quote_my_table(from_table.expect("table required"))
+            )
+        };
+        conn.query_first::<i64, _>(sql)
+            .await
+            .map(|v| v.unwrap_or(0))
+            .map_err(|e| EtlError::from(e).context("reading mysql null-watermark count"))
     }
 }
 

@@ -123,6 +123,7 @@ qh.<span class="n">sync</span>(
       <li><a href="guide/destinations.html">Destinations</a></li>
       <li><a href="guide/sync-modes.html">Sync modes</a></li>
       <li><a href="guide/type-mapping.html">Type mapping</a></li>
+      <li><a href="guide/data-quality.html">Data quality</a></li>
       <li><a href="guide/performance.html">Performance &amp; safety</a></li>
       <li><a href="cli.html">Command-line interface</a></li>
       <li><a href="examples.html">Examples</a></li>
@@ -162,6 +163,7 @@ guide/sources
 guide/destinations
 guide/sync-modes
 guide/type-mapping
+guide/data-quality
 guide/performance
 cli
 examples

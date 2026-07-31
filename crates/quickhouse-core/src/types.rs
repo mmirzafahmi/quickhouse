@@ -343,7 +343,11 @@ pub mod mysql {
     /// `is_unsigned` distinguishes e.g. `INT UNSIGNED` (fits `UInt32`) from
     /// signed `INT`. `TINYINT(1)` is treated as MySQL's de facto boolean
     /// convention (matching most MySQL client libraries); other TINYINT
-    /// widths map to `Int8`. `numeric`/`DECIMAL` maps to `Float64` by default,
+    /// widths map to `Int8`. That convention is a *display-width* guess, not a
+    /// real type, and it's wrong for schemas that store genuine small integers
+    /// in a `tinyint(1)` — the caller passes `is_tinyint1: false` (from
+    /// `tinyint1_as_bool=False`) to fall through to the plain `Int8`/`UInt8`
+    /// arm below. `numeric`/`DECIMAL` maps to `Float64` by default,
     /// same policy as the PostgreSQL source — override via `type_overrides`
     /// for exact `Decimal(P, S)` semantics.
     pub fn map_mysql_type(
@@ -507,6 +511,32 @@ mod tests {
             );
             assert_eq!(ch, "DateTime64(6, 'UTC')", "{ty:?} ClickHouse type");
         }
+    }
+
+    /// `tinyint(1)` -> Bool is a display-width guess that some schemas violate
+    /// by storing genuine small integers there (a real production incident:
+    /// 9 columns across 8 tables silently collapsed to 0/1). `is_tinyint1:
+    /// false` — what `tinyint1_as_bool=False` resolves to — must fall through
+    /// to the plain integer arm, honouring UNSIGNED.
+    #[test]
+    fn mysql_tinyint1_bool_mapping_is_opt_outable() {
+        use super::mysql::map_mysql_type;
+        use mysql_async::consts::ColumnType as MyType;
+        let t = MyType::MYSQL_TYPE_TINY;
+        // Default (the convention): Bool.
+        assert_eq!(
+            map_mysql_type(t, false, true, false).unwrap(),
+            (DataType::Boolean, "Bool".to_string())
+        );
+        // Opted out: the integer it really is, signedness preserved.
+        assert_eq!(
+            map_mysql_type(t, false, false, false).unwrap(),
+            (DataType::Int8, "Int8".to_string())
+        );
+        assert_eq!(
+            map_mysql_type(t, true, false, false).unwrap(),
+            (DataType::UInt8, "UInt8".to_string())
+        );
     }
 
     /// BLOB-family wire codes are shared by real BLOB and TEXT; only the charset
