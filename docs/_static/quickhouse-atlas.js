@@ -65,14 +65,20 @@
     // data-qh-section attribute (not by parsing href, since Sphinx's pathto()
     // renders a same-directory link as a bare filename and a self-link as "#",
     // neither of which a naive href parse can distinguish reliably).
+    // A page's own filename (e.g. benchmark.html) always wins over a mere
+    // ancestor-directory match (e.g. "guide"), so a page that's both nested
+    // under one section and promoted to its own nav item — like
+    // guide/benchmark.html — only highlights the more specific one.
     var path = window.location.pathname;
-    document.querySelectorAll(".qh-topnav__links a[data-qh-section]").forEach(function (a) {
-      var section = a.getAttribute("data-qh-section");
-      var isCurrent = new RegExp("(^|/)" + section + "(/|\\.html$)").test(path);
-      if (isCurrent) {
-        a.classList.add("qh-current");
-        a.setAttribute("aria-current", "page");
-      }
+    var navLinks = Array.prototype.slice.call(document.querySelectorAll(".qh-topnav__links a[data-qh-section]"));
+    var exact = navLinks.filter(function (a) {
+      return new RegExp("/" + a.getAttribute("data-qh-section") + "\\.html$").test(path);
+    });
+    (exact.length ? exact : navLinks.filter(function (a) {
+      return new RegExp("(^|/)" + a.getAttribute("data-qh-section") + "(/|\\.html$)").test(path);
+    })).forEach(function (a) {
+      a.classList.add("qh-current");
+      a.setAttribute("aria-current", "page");
     });
 
     // Sync-modes selector cards (guide/sync-modes.md): filter the page down

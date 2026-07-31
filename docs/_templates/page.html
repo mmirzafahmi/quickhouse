@@ -7,7 +7,7 @@
 <div class="qh-announce">
   <b>{{ version }}</b>
   <span class="qh-announce__sep">/</span>
-  <span>incremental sync now resumes from the last watermark</span>
+  <span>data-quality gate: validate a staging table before it is promoted</span>
   <a href="{{ pathto('changelog') }}">read &rarr;</a>
 </div>
 <div class="qh-topnav">
@@ -17,6 +17,7 @@
   </a>
   <nav class="qh-topnav__links">
     <a data-qh-section="guide" href="{{ pathto('guide/sources') }}">Guide</a>
+    <a data-qh-section="benchmark" href="{{ pathto('guide/benchmark') }}">Benchmark</a>
     <a data-qh-section="api" href="{{ pathto('api') }}">API</a>
     <a data-qh-section="cli" href="{{ pathto('cli') }}">CLI</a>
     <a data-qh-section="examples" href="{{ pathto('examples') }}">Examples</a>

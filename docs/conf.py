@@ -122,8 +122,8 @@ html_theme = "furo"
 html_title = f"quickhouse {release}"
 html_static_path = ["_static"]
 templates_path = ["_templates"]     # _templates/page.html adds the Atlas top nav
-html_css_files = ["quickhouse-atlas.css"]
-html_js_files = ["quickhouse-atlas.js"]
+html_css_files = ["quickhouse-atlas.css", "quickhouse-bench.css"]
+html_js_files = ["quickhouse-atlas.js", "quickhouse-bench.js"]
 html_favicon = "_static/favicon.svg"
 # Furo renders the syntax itself; the Atlas theme owns all tokens (colors,
 # fonts, both schemes) in _static/quickhouse-atlas.css. "nord" reads closest to

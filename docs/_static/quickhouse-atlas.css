@@ -443,20 +443,6 @@ body:not([data-theme="dark"]) .qh-slab pre { color: var(--qh-ink); }
   font-family: var(--qh-serif); font-size: 26px; font-weight: 400;
   letter-spacing: -0.02em; margin: 0 0 18px; padding: 0; border: 0;
 }
-.qh-matrix {
-  width: 100%; border-collapse: collapse; font-size: 14.5px;
-  color: var(--color-foreground-secondary);
-}
-.qh-matrix th {
-  font-family: var(--qh-mono); font-size: 10.5px; letter-spacing: 0.16em;
-  text-transform: uppercase; font-weight: 400; text-align: left;
-  color: var(--color-foreground-muted);
-  padding: 0 0 10px; border-bottom: 1px solid var(--qh-rule);
-}
-.qh-matrix th:not(:first-child), .qh-matrix td:not(:first-child) { text-align: right; width: 22%; }
-.qh-matrix td { padding: 11px 0; border-bottom: 1px solid var(--qh-rule); }
-.qh-matrix tr:last-child td { border-bottom: 0; }
-.qh-matrix td.yes { font-family: var(--qh-mono); color: var(--qh-accent-text); }
 .qh-why p {
   font-size: 15px; line-height: 1.7; margin: 0 0 14px;
   color: var(--color-foreground-secondary); text-wrap: pretty;
