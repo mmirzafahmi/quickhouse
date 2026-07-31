@@ -27,9 +27,6 @@
   --qh-code-bg: #f3f1ec;
 
   --content-padding: 2rem;
-  --content-width: 50rem;
-  --sidebar-width: 15.5rem;
-  --toc-width: 13rem;
   --qh-topnav-h: 66px;
   --qh-announce-h: 34px;
 }
@@ -45,7 +42,7 @@ body {
   --color-background-border: var(--qh-rule);
   --color-foreground-primary: var(--qh-ink);
   --color-foreground-secondary: var(--qh-ink-muted);
-  --color-foreground-muted: #7c7a75;
+  --color-foreground-muted: #6b6964;
   --color-foreground-border: var(--qh-rule);
   --color-inline-code-background: var(--qh-code-bg);
   --color-code-background: var(--qh-code-bg);
@@ -53,6 +50,15 @@ body {
   --color-api-name: var(--qh-ink);
   --color-api-pre-name: var(--qh-ink-muted);
   --color-highlight-on-target: #fdf3dd;
+
+  /* Text-safe variants: --qh-accent/--qh-syntax-*/--qh-danger are tuned for
+     dark surfaces; these give every theme block a same-named token that's
+     readable as small/normal text on a light surface too (see uses below). */
+  --qh-accent-text: #8a6516;
+  --qh-syntax-n: #8a6516;
+  --qh-syntax-s: #3f6b43;
+  --qh-syntax-m: #6b4a86;
+  --qh-danger: #97552f;
 }
 
 /* dark — Furo toggles [data-theme]; the media query covers "auto" */
@@ -81,6 +87,12 @@ body[data-theme="dark"] {
   --color-api-name: #f2efe9;
   --color-api-pre-name: #98958e;
   --color-highlight-on-target: #1d1708;
+
+  --qh-accent-text: var(--qh-accent);
+  --qh-syntax-n: #e4c07a;
+  --qh-syntax-s: #9ab89b;
+  --qh-syntax-m: #c2a0d8;
+  --qh-danger: #c9713f;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -109,6 +121,12 @@ body[data-theme="dark"] {
     --color-api-name: #f2efe9;
     --color-api-pre-name: #98958e;
     --color-highlight-on-target: #1d1708;
+
+    --qh-accent-text: var(--qh-accent);
+    --qh-syntax-n: #e4c07a;
+    --qh-syntax-s: #9ab89b;
+    --qh-syntax-m: #c2a0d8;
+    --qh-danger: #c9713f;
   }
 }
 
@@ -127,11 +145,6 @@ article h3 { font-size: 1.25rem; margin: 2rem 0 0.6rem; }
 article p { line-height: 1.68; text-wrap: pretty; }
 article a { text-underline-offset: 3px; text-decoration-thickness: 1px; }
 
-/* Furo's mobile header would stack under our nav on desktop */
-@media (min-width: 82em) {
-  .mobile-header { display: none; }
-}
-
 /* ---------- 3. Announce strip + top nav --------------------- */
 
 .qh-announce {
@@ -142,8 +155,8 @@ article a { text-underline-offset: 3px; text-decoration-thickness: 1px; }
   background: var(--color-background-primary);
   border-bottom: 1px solid var(--qh-rule);
 }
-.qh-announce b { color: var(--qh-accent); font-weight: 500; }
-.qh-announce a { color: var(--qh-accent); text-decoration: none; }
+.qh-announce b { color: var(--qh-accent-text); font-weight: 500; }
+.qh-announce a { color: var(--qh-accent-text); text-decoration: none; }
 .qh-announce__sep { color: var(--qh-rule); }
 
 .qh-topnav {
@@ -205,21 +218,16 @@ article a { text-underline-offset: 3px; text-decoration-thickness: 1px; }
 
 .qh-hero-page .sidebar-drawer,
 .qh-hero-page .toc-drawer,
+.qh-hero-page .mobile-header,
 body:has(.qh-hero) .sidebar-drawer,
-body:has(.qh-hero) .toc-drawer { display: none !important; }
-
-.qh-hero-page,
-body:has(.qh-hero) {
-  /* Furo sizes .content from these, so overriding the vars is what actually
-     widens the landing page — a max-width on .content alone loses to Furo's
-     own `width: var(--content-width)`. */
-  --content-width: 1180px;
-  --sidebar-width: 0px;
-  --toc-width: 0px;
-}
+body:has(.qh-hero) .toc-drawer,
+body:has(.qh-hero) .mobile-header { display: none !important; }
 
 .qh-hero-page .content,
 body:has(.qh-hero) .content {
+  /* Furo's own rule is `.content{width:46em}` (a plain literal, not a custom
+     property) — this beats it purely on selector specificity, not on
+     cascade order. */
   max-width: 1180px; width: min(1180px, 100%); margin: 0 auto;
   padding: 0 clamp(20px, 4vw, 60px) 5rem;
 }
@@ -243,14 +251,14 @@ body:has(.qh-hero) .related-pages { display: none; }
 .qh-hero__pitch { max-width: 100%; min-width: 0; }
 .qh-hero__eyebrow {
   font-family: var(--qh-mono); font-size: 11.5px; letter-spacing: 0.2em;
-  text-transform: uppercase; color: var(--qh-accent); margin: 0 0 26px;
+  text-transform: uppercase; color: var(--qh-accent-text); margin: 0 0 26px;
 }
 .qh-hero h1 {
   font-family: var(--qh-serif); font-size: clamp(36px, 3.9vw, 54px);
   line-height: 1.02; font-weight: 400; letter-spacing: -0.02em;
   margin: 0 0 24px; color: var(--color-foreground-primary);
 }
-.qh-hero h1 em { font-style: italic; color: var(--qh-accent); }
+.qh-hero h1 em { font-style: italic; color: var(--qh-accent-text); }
 .qh-hero__sub {
   font-size: 17.5px; line-height: 1.65; margin: 0; max-width: 46ch;
   color: var(--color-foreground-secondary); text-wrap: pretty;
@@ -269,15 +277,28 @@ body:has(.qh-hero) .related-pages { display: none; }
   color: var(--color-foreground-primary); background: none;
   white-space: nowrap; overflow-x: auto;
 }
-.qh-install code .qh-prompt { color: var(--qh-accent); }
+.qh-install code .qh-prompt { color: var(--qh-accent-text); }
 .qh-copy {
   font-family: var(--qh-mono); font-size: 11.5px; padding: 13px 15px; cursor: pointer;
   color: var(--color-foreground-muted); background: none;
   border: 0; border-left: 1px solid var(--qh-rule);
 }
 .qh-copy:hover { color: var(--color-foreground-primary); }
-.qh-copy[data-copied="1"] { color: var(--qh-accent); }
+.qh-copy[data-copied="1"] { color: var(--qh-accent-text); }
+.qh-copy[data-copy-failed="1"] { color: var(--qh-danger); }
 .qh-slab__bar .qh-copy { border-left: 0; padding: 6px 4px; }
+
+/* Focus states — .qh-install clips an outline on .qh-copy via overflow:hidden,
+   so give the custom controls their own inset (never-clipped) focus ring. */
+.qh-copy:focus-visible,
+.qh-btn:focus-visible,
+.qh-slab__tab:focus-visible,
+.qh-mode:focus-visible,
+.qh-topnav__links a:focus-visible {
+  outline: 2px solid var(--qh-accent-text);
+  outline-offset: -2px;
+  border-radius: 4px;
+}
 
 .qh-btns { display: flex; gap: 10px; }
 .qh-btn {
@@ -335,12 +356,9 @@ body:has(.qh-hero) .related-pages { display: none; }
 }
 body:not([data-theme="dark"]) .qh-slab pre { color: var(--qh-ink); }
 .qh-slab .k { color: var(--color-foreground-muted); }
-.qh-slab .n { color: #e4c07a; }
-.qh-slab .s { color: #9ab89b; }
-.qh-slab .m { color: #c2a0d8; }
-body:not([data-theme="dark"]) .qh-slab .n { color: #8a6516; }
-body:not([data-theme="dark"]) .qh-slab .s { color: #3f6b43; }
-body:not([data-theme="dark"]) .qh-slab .m { color: #6b4a86; }
+.qh-slab .n { color: var(--qh-syntax-n); }
+.qh-slab .s { color: var(--qh-syntax-s); }
+.qh-slab .m { color: var(--qh-syntax-m); }
 
 .qh-result {
   border-top: 1px solid var(--qh-rule); padding: 18px 24px; min-width: 0;
@@ -354,7 +372,7 @@ body:not([data-theme="dark"]) .qh-slab .m { color: #6b4a86; }
 }
 .qh-result__row { display: flex; justify-content: space-between; gap: 16px; }
 .qh-result__row b { font-weight: 400; color: var(--color-foreground-primary); }
-.qh-result__row b.qh-hi { color: var(--qh-accent); }
+.qh-result__row b.qh-hi { color: var(--qh-accent-text); }
 
 @media (max-width: 68em) {
   .qh-hero { grid-template-columns: minmax(0, 1fr); }
@@ -406,7 +424,7 @@ body:not([data-theme="dark"]) .qh-slab .m { color: #6b4a86; }
   color: var(--color-foreground-secondary) !important;
   text-decoration: none !important;
 }
-.qh-index a:hover { color: var(--qh-accent) !important; }
+.qh-index a:hover { color: var(--qh-accent-text) !important; }
 .qh-index a .qh-ext { font-size: 11px; opacity: 0.6; margin-left: 4px; }
 @media (max-width: 60em) {
   .qh-index { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 32px 0; }
@@ -438,7 +456,7 @@ body:not([data-theme="dark"]) .qh-slab .m { color: #6b4a86; }
 .qh-matrix th:not(:first-child), .qh-matrix td:not(:first-child) { text-align: right; width: 22%; }
 .qh-matrix td { padding: 11px 0; border-bottom: 1px solid var(--qh-rule); }
 .qh-matrix tr:last-child td { border-bottom: 0; }
-.qh-matrix td.yes { font-family: var(--qh-mono); color: var(--qh-accent); }
+.qh-matrix td.yes { font-family: var(--qh-mono); color: var(--qh-accent-text); }
 .qh-why p {
   font-size: 15px; line-height: 1.7; margin: 0 0 14px;
   color: var(--color-foreground-secondary); text-wrap: pretty;
@@ -446,6 +464,37 @@ body:not([data-theme="dark"]) .qh-slab .m { color: #6b4a86; }
 .qh-why strong { color: var(--color-foreground-primary); font-weight: 600; }
 @media (max-width: 60em) {
   .qh-split { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* ---------- 7d. Sync-mode selector cards ---------------------
+   Used on guide/sync-modes.md to switch which mode's section is shown. */
+
+.qh-modes {
+  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1px; background: var(--qh-rule);
+  border: 1px solid var(--qh-rule); border-radius: 10px;
+  margin: 1.75rem 0 2.25rem; overflow: hidden;
+}
+.qh-mode {
+  display: block; padding: 18px 20px;
+  background: var(--qh-surface);
+  text-decoration: none !important;
+  border-top: 2px solid transparent;
+}
+.qh-mode:hover { background: var(--color-background-hover); }
+.qh-mode--current { border-top-color: var(--qh-accent-text); }
+.qh-mode__name {
+  font-family: var(--qh-mono); font-size: 11px; letter-spacing: 0.14em;
+  text-transform: uppercase; color: var(--color-foreground-muted);
+  margin: 0 0 8px;
+}
+.qh-mode--current .qh-mode__name { color: var(--qh-accent-text); }
+.qh-mode__desc {
+  font-size: 13.5px; line-height: 1.5;
+  color: var(--color-foreground-secondary);
+}
+@media (max-width: 46em) {
+  .qh-modes { grid-template-columns: minmax(0, 1fr); }
 }
 
 /* ---------- 8. Docs pages ----------------------------------- */
@@ -469,7 +518,7 @@ body:not([data-theme="dark"]) .qh-slab .m { color: #6b4a86; }
   text-transform: uppercase; color: var(--color-foreground-muted);
 }
 .toc-tree a.reference { font-size: 13.5px; }
-.toc-tree li.scroll-current > .reference { color: var(--qh-accent) !important; font-weight: 500; }
+.toc-tree li.scroll-current > .reference { color: var(--qh-accent-text) !important; font-weight: 500; }
 
 .qh-crumb {
   font-family: var(--qh-mono); font-size: 11.5px;
@@ -485,8 +534,7 @@ dl.c > dt.sig {
   border-left: 2px solid var(--qh-accent); border-radius: 8px;
   padding: 16px 22px; margin-bottom: 1.2rem;
 }
-dl.py dt.sig .sig-name { color: #e4c07a; }
-body:not([data-theme="dark"]) dl.py dt.sig .sig-name { color: #8a6516; }
+dl.py dt.sig .sig-name { color: var(--qh-syntax-n); }
 dl.py dt.sig .sig-return { color: var(--color-foreground-muted); }
 dl.field-list > dt {
   font-family: var(--qh-mono); font-size: 10.5px; letter-spacing: 0.18em;
@@ -525,15 +573,15 @@ dl.field-list > dt {
 }
 .admonition > .admonition-title {
   font-family: var(--qh-mono); font-size: 11px; letter-spacing: 0.14em;
-  text-transform: uppercase; color: var(--qh-accent) !important;
+  text-transform: uppercase; color: var(--qh-accent-text) !important;
   background: none !important; padding: 14px 0 6px; margin: 0;
 }
 .admonition > .admonition-title::before,
 .admonition > .admonition-title::after { display: none !important; }
-.admonition.warning, .admonition.danger, .admonition.caution { border-left-color: #c9713f; }
+.admonition.warning, .admonition.danger, .admonition.caution { border-left-color: var(--qh-danger); }
 .admonition.warning > .admonition-title,
 .admonition.danger > .admonition-title,
-.admonition.caution > .admonition-title { color: #c9713f !important; }
+.admonition.caution > .admonition-title { color: var(--qh-danger) !important; }
 
 /* Body code blocks */
 article .highlight {

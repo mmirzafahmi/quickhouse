@@ -16,7 +16,7 @@ sd_hide_title: true
     <div class="qh-hero__actions">
       <div class="qh-install">
         <code><span class="qh-prompt">$</span> pip install quickhouse</code>
-        <button type="button" class="qh-copy" data-qh-copy="pip install quickhouse">copy</button>
+        <button type="button" class="qh-copy" data-qh-copy="pip install quickhouse" aria-live="polite">copy</button>
       </div>
       <div class="qh-btns">
         <a class="qh-btn qh-btn--solid" href="quickstart.html">Quickstart</a>
@@ -32,16 +32,16 @@ sd_hide_title: true
 
   <div class="qh-slab">
     <div class="qh-slab__bar">
-      <div class="qh-slab__tabs" role="tablist">
-        <button type="button" class="qh-slab__tab" role="tab" aria-selected="true">full refresh</button>
-        <button type="button" class="qh-slab__tab" role="tab" aria-selected="false">incremental</button>
-        <button type="button" class="qh-slab__tab" role="tab" aria-selected="false">CLI</button>
+      <div class="qh-slab__tabs" role="tablist" aria-label="Sync example">
+        <button type="button" class="qh-slab__tab" role="tab" id="qh-tab-full" aria-selected="true" aria-controls="qh-panel-full" tabindex="0">full refresh</button>
+        <button type="button" class="qh-slab__tab" role="tab" id="qh-tab-incremental" aria-selected="false" aria-controls="qh-panel-incremental" tabindex="-1">incremental</button>
+        <button type="button" class="qh-slab__tab" role="tab" id="qh-tab-cli" aria-selected="false" aria-controls="qh-panel-cli" tabindex="-1">CLI</button>
       </div>
-      <button type="button" class="qh-copy" data-qh-copy="import quickhouse as qh">copy</button>
+      <button type="button" class="qh-copy" data-qh-copy="import quickhouse as qh" aria-live="polite">copy</button>
     </div>
     <div class="qh-slab__body">
       <div>
-<div class="qh-slab__panel" data-active="1" role="tabpanel"><pre><span class="k">import</span> quickhouse <span class="k">as</span> qh
+<div class="qh-slab__panel" data-active="1" role="tabpanel" id="qh-panel-full" aria-labelledby="qh-tab-full"><pre><span class="k">import</span> quickhouse <span class="k">as</span> qh
 
 src = qh.<span class="n">Postgres</span>(<span class="s">"postgresql://user:pw@host:5432/shop"</span>)
 dst = qh.<span class="n">ClickHouse</span>(<span class="s">"http://localhost:8123"</span>, database=<span class="s">"analytics"</span>)
@@ -51,7 +51,7 @@ qh.<span class="n">sync</span>(
     source_table=<span class="s">"public.orders"</span>,
     dest_table=<span class="s">"orders"</span>, key=[<span class="s">"id"</span>]
 )</pre></div>
-<div class="qh-slab__panel" role="tabpanel"><pre><span class="k">import</span> quickhouse <span class="k">as</span> qh
+<div class="qh-slab__panel" role="tabpanel" id="qh-panel-incremental" aria-labelledby="qh-tab-incremental"><pre><span class="k">import</span> quickhouse <span class="k">as</span> qh
 
 qh.<span class="n">sync</span>(
     src, dst,
@@ -60,7 +60,7 @@ qh.<span class="n">sync</span>(
     mode=<span class="s">"incremental"</span>,
     watermark=<span class="s">"updated_at"</span>, key=[<span class="s">"id"</span>]
 )</pre></div>
-<div class="qh-slab__panel" role="tabpanel"><pre><span class="k">$</span> quickhouse run job.toml
+<div class="qh-slab__panel" role="tabpanel" id="qh-panel-cli" aria-labelledby="qh-tab-cli"><pre><span class="k">$</span> quickhouse run job.toml
 
 <span class="k">#</span> job.toml drives the same sync from cron or CI,
 <span class="k">#</span> no Python — see the CLI reference.</pre></div>
