@@ -86,14 +86,17 @@
     // Sphinx nests each H2 and everything under it (including H3 subsections)
     // inside one <section id="..."> element, so toggling that one element
     // per mode is enough — no manual sibling-walking needed.
+    // .qh-modes/.qh-mode is also reused elsewhere (e.g. guide/destinations.md)
+    // as a plain static comparison card with no filtering behavior — only
+    // engage the filter when this page actually has the sync-mode sections.
     var modesNav = document.querySelector(".qh-modes");
-    if (modesNav) {
+    var modeSections = {
+      full: document.getElementById("full-refresh"),
+      incremental: document.getElementById("incremental"),
+      append: document.getElementById("append-bronze-landing"),
+    };
+    if (modesNav && (modeSections.full || modeSections.incremental || modeSections.append)) {
       var hrefForMode = { full: "#full-refresh", incremental: "#incremental", append: "#append-bronze-landing" };
-      var modeSections = {
-        full: document.getElementById("full-refresh"),
-        incremental: document.getElementById("incremental"),
-        append: document.getElementById("append-bronze-landing"),
-      };
       var cards = Array.prototype.slice.call(modesNav.querySelectorAll(".qh-mode"));
       function showMode(mode) {
         Object.keys(modeSections).forEach(function (m) {

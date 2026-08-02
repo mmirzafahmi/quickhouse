@@ -112,6 +112,16 @@ pytest -v                              # integration tests green (if services ar
   without Python.
 - Match the surrounding code's style, naming, and comment density.
 
+## Challenging the benchmark
+
+The [benchmark page](https://quickhouse.readthedocs.io/en/latest/guide/benchmark.html)
+compares quickhouse against dlt and Sling, maintained by the project's author.
+It says so itself: treat "the author benchmarked their own tool" as the
+caveat it is. PRs that find a faster configuration for a competing tool, catch
+an unfair comparison, or extend the benchmark to a case it doesn't cover are
+welcome — open an issue or PR against `docs/guide/benchmark.md` with what you
+found.
+
 ## Common changes
 
 **Add a type mapping.** For a *source*: map the type in `src/types.rs`

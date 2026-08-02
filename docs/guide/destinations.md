@@ -14,10 +14,27 @@ qh.BigQuery("my-gcp-project", dataset_id="analytics")
 
 For the exact constructor signatures see the [API reference](../api.md).
 
+```{raw} html
+<div class="qh-modes">
+  <a class="qh-mode qh-mode--current" href="#s3-archive-clickhouse-destinations">
+    <div class="qh-mode__name">ClickHouse</div>
+    <div class="qh-mode__desc">MergeTree-family DDL, atomic swap. Optional S3 archive of every synced batch.</div>
+  </a>
+  <a class="qh-mode" href="#bigquery-as-a-destination">
+    <div class="qh-mode__name">BigQuery</div>
+    <div class="qh-mode__desc">MERGE-based upsert. Requires a dataset_id; insert_all or Storage Write transport.</div>
+  </a>
+</div>
+```
+
 ## BigQuery as a destination
 
-`dataset_id` is **required** (BigQuery's equivalent of ClickHouse's
-`database`). `write_method` selects how rows are written: `"insert_all"`
+```{note}
+`dataset_id` is **required** — it's BigQuery's equivalent of ClickHouse's
+`database`.
+```
+
+`write_method` selects how rows are written: `"insert_all"`
 (default; `tabledata.insertAll`, proven) or `"storage_write"` (the gRPC Storage
 Write API — free and higher-throughput). Both share the same atomic-swap /
 MERGE flow; only the row-insert transport differs. See

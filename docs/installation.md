@@ -26,15 +26,24 @@ pip install "quickhouse[cli]"         # TOML parser for `quickhouse run` on Pyth
 
 `quickhouse` extras:
 
-`progress`
-: Pulls in [tqdm](https://github.com/tqdm/tqdm) so you can use
-  {func}`quickhouse.progress_bar` as a drop-in `on_progress` callback. See
-  [Watching progress](guide/performance.md#watching-progress-and-diagnosing-failures).
-
-`cli`
-: A TOML parser (`tomli`) for the [`quickhouse run` command-line runner](cli.md),
-  needed only on Python 3.9 / 3.10 (Python 3.11+ has `tomllib` in the standard
-  library).
+```{raw} html
+<div class="qh-params">
+  <div>
+    <div>
+      <div class="qh-params__name">progress</div>
+      <div class="qh-params__type">pip install "quickhouse[progress]"</div>
+    </div>
+    <p class="qh-params__desc">Pulls in <a href="https://github.com/tqdm/tqdm">tqdm</a> so you can use <code>quickhouse.progress_bar</code> as a drop-in <code>on_progress</code> callback. See <a href="guide/performance.html#watching-progress-and-diagnosing-failures">Watching progress</a>.</p>
+  </div>
+  <div>
+    <div>
+      <div class="qh-params__name">cli</div>
+      <div class="qh-params__type">pip install "quickhouse[cli]"</div>
+    </div>
+    <p class="qh-params__desc">A TOML parser (<code>tomli</code>) for the <a href="cli.html"><code>quickhouse run</code> command-line runner</a>, needed only on Python 3.9 / 3.10 (Python 3.11+ has <code>tomllib</code> in the standard library).</p>
+  </div>
+</div>
+```
 
 ## Building from source
 

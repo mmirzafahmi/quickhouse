@@ -81,7 +81,7 @@ extensions = [
     "sphinx_design",             # cards, grids, tabs
 ]
 
-exclude_patterns = ["_build", "_shim", "Thumbs.db", ".DS_Store"]
+exclude_patterns = ["_build", "_shim", "Thumbs.db", ".DS_Store", "design_handoff_*"]
 
 # -- MyST (Markdown) ------------------------------------------------------
 myst_enable_extensions = [

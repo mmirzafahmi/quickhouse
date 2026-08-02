@@ -29,15 +29,38 @@ qh.Postgres(host="host", port=5432, user="u",               # discrete fields
 
 TLS:
 
-- **PostgreSQL** follows the standard `sslmode` DSN parameter
-  (`disable` | `prefer` (default) | `require`).
-- **MySQL** has no `sslmode` convention, so require TLS explicitly with
-  `require_tls=True`.
-- Add a private CA (e.g. AWS RDS's regional bundle) with `ca_cert_file="rds-ca.pem"`
-  — trusted in addition to the public CA store.
-- **mTLS** (client-certificate auth) for Postgres and MySQL: set
-  `client_cert_file=...` and `client_key_file=...` **together** (both PEM;
-  passing only one is a config error).
+```{raw} html
+<div class="qh-params">
+  <div>
+    <div>
+      <div class="qh-params__name">sslmode</div>
+      <div class="qh-params__type">DSN parameter &mdash; PostgreSQL</div>
+    </div>
+    <p class="qh-params__desc">Standard PostgreSQL DSN parameter: <code>disable</code> | <code>prefer</code> (default) | <code>require</code>.</p>
+  </div>
+  <div>
+    <div>
+      <div class="qh-params__name">require_tls</div>
+      <div class="qh-params__type">bool &mdash; MySQL</div>
+    </div>
+    <p class="qh-params__desc">MySQL has no <code>sslmode</code> convention, so require TLS explicitly with <code>require_tls=True</code>.</p>
+  </div>
+  <div>
+    <div>
+      <div class="qh-params__name">ca_cert_file</div>
+      <div class="qh-params__type">str, optional</div>
+    </div>
+    <p class="qh-params__desc">Add a private CA (e.g. AWS RDS's regional bundle) &mdash; trusted in addition to the public CA store.</p>
+  </div>
+  <div>
+    <div>
+      <div class="qh-params__name">client_cert_file / client_key_file</div>
+      <div class="qh-params__type">str, optional &mdash; mTLS</div>
+    </div>
+    <p class="qh-params__desc">Client-certificate auth for Postgres and MySQL. Set <strong>together</strong> (both PEM; passing only one is a config error).</p>
+  </div>
+</div>
+```
 
 ```python
 qh.Postgres(
@@ -48,11 +71,30 @@ qh.Postgres(
 )
 ```
 
-**BigQuery** authenticates with a service-account key file
-(`credentials_file="key.json"`), inline JSON contents
-(`credentials_json=os.environ["SA_JSON"]`, e.g. from a secrets manager — takes
-precedence over `credentials_file`), or Application Default Credentials (ADC).
-The same credentials work whether `BigQuery` is used as a source or a
+**BigQuery** authenticates with a service-account key file, inline JSON
+contents, or Application Default Credentials (ADC):
+
+```{raw} html
+<div class="qh-params">
+  <div>
+    <div>
+      <div class="qh-params__name">credentials_file</div>
+      <div class="qh-params__type">str, optional</div>
+    </div>
+    <p class="qh-params__desc">Path to a service-account key file, e.g. <code>"key.json"</code>.</p>
+  </div>
+  <div>
+    <div>
+      <div class="qh-params__name">credentials_json</div>
+      <div class="qh-params__type">str, optional</div>
+    </div>
+    <p class="qh-params__desc">Inline service-account JSON contents (e.g. <code>os.environ["SA_JSON"]</code>, from a secrets manager). Takes precedence over <code>credentials_file</code>.</p>
+  </div>
+</div>
+```
+
+Neither set: falls back to Application Default Credentials. The same
+credentials work whether `BigQuery` is used as a source or a
 [destination](destinations.md#bigquery-as-a-destination).
 
 ## BigQuery as a source

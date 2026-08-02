@@ -211,7 +211,6 @@
 
 .qh-hero > .qh-split,
 .qh-hero > .qh-newband,
-.qh-hero > .qh-flow__head,
 .qh-hero > .qh-flow,
 .qh-hero > h2,
 .qh-hero > p { grid-column: 1 / -1; }
@@ -223,16 +222,6 @@
 }
 
 /* ---------- landing: source → destination flow -------------- */
-
-.qh-flow__head {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 1rem;
-  margin-bottom: 1.1rem;
-}
-.qh-flow__head h2 { margin: 0; border: 0; padding: 0; }
-.qh-flow__caption { font-family: var(--qh-mono); font-size: 11.5px; color: var(--qh-ink-muted); }
 
 .qh-flow {
   display: grid;
@@ -255,9 +244,7 @@
   font-family: var(--qh-mono);
   font-size: 0.78rem;
   color: var(--qh-ink);
-  transition: border-color 0.2s ease;
 }
-.qh-flow__node:hover { border-color: var(--qh-accent-dim); }
 .qh-flow__node::before {
   content: "";
   width: 6px;
@@ -283,7 +270,6 @@
   height: 6px;
   border-radius: 50%;
   background: var(--qh-accent);
-  box-shadow: 0 0 10px color-mix(in srgb, var(--qh-accent) 70%, transparent);
   animation: qh-packet 2.6s linear infinite;
   animation-delay: var(--qh-delay, 0s);
 }
@@ -310,9 +296,6 @@
   padding: 0.8rem 0.9rem;
   border: 1px solid var(--qh-accent-dim);
   border-radius: 9px;
-  background: color-mix(in srgb, var(--qh-accent) 5%, transparent);
-  animation: qh-glow 2.6s ease-in-out infinite;
-  animation-delay: var(--qh-delay, 0s);
 }
 .qh-flow__dest b { display: block; font: 500 0.85rem/1 var(--qh-mono); color: var(--qh-accent-text); }
 .qh-flow__dest span { display: block; margin-top: 0.35rem; font-size: 0.72rem; color: var(--qh-ink-muted); }
@@ -324,13 +307,7 @@
   100% { left: calc(100% - 4px); opacity: 0; }
 }
 
-@keyframes qh-glow {
-  0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--qh-accent) 0%, transparent); }
-  50%      { box-shadow: 0 0 0 6px color-mix(in srgb, var(--qh-accent) 7%, transparent); }
-}
-
 @media (prefers-reduced-motion: reduce) {
-  .qh-flow__dest { animation: none; }
   .qh-flow__lane::after { animation: none; left: 50%; }
   .qh-teaser__slide { animation: none; }
 }
@@ -406,3 +383,27 @@
 @media (max-width: 52rem) {
   .qh-newband { grid-template-columns: 1fr; }
 }
+
+/* ============================================================
+   Interior doc pages — bring Furo closer to the mockup
+   ============================================================ */
+
+/* Sidebar: the current page reads as accent text, not a filled pill. */
+.sidebar-tree .current-page > .reference {
+  color: var(--qh-accent-text) !important;
+  background: transparent;
+  font-weight: 500;
+}
+.sidebar-tree .reference:hover { color: var(--qh-accent-text) !important; }
+
+/* The first section heading sits right under the title, so it should not
+   carry the between-sections rule and its 3rem of air. */
+article > section > section:first-of-type > h2,
+article > section > h1 + section > h2 {
+  margin-top: 1.8rem;
+  padding-top: 0;
+  border-top: 0;
+}
+
+/* Furo's per-page icon row (edit / theme) crowds the title. */
+article .content-icon-container { margin-top: 0.2rem; }

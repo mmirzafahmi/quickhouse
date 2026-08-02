@@ -28,11 +28,16 @@ script's docstring for the credentials and environment variables they need.
 
 ## Postgres → ClickHouse
 
+The minimal call — full-refresh a Postgres table into ClickHouse, with a
+progress callback.
+
 ```{literalinclude} ../examples/postgres_to_clickhouse.py
 :language: python
 ```
 
 ## Incremental sync
+
+Watermark-based incremental sync (idempotent; run it twice).
 
 ```{literalinclude} ../examples/incremental_sync.py
 :language: python
@@ -40,11 +45,15 @@ script's docstring for the credentials and environment variables they need.
 
 ## MySQL → BigQuery
 
+Same `sync()`, different engines — MySQL → BigQuery.
+
 ```{literalinclude} ../examples/mysql_to_bigquery.py
 :language: python
 ```
 
 ## CleverTap bronze append
+
+HTTP API source with a declared schema + `mode="append"` bronze landing.
 
 ```{literalinclude} ../examples/clevertap_bronze_append.py
 :language: python

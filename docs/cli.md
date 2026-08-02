@@ -36,11 +36,24 @@ key = ["id"]
 
 ## Recognized `type` values
 
-`[source]`
-: `postgres`, `mysql`, `bigquery`, `clevertap`, `appsflyer`
-
-`[target]`
-: `clickhouse`, `bigquery`
+```{raw} html
+<div class="qh-params">
+  <div>
+    <div>
+      <div class="qh-params__name">[source]</div>
+      <div class="qh-params__type">type =</div>
+    </div>
+    <p class="qh-params__desc"><code>postgres</code>, <code>mysql</code>, <code>bigquery</code>, <code>clevertap</code>, <code>appsflyer</code></p>
+  </div>
+  <div>
+    <div>
+      <div class="qh-params__name">[target]</div>
+      <div class="qh-params__type">type =</div>
+    </div>
+    <p class="qh-params__desc"><code>clickhouse</code>, <code>bigquery</code></p>
+  </div>
+</div>
+```
 
 Any other key in a table maps straight to the matching constructor argument
 (see [Sources](guide/sources.md), [Destinations](guide/destinations.md), and

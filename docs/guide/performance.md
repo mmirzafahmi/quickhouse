@@ -7,24 +7,36 @@ Python, no intermediate DataFrame. Tables are split into ranges and read in
 parallel, and decoding overlaps uploading. On a laptop-class box a 1M-row,
 20-column full refresh runs at **hundreds of thousands of rows per second**
 while peak memory stays flat (under ~180 MB) no matter how much you parallelize.
-Reproduce it with `python benchmarks/bench_transfer.py`.
+Reproduce it with `python benchmarks/bench_transfer.py`. For quickhouse measured
+head-to-head against other tools, see the [Benchmark](benchmark.md) page.
 
 ## Parallelism and batching
 
-`parallelism`
-: Number of concurrent read streams. The source table is split into ranges read
-  in parallel (Postgres/MySQL); for BigQuery it's a server-side stream hint.
-
-`batch_rows` / `batch_bytes`
-: How big each individual Arrow batch (and thus each insert) is — a
-  throughput/overhead granularity knob.
-
-`max_memory_bytes`
-: The **hard ceiling** on total in-flight batch memory across all partitions and
-  uploads, measured against each batch's real Arrow allocation. Decoding
-  overlaps with concurrent uploads and blocks (backpressure) when the ceiling is
-  reached, so peak RSS stays bounded regardless of `parallelism` or row width.
-  Default 512 MiB; `0` disables the ceiling.
+```{raw} html
+<div class="qh-params">
+  <div>
+    <div>
+      <div class="qh-params__name">parallelism</div>
+      <div class="qh-params__type">int</div>
+    </div>
+    <p class="qh-params__desc">Number of concurrent read streams. The source table is split into ranges read in parallel (Postgres/MySQL); for BigQuery it's a server-side stream hint.</p>
+  </div>
+  <div>
+    <div>
+      <div class="qh-params__name">batch_rows / batch_bytes</div>
+      <div class="qh-params__type">int</div>
+    </div>
+    <p class="qh-params__desc">How big each individual Arrow batch (and thus each insert) is &mdash; a throughput/overhead granularity knob.</p>
+  </div>
+  <div>
+    <div>
+      <div class="qh-params__name">max_memory_bytes</div>
+      <div class="qh-params__type">int = 512 MiB</div>
+    </div>
+    <p class="qh-params__desc">The <strong>hard ceiling</strong> on total in-flight batch memory across all partitions and uploads, measured against each batch's real Arrow allocation. Decoding overlaps with concurrent uploads and blocks (backpressure) when the ceiling is reached, so peak RSS stays bounded regardless of <code>parallelism</code> or row width. <code>0</code> disables the ceiling.</p>
+  </div>
+</div>
+```
 
 ## Being gentle on a small production database
 

@@ -79,33 +79,45 @@ watermark. `0` (default) disables lookback.
 A few knobs make the incremental cursor robust in the real world (all
 incremental-mode only):
 
-`state_key`
-: Pins the cursor's identity in the internal `_quickhouse_state` table. By
-  default it's keyed by the source table (or `source_query` text) + destination
-  — so editing a `source_query`'s `WHERE` would silently start a fresh full
-  pull, and two syncs into one destination tracking different `watermark`
-  columns would clobber each other's cursor. Set
-  `state_key="orders:updated_at"` to give each a stable, distinct identity.
-
-`seed_watermark` / `skip_to_max`
-: Seed the cursor on the **first** run only, then self-retire.
-  `seed_watermark="<value>"` is an explicit floor; `skip_to_max=True` seeds to
-  the source's current `MAX(watermark)`, reading almost nothing — for when the
-  destination already holds complete data from a prior pipeline and a full first
-  pull would be a waste. Mutually exclusive; safe to leave set.
-
-`advance_watermark=False`
-: Reads and merges a window *without* moving the cursor — for loading a
-  historical backfill without rewinding your regular schedule. The computed
-  watermark is still returned in `TransferResult.new_watermark`.
-
-`chunk_rows` *(experimental)*
-: Reads the source in keyset-ordered chunks of `N` rows, committing the cursor
-  per chunk so a mid-read failure resumes instead of restarting. **ClickHouse
-  destination + incremental only**, and the keyset column
-  (`partition_column`, else the first `key`) must be a **unique, NOT NULL
-  integer**. Single-stream (`parallelism` is ignored). `None` (default) = one
-  read.
+```{raw} html
+<div class="qh-params">
+  <div>
+    <div>
+      <div class="qh-params__name">state_key</div>
+      <div class="qh-params__type">Optional[str] = None</div>
+    </div>
+    <p class="qh-params__desc">Pins the cursor's identity in the internal <code>_quickhouse_state</code> table. By default it's keyed by the source table (or <code>source_query</code> text) + destination &mdash; so editing a <code>source_query</code>'s <code>WHERE</code> would silently start a fresh full pull, and two syncs into one destination tracking different <code>watermark</code> columns would clobber each other's cursor. Set <code>state_key="orders:updated_at"</code> to give each a stable, distinct identity.</p>
+  </div>
+  <div>
+    <div>
+      <div class="qh-params__name">seed_watermark</div>
+      <div class="qh-params__type">Optional[str] = None</div>
+    </div>
+    <p class="qh-params__desc">Seeds the cursor on the <strong>first</strong> run only, then self-retires, to an explicit floor value. Mutually exclusive with <code>skip_to_max</code>; safe to leave set.</p>
+  </div>
+  <div>
+    <div>
+      <div class="qh-params__name">skip_to_max</div>
+      <div class="qh-params__type">bool = False</div>
+    </div>
+    <p class="qh-params__desc">Seeds the cursor on the <strong>first</strong> run only, then self-retires, to the source's current <code>MAX(watermark)</code>, reading almost nothing &mdash; for when the destination already holds complete data from a prior pipeline and a full first pull would be a waste. Mutually exclusive with <code>seed_watermark</code>; safe to leave set.</p>
+  </div>
+  <div>
+    <div>
+      <div class="qh-params__name">advance_watermark</div>
+      <div class="qh-params__type">bool = True</div>
+    </div>
+    <p class="qh-params__desc">Set to <code>False</code> to read and merge a window <em>without</em> moving the cursor &mdash; for loading a historical backfill without rewinding your regular schedule. The computed watermark is still returned in <code>TransferResult.new_watermark</code>.</p>
+  </div>
+  <div>
+    <div>
+      <div class="qh-params__name">chunk_rows</div>
+      <div class="qh-params__type">Optional[int] = None &mdash; experimental</div>
+    </div>
+    <p class="qh-params__desc">Reads the source in keyset-ordered chunks of <code>N</code> rows, committing the cursor per chunk so a mid-read failure resumes instead of restarting. <strong>ClickHouse destination + incremental only</strong>, and the keyset column (<code>partition_column</code>, else the first <code>key</code>) must be a <strong>unique, NOT NULL integer</strong>. Single-stream (<code>parallelism</code> is ignored). <code>None</code> (default) = one read.</p>
+  </div>
+</div>
+```
 
 ### MERGE cost on large BigQuery tables
 

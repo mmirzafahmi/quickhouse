@@ -94,5 +94,40 @@
       show(0);
       start();
     });
+
+    // 4. Breadcrumb eyebrow above the page title, derived from the sidebar
+    //    caption the current page sits under (no per-page markup needed).
+    (function () {
+      var article = document.querySelector(".content > article");
+      if (!article || document.querySelector(".qh-hero")) return;
+      var h1 = article.querySelector("h1");
+      if (!h1 || h1.previousElementSibling && h1.previousElementSibling.classList.contains("qh-crumb")) return;
+
+      var current = document.querySelector(".sidebar-tree .current-page > .reference");
+      if (!current) return;
+
+      // Walk up to the <ul> that this page's caption precedes.
+      var list = current.closest("ul");
+      while (list && list.parentElement && list.parentElement.tagName === "LI") list = list.parentElement.closest("ul");
+      var caption = null, prev = list && list.previousElementSibling;
+      while (prev) {
+        if (prev.classList && prev.classList.contains("caption")) { caption = prev; break; }
+        prev = prev.previousElementSibling;
+      }
+      if (!caption) return;
+
+      var section = (caption.textContent || "").trim();
+      var page = (current.textContent || "").trim();
+      if (!section || !page) return;
+
+      var crumb = document.createElement("div");
+      crumb.className = "qh-crumb";
+      crumb.textContent = section + " ";
+      var sep = document.createElement("span");
+      sep.textContent = "/";
+      crumb.appendChild(sep);
+      crumb.appendChild(document.createTextNode(" " + page));
+      h1.parentNode.insertBefore(crumb, h1);
+    })();
   });
 })();
