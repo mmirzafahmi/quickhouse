@@ -98,7 +98,9 @@
     // 4. Breadcrumb eyebrow above the page title, derived from the sidebar
     //    caption the current page sits under (no per-page markup needed).
     (function () {
-      var article = document.querySelector(".content > article");
+      // Descendant, not child: Furo wraps the article in .article-container,
+      // so ".content > article" never matches and the crumb silently vanishes.
+      var article = document.querySelector(".content article");
       if (!article || document.querySelector(".qh-hero")) return;
       var h1 = article.querySelector("h1");
       if (!h1 || h1.previousElementSibling && h1.previousElementSibling.classList.contains("qh-crumb")) return;
