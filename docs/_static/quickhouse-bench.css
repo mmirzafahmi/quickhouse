@@ -204,6 +204,24 @@
 
 @keyframes qh-fade { from { opacity: 0; } to { opacity: 1; } }
 
+/* ---------- full-width rows inside .qh-hero -----------------
+   .qh-hero is a 2-column grid; anything added to it must span
+   both tracks or it collapses into a narrow column.
+   ------------------------------------------------------------ */
+
+.qh-hero > .qh-split,
+.qh-hero > .qh-newband,
+.qh-hero > .qh-flow__head,
+.qh-hero > .qh-flow,
+.qh-hero > h2,
+.qh-hero > p { grid-column: 1 / -1; }
+
+.qh-hero > h2 {
+  margin: 2.5rem 0 1rem;
+  font-size: 1.15rem;
+  letter-spacing: -0.01em;
+}
+
 /* ---------- landing: source → destination flow -------------- */
 
 .qh-flow__head {
