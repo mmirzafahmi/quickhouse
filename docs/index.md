@@ -160,6 +160,22 @@ qh.<span class="n">sync</span>(
       <p style="margin-top:0.9rem"><a href="guide/data-quality.html">Read the data-quality guide &rarr;</a></p>
     </div>
     <div>
+      <div class="qh-newband__code">
+        <div class="qh-newband__code-bar"><span>python</span><button type="button" class="qh-copy" data-qh-copy="validate=quickhouse.Validation(suite=suite, context=context, datasource=&quot;analytics_ch&quot;)" aria-live="polite">copy</button></div>
+        <pre><span class="k">import</span> quickhouse
+
+quickhouse.<span class="n">sync</span>(
+    src, dst,
+    dest_table=<span class="s">"orders"</span>,
+    validate=quickhouse.<span class="n">Validation</span>(
+        suite=suite,
+        context=context,
+        datasource=<span class="s">"analytics_ch"</span>,
+    ),
+)
+<span class="c"># on failure: ValidationFailed,</span>
+<span class="c"># and orders is left as it was</span></pre>
+      </div>
       <div class="qh-newband__checks">
         <div><span>stage &rarr; validate &rarr; promote</span><b>gated</b></div>
         <div><span>full refresh, both destinations</span><b>✓</b></div>
