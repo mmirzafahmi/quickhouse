@@ -511,7 +511,23 @@ article h1 {
   line-height: 1.1;
   letter-spacing: -0.03em;
   margin: 0.1rem 0 0.5rem;
-  text-indent: 0;
+}
+
+/* Sphinx leaves a whitespace text node between the title and its headerlink;
+   flex drops it, so the title sits flush with the breadcrumb above instead of
+   one space in from it.
+
+   Scoped to the page title — a direct child of the top section — on purpose.
+   Plain `article h1` also matches the landing hero, which is
+   `<h1>Move whole tables in <em>one</em> function call.</h1>`. Inline markup
+   makes each run a separate flex item, and with the default flex-wrap:nowrap
+   that 54px headline is forced onto one line and overflows its column.
+   `.qh-hero h1` outranks us on typography but declares no `display`, so
+   nothing there would have stopped it. */
+article > section > h1 {
+  display: flex;
+  align-items: baseline;
+  gap: 0.4rem;
 }
 article h2 { font-size: 1.45rem; }
 article h3 { font-size: 1.1rem; }
@@ -528,3 +544,18 @@ article .content-icon-container { display: none; }
 .sidebar-logo-container,
 .sidebar-search-container { display: none; }
 .sidebar-scroll { padding-top: 1.6rem; }
+
+/* ------------------------------------------------------------
+   Content gutters — the prototype gives the column 52px of air on
+   each side; Furo's default is roughly half that.
+   ------------------------------------------------------------ */
+
+.content {
+  padding-left: 3.25rem;
+  padding-right: 3.25rem;
+}
+article { padding-top: 0.6rem; }
+
+@media (max-width: 62rem) {
+  .content { padding-left: 1.5rem; padding-right: 1.5rem; }
+}
