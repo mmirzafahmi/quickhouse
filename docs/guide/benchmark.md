@@ -113,10 +113,24 @@ Same ~300k-row slice, same source query, same primary-key merge semantics,
           <span class="qh-bar__value">~200 MiB</span>
         </div>
       </div>
-      <p class="qh-bench__takeaway">At on-demand pricing ($6.25/TiB scanned) that is
-      <strong>$0.17</strong> per 1,000 syncs for quickhouse, against $0.73 for dlt and
-      $1.19 for Sling. The absolute dollars are small on a 300k-row slice — the
-      multiple is what scales with your table.</p>
+      <div class="qh-modes">
+        <div class="qh-mode qh-mode--current">
+          <div class="qh-mode__name">quickhouse</div>
+          <div class="qh-mode__desc">$0.17 per 1,000 syncs &middot; 1.0&times; baseline</div>
+        </div>
+        <div class="qh-mode">
+          <div class="qh-mode__name">dlt</div>
+          <div class="qh-mode__desc">$0.73 per 1,000 syncs &middot; 4.4&times; the bytes</div>
+        </div>
+        <div class="qh-mode">
+          <div class="qh-mode__name">Sling</div>
+          <div class="qh-mode__desc">$1.19 per 1,000 syncs &middot; 7.1&times; the bytes</div>
+        </div>
+      </div>
+      <p class="qh-bench__takeaway">Derived from the bytes above at on-demand pricing
+      ($6.25/TiB scanned), not measured off an invoice. The absolute dollars are small
+      on a 300k-row slice — the <strong>multiple</strong> is what scales with your
+      table.</p>
     </div>
   </div>
 </div>

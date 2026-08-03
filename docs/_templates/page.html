@@ -14,6 +14,10 @@
   <a class="qh-topnav__brand" href="{{ pathto(root_doc) }}">
     <img src="{{ pathto('_static/quickhouse-mark.svg', 1) }}" alt="" class="qh-topnav__mark" />
     <span>quickhouse</span>
+    {# Atlas styles .qh-topnav__version but nothing used it; the prototype puts
+       the full release next to the wordmark. Its own colour declaration beats
+       the brand's inherited !important, so it still reads muted. #}
+    <span class="qh-topnav__version">{{ release }}</span>
   </a>
   <nav class="qh-topnav__links">
     <a data-qh-section="guide" href="{{ pathto('guide/sources') }}">Guide</a>
