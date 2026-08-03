@@ -76,10 +76,6 @@
   background: var(--qh-accent);
   border-color: var(--qh-accent);
 }
-.qh-bench__switch button:focus-visible {
-  outline: 2px solid var(--qh-accent-text);
-  outline-offset: -2px;
-}
 
 .qh-bench__panel {
   border: 1px solid var(--qh-rule);
@@ -200,7 +196,6 @@
   transition: background 0.2s ease;
 }
 .qh-teaser__dot[aria-selected="true"] { background: var(--qh-accent); }
-.qh-teaser__dot:focus-visible { outline: 2px solid var(--qh-accent-text); outline-offset: 2px; }
 
 @keyframes qh-fade { from { opacity: 0; } to { opacity: 1; } }
 
@@ -376,7 +371,7 @@
 .qh-newband__code pre .s,
 .qh-newband__code pre .c { color: var(--qh-ink-muted); }
 
-.qh-newband__checks { display: grid; gap: 0.5rem; margin-top: 0.9rem; font-family: var(--qh-mono); font-size: 0.78rem; }
+.qh-newband__checks { margin-top: 0.9rem; display: grid; gap: 0.5rem; margin-top: 1rem; font-family: var(--qh-mono); font-size: 0.78rem; }
 .qh-newband__checks div { display: flex; justify-content: space-between; gap: 1rem; color: var(--qh-ink-muted); }
 .qh-newband__checks b { font-weight: 500; color: var(--qh-accent-text); }
 
@@ -398,12 +393,138 @@
 
 /* The first section heading sits right under the title, so it should not
    carry the between-sections rule and its 3rem of air. */
-article > section > section:first-of-type > h2,
-article > section > h1 + section > h2 {
-  margin-top: 1.8rem;
-  padding-top: 0;
-  border-top: 0;
+article section > section:first-of-type > h2,
+article h1 + section > h2,
+article h1 + p + section > h2,
+article > section > h2:first-of-type {
+  margin-top: 1.8rem !important;
+  padding-top: 0 !important;
+  border-top: 0 !important;
 }
 
 /* Furo's per-page icon row (edit / theme) crowds the title. */
 article .content-icon-container { margin-top: 0.2rem; }
+
+/* ------------------------------------------------------------
+   Body code blocks — the mockup's language bar + copy button.
+   Furo/Pygments renders a bare <div class="highlight"><pre>; the
+   prototype wraps every code block in chrome. quickhouse-bench.js
+   inserts .qh-codeblock around each one and builds the bar, so
+   nothing in the markdown changes.
+   ------------------------------------------------------------ */
+
+article .qh-codeblock {
+  margin: 1.2rem 0;
+  border: 1px solid var(--qh-rule);
+  border-radius: 9px;
+  background: var(--qh-surface);
+  overflow: hidden;
+}
+
+article .qh-codeblock__bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.45rem 0.85rem;
+  border-bottom: 1px solid var(--qh-rule);
+  font-family: var(--qh-mono);
+  font-size: 0.7rem;
+  color: var(--qh-ink-muted);
+}
+
+article .qh-codeblock__lang { letter-spacing: 0.04em; }
+
+article .qh-codeblock__copy {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  color: var(--qh-ink-muted);
+  cursor: pointer;
+  transition: color 0.18s ease;
+}
+article .qh-codeblock__copy:hover { color: var(--qh-accent-text); }
+article .qh-codeblock__copy[data-copied] { color: var(--qh-accent-text); }
+article .qh-codeblock__copy:focus-visible {
+  outline: 2px solid var(--qh-accent-text);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+
+/* The chrome now owns the frame, so the inner block gives up its own. */
+article .qh-codeblock .highlight {
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+article .qh-codeblock .highlight pre {
+  margin: 0;
+  padding: 1rem 1.1rem;
+  border: 0;
+  background: transparent;
+  font-size: 0.78rem;
+  line-height: 1.75;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* Furo puts its own copy button on hover; the bar replaces it. */
+article .qh-codeblock .copybtn { display: none; }
+
+/* Literal blocks inside admonitions keep the plain treatment. */
+article .admonition .qh-codeblock { border-radius: 7px; }
+
+/* ------------------------------------------------------------
+   Right rail — "On this page" reads like the prototype's.
+   ------------------------------------------------------------ */
+
+.toc-drawer .toc-title {
+  font-family: var(--qh-mono);
+  font-size: 0.66rem;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+  color: var(--qh-ink-muted);
+}
+.toc-tree { border-left: 1px solid var(--qh-rule); }
+.toc-tree li.scroll-current > .reference { color: var(--qh-accent-text); font-weight: 500; }
+
+/* ------------------------------------------------------------
+   Interior page header — match the prototype exactly.
+   Atlas sets article headings in --qh-serif at 2.6rem; the
+   prototype sets them in the sans face, smaller and tighter, and
+   drops Furo's per-page icon row and duplicated sidebar search.
+   ------------------------------------------------------------ */
+
+article h1,
+article h2,
+article h3,
+article h4 {
+  font-family: var(--qh-sans);
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
+article h1 {
+  font-size: 2.35rem;
+  line-height: 1.1;
+  letter-spacing: -0.03em;
+  margin: 0.1rem 0 0.5rem;
+  text-indent: 0;
+}
+article h2 { font-size: 1.45rem; }
+article h3 { font-size: 1.1rem; }
+
+/* The breadcrumb and the title share one left edge. */
+.qh-crumb { margin-bottom: 0.55rem; }
+
+/* Furo's eye / edit / theme / collapse row is not part of the design. */
+article .content-icon-container { display: none; }
+
+/* The top nav already carries brand and search, so the sidebar starts
+   straight at the navigation tree. */
+.sidebar-brand,
+.sidebar-logo-container,
+.sidebar-search-container { display: none; }
+.sidebar-scroll { padding-top: 1.6rem; }

@@ -98,8 +98,11 @@
     // 4. Breadcrumb eyebrow above the page title, derived from the sidebar
     //    caption the current page sits under (no per-page markup needed).
     (function () {
-      // Descendant, not child: Furo wraps the article in .article-container,
-      // so ".content > article" never matches and the crumb silently vanishes.
+      // Descendant, NOT child. Furo's real chain is
+      //   div.content > div.article-container > article
+      // so ".content > article" matches zero elements and this whole
+      // function returns at the first line, silently. Verified against the
+      // built HTML: "> article" = 0 matches, " article" = 1.
       var article = document.querySelector(".content article");
       if (!article || document.querySelector(".qh-hero")) return;
       var h1 = article.querySelector("h1");
@@ -130,6 +133,72 @@
       crumb.appendChild(sep);
       crumb.appendChild(document.createTextNode(" " + page));
       h1.parentNode.insertBefore(crumb, h1);
+    })();
+
+    // 5. Body code blocks get the mockup's chrome: a language bar with a copy
+    //    button. Pygments emits <div class="highlight-python notranslate">
+    //    <div class="highlight"><pre>; the language lives on the outer wrapper.
+    (function () {
+      // Descendant, NOT child. Furo's real chain is
+      //   div.content > div.article-container > article
+      // so ".content > article" matches zero elements and this whole
+      // function returns at the first line, silently. Verified against the
+      // built HTML: "> article" = 0 matches, " article" = 1.
+      var article = document.querySelector(".content article");
+      if (!article) return;
+
+      var PRETTY = {
+        python: "python", py: "python", pycon: "python",
+        bash: "shell", console: "shell", shell: "shell", sh: "shell",
+        toml: "toml", yaml: "yaml", json: "json", sql: "sql",
+        text: "text", default: "text", none: "text"
+      };
+
+      article.querySelectorAll("div.highlight").forEach(function (hl) {
+        if (hl.closest(".qh-codeblock") || hl.closest(".qh-slab") || hl.closest(".qh-newband")) return;
+
+        // The language lives on the Pygments wrapper, if there is one; that
+        // wrapper is also what we move into the chrome, so caption and content
+        // are read from the same element.
+        var outer = hl.parentElement;
+        var m = outer && outer.className ? outer.className.match(/highlight-([a-z0-9+#-]+)/i) : null;
+        var lang = m ? (PRETTY[m[1].toLowerCase()] || m[1].toLowerCase()) : "text";
+        var host = m ? outer : hl;
+        var wrap = document.createElement("div");
+        wrap.className = "qh-codeblock";
+        host.parentNode.insertBefore(wrap, host);
+
+        var bar = document.createElement("div");
+        bar.className = "qh-codeblock__bar";
+        var label = document.createElement("span");
+        label.className = "qh-codeblock__lang";
+        label.textContent = lang;
+        var btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "qh-codeblock__copy";
+        btn.textContent = "copy";
+        btn.setAttribute("aria-live", "polite");
+        bar.appendChild(label);
+        bar.appendChild(btn);
+
+        wrap.appendChild(bar);
+        wrap.appendChild(host);
+
+        btn.addEventListener("click", function () {
+          var pre = hl.querySelector("pre");
+          var text = pre ? pre.innerText.replace(/\n$/, "") : "";
+          var settle = function (msg, ok) {
+            btn.textContent = msg;
+            if (ok) btn.dataset.copied = "1";
+            setTimeout(function () { btn.textContent = "copy"; delete btn.dataset.copied; }, 1400);
+          };
+          if (!navigator.clipboard) { settle("copy failed", false); return; }
+          navigator.clipboard.writeText(text).then(
+            function () { settle("copied", true); },
+            function () { settle("copy failed", false); }
+          );
+        });
+      });
     })();
   });
 })();
