@@ -590,3 +590,19 @@ article { padding-top: 0.6rem; }
    plain <div> cards (the benchmark's cost comparison) is a static display
    and must not advertise itself as clickable. */
 a.qh-mode { cursor: pointer; }
+
+/* .qh-modes is a hard repeat(3, ...) -- it was authored for sync-modes.md,
+   which has exactly three cards. Every two-card grid (both source/destination
+   pickers, and the destinations page before the split) therefore rendered one
+   full empty column. Match "exactly two children" via :last-child:nth-child(2)
+   and split the row evenly instead.
+
+   Kept inside a min-width query because Atlas's own `max-width: 46em` rule
+   collapses the grid to one column, and :has() would outrank it -- without
+   this the fix would resurrect two columns on phones. 46.01em, not 46em: at
+   exactly 46em both queries match, and Atlas's must win. */
+@media (min-width: 46.01em) {
+  .qh-modes:has(> .qh-mode:last-child:nth-child(2)) {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}

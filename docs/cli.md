@@ -56,7 +56,7 @@ key = ["id"]
 ```
 
 Any other key in a table maps straight to the matching constructor argument
-(see [Sources](guide/sources.md), [Destinations](guide/destinations.md), and
+(see [Sources](guide/sources/index.md), [Destinations](guide/destinations/index.md), and
 the [API reference](api.md)). A misspelled or missing key produces a clear
 config error naming the section.
 

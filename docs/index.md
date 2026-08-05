@@ -227,8 +227,8 @@ quickhouse.<span class="n">sync</span>(
   <div>
     <h2>User guide</h2>
     <ul>
-      <li><a href="guide/sources.html">Sources</a></li>
-      <li><a href="guide/destinations.html">Destinations</a></li>
+      <li><a href="guide/sources/index.html">Sources</a></li>
+      <li><a href="guide/destinations/index.html">Destinations</a></li>
       <li><a href="guide/sync-modes.html">Sync modes</a></li>
       <li><a href="guide/type-mapping.html">Type mapping</a></li>
       <li><a href="guide/data-quality.html">Data quality</a></li>
@@ -268,8 +268,8 @@ quickstart
 :hidden:
 :caption: User guide
 
-guide/sources
-guide/destinations
+guide/sources/index
+guide/destinations/index
 guide/sync-modes
 guide/type-mapping
 guide/data-quality

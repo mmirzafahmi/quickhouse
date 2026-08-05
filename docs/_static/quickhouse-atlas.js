@@ -85,8 +85,8 @@
     // live here as a filter that set display:none on every unselected mode
     // section, which hid two thirds of guide/sync-modes.md on load — and with
     // it the target of the #append-bronze-landing cross-reference in
-    // guide/sources.md. Selection now marks the card and leaves the prose in
-    // the document.
+    // guide/sources/http-apis.md. Selection now marks the card and leaves the
+    // prose in the document.
 
     // "/" focuses search
     document.addEventListener("keydown", function (e) {

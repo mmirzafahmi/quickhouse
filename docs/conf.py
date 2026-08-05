@@ -81,7 +81,18 @@ extensions = [
     "sphinx_design",             # cards, grids, tabs
 ]
 
-exclude_patterns = ["_build", "_shim", "Thumbs.db", ".DS_Store", "design_handoff_*"]
+# DESIGN.md and the design handoff live under docs/ but are implementation
+# reference for whoever edits the theme -- not published pages. Sphinx would
+# otherwise read them as sources and warn that they are in no toctree, which
+# is an error under -W.
+exclude_patterns = [
+    "_build",
+    "_shim",
+    "Thumbs.db",
+    ".DS_Store",
+    "design_handoff_*",
+    "DESIGN.md",
+]
 
 # -- MyST (Markdown) ------------------------------------------------------
 myst_enable_extensions = [
