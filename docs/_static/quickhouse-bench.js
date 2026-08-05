@@ -200,5 +200,75 @@
         });
       });
     })();
+
+    // 6. Sidebar expansion. Furo folds a nested toctree behind a hidden
+    //    checkbox, so a section's own index page renders with its children
+    //    collapsed. Check every checkbox on the path to the current page so
+    //    the section you are inside stays open. No-op until a section
+    //    actually nests — see DESIGN.md §7.
+    (function () {
+      var current = document.querySelector(".sidebar-tree .current-page");
+      if (!current) return;
+      for (var node = current; node && node !== document; node = node.parentNode) {
+        if (node.tagName !== "LI") continue;
+        var kids = node.children;
+        for (var i = 0; i < kids.length; i++) {
+          if (kids[i].classList && kids[i].classList.contains("toctree-checkbox")) {
+            kids[i].checked = true;
+          }
+        }
+      }
+    })();
+
+    // 7. Mode-card selection. Clicking marks the card and follows its anchor;
+    //    a scroll-spy then moves the selection to whichever linked section is
+    //    in view. Nothing is hidden — the prose stays in the document, so
+    //    Ctrl-F, deep links and no-JS all keep working.
+    //
+    //    Only anchor cards are interactive, per DESIGN.md §4 ("Anchor
+    //    children"). A grid of plain <div> cards — the benchmark's cost
+    //    comparison — is a static display, and a click there must not be able
+    //    to move the accent off the leading row.
+    document.querySelectorAll(".qh-modes").forEach(function (grid) {
+      var cards = Array.prototype.slice.call(grid.querySelectorAll("a.qh-mode"));
+      if (!cards.length) return;
+
+      function select(card) {
+        cards.forEach(function (c) {
+          var on = c === card;
+          c.classList.toggle("qh-mode--current", on);
+          if (on) c.setAttribute("aria-current", "true");
+          else c.removeAttribute("aria-current");
+        });
+      }
+
+      // Normalise whatever the markdown authored, so the load state and the
+      // JS state agree before any interaction.
+      select(cards.filter(function (c) {
+        return c.classList.contains("qh-mode--current");
+      })[0] || cards[0]);
+
+      cards.forEach(function (card) {
+        card.addEventListener("click", function () { select(card); });
+      });
+
+      // Spy only on cards that point at a section of this page; a grid that
+      // links to other pages keeps click behaviour alone.
+      var targets = cards.map(function (card) {
+        var href = card.getAttribute("href") || "";
+        return href.charAt(0) === "#" ? document.getElementById(href.slice(1)) : null;
+      });
+      if (!("IntersectionObserver" in window)) return;
+      if (!targets.some(function (t) { return t; })) return;
+
+      var spy = new IntersectionObserver(function (entries) {
+        entries.forEach(function (e) {
+          if (!e.isIntersecting) return;
+          var i = targets.indexOf(e.target);
+          if (i >= 0) select(cards[i]);
+        });
+      }, { rootMargin: "-25% 0px -60% 0px" });
+      targets.forEach(function (t) { if (t) spy.observe(t); });
+    });
   });
 })();

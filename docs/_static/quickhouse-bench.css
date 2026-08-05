@@ -559,3 +559,34 @@ article { padding-top: 0.6rem; }
 @media (max-width: 62rem) {
   .content { padding-left: 1.5rem; padding-right: 1.5rem; }
 }
+
+/* ------------------------------------------------------------
+   Sidebar carets — the nested-toctree affordance.
+
+   Furo hides a checkbox and puts the caret in a sibling <label>, then
+   rotates `label .icon svg` on :checked. Two of its defaults land badly
+   on Atlas: the caret colour comes from --color-sidebar-link-text--top-level,
+   which resolves to --color-brand-primary, which Atlas remaps to
+   full-strength ink -- so the caret reads as loud as the page link beside
+   it -- and --color-sidebar-item-expander-background is `transparent`, so
+   there is no hover target at all. Furo's `svg { fill: currentColor }`
+   means setting `color` is enough to retint it.
+   ------------------------------------------------------------ */
+
+.sidebar-tree label .icon,
+.sidebar-tree .toctree-l1 > label .icon {
+  color: var(--qh-ink-muted);
+  transition: color 0.18s ease;
+}
+.sidebar-tree label:hover { background: var(--color-background-hover); }
+.sidebar-tree label:hover .icon,
+.sidebar-tree .current-page > label .icon,
+.sidebar-tree .current > label .icon {
+  color: var(--qh-accent-text);
+}
+
+/* Mode cards are anchors but said nothing about it -- no pointer, so no
+   hint that the grid is navigable. Scoped to anchors on purpose: a grid of
+   plain <div> cards (the benchmark's cost comparison) is a static display
+   and must not advertise itself as clickable. */
+a.qh-mode { cursor: pointer; }

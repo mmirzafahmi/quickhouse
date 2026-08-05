@@ -81,44 +81,12 @@
       a.setAttribute("aria-current", "page");
     });
 
-    // Sync-modes selector cards (guide/sync-modes.md): filter the page down
-    // to one mode's section at a time instead of just anchor-jumping to it.
-    // Sphinx nests each H2 and everything under it (including H3 subsections)
-    // inside one <section id="..."> element, so toggling that one element
-    // per mode is enough — no manual sibling-walking needed.
-    // .qh-modes/.qh-mode is also reused elsewhere (e.g. guide/destinations.md)
-    // as a plain static comparison card with no filtering behavior — only
-    // engage the filter when this page actually has the sync-mode sections.
-    var modesNav = document.querySelector(".qh-modes");
-    var modeSections = {
-      full: document.getElementById("full-refresh"),
-      incremental: document.getElementById("incremental"),
-      append: document.getElementById("append-bronze-landing"),
-    };
-    if (modesNav && (modeSections.full || modeSections.incremental || modeSections.append)) {
-      var hrefForMode = { full: "#full-refresh", incremental: "#incremental", append: "#append-bronze-landing" };
-      var cards = Array.prototype.slice.call(modesNav.querySelectorAll(".qh-mode"));
-      function showMode(mode) {
-        Object.keys(modeSections).forEach(function (m) {
-          if (modeSections[m]) modeSections[m].style.display = m === mode ? "" : "none";
-        });
-        cards.forEach(function (c) {
-          var isCurrent = c.getAttribute("href") === hrefForMode[mode];
-          c.classList.toggle("qh-mode--current", isCurrent);
-          if (isCurrent) c.setAttribute("aria-current", "page");
-          else c.removeAttribute("aria-current");
-        });
-      }
-      cards.forEach(function (card) {
-        card.addEventListener("click", function (e) {
-          e.preventDefault();
-          var href = card.getAttribute("href");
-          var mode = Object.keys(hrefForMode).filter(function (m) { return hrefForMode[m] === href; })[0];
-          if (mode) showMode(mode);
-        });
-      });
-      showMode("full");
-    }
+    // Mode-card selection lives in quickhouse-bench.js (pass 7). It used to
+    // live here as a filter that set display:none on every unselected mode
+    // section, which hid two thirds of guide/sync-modes.md on load — and with
+    // it the target of the #append-bronze-landing cross-reference in
+    // guide/sources.md. Selection now marks the card and leaves the prose in
+    // the document.
 
     // "/" focuses search
     document.addEventListener("keydown", function (e) {
