@@ -216,6 +216,7 @@ pub trait Sink: Send + Sync {
         _key: &[String],
         _columns: &[ColumnType],
         _prune_partition: Option<&str>,
+        _prune_key_range: bool,
         _delete_stale: bool,
         _dedup_order: Option<&str>,
     ) -> Result<()> {

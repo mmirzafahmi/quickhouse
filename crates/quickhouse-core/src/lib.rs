@@ -19,6 +19,7 @@ pub mod decode_api;
 pub mod decode_bigquery;
 pub mod decode_mysql;
 pub mod error;
+pub mod host;
 pub mod memory;
 pub mod sink;
 pub mod source;

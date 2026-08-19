@@ -16,7 +16,7 @@
 //! conversion in this file's own code.
 #![allow(clippy::useless_conversion)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Once};
 
 use pyo3::exceptions::PyRuntimeError;
@@ -241,7 +241,7 @@ struct BigQuery {
 #[pymethods]
 impl BigQuery {
     #[new]
-    #[pyo3(signature = (project_id=None, *, credentials_file=None, credentials_json=None, dataset_id=None, write_method="insert_all".to_string()))]
+    #[pyo3(signature = (project_id=None, *, credentials_file=None, credentials_json=None, dataset_id=None, write_method="storage_write".to_string()))]
     fn new(
         project_id: Option<String>,
         credentials_file: Option<String>,
@@ -682,12 +682,14 @@ struct ClickHouse {
     password: String,
     compression: String,
     archive: Option<S3Archive>,
+    settings: BTreeMap<String, String>,
+    insert_dedup_token: bool,
 }
 
 #[pymethods]
 impl ClickHouse {
     #[new]
-    #[pyo3(signature = (url, *, database="default".to_string(), user="default".to_string(), password="".to_string(), compression="zstd".to_string(), archive=None))]
+    #[pyo3(signature = (url, *, database="default".to_string(), user="default".to_string(), password="".to_string(), compression="zstd".to_string(), archive=None, settings=None, insert_dedup_token=false))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         url: String,
@@ -696,6 +698,8 @@ impl ClickHouse {
         password: String,
         compression: String,
         archive: Option<S3Archive>,
+        settings: Option<BTreeMap<String, String>>,
+        insert_dedup_token: bool,
     ) -> Self {
         ClickHouse {
             url,
@@ -704,6 +708,8 @@ impl ClickHouse {
             password,
             compression,
             archive,
+            settings: settings.unwrap_or_default(),
+            insert_dedup_token,
         }
     }
 
@@ -755,6 +761,8 @@ impl AnyDestination {
                         user: c.user,
                         password: c.password,
                         compression: parse_compression(&c.compression)?,
+                        insert_dedup_token: c.insert_dedup_token,
+                        settings: c.settings,
                         s3_archive,
                     },
                 ))
@@ -953,12 +961,16 @@ fn parse_parquet_compression(c: &str) -> PyResult<core::ParquetCompression> {
     partition_by=None,
     primary_key=None,
     merge_prune_partition_by=None,
+    merge_prune_key_range=true,
     delete_stale_in_window=false,
-    parallelism=4,
+    parallelism=0,
     batch_rows=100_000,
     batch_bytes=4_194_304,
+    insert_bytes=33_554_432,
     max_memory_bytes=536_870_912,
+    max_memory_fraction=0.0,
     partition_column=None,
+    partition_source_expr=None,
     read_max_rows_per_sec=None,
     chunk_rows=None,
     retry_max_attempts=1,
@@ -1001,12 +1013,16 @@ fn sync(
     partition_by: Option<String>,
     primary_key: Option<Vec<String>>,
     merge_prune_partition_by: Option<String>,
+    merge_prune_key_range: bool,
     delete_stale_in_window: bool,
     parallelism: usize,
     batch_rows: usize,
     batch_bytes: usize,
+    insert_bytes: usize,
     max_memory_bytes: usize,
+    max_memory_fraction: f64,
     partition_column: Option<String>,
+    partition_source_expr: Option<String>,
     read_max_rows_per_sec: Option<u64>,
     chunk_rows: Option<usize>,
     retry_max_attempts: u32,
@@ -1059,12 +1075,16 @@ fn sync(
         partition_by,
         primary_key: primary_key.unwrap_or_default(),
         merge_prune_partition_by,
+        merge_prune_key_range,
         delete_stale_in_window,
         parallelism,
         batch_rows,
         batch_bytes,
+        insert_bytes,
         max_memory_bytes,
+        max_memory_fraction,
         partition_column,
+        partition_source_expr,
         read_max_rows_per_sec,
         chunk_rows,
         retry_max_attempts,

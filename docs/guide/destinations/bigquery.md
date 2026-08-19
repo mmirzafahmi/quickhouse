@@ -5,10 +5,11 @@
 `database`.
 ```
 
-`write_method` selects how rows are written: `"insert_all"`
-(default; `tabledata.insertAll`, proven) or `"storage_write"` (the gRPC Storage
-Write API — free and higher-throughput). Both share the same atomic-swap /
-MERGE flow; only the row-insert transport differs. See
+`write_method` selects how rows are written: `"storage_write"` (default since
+0.14.0; the gRPC Storage Write API — free up to 2 TiB/month, then $0.025/GB) or
+the legacy `"insert_all"` (`tabledata.insertAll`, billed $0.01 per 200 MiB —
+roughly double — and slower). Both share the same atomic-swap / MERGE flow; only
+the row-insert transport differs. See
 [BigQuery authentication](../sources/index.md#authentication) — the same credentials
 work in either role.
 

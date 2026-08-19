@@ -254,13 +254,24 @@ impl PgSource {
         Ok(rows.into_iter().map(|r| r.get::<_, String>(0)).collect())
     }
 
-    /// Compute range partitions over `column` for a base table. Falls back to a
-    /// single partition when the column is not an integer or has no rows.
+    /// Compute range partitions over `column`, either for a base table
+    /// (`from_table`) or for a wrapped `source_query` (`base_query`). Falls back
+    /// to a single partition when the column is not an integer or has no rows.
+    ///
+    /// `source_expr`, when set, replaces the bare `column` in both the
+    /// `MIN`/`MAX` probe and the emitted range predicates (a raw SQL expression
+    /// — typically the pass-through alias `source_query` projects the indexed
+    /// key column under). This is what makes the `base_query` form partitionable
+    /// at all; see `TransferConfig::partition_source_expr`. Kept in lockstep
+    /// with `copy_sql`, which AND-s these predicates into the same wrapper.
+    #[allow(clippy::too_many_arguments)]
     pub async fn range_partitions(
         &self,
         client: &Client,
-        table: &str,
+        from_table: Option<&str>,
+        base_query: Option<&str>,
         column: &str,
+        source_expr: Option<&str>,
         column_oid: u32,
         n: usize,
         column_nullable: bool,
@@ -272,21 +283,35 @@ impl PgSource {
             }]
         };
 
-        let is_int = matches!(column_oid, oid::INT2 | oid::INT4 | oid::INT8);
-        if n <= 1 || !is_int {
+        // With an explicit `source_expr` the type gate is the caller's job (the
+        // expression need not be a projected column we have a type for), and a
+        // non-integer there is a hard config error rather than a quiet fallback.
+        if n <= 1 || (source_expr.is_none() && !is_range_partitionable(column_oid)) {
             return Ok(single());
         }
 
-        let row = client
-            .query_one(
-                &format!(
-                    "SELECT min({c})::bigint, max({c})::bigint FROM {t}",
-                    c = quote_pg(column),
-                    t = quote_pg_table(table),
-                ),
-                &[],
-            )
-            .await?;
+        let key = source_expr
+            .map(str::to_string)
+            .unwrap_or_else(|| quote_pg(column));
+        let sql = match base_query {
+            Some(q) => format!("SELECT min({key})::bigint, max({key})::bigint FROM ({q}) AS _src"),
+            None => format!(
+                "SELECT min({key})::bigint, max({key})::bigint FROM {t}",
+                t = quote_pg_table(from_table.expect("table or query required")),
+            ),
+        };
+        let row = client.query_one(&sql, &[]).await.map_err(|e| {
+            // A bad `partition_source_expr` surfaces here as an opaque SQL
+            // error; name the knob so the fix is obvious.
+            match source_expr {
+                Some(expr) => EtlError::config(format!(
+                    "partition_source_expr='{expr}' could not be probed for a MIN/MAX range: {e}. \
+                     It must be a raw SQL expression over a column source_query projects, and it \
+                     must resolve to an integer type."
+                )),
+                None => e.into(),
+            }
+        })?;
         let lo: Option<i64> = row.get(0);
         let hi: Option<i64> = row.get(1);
         let (lo, hi) = match (lo, hi) {
@@ -294,12 +319,12 @@ impl PgSource {
             _ => return Ok(single()),
         };
 
-        let mut parts = super::range_partitions(lo as i128, hi as i128, n, &quote_pg(column));
+        let mut parts = super::range_partitions(lo as i128, hi as i128, n, &key);
         // Rows whose partition key is NULL would be skipped by range predicates.
         if column_nullable {
             parts.push(Partition {
                 label: "null-key".into(),
-                predicate: Some(format!("{} IS NULL", quote_pg(column))),
+                predicate: Some(format!("{key} IS NULL")),
             });
         }
         Ok(parts)
@@ -460,6 +485,14 @@ pub(crate) fn unquote(s: &str) -> String {
 }
 
 /// Double-quote a PostgreSQL identifier.
+/// Whether a Postgres column type can be split into numeric ranges for
+/// parallel partitioning. The single definition of that gate — used both by
+/// [`PgSource::range_partitions`] (the implicit base-table path) and by
+/// `sync`'s planner when `partition_source_expr` names a projected column.
+pub(crate) fn is_range_partitionable(column_oid: u32) -> bool {
+    matches!(column_oid, oid::INT2 | oid::INT4 | oid::INT8)
+}
+
 pub(crate) fn quote_pg(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }

@@ -107,11 +107,16 @@ class BigQuery:
         carry the dataset there).
     write_method:
         How rows are written when this is a ``target=`` (ignored as a
-        ``source=``). ``"insert_all"`` (default) uses ``tabledata.insertAll``
-        (JSON over REST — proven, but billed and lower-throughput).
-        ``"storage_write"`` uses the BigQuery Storage Write API (gRPC +
-        protobuf — free and higher-throughput). Both share the same atomic
-        swap / MERGE flow; only the row-insert transport differs.
+        ``source=``). ``"storage_write"`` (default) uses the BigQuery Storage
+        Write API (gRPC + protobuf — free up to 2 TiB/month, then $0.025/GB,
+        and higher-throughput). ``"insert_all"`` uses the legacy
+        ``tabledata.insertAll`` (JSON over REST), which bills $0.01 per 200 MiB
+        — roughly double — and is slower; it remains available for
+        compatibility. Both share the same atomic swap / MERGE flow; only the
+        row-insert transport differs.
+
+        .. versionchanged:: 0.14.0
+           The default changed from ``"insert_all"`` to ``"storage_write"``.
 
     Notes
     -----
@@ -140,7 +145,7 @@ class BigQuery:
         credentials_file: Optional[str] = None,
         credentials_json: Optional[str] = None,
         dataset_id: Optional[str] = None,
-        write_method: str = "insert_all",
+        write_method: str = "storage_write",
     ) -> None:
         """``credentials_json`` holds inline service-account JSON key contents
         (e.g. loaded from a secrets manager) as an alternative to
@@ -348,6 +353,34 @@ class ClickHouse:
         Optional :class:`S3Archive` — also write every synced batch as
         Parquet to S3 for backup/historical analysis. ``None`` (default)
         disables this entirely.
+    settings:
+        Arbitrary ClickHouse settings, sent as URL query parameters on **every**
+        request this destination makes (DDL, inserts, reads, swaps) — the HTTP
+        interface's own per-request settings mechanism. Names are passed through
+        verbatim; ClickHouse itself rejects an unknown one. Avoid ``database``,
+        which is already sent.
+
+        This reaches server-side behaviour no client-side knob can, e.g.
+        ``{"select_sequential_consistency": "1"}`` to stop the post-swap
+        row-count guard reading a lagging ClickHouse Cloud replica and failing a
+        run that actually succeeded, or ``{"async_insert": "1"}`` /
+        ``{"max_execution_time": "300"}``.
+
+        .. versionadded:: 0.14.0
+    insert_dedup_token:
+        Attach a generated ``insert_deduplication_token`` to every insert, so a
+        retry whose original attempt the server had already committed is
+        discarded instead of duplicating rows. ``False`` (default).
+
+        **Opt-in deliberately.** ClickHouse deduplicates per *block*, not per
+        request; a single insert large enough to be split server-side shares one
+        token across its blocks, and if that makes later blocks look like
+        duplicates of the first they are dropped silently. Verify against your
+        own ClickHouse version — on a ``Replicated*MergeTree``, with a large
+        insert, comparing row counts — before enabling it in production. It is
+        also a no-op on engines without replicated dedup.
+
+        .. versionadded:: 0.14.0
     """
 
     def __init__(
@@ -359,6 +392,8 @@ class ClickHouse:
         password: str = "",
         compression: str = "zstd",
         archive: Optional[S3Archive] = None,
+        settings: Optional[Mapping[str, str]] = None,
+        insert_dedup_token: bool = False,
     ) -> None: ...
 
 class Progress:
@@ -412,12 +447,16 @@ def sync(
     partition_by: Optional[str] = None,
     primary_key: Optional[Sequence[str]] = None,
     merge_prune_partition_by: Optional[str] = None,
+    merge_prune_key_range: bool = True,
     delete_stale_in_window: bool = False,
-    parallelism: int = 4,
+    parallelism: int = 0,
     batch_rows: int = 100_000,
     batch_bytes: int = 4_194_304,
+    insert_bytes: int = 33_554_432,
     max_memory_bytes: int = 536_870_912,
+    max_memory_fraction: float = 0.0,
     partition_column: Optional[str] = None,
+    partition_source_expr: Optional[str] = None,
     read_max_rows_per_sec: Optional[int] = None,
     chunk_rows: Optional[int] = None,
     retry_max_attempts: int = 1,
@@ -474,6 +513,25 @@ def sync(
     size. Have ``source_query`` additionally project the raw, indexed column
     under a second name (e.g. ``write_date AS write_date_raw``) and set
     ``watermark_source_expr="write_date_raw"``.
+
+    ``partition_source_expr`` (new in 0.14.0; PostgreSQL/MySQL sources only) is
+    the same idea applied to parallel reads, and it is what makes
+    ``parallelism`` mean anything for a custom query. Range partitioning needs a
+    key column it can probe ``MIN``/``MAX`` on and bound with an indexable
+    predicate; ``source_query`` hides that column behind its own projection, so
+    such a transfer silently ran single-stream however large it was — and since
+    a ``CAST`` can only live in ``source_query``, that covered most non-trivial
+    tables. Have ``source_query`` project the raw, indexed key column under a
+    second name (e.g. ``id AS id_raw``) and set
+    ``partition_source_expr="id_raw"`` to fan out. ``None`` (default) keeps the
+    old single-stream behaviour, now logged so it isn't invisible.
+
+    Two costs: the ``MIN``/``MAX`` probe runs against the wrapped query rather
+    than a base table (a single-table query flattens and still uses the index; a
+    query with joins pays for one extra evaluation per run), and an expression
+    that is missing or non-integer is a hard error rather than a silent
+    fallback — an explicitly requested fan-out that quietly collapses to one
+    stream is the bug this fixes.
 
     **Experimental features** (may change without a major-version bump, and carry
     sharper edges — read their notes before relying on them):
@@ -650,6 +708,19 @@ def sync(
     merge-filter dup bug). quickhouse can't detect mutability — this is a
     deliberate per-table opt-in. Default ``None`` keeps the safe full scan.
 
+    ``merge_prune_key_range`` (new in 0.14.0, default ``True``) additionally
+    bounds that scan to the staging batch's ``[MIN, MAX]`` on the merge ``key``
+    itself. Unlike the knob above this needs no immutability contract and is on
+    by default, because it is a tautology rather than an assumption: a
+    destination row can only match by holding a staging row's exact key value,
+    which is inside that batch's own range by construction, so no configuration
+    exists in which it changes which rows merge. It pays off when the table is
+    clustered by the merge key — what quickhouse's own generated DDL does — and
+    is a near-free no-op otherwise. Ignored when ``delete_stale_in_window`` is
+    set, where narrowing the ``ON`` clause would quietly reduce "replace this
+    window" to "replace this key range". Set ``False`` to restore the unbounded
+    join.
+
     ``delete_stale_in_window=True`` (BigQuery incremental only) additionally
     DELETEs destination rows inside the merged window that are absent from the
     source pull (``WHEN NOT MATCHED BY SOURCE``) — "replace this window", and a
@@ -672,13 +743,34 @@ def sync(
     Memory vs. batch sizing:
 
     - ``batch_rows`` / ``batch_bytes`` control how big each individual Arrow
-      batch (and thus each insert) is — a throughput/overhead granularity knob.
+      batch is — the *decode* granularity.
+    - ``insert_bytes`` (new in 0.14.0, default 32 MiB) controls how much is sent
+      per insert: decoded batches accumulate until they reach it, then go out as
+      one request. Previously every batch was its own insert, so ``batch_bytes``
+      silently set both — at its 4 MiB default a 19.4M-row table meant 900+
+      round-trips and 900+ new ClickHouse parts, against ClickHouse's own
+      guidance of fewer, larger inserts (part count drives background merge
+      work, which on Cloud competes with query memory). ``0`` restores
+      one-insert-per-batch.
     - ``max_memory_bytes`` is the hard ceiling on *total* in-flight batch
       memory across all partitions and all uploads currently in flight,
       measured against each batch's real Arrow allocation. Decoding overlaps
       with concurrent uploads and blocks (backpressure) when this ceiling is
       reached, so peak RSS stays bounded regardless of ``parallelism`` or row
-      width. Default 512 MiB; ``0`` disables the ceiling (unbounded).
+      width. Default 512 MiB; ``0`` disables the ceiling (unbounded). Raising
+      ``insert_bytes`` does not raise this: batches still hold reservations while
+      they accumulate, and the destination serializes its payload incrementally
+      rather than buffering it whole.
+    - ``max_memory_fraction`` (new in 0.14.0) sets that ceiling as a fraction of
+      the memory this process is actually allowed — read from the cgroup limit
+      where there is one, so four containers sharing a VM each size against
+      their own 4 GiB rather than the host's 16. ``0.0`` (default) uses
+      ``max_memory_bytes`` verbatim. If the host won't report a limit (notably
+      off Linux), ``max_memory_bytes`` is kept as configured rather than
+      silently becoming unbounded.
+    - ``parallelism`` now defaults to ``0``, meaning "derive from the host"
+      (CPUs available to this process, container quota included), instead of a
+      fixed ``4``.
 
     Being gentle to a small source database:
 

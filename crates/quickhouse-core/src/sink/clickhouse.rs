@@ -16,10 +16,23 @@ use crate::error::{EtlError, Result};
 use crate::sink::{backoff_delay, SendError, Sink, MAX_INSERT_ATTEMPTS};
 use crate::types::ColumnType;
 
+/// The ClickHouse setting name this sink generates a value for when
+/// `insert_dedup_token` is on — and the one an explicit caller setting can
+/// override.
+const DEDUP_TOKEN_SETTING: &str = "insert_deduplication_token";
+
 #[derive(Clone)]
 pub struct ClickHouseSink {
     client: Client,
     cfg: Arc<ClickHouseConfig>,
+    /// Per-sink token making this run's dedup tokens distinct from any other
+    /// process/run inserting into the same table (a nanosecond timestamp, the
+    /// same approach the BigQuery sink takes for `insertId`).
+    run_token: String,
+    /// Hands each insert its own dedup token. Only ever incremented — a retry
+    /// reuses the value it already took, which is what makes the retry
+    /// idempotent rather than merely distinct.
+    insert_epoch: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ClickHouseSink {
@@ -28,7 +41,25 @@ impl ClickHouseSink {
         Ok(Self {
             client,
             cfg: Arc::new(cfg),
+            run_token: time::OffsetDateTime::now_utc()
+                .unix_timestamp_nanos()
+                .to_string(),
+            insert_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
+    }
+
+    /// A dedup token for one logical insert, or `None` when the feature is off
+    /// or the caller set the setting themselves. Called once per
+    /// `insert_batches` — outside the retry loop, so every attempt at the same
+    /// insert presents the same token.
+    fn next_dedup_token(&self) -> Option<String> {
+        if !self.cfg.insert_dedup_token || self.cfg.settings.contains_key(DEDUP_TOKEN_SETTING) {
+            return None;
+        }
+        let epoch = self
+            .insert_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(format!("{}-{epoch}", self.run_token))
     }
 
     pub fn database(&self) -> &str {
@@ -36,11 +67,20 @@ impl ClickHouseSink {
     }
 
     fn base_request(&self) -> reqwest::RequestBuilder {
-        self.client
+        let req = self
+            .client
             .post(&self.cfg.url)
             .header("X-ClickHouse-User", &self.cfg.user)
             .header("X-ClickHouse-Key", &self.cfg.password)
-            .query(&[("database", &self.cfg.database)])
+            .query(&[("database", &self.cfg.database)]);
+        // Caller-supplied ClickHouse settings ride along as query parameters on
+        // every request — see `ClickHouseConfig::settings`. Applied here rather
+        // than per-call site so DDL, inserts, reads and swaps all get them.
+        if self.cfg.settings.is_empty() {
+            req
+        } else {
+            req.query(&self.cfg.settings.iter().collect::<Vec<_>>())
+        }
     }
 
     /// Execute a statement that returns no rows (DDL, TRUNCATE, EXCHANGE, ...).
@@ -318,9 +358,10 @@ impl ClickHouseSink {
         if batches.iter().all(|b| b.num_rows() == 0) {
             return Ok(0);
         }
-        // `Bytes` (not `Vec<u8>`) so each retry attempt re-wraps the payload
-        // with a cheap Arc-clone instead of copying the serialized IPC again.
-        let payload = Bytes::from(serialize_ipc(schema, batches)?);
+        // Shared, not copied: each retry attempt re-encodes from these same
+        // batches (an Arc clone per array) rather than holding a serialized
+        // payload alive between attempts. See `ipc_stream`.
+        let batches = Arc::new(batches.to_vec());
 
         let query = format!(
             "INSERT INTO {}.{} FORMAT ArrowStream",
@@ -339,20 +380,28 @@ impl ClickHouseSink {
         // key); for full-refresh into a plain MergeTree it can leave duplicate
         // rows from the single re-sent batch. Preferred over aborting the whole
         // transfer; dedupe downstream if exactness matters.
+        // Taken once, before the retry loop: the point of the token is that all
+        // attempts at this one insert present the *same* value.
+        let dedup_token = self.next_dedup_token();
+
         let mut attempt = 0u32;
         loop {
             attempt += 1;
             let sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
             let mut req = self.base_request().query(&[("query", query.as_str())]);
+            if let Some(token) = &dedup_token {
+                req = req.query(&[(DEDUP_TOKEN_SETTING, token.as_str())]);
+            }
+            let ipc = ipc_stream(schema.clone(), batches.clone());
             let body = match self.cfg.compression {
-                Compression::None => counting_body(payload.clone(), sent.clone()),
+                Compression::None => counting_body(ipc, sent.clone()),
                 Compression::Gzip => {
                     req = req.header("Content-Encoding", "gzip");
-                    gzip_body(payload.clone(), sent.clone())
+                    gzip_body(ipc, sent.clone())
                 }
                 Compression::Zstd => {
                     req = req.header("Content-Encoding", "zstd");
-                    zstd_body(payload.clone(), sent.clone())
+                    zstd_body(ipc, sent.clone())
                 }
             };
 
@@ -564,26 +613,13 @@ fn escape_sql_string(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\'', "''")
 }
 
-/// Serialize batches to an in-memory Arrow IPC stream.
-fn serialize_ipc(schema: SchemaRef, batches: &[RecordBatch]) -> Result<Vec<u8>> {
-    let mut buf: Vec<u8> = Vec::new();
-    {
-        let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut buf, &schema)?;
-        for b in batches {
-            writer.write(b)?;
-        }
-        writer.finish()?;
-    }
-    Ok(buf)
-}
-
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_compression::tokio::bufread::{GzipEncoder, ZstdEncoder};
 use bytes::Bytes;
 use futures::TryStreamExt;
 use tokio::io::BufReader;
-use tokio_util::io::ReaderStream;
+use tokio_util::io::{ReaderStream, StreamReader};
 
 /// Wrap a byte stream so every chunk that flows through is tallied into
 /// `counter` — used to report the actual wire size of a streamed body.
@@ -600,23 +636,131 @@ where
 }
 
 /// Uncompressed streamed body.
-fn counting_body(payload: Bytes, counter: Arc<AtomicU64>) -> reqwest::Body {
-    let stream = ReaderStream::new(std::io::Cursor::new(payload));
-    reqwest::Body::wrap_stream(count_stream(stream, counter))
+fn counting_body<S>(source: S, counter: Arc<AtomicU64>) -> reqwest::Body
+where
+    S: futures::Stream<Item = std::io::Result<Bytes>> + Send + Sync + 'static,
+{
+    reqwest::Body::wrap_stream(count_stream(source, counter))
 }
 
 /// gzip-compressed streamed body (compression happens incrementally).
-fn gzip_body(payload: Bytes, counter: Arc<AtomicU64>) -> reqwest::Body {
-    let enc = GzipEncoder::new(BufReader::new(std::io::Cursor::new(payload)));
+fn gzip_body<S>(source: S, counter: Arc<AtomicU64>) -> reqwest::Body
+where
+    S: futures::Stream<Item = std::io::Result<Bytes>> + Send + Sync + 'static,
+{
+    let enc = GzipEncoder::new(BufReader::new(StreamReader::new(source)));
     let stream = ReaderStream::new(enc);
     reqwest::Body::wrap_stream(count_stream(stream, counter))
 }
 
 /// zstd-compressed streamed body (compression happens incrementally).
-fn zstd_body(payload: Bytes, counter: Arc<AtomicU64>) -> reqwest::Body {
-    let enc = ZstdEncoder::new(BufReader::new(std::io::Cursor::new(payload)));
+fn zstd_body<S>(source: S, counter: Arc<AtomicU64>) -> reqwest::Body
+where
+    S: futures::Stream<Item = std::io::Result<Bytes>> + Send + Sync + 'static,
+{
+    let enc = ZstdEncoder::new(BufReader::new(StreamReader::new(source)));
     let stream = ReaderStream::new(enc);
     reqwest::Body::wrap_stream(count_stream(stream, counter))
+}
+
+/// How many IPC bytes accumulate before a chunk is handed to the HTTP body.
+/// Small enough that peak per-insert overhead stays flat as insert size grows,
+/// large enough that neither the channel nor the compressor sees tiny writes.
+const IPC_CHUNK_BYTES: usize = 256 * 1024;
+
+/// IPC chunks allowed in flight between the serializer and the socket. This,
+/// times `IPC_CHUNK_BYTES`, is the whole steady-state serialization footprint
+/// of an insert — independent of how many batches it carries.
+const IPC_CHUNK_QUEUE: usize = 4;
+
+/// Serialize `batches` as an Arrow IPC stream *incrementally*, as a stream of
+/// byte chunks.
+///
+/// This is what lets insert size grow without RSS following it. Building the
+/// whole IPC payload into a `Vec<u8>` first was harmless at 4 MiB batches, but
+/// coalescing inserts to tens of MiB would have made that buffer the dominant
+/// allocation of the entire pipeline — and `parallelism` multiplies it. Here
+/// peak serialization memory is `IPC_CHUNK_BYTES * IPC_CHUNK_QUEUE` per
+/// in-flight insert whatever the payload size, so `MemoryBudget`'s accounting
+/// over the Arrow batches themselves stays the honest number it claims to be.
+///
+/// `StreamWriter` is synchronous, so it's driven on the blocking pool and hands
+/// finished chunks over a bounded channel — which also keeps the serialization
+/// CPU off the async reactor. A dropped receiver (abandoned attempt, aborted
+/// request) makes the next send fail, which ends the task rather than leaking
+/// it. Serialization restarts per retry attempt; the batches are `Arc`-shared,
+/// so that costs nothing but the re-encode.
+fn ipc_stream(
+    schema: SchemaRef,
+    batches: Arc<Vec<RecordBatch>>,
+) -> impl futures::Stream<Item = std::io::Result<Bytes>> + Send + Sync + 'static {
+    let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<Bytes>>(IPC_CHUNK_QUEUE);
+    tokio::task::spawn_blocking(move || {
+        let sink = ChunkWriter {
+            tx: tx.clone(),
+            buf: Vec::with_capacity(IPC_CHUNK_BYTES),
+        };
+        let write_all = || -> std::io::Result<()> {
+            let mut writer = arrow::ipc::writer::StreamWriter::try_new(sink, &schema)
+                .map_err(std::io::Error::other)?;
+            for b in batches.iter() {
+                writer.write(b).map_err(std::io::Error::other)?;
+            }
+            writer.finish().map_err(std::io::Error::other)?;
+            let mut done = writer.into_inner().map_err(std::io::Error::other)?;
+            done.send_buffered()
+        };
+        if let Err(e) = write_all() {
+            // The receiver going away is the normal "nobody wants this
+            // any more" path, not an error worth reporting anywhere.
+            let _ = tx.blocking_send(Err(e));
+        }
+    });
+    futures::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|chunk| (chunk, rx))
+    })
+}
+
+/// `std::io::Write` adapter that forwards to an async channel in
+/// `IPC_CHUNK_BYTES`-sized pieces. Used only from inside `spawn_blocking`,
+/// which is what makes `blocking_send` the right call here.
+struct ChunkWriter {
+    tx: tokio::sync::mpsc::Sender<std::io::Result<Bytes>>,
+    buf: Vec<u8>,
+}
+
+impl ChunkWriter {
+    /// Hand whatever is buffered to the consumer. A closed channel surfaces as
+    /// a broken pipe, which aborts serialization instead of spinning.
+    fn send_buffered(&mut self) -> std::io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        let chunk = Bytes::from(std::mem::replace(
+            &mut self.buf,
+            Vec::with_capacity(IPC_CHUNK_BYTES),
+        ));
+        self.tx.blocking_send(Ok(chunk)).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "clickhouse insert body was dropped before serialization finished",
+            )
+        })
+    }
+}
+
+impl std::io::Write for ChunkWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.buf.extend_from_slice(data);
+        if self.buf.len() >= IPC_CHUNK_BYTES {
+            self.send_buffered()?;
+        }
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.send_buffered()
+    }
 }
 
 #[cfg(test)]
@@ -626,6 +770,186 @@ mod tests {
     #[test]
     fn escape_sql_string_doubles_quotes() {
         assert_eq!(escape_sql_string("o'brien"), "o''brien");
+    }
+
+    fn sink_with_settings(settings: &[(&str, &str)]) -> ClickHouseSink {
+        ClickHouseSink::new(ClickHouseConfig {
+            url: "http://ch:8123".into(),
+            database: "analytics".into(),
+            user: "default".into(),
+            password: String::new(),
+            compression: Compression::None,
+            insert_dedup_token: false,
+            settings: settings
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            s3_archive: None,
+        })
+        .unwrap()
+    }
+
+    /// The URL every request is built from, so this covers DDL, inserts, reads
+    /// and swaps at once — they all go through `base_request`.
+    fn base_url(sink: &ClickHouseSink) -> String {
+        sink.base_request().build().unwrap().url().to_string()
+    }
+
+    #[test]
+    fn settings_ride_along_as_query_parameters() {
+        let url = base_url(&sink_with_settings(&[
+            ("select_sequential_consistency", "1"),
+            ("async_insert", "1"),
+        ]));
+        assert!(url.contains("database=analytics"), "{url}");
+        assert!(url.contains("select_sequential_consistency=1"), "{url}");
+        assert!(url.contains("async_insert=1"), "{url}");
+    }
+
+    #[test]
+    fn settings_are_emitted_in_a_stable_order() {
+        // BTreeMap, not HashMap: the same config must produce the same URL every
+        // run so request logs are reproducible.
+        let s = &[("z_last", "1"), ("a_first", "2"), ("m_middle", "3")];
+        assert_eq!(
+            base_url(&sink_with_settings(s)),
+            base_url(&sink_with_settings(s))
+        );
+        let url = base_url(&sink_with_settings(s));
+        let a = url.find("a_first").unwrap();
+        let m = url.find("m_middle").unwrap();
+        let z = url.find("z_last").unwrap();
+        assert!(a < m && m < z, "settings not sorted: {url}");
+    }
+
+    #[test]
+    fn no_settings_leaves_the_request_url_untouched() {
+        let url = base_url(&sink_with_settings(&[]));
+        assert!(url.ends_with("database=analytics"), "{url}");
+    }
+
+    fn sink_with_dedup(enabled: bool, settings: &[(&str, &str)]) -> ClickHouseSink {
+        ClickHouseSink::new(ClickHouseConfig {
+            url: "http://ch:8123".into(),
+            database: "analytics".into(),
+            user: "default".into(),
+            password: String::new(),
+            compression: Compression::None,
+            insert_dedup_token: enabled,
+            settings: settings
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            s3_archive: None,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn dedup_token_is_absent_unless_enabled() {
+        assert!(sink_with_dedup(false, &[]).next_dedup_token().is_none());
+    }
+
+    #[test]
+    fn each_insert_gets_its_own_dedup_token() {
+        // Distinctness is what keeps legitimate inserts from deduplicating each
+        // other; a shared constant token would discard everything after the first.
+        let sink = sink_with_dedup(true, &[]);
+        let a = sink.next_dedup_token().expect("enabled");
+        let b = sink.next_dedup_token().expect("enabled");
+        assert_ne!(a, b);
+        // Retries reuse the token their attempt already took, which is why the
+        // value is minted once per insert rather than once per request — see
+        // `insert_batches`. Both share the run token.
+        let run = a.rsplit_once('-').unwrap().0;
+        assert_eq!(run, b.rsplit_once('-').unwrap().0);
+    }
+
+    #[test]
+    fn an_explicit_caller_setting_wins_over_the_generated_token() {
+        let sink = sink_with_dedup(true, &[(DEDUP_TOKEN_SETTING, "mine")]);
+        assert!(sink.next_dedup_token().is_none());
+        // ...and the caller's value is what actually goes on the wire.
+        assert!(base_url(&sink).contains("insert_deduplication_token=mine"));
+    }
+
+    fn ipc_test_batch(schema: &SchemaRef, from: i64, rows: i64) -> RecordBatch {
+        let ids: Vec<i64> = (from..from + rows).collect();
+        let names: Vec<String> = ids.iter().map(|i| format!("name-{i}")).collect();
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(arrow_array::Int64Array::from(ids)),
+                Arc::new(arrow_array::StringArray::from(names)),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn ipc_test_schema() -> SchemaRef {
+        Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
+            arrow_schema::Field::new("name", arrow_schema::DataType::Utf8, true),
+        ]))
+    }
+
+    /// The chunked, incrementally-serialized body must still be a byte-exact
+    /// Arrow IPC stream — this is what ClickHouse's `FORMAT ArrowStream`
+    /// parses, so a framing mistake here would corrupt every insert.
+    #[tokio::test]
+    async fn streamed_ipc_round_trips_through_an_arrow_reader() {
+        use futures::StreamExt;
+
+        let schema = ipc_test_schema();
+        // Deliberately larger than IPC_CHUNK_BYTES so the writer really does
+        // hand over multiple chunks rather than one buffered payload.
+        let batches = vec![
+            ipc_test_batch(&schema, 0, 20_000),
+            ipc_test_batch(&schema, 20_000, 20_000),
+        ];
+        let expected_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+
+        let mut stream = Box::pin(ipc_stream(schema.clone(), Arc::new(batches)));
+        let mut payload: Vec<u8> = Vec::new();
+        let mut chunks = 0;
+        while let Some(chunk) = stream.next().await {
+            payload.extend_from_slice(&chunk.expect("no serialization error"));
+            chunks += 1;
+        }
+        assert!(
+            chunks > 1,
+            "expected the payload to arrive in multiple chunks, got {chunks}"
+        );
+
+        let reader =
+            arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(payload), None).unwrap();
+        assert_eq!(reader.schema(), schema);
+        let decoded: Vec<RecordBatch> = reader.map(|b| b.unwrap()).collect();
+        let decoded_rows: usize = decoded.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(decoded_rows, expected_rows);
+    }
+
+    /// Every retry attempt re-encodes from the shared batches, so the same
+    /// input must serialize identically each time.
+    #[tokio::test]
+    async fn streamed_ipc_is_reproducible_across_attempts() {
+        use futures::StreamExt;
+
+        let schema = ipc_test_schema();
+        let batches = Arc::new(vec![ipc_test_batch(&schema, 0, 500)]);
+        let collect = || {
+            let schema = schema.clone();
+            let batches = batches.clone();
+            async move {
+                let mut s = Box::pin(ipc_stream(schema, batches));
+                let mut out: Vec<u8> = Vec::new();
+                while let Some(c) = s.next().await {
+                    out.extend_from_slice(&c.unwrap());
+                }
+                out
+            }
+        };
+        assert_eq!(collect().await, collect().await);
     }
 
     #[test]

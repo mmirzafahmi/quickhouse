@@ -2,10 +2,18 @@
 //! ClickHouse — see `build_table`), and writes via either `tabledata.insertAll`
 //! (default) or the Storage Write API (opt-in, `write_method="storage_write"`
 //! — see `bigquery_proto` for the runtime protobuf descriptor/encoder).
-//! Load jobs were also considered, BigQuery's own recommended bulk path, but
-//! this crate only supports them via a GCS `source_uris` staging file, which
-//! would add a hard Cloud Storage dependency and a bucket requirement just
-//! for this destination.
+//! Load jobs — BigQuery's own recommended bulk path, and free — are still not
+//! implemented, but the reason recorded here previously (that they "would add a
+//! hard Cloud Storage dependency and a bucket requirement just for this
+//! destination") no longer holds: `object_store` and `parquet` are already
+//! workspace dependencies, and `archive.rs` already streams `RecordBatch`es to
+//! Parquet in object storage via `ParquetObjectWriter`, so a staging writer
+//! would be reuse rather than new machinery. What actually blocks it is narrower
+//! and worth stating: a Parquet load path needs its own verified type mapping
+//! (this crate is deliberately exacting about decimal precision and timestamp
+//! fidelity — see `decimal.rs` and `bigquery_proto`), and the `Sink` trait has
+//! no "all writes are done" hook for a bulk load to fire from. Both are
+//! tractable; neither is a detail to guess at.
 //!
 //! The atomic full-refresh swap (ClickHouse's `EXCHANGE TABLES`) has no
 //! single-statement BigQuery equivalent. The obvious-looking option — a COPY
@@ -623,6 +631,7 @@ impl BigQuerySink {
         key: &[String],
         columns: &[ColumnType],
         prune_partition: Option<&str>,
+        prune_key_range: bool,
         delete_stale: bool,
         dedup_order: Option<&str>,
     ) -> Result<()> {
@@ -634,6 +643,7 @@ impl BigQuerySink {
             key,
             columns,
             prune_partition,
+            prune_key_range,
             delete_stale,
             dedup_order,
         )?;
@@ -936,6 +946,7 @@ impl Sink for BigQuerySink {
         key: &[String],
         columns: &[ColumnType],
         prune_partition: Option<&str>,
+        prune_key_range: bool,
         delete_stale: bool,
         dedup_order: Option<&str>,
     ) -> Result<()> {
@@ -946,6 +957,7 @@ impl Sink for BigQuerySink {
             key,
             columns,
             prune_partition,
+            prune_key_range,
             delete_stale,
             dedup_order,
         )
@@ -1131,6 +1143,7 @@ fn build_merge_sql(
     key: &[String],
     columns: &[ColumnType],
     prune_partition: Option<&str>,
+    prune_key_range: bool,
     delete_stale: bool,
     dedup_order: Option<&str>,
 ) -> Result<String> {
@@ -1165,6 +1178,27 @@ fn build_merge_sql(
     });
     if let Some(bound) = &window_bound {
         on_clause.push_str(&format!(" AND {bound}"));
+    }
+    // Key-range pruning: bound the destination scan to the staging batch's
+    // [MIN, MAX] on the merge key itself. Safe with no immutability contract
+    // (unlike the partition prune above) because it's a tautology, not an
+    // assumption: a destination row can only match on `T.k = S.k`, so its key
+    // already lies inside the staging batch's own range on that column. Every
+    // key column is bounded — the same argument holds per column, and it gives
+    // BigQuery more clustering fields to prune blocks on.
+    //
+    // Skipped for `delete_stale`: `WHEN NOT MATCHED BY SOURCE` only sees rows
+    // the ON clause admits, so narrowing it here would silently reduce
+    // "replace this window" to "replace this key range" and strand
+    // deleted-at-source rows outside the batch's key span.
+    if prune_key_range && !delete_stale {
+        for k in key {
+            on_clause.push_str(&format!(
+                " AND T.`{k}` BETWEEN \
+                 (SELECT MIN(`{k}`) FROM `{project_id}`.`{dataset_id}`.`{staging}`) \
+                 AND (SELECT MAX(`{k}`) FROM `{project_id}`.`{dataset_id}`.`{staging}`)"
+            ));
+        }
     }
 
     let all_cols: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
@@ -1530,12 +1564,16 @@ mod tests {
             partition_by: None,
             primary_key: vec![],
             merge_prune_partition_by: None,
+            merge_prune_key_range: true,
             delete_stale_in_window: false,
             parallelism: 1,
             batch_rows: 1000,
             batch_bytes: 0,
+            insert_bytes: 0,
             max_memory_bytes: 0,
+            max_memory_fraction: 0.0,
             partition_column: None,
+            partition_source_expr: None,
             read_max_rows_per_sec: None,
             chunk_rows: None,
             retry_max_attempts: 1,
@@ -1869,6 +1907,7 @@ mod tests {
             &cols,
             None,
             false,
+            false,
             None,
         )
         .unwrap();
@@ -1884,7 +1923,10 @@ mod tests {
             "{sql}"
         );
         assert!(sql.contains("ON T.`id` = S.`id`"));
-        // No prune column -> no partition-bound predicate (full-scan, correct default).
+        // No prune column and key-range pruning off -> no bound of either kind.
+        // (Key-range pruning is on by default in real runs; it has its own
+        // tests, and is passed `false` here to keep this one about the base
+        // MERGE shape.)
         assert!(
             !sql.contains("BETWEEN"),
             "unexpected prune predicate without an immutable column: {sql}"
@@ -1907,8 +1949,108 @@ mod tests {
             col("b", DataType::Int64, false),
         ];
         let key = vec!["a".to_string(), "b".to_string()];
-        let sql = build_merge_sql("p", "d", "t", "s", &key, &cols, None, false, None).unwrap();
+        let sql =
+            build_merge_sql("p", "d", "t", "s", &key, &cols, None, false, false, None).unwrap();
         assert!(sql.contains("ON T.`a` = S.`a` AND T.`b` = S.`b`"));
+    }
+
+    #[test]
+    fn build_merge_sql_bounds_the_destination_scan_to_the_staging_key_range() {
+        // Default-on, and safe without any immutability contract: a row can only
+        // match on the key, so its key is inside staging's own range already.
+        let cols = vec![
+            col("id", DataType::Int64, false),
+            col("amount", DataType::Float64, true),
+        ];
+        let key = vec!["id".to_string()];
+        let sql = build_merge_sql(
+            "p",
+            "d",
+            "orders",
+            "orders_tmp",
+            &key,
+            &cols,
+            None,
+            true,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(sql.contains("ON T.`id` = S.`id`"), "{sql}");
+        assert!(
+            sql.contains(
+                "AND T.`id` BETWEEN \
+                 (SELECT MIN(`id`) FROM `p`.`d`.`orders_tmp`) \
+                 AND (SELECT MAX(`id`) FROM `p`.`d`.`orders_tmp`)"
+            ),
+            "missing key-range bound: {sql}"
+        );
+    }
+
+    #[test]
+    fn build_merge_sql_bounds_every_column_of_a_composite_key() {
+        // Per-column, the same tautology holds — a matched row carries the
+        // staging row's exact value in each key column.
+        let cols = vec![
+            col("a", DataType::Int64, false),
+            col("b", DataType::Int64, false),
+            col("v", DataType::Float64, true),
+        ];
+        let key = vec!["a".to_string(), "b".to_string()];
+        let sql =
+            build_merge_sql("p", "d", "t", "s", &key, &cols, None, true, false, None).unwrap();
+        assert!(sql.contains("T.`a` BETWEEN (SELECT MIN(`a`)"), "{sql}");
+        assert!(sql.contains("T.`b` BETWEEN (SELECT MIN(`b`)"), "{sql}");
+    }
+
+    #[test]
+    fn build_merge_sql_key_range_bound_is_opt_outable() {
+        let cols = vec![
+            col("id", DataType::Int64, false),
+            col("amount", DataType::Float64, true),
+        ];
+        let key = vec!["id".to_string()];
+        let sql =
+            build_merge_sql("p", "d", "t", "s", &key, &cols, None, false, false, None).unwrap();
+        assert!(sql.contains("ON T.`id` = S.`id`"), "{sql}");
+        assert!(!sql.contains("BETWEEN"), "bound should be absent: {sql}");
+    }
+
+    #[test]
+    fn build_merge_sql_key_range_bound_is_suppressed_by_delete_stale() {
+        // `WHEN NOT MATCHED BY SOURCE` only sees rows the ON clause admits, so a
+        // key-range bound would quietly turn "replace this window" into
+        // "replace this key range" and strand deleted-at-source rows whose keys
+        // fall outside the batch's span.
+        let cols = vec![
+            col("id", DataType::Int64, false),
+            col(
+                "create_date",
+                DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
+            col("amount", DataType::Float64, true),
+        ];
+        let key = vec!["id".to_string()];
+        let sql = build_merge_sql(
+            "p",
+            "d",
+            "orders",
+            "orders_tmp",
+            &key,
+            &cols,
+            Some("create_date"),
+            true,
+            true,
+            None,
+        )
+        .unwrap();
+        assert!(
+            !sql.contains("T.`id` BETWEEN"),
+            "key-range bound must not narrow a NOT MATCHED BY SOURCE delete: {sql}"
+        );
+        // The window bound it does require is still there.
+        assert!(sql.contains("T.`create_date` BETWEEN"), "{sql}");
     }
 
     #[test]
@@ -1931,6 +2073,7 @@ mod tests {
             &key,
             &cols,
             Some("create_date"),
+            false,
             false,
             None,
         )
@@ -1969,6 +2112,7 @@ mod tests {
             &key,
             &cols,
             Some("create_date"),
+            false,
             true,
             None,
         )
@@ -1994,7 +2138,7 @@ mod tests {
             col("v", DataType::Int64, true),
         ];
         let key = vec!["id".to_string()];
-        let err = build_merge_sql("p", "d", "t", "s", &key, &cols, None, true, None)
+        let err = build_merge_sql("p", "d", "t", "s", &key, &cols, None, false, true, None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("delete_stale"), "{err}");
@@ -2004,7 +2148,8 @@ mod tests {
     fn build_merge_sql_all_columns_are_key_becomes_insert_only() {
         let cols = vec![col("id", DataType::Int64, false)];
         let key = vec!["id".to_string()];
-        let sql = build_merge_sql("p", "d", "t", "s", &key, &cols, None, false, None).unwrap();
+        let sql =
+            build_merge_sql("p", "d", "t", "s", &key, &cols, None, false, false, None).unwrap();
         assert!(
             !sql.contains("WHEN MATCHED"),
             "no columns left to update: {sql}"
@@ -2035,6 +2180,7 @@ mod tests {
             &cols,
             None,
             false,
+            false,
             Some("write_date"),
         )
         .unwrap();
@@ -2063,7 +2209,8 @@ mod tests {
             col("v", DataType::Int64, true),
         ];
         let key = vec!["a".to_string(), "b".to_string()];
-        let sql = build_merge_sql("p", "d", "t", "s", &key, &cols, None, false, None).unwrap();
+        let sql =
+            build_merge_sql("p", "d", "t", "s", &key, &cols, None, false, false, None).unwrap();
         assert!(
             sql.contains("PARTITION BY `a`, `b` ORDER BY `a`, `b`"),
             "{sql}"
@@ -2090,6 +2237,7 @@ mod tests {
             &cols,
             None,
             false,
+            false,
             Some("not_a_staging_column"),
         )
         .unwrap();
@@ -2100,7 +2248,7 @@ mod tests {
     #[test]
     fn build_merge_sql_rejects_empty_key() {
         let cols = vec![col("id", DataType::Int64, false)];
-        let err = build_merge_sql("p", "d", "t", "s", &[], &cols, None, false, None)
+        let err = build_merge_sql("p", "d", "t", "s", &[], &cols, None, false, false, None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("empty key"), "{err}");

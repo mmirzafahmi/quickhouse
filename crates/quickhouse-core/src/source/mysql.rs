@@ -174,13 +174,25 @@ impl MySqlSource {
         Ok(cols)
     }
 
-    /// Compute range partitions over `column` for a base table. Falls back to
-    /// a single partition when the column isn't an integer type or has no rows.
+    /// Compute range partitions over `column`, either for a base table
+    /// (`from_table`) or for a wrapped `source_query` (`base_query`). Falls back
+    /// to a single partition when the column isn't an integer type or has no
+    /// rows.
+    ///
+    /// `source_expr`, when set, replaces the bare `column` in both the
+    /// `MIN`/`MAX` probe and the emitted range predicates (a raw SQL expression
+    /// — typically the pass-through alias `source_query` projects the indexed
+    /// key column under). This is what makes the `base_query` form partitionable
+    /// at all; see `TransferConfig::partition_source_expr`. Kept in lockstep
+    /// with `select_sql`, which AND-s these predicates into the same wrapper.
+    #[allow(clippy::too_many_arguments)]
     pub async fn range_partitions(
         &self,
         conn: &mut Conn,
-        table: &str,
+        from_table: Option<&str>,
+        base_query: Option<&str>,
         column: &str,
+        source_expr: Option<&str>,
         column_type_id: u32,
         n: usize,
         column_nullable: bool,
@@ -192,23 +204,23 @@ impl MySqlSource {
             }]
         };
 
-        let is_int = matches!(
-            column_type_id,
-            type_code::TINY
-                | type_code::SHORT
-                | type_code::INT24
-                | type_code::LONG
-                | type_code::LONGLONG
-        );
-        if n <= 1 || !is_int {
+        // With an explicit `source_expr` the type gate is the caller's job (the
+        // expression need not be a projected column we have a type for), and a
+        // non-integer there is a hard config error rather than a quiet fallback.
+        if n <= 1 || (source_expr.is_none() && !is_range_partitionable(column_type_id)) {
             return Ok(single());
         }
 
-        let sql = format!(
-            "SELECT MIN({c}), MAX({c}) FROM {t}",
-            c = quote_my(column),
-            t = quote_my_table(table),
-        );
+        let key = source_expr
+            .map(str::to_string)
+            .unwrap_or_else(|| quote_my(column));
+        let sql = match base_query {
+            Some(q) => format!("SELECT MIN({key}), MAX({key}) FROM ({q}) AS _src"),
+            None => format!(
+                "SELECT MIN({key}), MAX({key}) FROM {t}",
+                t = quote_my_table(from_table.expect("table or query required")),
+            ),
+        };
         // Decode as the raw wire `Value` rather than `i64` directly: a
         // BIGINT UNSIGNED column can legitimately hold values above
         // i64::MAX (up to u64::MAX), and MySQL reports those as
@@ -216,10 +228,17 @@ impl MySqlSource {
         // fail the whole probe (and abort the entire transfer) instead of
         // gracefully falling back to a single partition like every other
         // non-partitionable case below.
-        let row: Option<(Option<Value>, Option<Value>)> = conn
-            .query_first(sql)
-            .await
-            .map_err(|e| EtlError::from(e).context("computing mysql partition bounds"))?;
+        let row: Option<(Option<Value>, Option<Value>)> =
+            conn.query_first(sql).await.map_err(|e| match source_expr {
+                // A bad `partition_source_expr` surfaces here as an opaque SQL
+                // error; name the knob so the fix is obvious.
+                Some(expr) => EtlError::config(format!(
+                    "partition_source_expr='{expr}' could not be probed for a MIN/MAX range: {e}. \
+                     It must be a raw SQL expression over a column source_query projects, and it \
+                     must resolve to an integer type."
+                )),
+                None => EtlError::from(e).context("computing mysql partition bounds"),
+            })?;
         let as_i128 = |v: Value| match v {
             Value::Int(i) => Some(i as i128),
             Value::UInt(u) => Some(u as i128),
@@ -233,11 +252,11 @@ impl MySqlSource {
             _ => return Ok(single()),
         };
 
-        let mut parts = super::range_partitions(lo, hi, n, &quote_my(column));
+        let mut parts = super::range_partitions(lo, hi, n, &key);
         if column_nullable {
             parts.push(Partition {
                 label: "null-key".into(),
-                predicate: Some(format!("{} IS NULL", quote_my(column))),
+                predicate: Some(format!("{key} IS NULL")),
             });
         }
         Ok(parts)
@@ -369,6 +388,21 @@ fn combine_filters(a: &Option<String>, b: Option<&str>) -> Option<String> {
 }
 
 /// Backtick-quote a MySQL identifier.
+/// Whether a MySQL column type can be split into numeric ranges for parallel
+/// partitioning. The single definition of that gate — used both by
+/// [`MySqlSource::range_partitions`] (the implicit base-table path) and by
+/// `sync`'s planner when `partition_source_expr` names a projected column.
+pub(crate) fn is_range_partitionable(column_type_id: u32) -> bool {
+    matches!(
+        column_type_id,
+        type_code::TINY
+            | type_code::SHORT
+            | type_code::INT24
+            | type_code::LONG
+            | type_code::LONGLONG
+    )
+}
+
 pub(crate) fn quote_my(name: &str) -> String {
     format!("`{}`", name.replace('`', "``"))
 }

@@ -143,8 +143,9 @@ qh.BigQuery("my-gcp-project", dataset_id="analytics")
 
 BigQuery authenticates with a service-account key (`credentials_file=...`) or
 Application Default Credentials. As a **destination** it also takes
-`write_method`: the default `"insert_all"` (simple, proven) or the opt-in
-`"storage_write"` (the gRPC Storage Write API — free and higher-throughput).
+`write_method`: the default `"storage_write"` (the gRPC Storage Write API — free
+up to 2 TiB/month and higher-throughput) or the legacy `"insert_all"`
+(`tabledata.insertAll`, billed at roughly double and slower).
 
 ### HTTP API sources — CleverTap, AppsFlyer & generic HTTP
 

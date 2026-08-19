@@ -90,6 +90,32 @@ pub struct Reservation {
     _permit: Option<OwnedSemaphorePermit>,
 }
 
+impl MemoryBudget {
+    /// Reserve room for `size` bytes only if it's free right now; `None` if the
+    /// budget is too full, without waiting.
+    ///
+    /// This exists for callers that *hold* reservations while accumulating (the
+    /// insert coalescer): for them, blocking on a full budget is a deadlock
+    /// rather than backpressure, because the memory they're waiting on is the
+    /// memory they themselves are holding. A `None` here is their signal to
+    /// flush what they have — which hands those reservations to an in-flight
+    /// upload that will release them — and only then block on [`Self::reserve`].
+    pub fn try_reserve(&self, size: usize) -> Option<Reservation> {
+        match &self.sem {
+            None => Some(Reservation { _permit: None }),
+            Some(sem) => {
+                let want = size.min(self.total).min(MAX_PERMITS as usize).max(1) as u32;
+                sem.clone()
+                    .try_acquire_many_owned(want)
+                    .ok()
+                    .map(|permit| Reservation {
+                        _permit: Some(permit),
+                    })
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,6 +146,25 @@ mod tests {
         // clamped to the whole budget and runs alone.
         let budget = MemoryBudget::new(1000);
         let _r = budget.reserve(5000).await; // clamped to 1000, resolves
+    }
+
+    #[tokio::test]
+    async fn try_reserve_declines_instead_of_waiting_when_full() {
+        // The insert coalescer relies on this: it holds reservations while
+        // accumulating, so a *blocking* reserve on a budget full of its own
+        // batches would deadlock. Declining lets it flush and then wait.
+        let budget = MemoryBudget::new(1000);
+        let held = budget.reserve(1000).await;
+        assert!(budget.try_reserve(1).is_none());
+        drop(held);
+        assert!(budget.try_reserve(1000).is_some());
+    }
+
+    #[test]
+    fn try_reserve_always_succeeds_when_unbounded() {
+        let budget = MemoryBudget::new(0);
+        assert!(budget.try_reserve(usize::MAX).is_some());
+        assert!(budget.try_reserve(usize::MAX).is_some());
     }
 
     #[tokio::test]

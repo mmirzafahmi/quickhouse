@@ -9,6 +9,113 @@ any breaking change is called out explicitly.
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-08-20
+
+A performance release. Three independent measurements agreed that the reader was
+never the bottleneck — quickhouse's entire extract-load-merge into ClickHouse
+finished faster than a purpose-built Arrow reader took to *extract* the same
+slice — so nothing here touches the read transport. What it does instead is turn
+on parallelism that was structurally switched off, stop the BigQuery `MERGE`
+full-scanning a table quickhouse itself clustered, and get the decode loop off
+the async reactor.
+
+### Changed — please read before upgrading
+Four defaults changed. None of them reject a configuration that used to work,
+but each changes what a call does:
+
+- **`BigQuery(write_method=...)` now defaults to `"storage_write"`** instead of
+  `"insert_all"`. The legacy `insertAll` path bills $0.01 per 200 MiB against
+  Storage Write's $0.025/GB with 2 TiB/month free — roughly double, and slower.
+  Storage Write uses a different API call on the same write permission
+  (`CreateWriteStream`), so smoke-test a throwaway dataset before a large run,
+  and pass `write_method="insert_all"` explicitly to keep the old path.
+- **`parallelism` now defaults to `0`, meaning "derive from the host"** (CPUs
+  available to this process, container CPU quota included) rather than a fixed
+  `4`. An explicit value is still honoured exactly as before. Note this only
+  raises a ceiling: whether a read actually fans out depends on it being
+  partitionable at all — see `partition_source_expr` below.
+- **Inserts are now coalesced.** Decoded batches accumulate to `insert_bytes`
+  (new, default 32 MiB) before being sent, instead of one insert per batch.
+  `batch_bytes` had silently been setting both, so at its 4 MiB default a
+  19.4M-row table meant 900+ HTTP round-trips and 900+ new ClickHouse parts —
+  against ClickHouse's own guidance of fewer, larger inserts, since part count
+  drives background merge work that on Cloud competes with query memory. Set
+  `insert_bytes=0` to restore one-insert-per-batch. This does not raise peak
+  memory; see *Performance* below for why.
+- **The generated BigQuery `MERGE` now bounds its destination scan to the
+  staging batch's key range** (`merge_prune_key_range`, new, default `True`).
+  Unlike `merge_prune_partition_by` this needs no immutability contract and is
+  therefore safe to have on: bounding on the *join key* is a tautology, not an
+  assumption — a destination row can only match by holding a staging row's exact
+  key value, which is inside that batch's own `[MIN, MAX]` by construction — so
+  no configuration exists in which it changes which rows merge. It is
+  automatically skipped when `delete_stale_in_window` is set, where narrowing the
+  `ON` clause would quietly reduce "replace this window" to "replace this key
+  range". Pass `merge_prune_key_range=False` to restore the unbounded join.
+
+### Added
+- **`partition_source_expr` — parallel reads for `source_query` transfers.**
+  This was the single largest unrealised speedup in the project. Range
+  partitioning needs a key column it can probe `MIN`/`MAX` on and bound with an
+  indexable predicate, and `source_query` hides that column behind its own
+  projection, so *any* custom-query transfer silently ran single-stream however
+  large it was — and since a `CAST` can only live in `source_query`, that covered
+  essentially every non-trivial table. `parallelism` was simply inert for them.
+  Have `source_query` additionally project the raw, indexed key column under a
+  second name (e.g. `id AS id_raw`) and set `partition_source_expr="id_raw"`;
+  the planner then probes and bounds on that bare pass-through column, exactly
+  as `watermark_source_expr` already does for the incremental filter. Two costs
+  are documented on the parameter: the probe now runs against the wrapped query,
+  and an expression that is missing or non-integer is a hard error rather than a
+  silent fallback — an explicitly requested fan-out that quietly collapses to one
+  stream is the bug this exists to fix. Leaving it unset keeps the old
+  single-stream behaviour, now logged rather than invisible.
+- **`ClickHouse(settings={...})` — arbitrary ClickHouse settings passthrough**,
+  sent as query parameters on every request (DDL, inserts, reads, swaps). Server
+  behaviour that only ClickHouse can decide was previously unreachable from the
+  client at any price. One concrete case it fixes today: on a Cloud service with
+  lagging replicas, quickhouse's own post-swap row-count guard can read a stale
+  replica, see 0 rows, and fail a run that in fact succeeded — now fixable from
+  the caller with `{"select_sequential_consistency": "1"}`.
+- **`max_memory_fraction` — size the memory ceiling from the host** instead of an
+  absolute byte count, read from the cgroup limit where there is one. An absolute
+  ceiling is the wrong *unit* once containers share a VM: four containers capped
+  at 4 GiB on one 16 GiB box each need to size against their own 4 GiB, and only
+  the container knows which it is. If the host won't report a limit (notably off
+  Linux), `max_memory_bytes` is kept as configured rather than silently becoming
+  unbounded.
+- **`ClickHouse(insert_dedup_token=True)` — exactly-once inserts, opt-in.**
+  Attaches a generated `insert_deduplication_token` that is unique per insert and
+  identical across that insert's own retries, so a retry whose original the
+  server had already committed is discarded rather than duplicating rows. It ships
+  **off by default** on purpose: ClickHouse deduplicates per *block*, not per
+  request, and a single insert large enough to be split server-side shares one
+  token across its blocks — if that makes later blocks look like duplicates of
+  the first they are dropped silently, which is data loss rather than a visible
+  error. Coalesced inserts make multi-block inserts more likely. Verify on a
+  `Replicated*MergeTree` with a large insert, comparing row counts, before
+  enabling it in production.
+
+### Performance
+- **Decode no longer runs on the async reactor.** `CopyDecoder::feed` is a
+  two-pass per-tuple parse into Arrow builders — the CPU-heaviest step in the
+  pipeline — and it ran inline on the Tokio worker that owns the socket. That
+  worker could poll nothing else for the duration of every parse, and the `COPY`
+  stream sat idle between chunks instead of draining. The parse now runs on the
+  blocking pool while the next chunk is pulled off the socket concurrently. One
+  consequence worth knowing: `read_max_rows_per_sec` now bites one chunk later
+  than it used to, since a chunk is already in hand when the throttle is checked.
+  It still bounds the sustained rate. (The MySQL path is unchanged — it decodes
+  per row between awaits, so it has no long inline CPU block to move.)
+- **The Arrow IPC payload is serialized incrementally rather than materialized.**
+  Compression already streamed; the serialization built a complete `Vec<u8>`
+  first. Harmless at 4 MiB batches, which is why it had never mattered — but it
+  would have become the dominant allocation of the pipeline the moment inserts
+  were coalesced to tens of MiB, multiplied by `parallelism`. Peak serialization
+  memory is now flat in the payload size, which is what lets `insert_bytes` grow
+  without RSS following it, and keeps `max_memory_bytes` the honest single number
+  it claims to be.
+
 ## [0.13.0] - 2026-07-31
 
 ### Changed — please read before upgrading

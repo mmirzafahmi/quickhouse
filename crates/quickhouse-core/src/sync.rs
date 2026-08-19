@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, SchemaRef};
+use bytes::Bytes;
 use chrono::Utc;
 use futures::StreamExt;
 use mysql_async::prelude::*;
@@ -26,7 +27,7 @@ use crate::decode_api::{resolve_api_columns, ApiBatcher};
 use crate::decode_bigquery::BigQueryBatcher;
 use crate::decode_mysql::MySqlBatcher;
 use crate::error::{EtlError, Result};
-use crate::memory::MemoryBudget;
+use crate::memory::{MemoryBudget, Reservation};
 use crate::sink::{build_sink, Sink};
 use crate::source::appsflyer::AppsFlyerSource;
 use crate::source::clevertap::{CleverTapSource, PageStatus};
@@ -116,6 +117,7 @@ async fn promote_staged_incremental(
     key: &[String],
     columns: &[ColumnType],
     merge_prune_partition_by: Option<&str>,
+    prune_key_range: bool,
     delete_stale_in_window: bool,
     on_staged: &Option<StagedValidationCb>,
     rows_written: u64,
@@ -130,6 +132,7 @@ async fn promote_staged_incremental(
             key,
             columns,
             merge_prune_partition_by,
+            prune_key_range,
             delete_stale_in_window,
             dedup_order,
         )
@@ -223,33 +226,121 @@ struct SendCtx {
     throttle: Option<Arc<ReadThrottle>>,
 }
 
+/// One partition's accumulator of decoded batches, so an insert carries a
+/// worthwhile amount of data instead of one batch per HTTP round-trip.
+///
+/// `insert_batches` always took a slice; every caller passed exactly one batch,
+/// which at the default 4 MiB `batch_bytes` turned a 19.4M-row table into 900+
+/// round-trips and 900+ new parts. ClickHouse's own guidance is the opposite —
+/// fewer, larger inserts — because part count drives background merge work, and
+/// on Cloud that merge pressure competes with query memory. Decode granularity
+/// (`batch_bytes`) and insert granularity (`insert_bytes`) are now separate
+/// knobs, which is what `batch_bytes` was always documented to be.
+///
+/// Each buffered batch holds its own [`MemoryBudget`] reservation, so the
+/// ceiling still covers everything decoded-but-not-yet-landed rather than only
+/// what's on the wire. That's also why the fill path must never *block* on the
+/// budget while holding a group — see [`SendCtx::push_batch`].
+struct InsertBuffer {
+    batches: Vec<RecordBatch>,
+    reservations: Vec<Reservation>,
+    bytes: usize,
+    /// Flush once the group reaches this many bytes of real Arrow memory
+    /// (measured like `batch_bytes` and `max_memory_bytes`, not post-compression).
+    target: usize,
+}
+
+impl InsertBuffer {
+    fn new(target: usize) -> Self {
+        InsertBuffer {
+            batches: Vec::new(),
+            reservations: Vec::new(),
+            bytes: 0,
+            target,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.batches.is_empty()
+    }
+
+    /// Add a batch and its reservation; `true` once the group is worth sending.
+    fn push(&mut self, batch: RecordBatch, reservation: Reservation, size: usize) -> bool {
+        self.batches.push(batch);
+        self.reservations.push(reservation);
+        self.bytes += size;
+        self.bytes >= self.target
+    }
+
+    /// Take everything buffered, leaving the buffer empty.
+    fn take(&mut self) -> (Vec<RecordBatch>, Vec<Reservation>) {
+        self.bytes = 0;
+        (
+            std::mem::take(&mut self.batches),
+            std::mem::take(&mut self.reservations),
+        )
+    }
+}
+
 impl SendCtx {
-    /// Reserve budget for `batch` — awaiting here is the backpressure point:
-    /// if the pipeline's memory ceiling is reached, the caller (decoder) stalls
-    /// until in-flight uploads drain — then spawn its upload as a background
-    /// task and return immediately so decoding can continue overlapping the
-    /// network round-trip. The reservation is held until the upload completes.
-    async fn spawn_upload(
+    /// Buffer one decoded batch, uploading the accumulated group once it's big
+    /// enough. This is the backpressure point: if the pipeline's memory ceiling
+    /// is reached, the caller (decoder) stalls here until in-flight uploads
+    /// drain.
+    ///
+    /// The reservation is taken with `try_reserve` first. Blocking outright
+    /// would deadlock rather than throttle: a full budget can be full *of this
+    /// buffer's own batches*, and nothing would ever release them. So on
+    /// pressure we flush first — handing those reservations to a send task that
+    /// will release them — and only then wait.
+    async fn push_batch(
         &self,
         sends: &mut JoinSet<Result<()>>,
+        buffer: &mut InsertBuffer,
         schema: SchemaRef,
         batch: RecordBatch,
     ) {
-        let reservation = self.budget.reserve(batch.get_array_memory_size()).await;
+        let size = batch.get_array_memory_size();
+        let reservation = match self.budget.try_reserve(size) {
+            Some(r) => r,
+            None => {
+                if !buffer.is_empty() {
+                    self.flush(sends, buffer, schema.clone()).await;
+                }
+                self.budget.reserve(size).await
+            }
+        };
+        if buffer.push(batch, reservation, size) {
+            self.flush(sends, buffer, schema).await;
+        }
+    }
+
+    /// Upload whatever is buffered as one insert, as a background task so
+    /// decoding keeps overlapping the network round-trip. No-op when empty.
+    async fn flush(
+        &self,
+        sends: &mut JoinSet<Result<()>>,
+        buffer: &mut InsertBuffer,
+        schema: SchemaRef,
+    ) {
+        if buffer.is_empty() {
+            return;
+        }
+        let (batches, reservations) = buffer.take();
         let ctx = self.clone();
         sends.spawn(async move {
-            let _reservation = reservation; // released on task completion
-            let rows = batch.num_rows() as u64;
+            let _reservations = reservations; // released on task completion
+            let rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
             let bytes = ctx
                 .sink
-                .insert_batches(&ctx.target_table, schema, std::slice::from_ref(&batch))
+                .insert_batches(&ctx.target_table, schema, &batches)
                 .await?;
             ctx.counters.rows_written.fetch_add(rows, Ordering::Relaxed);
             ctx.counters
                 .bytes_written
                 .fetch_add(bytes, Ordering::Relaxed);
             // Progress fires on *completion*, so rows_written reflects rows
-            // actually landed in ClickHouse, not merely decoded.
+            // actually landed in the destination, not merely decoded.
             emit_progress(&ctx.counters, &ctx.progress, ctx.started);
             Ok(())
         });
@@ -811,6 +902,7 @@ async fn run_transfer_impl(
                     &cfg.key,
                     &plan.dest_columns,
                     cfg.merge_prune_partition_by.as_deref(),
+                    cfg.merge_prune_key_range,
                     cfg.delete_stale_in_window,
                     &on_staged,
                     counters.rows_written.load(Ordering::Relaxed),
@@ -895,6 +987,13 @@ async fn run_transfer_bigquery(
             "watermark_source_expr is not supported for a BigQuery source (its Storage Read API \
              row_restriction always applies to the resolved table's own columns, not a nested \
              query, so the full-scan risk it addresses doesn't apply there)",
+        ));
+    }
+    if cfg.partition_source_expr.is_some() {
+        return Err(EtlError::config(
+            "partition_source_expr is not supported for a BigQuery source (it reads through one \
+             Storage Read session whose own stream count is the parallelism — there are no \
+             discrete range partitions for an expression to bound)",
         ));
     }
     let (client, project_id) = source.connect().await?;
@@ -1007,6 +1106,7 @@ async fn run_transfer_bigquery(
         let mut batcher = BigQueryBatcher::with_batch_bytes(&plan.dest_columns, cfg.batch_rows, cfg.batch_bytes)?;
         let schema = batcher.schema();
         let mut sends: JoinSet<Result<()>> = JoinSet::new();
+        let mut insert_buf = InsertBuffer::new(cfg.insert_bytes);
         // No discrete partitions on this path (see the module docs) — "all" is
         // the only file this run will ever archive for this table.
         let mut archive_writer = match &ctx.archive {
@@ -1022,7 +1122,7 @@ async fn run_transfer_bigquery(
                 if let Some(w) = archive_writer.as_mut() {
                     w.write(&batch).await?;
                 }
-                ctx.spawn_upload(&mut sends, schema.clone(), batch).await;
+                ctx.push_batch(&mut sends, &mut insert_buf, schema.clone(), batch).await;
                 reap(&mut sends, false).await?;
             }
         }
@@ -1030,11 +1130,12 @@ async fn run_transfer_bigquery(
             if let Some(w) = archive_writer.as_mut() {
                 w.write(&batch).await?;
             }
-            ctx.spawn_upload(&mut sends, schema.clone(), batch).await;
+            ctx.push_batch(&mut sends, &mut insert_buf, schema.clone(), batch).await;
         }
         if let Some(w) = archive_writer.take() {
             w.close().await?;
         }
+        ctx.flush(&mut sends, &mut insert_buf, schema.clone()).await;
         reap(&mut sends, true).await?;
         counters
             .rows_read
@@ -1067,6 +1168,7 @@ async fn run_transfer_bigquery(
                     &cfg.key,
                     &plan.dest_columns,
                     cfg.merge_prune_partition_by.as_deref(),
+                    cfg.merge_prune_key_range,
                     cfg.delete_stale_in_window,
                     &on_staged,
                     counters.rows_written.load(Ordering::Relaxed),
@@ -1325,6 +1427,7 @@ async fn run_transfer_api(
         let mut batcher = ApiBatcher::new(&plan.dest_columns, &lookups, cfg.batch_rows, cfg.batch_bytes)?;
         let schema = batcher.schema();
         let mut sends: JoinSet<Result<()>> = JoinSet::new();
+        let mut insert_buf = InsertBuffer::new(cfg.insert_bytes);
 
         match &source_cfg {
             SourceConfig::CleverTap(c) => {
@@ -1336,7 +1439,7 @@ async fn run_transfer_api(
                     let page = src.next_page(&cursor).await?;
                     for rec in &page.records {
                         if let Some(b) = batcher.append_record(rec)? {
-                            ctx.spawn_upload(&mut sends, schema.clone(), b).await;
+                            ctx.push_batch(&mut sends, &mut insert_buf, schema.clone(), b).await;
                             reap(&mut sends, false).await?;
                         }
                     }
@@ -1356,7 +1459,7 @@ async fn run_transfer_api(
                 let records = src.fetch_records(&from, &to, &lookups).await?;
                 for rec in &records {
                     if let Some(b) = batcher.append_record(rec)? {
-                        ctx.spawn_upload(&mut sends, schema.clone(), b).await;
+                        ctx.push_batch(&mut sends, &mut insert_buf, schema.clone(), b).await;
                         reap(&mut sends, false).await?;
                     }
                 }
@@ -1366,7 +1469,7 @@ async fn run_transfer_api(
                 let records = src.fetch_records(&from, &to, &lookups).await?;
                 for rec in &records {
                     if let Some(b) = batcher.append_record(rec)? {
-                        ctx.spawn_upload(&mut sends, schema.clone(), b).await;
+                        ctx.push_batch(&mut sends, &mut insert_buf, schema.clone(), b).await;
                         reap(&mut sends, false).await?;
                     }
                 }
@@ -1374,8 +1477,9 @@ async fn run_transfer_api(
             _ => unreachable!("run_transfer_api only handles API sources"),
         }
         if let Some(b) = batcher.finish()? {
-            ctx.spawn_upload(&mut sends, schema.clone(), b).await;
+            ctx.push_batch(&mut sends, &mut insert_buf, schema.clone(), b).await;
         }
+        ctx.flush(&mut sends, &mut insert_buf, schema.clone()).await;
         reap(&mut sends, true).await?;
         counters.rows_read.fetch_add(batcher.rows_total, Ordering::Relaxed);
         emit_progress(&counters, &progress, started);
@@ -1432,6 +1536,7 @@ async fn run_transfer_api(
                     &cfg.key,
                     &plan.dest_columns,
                     cfg.merge_prune_partition_by.as_deref(),
+                    cfg.merge_prune_key_range,
                     cfg.delete_stale_in_window,
                     &on_staged,
                     counters.rows_written.load(Ordering::Relaxed),
@@ -1814,11 +1919,21 @@ async fn transfer_keyset_postgres(
         let mut decoder =
             CopyDecoder::with_batch_bytes(&plan.dest_columns, cfg.batch_rows, cfg.batch_bytes)?;
         let mut sends: JoinSet<Result<()>> = JoinSet::new();
+        let mut insert_buf = InsertBuffer::new(cfg.insert_bytes);
         let mut cursor_candidate: Option<i128> = None;
 
-        while let Some(bytes) = stream.next().await {
+        // Same read/parse overlap as the non-chunked path (see
+        // `feed_off_reactor`): parse on the blocking pool, fetch the next chunk
+        // of bytes concurrently.
+        let mut pending = stream.next().await;
+        while let Some(bytes) = pending {
             let bytes = bytes?;
-            for batch in decoder.feed(&bytes)? {
+            let decoding = feed_off_reactor(decoder, bytes);
+            let (next, joined) = tokio::join!(stream.next(), decoding);
+            pending = next;
+            let (returned, decoded) = joined.map_err(decode_task_failed)?;
+            decoder = returned;
+            for batch in decoded? {
                 let rows = batch.num_rows() as u64;
                 if let Some(k) = last_int_key(&batch, chunk.keyset_idx)? {
                     cursor_candidate = Some(cursor_candidate.map_or(k, |c| c.max(k)));
@@ -1826,7 +1941,8 @@ async fn transfer_keyset_postgres(
                 if let Some(w) = archive_writer.as_mut() {
                     w.write(&batch).await?;
                 }
-                ctx.spawn_upload(&mut sends, schema.clone(), batch).await;
+                ctx.push_batch(&mut sends, &mut insert_buf, schema.clone(), batch)
+                    .await;
                 if let Some(t) = &ctx.throttle {
                     t.acquire(rows).await;
                 }
@@ -1845,10 +1961,12 @@ async fn transfer_keyset_postgres(
             if let Some(w) = archive_writer.as_mut() {
                 w.write(&batch).await?;
             }
-            ctx.spawn_upload(&mut sends, schema.clone(), batch).await;
+            ctx.push_batch(&mut sends, &mut insert_buf, schema.clone(), batch)
+                .await;
         }
         // Force this chunk's rows durable in the destination BEFORE advancing
         // the cursor — the invariant that makes a crash resumable.
+        ctx.flush(&mut sends, &mut insert_buf, schema.clone()).await;
         reap(&mut sends, true).await?;
 
         let rows_this_chunk = decoder.rows_total;
@@ -1942,22 +2060,35 @@ async fn transfer_partition_postgres(
         CopyDecoder::with_batch_bytes(&plan.dest_columns, cfg.batch_rows, cfg.batch_bytes)?;
     let schema = decoder.schema();
     let mut sends: JoinSet<Result<()>> = JoinSet::new();
+    let mut insert_buf = InsertBuffer::new(cfg.insert_bytes);
     let mut archive_writer = match &ctx.archive {
         Some(info) => Some(info.writer_for(&partition.label, schema.clone())?),
         None => None,
     };
 
-    while let Some(chunk) = stream.next().await {
+    // Read/parse overlap: each chunk's parse runs on the blocking pool while
+    // the next chunk is pulled off the socket, so the COPY stream keeps draining
+    // instead of idling for the duration of every parse.
+    let mut pending = stream.next().await;
+    while let Some(chunk) = pending {
         let chunk = chunk?;
-        let batches = decoder.feed(&chunk)?;
-        for batch in batches {
+        let decoding = feed_off_reactor(decoder, chunk);
+        let (next, joined) = tokio::join!(stream.next(), decoding);
+        pending = next;
+        let (returned, decoded) = joined.map_err(decode_task_failed)?;
+        decoder = returned;
+        for batch in decoded? {
             let rows = batch.num_rows() as u64;
             if let Some(w) = archive_writer.as_mut() {
                 w.write(&batch).await?;
             }
-            ctx.spawn_upload(&mut sends, schema.clone(), batch).await;
-            // Pace the read: pausing before pulling the next chunk applies TCP
-            // backpressure to the COPY stream, slowing the server-side scan.
+            ctx.push_batch(&mut sends, &mut insert_buf, schema.clone(), batch)
+                .await;
+            // Pace the read: pausing here applies TCP backpressure to the COPY
+            // stream, slowing the server-side scan. One chunk is already in
+            // hand by this point (that's the overlap above), so the throttle
+            // now bites a chunk later than it used to — it still bounds the
+            // sustained rate, just with that much slack.
             if let Some(t) = &ctx.throttle {
                 t.acquire(rows).await;
             }
@@ -1974,11 +2105,13 @@ async fn transfer_partition_postgres(
         if let Some(w) = archive_writer.as_mut() {
             w.write(&batch).await?;
         }
-        ctx.spawn_upload(&mut sends, schema.clone(), batch).await;
+        ctx.push_batch(&mut sends, &mut insert_buf, schema.clone(), batch)
+            .await;
     }
     if let Some(w) = archive_writer.take() {
         w.close().await?;
     }
+    ctx.flush(&mut sends, &mut insert_buf, schema.clone()).await;
     reap(&mut sends, true).await?; // wait for all uploads before returning
 
     ctx.counters
@@ -2056,6 +2189,7 @@ async fn transfer_keyset_mysql(
         let mut batcher =
             MySqlBatcher::with_batch_bytes(&plan.dest_columns, cfg.batch_rows, cfg.batch_bytes)?;
         let mut sends: JoinSet<Result<()>> = JoinSet::new();
+        let mut insert_buf = InsertBuffer::new(cfg.insert_bytes);
         let mut cursor_candidate: Option<i128> = None;
 
         let stmt = conn
@@ -2083,7 +2217,8 @@ async fn transfer_keyset_mysql(
                 if let Some(w) = archive_writer.as_mut() {
                     w.write(&batch).await?;
                 }
-                ctx.spawn_upload(&mut sends, schema.clone(), batch).await;
+                ctx.push_batch(&mut sends, &mut insert_buf, schema.clone(), batch)
+                    .await;
                 reap(&mut sends, false).await?;
                 if let Some(t) = &ctx.throttle {
                     t.acquire(rows).await;
@@ -2097,8 +2232,10 @@ async fn transfer_keyset_mysql(
             if let Some(w) = archive_writer.as_mut() {
                 w.write(&batch).await?;
             }
-            ctx.spawn_upload(&mut sends, schema.clone(), batch).await;
+            ctx.push_batch(&mut sends, &mut insert_buf, schema.clone(), batch)
+                .await;
         }
+        ctx.flush(&mut sends, &mut insert_buf, schema.clone()).await;
         reap(&mut sends, true).await?;
 
         let rows_this_chunk = batcher.rows_total;
@@ -2188,6 +2325,7 @@ async fn transfer_partition_mysql(
         MySqlBatcher::with_batch_bytes(&plan.dest_columns, cfg.batch_rows, cfg.batch_bytes)?;
     let schema = batcher.schema();
     let mut sends: JoinSet<Result<()>> = JoinSet::new();
+    let mut insert_buf = InsertBuffer::new(cfg.insert_bytes);
     let mut archive_writer = match &ctx.archive {
         Some(info) => Some(info.writer_for(&partition.label, schema.clone())?),
         None => None,
@@ -2219,7 +2357,8 @@ async fn transfer_partition_mysql(
             if let Some(w) = archive_writer.as_mut() {
                 w.write(&batch).await?;
             }
-            ctx.spawn_upload(&mut sends, schema.clone(), batch).await;
+            ctx.push_batch(&mut sends, &mut insert_buf, schema.clone(), batch)
+                .await;
             reap(&mut sends, false).await?; // surface any upload error promptly
                                             // Pace the read: pausing before fetching more rows applies
                                             // backpressure to the streaming result set, slowing the scan.
@@ -2232,11 +2371,13 @@ async fn transfer_partition_mysql(
         if let Some(w) = archive_writer.as_mut() {
             w.write(&batch).await?;
         }
-        ctx.spawn_upload(&mut sends, schema.clone(), batch).await;
+        ctx.push_batch(&mut sends, &mut insert_buf, schema.clone(), batch)
+            .await;
     }
     if let Some(w) = archive_writer.take() {
         w.close().await?;
     }
+    ctx.flush(&mut sends, &mut insert_buf, schema.clone()).await;
     reap(&mut sends, true).await?; // wait for all uploads before returning
 
     ctx.counters
@@ -2633,15 +2774,14 @@ async fn compute_partitions_pg(
     if cfg.chunk_rows.is_some() {
         return Ok(single);
     }
-
-    // Only base tables (not custom queries) support cheap range partitioning.
-    let table = match &cfg.source_table {
-        Some(t) if cfg.source_query.is_none() => t,
-        _ => return Ok(single),
-    };
     if cfg.parallelism <= 1 {
         return Ok(single);
     }
+
+    let (from_table, base_query) = match partition_target(cfg) {
+        Some(t) => t,
+        None => return Ok(single),
+    };
 
     let part_col = cfg
         .partition_column
@@ -2651,21 +2791,100 @@ async fn compute_partitions_pg(
         Some(c) => c,
         None => return Ok(single),
     };
-    let col = match source_cols.iter().find(|c| c.name == part_col) {
-        Some(c) => c,
+    let source_expr = cfg.partition_source_expr.as_deref();
+    // Without an override the partition column must be a resolvable source
+    // column; with one, `range_partitions` probes the expression instead (and
+    // `partition_key_type` has already rejected a non-integer named column).
+    let (type_id, nullable) = match partition_key_type(
+        source_cols,
+        &part_col,
+        source_expr,
+        crate::source::postgres::is_range_partitionable,
+    )? {
+        Some(t) => t,
         None => return Ok(single),
     };
 
     source
         .range_partitions(
             client,
-            table,
+            from_table,
+            base_query,
             &part_col,
-            col.type_id,
+            source_expr,
+            type_id,
             cfg.parallelism,
-            col.nullable,
+            nullable,
         )
         .await
+}
+
+/// Which relation the range-partition probe reads: `(Some(table), None)` for a
+/// base table, `(None, Some(query))` for a `source_query` that opted in via
+/// `partition_source_expr`. `None` means this transfer can't be range
+/// partitioned at all and should run single-stream.
+///
+/// A `source_query` without `partition_source_expr` is the case that used to be
+/// silently unpartitionable for every custom query — it still runs single-stream
+/// (that's the compatible default), but now says so and names the way out.
+fn partition_target(cfg: &TransferConfig) -> Option<(Option<&str>, Option<&str>)> {
+    match (cfg.source_table.as_deref(), cfg.source_query.as_deref()) {
+        (Some(t), None) => Some((Some(t), None)),
+        (_, Some(q)) => match cfg.partition_source_expr.as_deref() {
+            Some(_) => Some((None, Some(q))),
+            None => {
+                tracing::info!(
+                    "parallelism={} is inert for this transfer: range partitioning needs a key \
+                     column it can probe MIN/MAX on and bound with an indexable predicate, and \
+                     source_query hides that column behind its own projection, so the read runs \
+                     single-stream. Have source_query additionally project the raw, indexed key \
+                     column (e.g. `id AS id_raw`) and set partition_source_expr=\"id_raw\" to fan \
+                     out.",
+                    cfg.parallelism
+                );
+                None
+            }
+        },
+        (None, None) => None,
+    }
+}
+
+/// Resolve the partition key's `(type_id, nullable)` for the range probe.
+/// `is_int` is the reading engine's own range-partitionable type gate.
+///
+/// With no `partition_source_expr`, this is just the named source column (and
+/// an unresolvable name means "not partitionable", as before). With one, the
+/// expression is authoritative: if it happens to name a projected column we
+/// type-gate on that column and reject a non-integer outright — an explicitly
+/// requested fan-out that silently collapses to one stream is the exact bug
+/// `partition_source_expr` exists to fix. If it names no column we can type
+/// (a real expression), the source's own `MIN`/`MAX` probe is the gate, and the
+/// key is assumed nullable so NULL-keyed rows still get their own partition
+/// rather than being dropped.
+fn partition_key_type(
+    source_cols: &[ColumnType],
+    part_col: &str,
+    source_expr: Option<&str>,
+    is_int: impl Fn(u32) -> bool,
+) -> Result<Option<(u32, bool)>> {
+    let expr = match source_expr {
+        None => {
+            return Ok(source_cols
+                .iter()
+                .find(|c| c.name == part_col)
+                .map(|c| (c.type_id, c.nullable)))
+        }
+        Some(e) => e,
+    };
+    match source_cols.iter().find(|c| c.name == expr) {
+        Some(c) if !is_int(c.type_id) => Err(EtlError::config(format!(
+            "partition_source_expr='{expr}' resolves to a non-integer column, which cannot be \
+             split into numeric ranges. Point it at the raw integer key column source_query \
+             projects, or unset it to read single-stream."
+        ))),
+        Some(c) => Ok(Some((c.type_id, c.nullable))),
+        None => Ok(Some((0, true))),
+    }
 }
 
 async fn compute_partitions_mysql(
@@ -2682,14 +2901,14 @@ async fn compute_partitions_mysql(
     if cfg.chunk_rows.is_some() {
         return Ok(single);
     }
-
-    let table = match &cfg.source_table {
-        Some(t) if cfg.source_query.is_none() => t,
-        _ => return Ok(single),
-    };
     if cfg.parallelism <= 1 {
         return Ok(single);
     }
+
+    let (from_table, base_query) = match partition_target(cfg) {
+        Some(t) => t,
+        None => return Ok(single),
+    };
 
     let part_col = cfg
         .partition_column
@@ -2699,21 +2918,60 @@ async fn compute_partitions_mysql(
         Some(c) => c,
         None => return Ok(single),
     };
-    let col = match source_cols.iter().find(|c| c.name == part_col) {
-        Some(c) => c,
+    let source_expr = cfg.partition_source_expr.as_deref();
+    let (type_id, nullable) = match partition_key_type(
+        source_cols,
+        &part_col,
+        source_expr,
+        crate::source::mysql::is_range_partitionable,
+    )? {
+        Some(t) => t,
         None => return Ok(single),
     };
 
     source
         .range_partitions(
             conn,
-            table,
+            from_table,
+            base_query,
             &part_col,
-            col.type_id,
+            source_expr,
+            type_id,
             cfg.parallelism,
-            col.nullable,
+            nullable,
         )
         .await
+}
+
+/// Hand one `COPY` chunk to `CopyDecoder::feed` on Tokio's blocking pool,
+/// returning the decoder along with the result.
+///
+/// `feed` is a two-pass per-tuple parse into Arrow builders — the CPU-heaviest
+/// step in the pipeline — and it used to run inline on the async worker that
+/// owns the socket. That had two costs: the worker couldn't poll anything else
+/// (other partitions' sockets, in-flight upload futures) for the duration of
+/// every parse, and the `COPY` stream sat idle between chunks instead of
+/// draining while the previous chunk was decoded. Moving the parse to the
+/// blocking pool fixes the first; polling the next chunk concurrently with this
+/// future (see the call sites) fixes the second.
+///
+/// The decoder is passed by value and handed back rather than borrowed: it
+/// carries builder state across chunks, so it can't be shared with a
+/// `'static` task any other way.
+fn feed_off_reactor(
+    mut decoder: CopyDecoder,
+    chunk: Bytes,
+) -> tokio::task::JoinHandle<(CopyDecoder, Result<Vec<RecordBatch>>)> {
+    tokio::task::spawn_blocking(move || {
+        let decoded = decoder.feed(&chunk);
+        (decoder, decoded)
+    })
+}
+
+/// A panic (or cancellation) inside the off-reactor decode task. Not reachable
+/// through normal decode failures — those come back as the inner `Result`.
+fn decode_task_failed(e: tokio::task::JoinError) -> EtlError {
+    EtlError::other(format!("COPY decode task failed: {e}"))
 }
 
 /// Per-run-unique staging table name: `{dest}_quickhouse_tmp_{run_id}`.
@@ -2981,7 +3239,156 @@ fn build_watermark_filter(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::oid;
     use arrow_schema::DataType;
+
+    /// A source column carrying just the fields the partition planner reads.
+    fn pcol(name: &str, type_id: u32, nullable: bool) -> ColumnType {
+        ColumnType {
+            name: name.into(),
+            type_id,
+            nullable,
+            arrow: DataType::Int64,
+            clickhouse_inner: "Int64".into(),
+            arbitrary_precision_decimal: false,
+        }
+    }
+
+    /// A batch of `bytes` nominal size, for exercising the coalescer's arithmetic
+    /// (the buffer is told the size, so the contents don't matter).
+    fn sized_batch() -> RecordBatch {
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            DataType::Int64,
+            false,
+        )]));
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow_array::Int64Array::from(vec![1i64]))],
+        )
+        .unwrap()
+    }
+
+    fn free_reservation() -> Reservation {
+        MemoryBudget::new(0)
+            .try_reserve(1)
+            .expect("an unbounded budget always reserves")
+    }
+
+    #[test]
+    fn insert_buffer_holds_batches_until_the_target_is_reached() {
+        let mut buf = InsertBuffer::new(1000);
+        assert!(buf.is_empty());
+        assert!(!buf.push(sized_batch(), free_reservation(), 400));
+        assert!(!buf.push(sized_batch(), free_reservation(), 400));
+        // Crossing the target is the flush signal.
+        assert!(buf.push(sized_batch(), free_reservation(), 400));
+        let (batches, reservations) = buf.take();
+        assert_eq!(batches.len(), 3, "all three batches go out as one insert");
+        assert_eq!(reservations.len(), 3, "their reservations travel with them");
+        assert!(buf.is_empty(), "taking leaves the buffer reusable");
+    }
+
+    #[test]
+    fn insert_buffer_with_a_zero_target_sends_every_batch_immediately() {
+        // insert_bytes=0 is the documented opt-out: one insert per decoded
+        // batch, exactly the pre-0.14 behavior.
+        let mut buf = InsertBuffer::new(0);
+        assert!(buf.push(sized_batch(), free_reservation(), 1));
+        assert_eq!(buf.take().0.len(), 1);
+    }
+
+    #[test]
+    fn insert_buffer_take_on_empty_yields_nothing() {
+        // The tail flush before every durability barrier hits this whenever the
+        // last batch already triggered a send.
+        let mut buf = InsertBuffer::new(1000);
+        let (batches, reservations) = buf.take();
+        assert!(batches.is_empty() && reservations.is_empty());
+    }
+
+    #[test]
+    fn source_query_without_partition_expr_still_runs_single_stream() {
+        // The compatible default: parallelism stays inert for a custom query
+        // until the caller names the raw key column.
+        let mut cfg = crate::config::default_test_config();
+        cfg.source_table = None;
+        cfg.source_query = Some("SELECT id, CAST(amt AS numeric) AS amt FROM orders".into());
+        assert!(partition_target(&cfg).is_none());
+    }
+
+    #[test]
+    fn partition_source_expr_makes_a_source_query_partitionable() {
+        // The whole point of the knob: the planner now targets the wrapped
+        // query instead of refusing, so `parallelism` fans out.
+        let mut cfg = crate::config::default_test_config();
+        cfg.source_table = None;
+        cfg.source_query = Some("SELECT id AS id_raw, CAST(amt AS numeric) AS amt FROM o".into());
+        cfg.partition_source_expr = Some("id_raw".into());
+        let (from_table, base_query) = partition_target(&cfg).expect("partitionable");
+        assert!(from_table.is_none());
+        assert_eq!(
+            base_query,
+            Some("SELECT id AS id_raw, CAST(amt AS numeric) AS amt FROM o")
+        );
+    }
+
+    #[test]
+    fn base_table_partition_target_is_unchanged_by_the_new_knob() {
+        let cfg = crate::config::default_test_config();
+        let (from_table, base_query) = partition_target(&cfg).expect("partitionable");
+        assert_eq!(from_table, Some("t"));
+        assert!(base_query.is_none());
+    }
+
+    #[test]
+    fn partition_key_type_reads_the_named_column_when_no_expr_is_set() {
+        let cols = vec![pcol("id", oid::INT8, false), pcol("name", oid::TEXT, true)];
+        let got = partition_key_type(&cols, "id", None, is_pg_int).unwrap();
+        assert_eq!(got, Some((oid::INT8, false)));
+        // An unresolvable column means "not partitionable" — a fallback, not an
+        // error, because this path is implicit (derived from `key`).
+        assert_eq!(
+            partition_key_type(&cols, "missing", None, is_pg_int).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn partition_source_expr_pointing_at_a_non_integer_column_is_a_hard_error() {
+        // Explicit fan-out that silently collapses to one stream is the bug
+        // this knob fixes, so a non-range-able key fails loudly instead.
+        let cols = vec![
+            pcol("id", oid::INT8, false),
+            pcol("wm", oid::TIMESTAMPTZ, true),
+        ];
+        let err = partition_key_type(&cols, "id", Some("wm"), is_pg_int).unwrap_err();
+        assert!(
+            err.to_string().contains("partition_source_expr"),
+            "error should name the knob: {err}"
+        );
+    }
+
+    #[test]
+    fn partition_source_expr_naming_a_projected_int_column_uses_its_type() {
+        let cols = vec![pcol("id_raw", oid::INT4, false)];
+        let got = partition_key_type(&cols, "id", Some("id_raw"), is_pg_int).unwrap();
+        assert_eq!(got, Some((oid::INT4, false)));
+    }
+
+    #[test]
+    fn a_real_expression_defers_to_the_probe_and_assumes_nullable() {
+        // Not a projected column, so there's no type to gate on — the source's
+        // own MIN/MAX probe decides. Nullable is assumed so NULL-keyed rows
+        // still get their own partition instead of being silently dropped.
+        let cols = vec![pcol("id", oid::INT8, false)];
+        let got = partition_key_type(&cols, "id", Some("COALESCE(a, b)"), is_pg_int).unwrap();
+        assert_eq!(got, Some((0, true)));
+    }
+
+    fn is_pg_int(t: u32) -> bool {
+        crate::source::postgres::is_range_partitionable(t)
+    }
 
     #[test]
     fn staging_name_includes_dest_suffix_and_run_id() {
@@ -3060,6 +3467,8 @@ mod tests {
             user: "default".into(),
             password: String::new(),
             compression: crate::config::Compression::None,
+            insert_dedup_token: false,
+            settings: Default::default(),
             s3_archive: None,
         });
         let cb: StagedValidationCb = Arc::new(|_info: &StagedInfo| Ok(()));

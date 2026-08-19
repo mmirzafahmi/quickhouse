@@ -221,6 +221,58 @@ pub struct ClickHouseConfig {
     pub password: String,
     /// `"none" | "gzip" | "zstd"` — HTTP body compression for inserts.
     pub compression: Compression,
+    /// Attach a generated `insert_deduplication_token` to every insert, making
+    /// the retry path exactly-once instead of at-least-once. `false` (default).
+    ///
+    /// Inserts retry on transient failures, and a transient failure includes
+    /// "the server committed the block but the ack was lost" — so a retry can
+    /// duplicate one block's rows. Incremental mode hides this (a
+    /// `ReplacingMergeTree` collapses by key), but a full refresh into a plain
+    /// `MergeTree` keeps the duplicates. With this on, each insert carries a
+    /// token that is unique per insert and identical across that insert's own
+    /// retries, so the server recognises and discards the repeat.
+    ///
+    /// **Why it is opt-in.** ClickHouse deduplicates per *block*, not per
+    /// request. A single insert large enough to be split into several blocks
+    /// server-side shares one token across them, and if that makes blocks after
+    /// the first look like duplicates of it, they are silently dropped — data
+    /// loss, not a visible error. Coalesced inserts (see
+    /// `TransferConfig::insert_bytes`) make multi-block inserts more likely, so
+    /// this ships off by default until it has been verified against the
+    /// ClickHouse version you actually run. Verify on a `Replicated*MergeTree`
+    /// with a large insert, comparing row counts, before enabling it in
+    /// production.
+    ///
+    /// Also note it only does anything on `Replicated*MergeTree` engines (or a
+    /// `MergeTree` with `non_replicated_deduplication_window` set) — elsewhere
+    /// ClickHouse ignores the token. An explicit
+    /// `settings["insert_deduplication_token"]` always wins over this, though a
+    /// hand-set constant token is a much worse idea than it looks: shared by
+    /// every insert of the run, it would make ClickHouse discard all of them
+    /// after the first.
+    pub insert_dedup_token: bool,
+    /// Arbitrary ClickHouse settings, sent as URL query parameters on **every**
+    /// request this sink makes (DDL, inserts, reads, swaps) — the HTTP
+    /// interface's own mechanism for per-request settings.
+    ///
+    /// This is deliberately an open passthrough rather than a fixed set of
+    /// typed knobs. Server-side behavior that only ClickHouse can decide —
+    /// `async_insert`, `max_insert_block_size`, `max_execution_time`,
+    /// `insert_deduplication_token`, `select_sequential_consistency` — was
+    /// previously unreachable from the client at any price, so tuning one meant
+    /// waiting for a quickhouse release. One concrete case: on a ClickHouse
+    /// Cloud service with lagging replicas, quickhouse's own post-swap row-count
+    /// guard can read a stale replica, see 0 rows, and fail a run that in fact
+    /// succeeded; `select_sequential_consistency=1` fixes it server-side and is
+    /// now settable from the caller.
+    ///
+    /// A `BTreeMap` (not `HashMap`) so the generated query string is stable
+    /// across runs — worth it for reproducible request logs.
+    ///
+    /// Names are passed through verbatim and unvalidated: ClickHouse rejects an
+    /// unknown setting itself, with a better message than a client-side
+    /// allowlist could give. Avoid `database`, which the sink already sends.
+    pub settings: std::collections::BTreeMap<String, String>,
     /// Optional: also archive every synced batch as Parquet into S3 (or an
     /// S3-compatible store like MinIO) — a secondary, best-effort-free data
     /// lake for backup/historical analysis, independent of ClickHouse's own
@@ -485,6 +537,39 @@ pub struct TransferConfig {
     /// do not "optimize" a mutable partition column into this field.) quickhouse
     /// cannot detect mutability, so this is a deliberate per-table opt-in.
     pub merge_prune_partition_by: Option<String>,
+    /// BigQuery-destination incremental only: bound the `MERGE`'s destination
+    /// scan to the staging batch's `[MIN, MAX]` range on the merge `key` itself.
+    /// `true` (default) emits the bound; `false` restores the unbounded
+    /// `ON T.key = S.key`.
+    ///
+    /// **Why this is on by default**, unlike
+    /// [`Self::merge_prune_partition_by`]. That knob bounds a *different*
+    /// column than the one being joined, which is why it needs an immutability
+    /// contract: an updated row whose `write_date` moved lives in a partition
+    /// the staging row no longer implies, so pruning misses it and the merge
+    /// inserts a duplicate key. Bounding on the join key has no such hazard,
+    /// because it is tautological rather than an assumption — a destination row
+    /// can only match a staging row by holding that row's exact key value, and
+    /// that value is inside the staging batch's own `[MIN, MAX]` by
+    /// construction. Nothing matchable can fall outside the bound, so there is
+    /// no configuration in which this changes which rows merge; a NULL key is
+    /// equally unmatchable with or without it.
+    ///
+    /// It pays off when `dest` is clustered by the merge key — which is what
+    /// quickhouse's own generated DDL does (see [`Self::key`]) — since BigQuery
+    /// can then skip whole blocks instead of scanning the full destination on
+    /// every run. On an unclustered or differently-clustered table it is a
+    /// near-free no-op: two scalar subqueries over the small staging table, and
+    /// a predicate evaluated during a scan that was happening anyway.
+    ///
+    /// Ignored when [`Self::delete_stale_in_window`] is set: that feature's
+    /// `WHEN NOT MATCHED BY SOURCE` clause deletes destination rows the source
+    /// pull no longer has, and it can only see rows the `ON` clause admits — so
+    /// a key-range bound there would quietly narrow "replace this window" to
+    /// "replace this key range", leaving deleted-at-source rows outside the
+    /// batch's key span alive. Those transfers keep the partition-scoped bound
+    /// they already required.
+    pub merge_prune_key_range: bool,
     /// BigQuery-destination incremental only: additionally `DELETE` destination
     /// rows *inside the merged window* that are absent from the source pull
     /// (`WHEN NOT MATCHED BY SOURCE`), giving "replace this window" semantics
@@ -500,6 +585,15 @@ pub struct TransferConfig {
     pub delete_stale_in_window: bool,
 
     // ---- parallelism / batching ----
+    /// How many partitions read concurrently. `0` means "derive from the host"
+    /// — [`crate::host::available_cpus`], which already reflects a container's
+    /// CPU quota rather than the whole machine's core count. Resolved in
+    /// [`Self::normalize`], so everything downstream sees a concrete number.
+    ///
+    /// Note this is a ceiling on *available* fan-out, not a promise of it: the
+    /// read must also be partitionable for it to matter at all (see
+    /// [`Self::partition_source_expr`], without which a `source_query` transfer
+    /// runs single-stream no matter what this says).
     pub parallelism: usize,
     /// Per-batch granularity: flush a RecordBatch once it reaches this many
     /// rows. Controls how big each individual insert is (a throughput/overhead
@@ -512,6 +606,46 @@ pub struct TransferConfig {
     /// *batch*; the total in-flight memory across all partitions and in-flight
     /// inserts is bounded separately by `max_memory_bytes`.
     pub batch_bytes: usize,
+    /// Size `max_memory_bytes` as this fraction of the memory this process is
+    /// actually allowed to use, instead of as an absolute byte count. `0.0`
+    /// (default) keeps `max_memory_bytes` as given. Values above `1.0` are
+    /// clamped.
+    ///
+    /// **Why a fraction is the better unit.** An absolute ceiling can't know how
+    /// many peers it has. Four containers capped at 4 GiB each on one 16 GiB VM
+    /// all want a different number from one container that owns the whole box,
+    /// and only the container itself knows which it is. Resolved against the
+    /// cgroup limit where there is one (so it reads *this* container's share,
+    /// not the host's total), falling back to total system memory. If the host
+    /// won't say — notably on non-Linux — `max_memory_bytes` is left exactly as
+    /// configured, so a fraction never silently becomes "unbounded".
+    ///
+    /// Suggested starting point: `0.25`. The pipeline's measured peak RSS is
+    /// ~100 MB at default batch sizes, so the ceiling normally has plenty of
+    /// headroom; its job is to bound the pathological case, not the usual one.
+    pub max_memory_fraction: f64,
+    /// Target size of one insert to the destination, in bytes of real Arrow
+    /// memory (measured the same way `batch_bytes` and `max_memory_bytes` are —
+    /// not post-compression wire size). Decoded batches accumulate until they
+    /// reach this, then go out as a single insert. `0` disables coalescing
+    /// entirely: one insert per decoded batch, the pre-0.14 behavior.
+    ///
+    /// **Why this is separate from `batch_bytes`.** `batch_bytes` is decode
+    /// granularity — how much Arrow to build before handing a batch onward — and
+    /// that is all it was ever documented to be. But every insert call site
+    /// passed exactly one batch, so it silently became the *insert* size too. At
+    /// the 4 MiB default, a 19.4M-row table meant 900+ HTTP round-trips and 900+
+    /// new ClickHouse parts, when ClickHouse's own guidance is fewer and larger
+    /// (10k–100k rows minimum) precisely to hold down part count and the
+    /// background merge load it creates — which on ClickHouse Cloud competes
+    /// with query memory on the same service.
+    ///
+    /// Raising this does not raise peak memory: `max_memory_bytes` still bounds
+    /// everything decoded-but-not-yet-landed (each buffered batch holds its own
+    /// reservation), and the destination serializes its payload incrementally
+    /// rather than materializing it, so a larger insert costs a larger *stream*,
+    /// not a larger buffer.
+    pub insert_bytes: usize,
     /// Hard ceiling on total in-flight Arrow batch memory across the whole
     /// transfer — every partition's decoded-but-not-yet-sent batches plus all
     /// batches currently being uploaded. Enforced against each batch's real
@@ -524,6 +658,38 @@ pub struct TransferConfig {
     /// Column used to split the table into parallel range partitions.
     /// Defaults to the first `key` column, else the sync falls back to a single stream.
     pub partition_column: Option<String>,
+    /// Postgres/MySQL only: a raw SQL expression that resolves the partition
+    /// column *inside* a `source_query`, which is what makes range partitioning
+    /// possible at all for a custom query. `None` (default) keeps the old
+    /// behavior exactly: a `source_query` transfer runs single-stream.
+    ///
+    /// **Why this exists.** Range partitioning needs two things a bare
+    /// `source_table` gives for free: a cheap `MIN`/`MAX` probe to find the key
+    /// span, and a per-partition `key >= lo AND key <= hi` predicate an index
+    /// can serve. With `source_query` set, the planner had no column it could
+    /// trust for either, so it returned a single partition — meaning
+    /// `parallelism` was silently inert for every custom-query transfer, however
+    /// large. Since a `CAST` (or any other projection fix-up) can only live in
+    /// `source_query`, that covered essentially every non-trivial table.
+    ///
+    /// Set this to the name `source_query` projects the raw, indexed key column
+    /// under (e.g. `id AS id_raw` -> `partition_source_expr="id_raw"`). The
+    /// planner then probes `SELECT MIN(<expr>), MAX(<expr>) FROM (<source_query>)
+    /// AS _src` and builds its range predicates over `<expr>`, so both bind to a
+    /// bare pass-through column the source can push down to the index — exactly
+    /// the arrangement [`Self::watermark_source_expr`] establishes for the
+    /// incremental filter. It may name the same column as `partition_column`
+    /// when `source_query` passes that column through unchanged.
+    ///
+    /// **Two costs to know.** (1) The `MIN`/`MAX` probe now runs against the
+    /// wrapped query, not a base table. A single-table `source_query` flattens
+    /// and still resolves via index, but a query with joins or aggregation pays
+    /// for one extra evaluation per run. (2) Unlike the implicit base-table path
+    /// — which degrades quietly to one stream when the key isn't range-able —
+    /// an expression set here that is missing or non-integer is a hard error,
+    /// not a silent fallback: you asked for fan-out explicitly, so failing to
+    /// deliver it silently would just recreate the bug this field fixes.
+    pub partition_source_expr: Option<String>,
     /// Optional cap on how many source rows are pulled **per second**, summed
     /// across all parallel partitions (a global limiter, not per-connection).
     /// Deliberately paces the read so a small/production database isn't
@@ -706,6 +872,30 @@ impl TransferConfig {
     /// watermark passed alongside `mode="full"` is dropped here, and the
     /// returned `new_watermark` is `None`.
     pub fn normalize(&mut self) {
+        // Host-derived tuning, resolved once so every later reader — the
+        // partition planner, `buffer_unordered`, `MemoryBudget` — sees a
+        // concrete number rather than a sentinel.
+        if self.parallelism == 0 {
+            self.parallelism = crate::host::available_cpus();
+            tracing::info!(
+                "parallelism derived from the host: {} CPU(s) available",
+                self.parallelism
+            );
+        }
+        if let Some(bytes) = crate::host::memory_fraction_bytes(self.max_memory_fraction) {
+            tracing::info!(
+                "max_memory_bytes derived from the host: {bytes} bytes ({} of the memory limit)",
+                self.max_memory_fraction
+            );
+            self.max_memory_bytes = bytes;
+        } else if self.max_memory_fraction > 0.0 {
+            tracing::warn!(
+                "max_memory_fraction={} was requested but this host's memory limit could not be \
+                 determined; keeping max_memory_bytes={}",
+                self.max_memory_fraction,
+                self.max_memory_bytes
+            );
+        }
         if self.mode == SyncMode::Full {
             self.watermark = None;
             self.watermark_source_expr = None;
@@ -818,8 +1008,13 @@ impl TransferConfig {
                  overlap window produces duplicate rows instead of an upsert)",
             ));
         }
-        if self.parallelism == 0 {
-            return Err(EtlError::config("parallelism must be >= 1"));
+        // `parallelism == 0` is no longer an error but the "derive from the
+        // host" request; `normalize` turns it into a concrete count before
+        // anything reads it. Nothing to validate here.
+        if self.max_memory_fraction < 0.0 || self.max_memory_fraction > 1.0 {
+            return Err(EtlError::config(
+                "max_memory_fraction must be between 0.0 (use max_memory_bytes as given) and 1.0",
+            ));
         }
         if self.batch_rows == 0 {
             return Err(EtlError::config("batch_rows must be >= 1"));
@@ -904,12 +1099,16 @@ pub(crate) fn default_test_config() -> TransferConfig {
         partition_by: None,
         primary_key: vec![],
         merge_prune_partition_by: None,
+        merge_prune_key_range: true,
         delete_stale_in_window: false,
         parallelism: 1,
         batch_rows: 1000,
         batch_bytes: 0,
+        insert_bytes: 0,
         max_memory_bytes: 0,
+        max_memory_fraction: 0.0,
         partition_column: None,
+        partition_source_expr: None,
         read_max_rows_per_sec: None,
         chunk_rows: None,
         retry_max_attempts: 1,
@@ -933,6 +1132,63 @@ pub(crate) fn default_test_config() -> TransferConfig {
 mod tests {
     use super::*;
 
+    #[test]
+    fn zero_parallelism_is_resolved_from_the_host_not_rejected() {
+        // The shipped default is now 0 = "derive", so validate must let it
+        // through and normalize must turn it into a real count.
+        let mut c = default_test_config();
+        c.parallelism = 0;
+        c.validate().expect("0 is a request, not an error");
+        c.normalize();
+        assert_eq!(c.parallelism, crate::host::available_cpus());
+        assert!(c.parallelism >= 1, "downstream needs a concrete count");
+    }
+
+    #[test]
+    fn an_explicit_parallelism_is_left_alone() {
+        let mut c = default_test_config();
+        c.parallelism = 3;
+        c.normalize();
+        assert_eq!(c.parallelism, 3);
+    }
+
+    #[test]
+    fn a_memory_fraction_outside_zero_to_one_is_rejected() {
+        let mut c = default_test_config();
+        c.max_memory_fraction = 1.5;
+        assert!(c
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("max_memory_fraction"));
+        c.max_memory_fraction = -0.5;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn no_memory_fraction_leaves_the_byte_ceiling_as_configured() {
+        let mut c = default_test_config();
+        c.max_memory_bytes = 12_345;
+        c.max_memory_fraction = 0.0;
+        c.normalize();
+        assert_eq!(c.max_memory_bytes, 12_345);
+    }
+
+    #[test]
+    fn a_memory_fraction_only_lowers_the_ceiling_when_the_host_is_known() {
+        let mut c = default_test_config();
+        c.max_memory_bytes = 512 * 1024 * 1024;
+        c.max_memory_fraction = 0.25;
+        c.normalize();
+        match crate::host::memory_limit_bytes() {
+            // Where the host reports a limit, the ceiling is that share of it.
+            Some(limit) => assert_eq!(c.max_memory_bytes, ((limit as f64) * 0.25) as usize),
+            // Where it doesn't, the configured value must survive untouched —
+            // a fraction must never silently become "unbounded".
+            None => assert_eq!(c.max_memory_bytes, 512 * 1024 * 1024),
+        }
+    }
+
     fn cfg(mode: SyncMode, watermark: Option<&str>) -> TransferConfig {
         TransferConfig {
             source_table: Some("t".into()),
@@ -952,12 +1208,16 @@ mod tests {
             partition_by: None,
             primary_key: vec![],
             merge_prune_partition_by: None,
+            merge_prune_key_range: true,
             delete_stale_in_window: false,
             parallelism: 1,
             batch_rows: 1000,
             batch_bytes: 0,
+            insert_bytes: 0,
             max_memory_bytes: 0,
+            max_memory_fraction: 0.0,
             partition_column: None,
+            partition_source_expr: None,
             read_max_rows_per_sec: None,
             chunk_rows: None,
             retry_max_attempts: 1,
