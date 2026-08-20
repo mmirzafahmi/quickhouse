@@ -536,6 +536,11 @@ pub struct TransferConfig {
     /// updating. (This is the historical `merge_query_filter` duplicate-id bug;
     /// do not "optimize" a mutable partition column into this field.) quickhouse
     /// cannot detect mutability, so this is a deliberate per-table opt-in.
+    ///
+    /// The bound is expressed as literals resolved from the staging batch before
+    /// the statement is built, not as subqueries over staging — see
+    /// [`Self::merge_prune_key_range`] for why it has to be, and what that
+    /// costs.
     pub merge_prune_partition_by: Option<String>,
     /// BigQuery-destination incremental only: bound the `MERGE`'s destination
     /// scan to the staging batch's `[MIN, MAX]` range on the merge `key` itself.
@@ -558,9 +563,25 @@ pub struct TransferConfig {
     /// It pays off when `dest` is clustered by the merge key — which is what
     /// quickhouse's own generated DDL does (see [`Self::key`]) — since BigQuery
     /// can then skip whole blocks instead of scanning the full destination on
-    /// every run. On an unclustered or differently-clustered table it is a
-    /// near-free no-op: two scalar subqueries over the small staging table, and
-    /// a predicate evaluated during a scan that was happening anyway.
+    /// every run. On an unclustered or differently-clustered table it costs one
+    /// small query against the staging table (the probe below) plus a predicate
+    /// evaluated during a scan that was happening anyway.
+    ///
+    /// **How the bound is expressed, and why it matters.** As literals:
+    /// quickhouse probes the staging batch's `[MIN, MAX]` per key column, then
+    /// pastes the values into the `ON` clause. It cannot be the obvious
+    /// `BETWEEN (SELECT MIN(k) FROM staging) AND (SELECT MAX(k) FROM staging)`,
+    /// because BigQuery rejects a subquery referencing a table inside a join
+    /// predicate — `Unsupported subquery with table in join predicate` — while
+    /// it *analyses* the statement, which means for every batch including an
+    /// empty one. 0.14.0 shipped that form and every BigQuery `MERGE` failed;
+    /// see the 0.14.1 changelog entry. BigQuery renders the literals itself
+    /// (`FORMAT('%T', …)`), so quickhouse formats no types by hand and the
+    /// `MIN`/`MAX` that picks a bound is evaluated by the same engine, over the
+    /// same table, as the `BETWEEN` that uses it.
+    ///
+    /// An empty batch leaves `MIN`/`MAX` NULL, so no bound is emitted at all —
+    /// always safe, since an absent bound only widens the scan.
     ///
     /// Ignored when [`Self::delete_stale_in_window`] is set: that feature's
     /// `WHEN NOT MATCHED BY SOURCE` clause deletes destination rows the source

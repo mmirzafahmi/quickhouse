@@ -46,6 +46,7 @@
 //! staging + MERGE flow" held only for keys already present in `dest`, and
 //! never for the pure-insert case that a first-time-seen id always is.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -635,6 +636,28 @@ impl BigQuerySink {
         delete_stale: bool,
         dedup_order: Option<&str>,
     ) -> Result<()> {
+        // Resolve the prune bounds up front: they go into the statement as
+        // literals, because BigQuery rejects a subquery that references a table
+        // inside a join predicate (see `StagingBounds`). Only the columns
+        // actually bounded are probed, so a transfer that prunes on nothing
+        // makes no extra call at all.
+        let bounded = bounded_columns(key, prune_partition, prune_key_range, delete_stale);
+        let bounds = match self.probe_staging_bounds(staging, &bounded).await {
+            Ok(b) => b,
+            // Pruning is an optimization, so a failed probe degrades to the
+            // unbounded join rather than failing the transfer — except under
+            // `delete_stale`, where the bound is the only thing keeping the
+            // DELETE inside the batch's window, and quietly dropping it would
+            // change what the statement means.
+            Err(e) if !delete_stale => {
+                tracing::warn!(
+                    "could not resolve staging prune bounds for '{dest}' ({e}); \
+                     merging without them"
+                );
+                StagingBounds::default()
+            }
+            Err(e) => return Err(e),
+        };
         let query = build_merge_sql(
             &self.project_id,
             &self.dataset_id,
@@ -646,6 +669,7 @@ impl BigQuerySink {
             prune_key_range,
             delete_stale,
             dedup_order,
+            &bounds,
         )?;
         let job = Job {
             job_reference: JobReference {
@@ -671,6 +695,59 @@ impl BigQuerySink {
             .map_err(|e| EtlError::other(format!("bigquery merge job error: {e}")))?;
         self.poll_job_until_done(created).await?;
         Ok(())
+    }
+
+    /// Resolve the staging batch's `[MIN, MAX]` on each of `columns`, as
+    /// GoogleSQL literals ready to paste into the `MERGE`'s predicates — see
+    /// [`StagingBounds`] for why the bound cannot be a subquery.
+    ///
+    /// One small query over the staging table (only the bounded columns are
+    /// read, and staging holds just the delta). A column whose bound comes back
+    /// `NULL` — an empty batch, or a column that is all-`NULL` in it — is left
+    /// out of the map, and the caller emits no bound for it.
+    async fn probe_staging_bounds(&self, staging: &str, columns: &[&str]) -> Result<StagingBounds> {
+        if columns.is_empty() {
+            return Ok(StagingBounds::default());
+        }
+        let query = build_staging_bounds_sql(&self.project_id, &self.dataset_id, staging, columns);
+        let request = QueryRequest {
+            query,
+            ..Default::default()
+        };
+        let mut iter = self
+            .client
+            .query::<QueryRow>(&self.project_id, request)
+            .await
+            .map_err(|e| EtlError::other(format!("bigquery staging bounds query error: {e}")))?;
+        // An un-grouped aggregate always returns exactly one row.
+        let row = match iter
+            .next()
+            .await
+            .map_err(|e| EtlError::other(format!("bigquery staging bounds row error: {e}")))?
+        {
+            Some(row) => row,
+            None => return Ok(StagingBounds::default()),
+        };
+        let mut resolved = HashMap::new();
+        for (i, col) in columns.iter().enumerate() {
+            let read = |idx: usize| {
+                row.column::<Option<String>>(idx).map_err(|e| {
+                    EtlError::other(format!("bigquery staging bounds column error: {e}"))
+                })
+            };
+            match (read(i * 2)?, read(i * 2 + 1)?) {
+                // `FORMAT('%T', NULL)` renders the bare string `NULL`, which is
+                // unambiguous: a STRING value of "NULL" renders *with* quotes.
+                (Some(lo), Some(hi)) if lo != "NULL" && hi != "NULL" => {
+                    resolved.insert((*col).to_string(), (lo, hi));
+                }
+                _ => tracing::debug!(
+                    "staging '{staging}' has no usable range on '{col}' (empty batch \
+                     or all-NULL column); merging without a bound on it"
+                ),
+            }
+        }
+        Ok(StagingBounds(resolved))
     }
 
     /// Idempotent, matching ClickHouse's `DROP TABLE IF EXISTS`: a
@@ -1130,6 +1207,97 @@ fn build_persist_watermark_sql(
     )
 }
 
+/// Literal `[MIN, MAX]` bounds over a staging table, per column, each already
+/// rendered as a GoogleSQL constant (`42`, `"abc"`, `DATE "2026-08-20"`,
+/// `TIMESTAMP "2026-08-19 21:53:01.234567+00"`, …).
+///
+/// **Why literals.** Both `MERGE` prunes used to express their bound as
+/// `T.c BETWEEN (SELECT MIN(c) FROM staging) AND (SELECT MAX(c) FROM staging)`.
+/// BigQuery rejects that at *analysis* time — `Unsupported subquery with table
+/// in join predicate` — so it failed every merge on every table regardless of
+/// the data, including no-op runs that staged zero rows. A constant is legal
+/// there, and is also the form BigQuery can actually prune partitions and
+/// clustering blocks on, which was the point of the feature.
+///
+/// **Why BigQuery renders them, not us.** The bounds are produced by
+/// `FORMAT('%T', …)` in [`build_staging_bounds_sql`], which returns each value
+/// in valid constant syntax for its own type. That keeps two things out of
+/// quickhouse: per-type literal formatting (timestamp precision, `NUMERIC`
+/// scale, string escaping), and any assumption that Rust and GoogleSQL order
+/// values the same way — the `MIN`/`MAX` that picks the bound is evaluated by
+/// the same engine, over the same staging table, as the `BETWEEN` that uses it.
+///
+/// **Why resolving them in a separate query is sound.** The bound is read before
+/// the `MERGE` runs, so a staging table still being written between the two
+/// would leave it stale, and a matched destination row outside a stale bound
+/// would fall through to `WHEN NOT MATCHED` and insert a duplicate key. Neither
+/// is reachable: `sync::staging_name` gives every run its own staging table
+/// (nanosecond run id), and that table is fully written before the promote step
+/// calls `merge_into` — so no other run, and no later append from this one, can
+/// move the range under the statement.
+#[derive(Debug, Default, Clone)]
+struct StagingBounds(HashMap<String, (String, String)>);
+
+impl StagingBounds {
+    /// The `(lo, hi)` literals for `column`, or `None` when the staging batch
+    /// yielded no usable range on it — in which case the caller emits no bound,
+    /// which is always safe (an absent bound only widens the scan).
+    fn get(&self, column: &str) -> Option<&(String, String)> {
+        self.0.get(column)
+    }
+}
+
+/// Which columns the `MERGE` needs a staging range for, in probe order: the
+/// immutable prune column if one is configured, plus every key column when
+/// key-range pruning applies. Deduplicated, because the prune column is allowed
+/// to also be a key column. An empty result means no probe is needed at all.
+///
+/// Mirrors the conditions [`build_merge_sql`] emits bounds under, so the two
+/// cannot drift into probing a column that is never bounded (a wasted read) or
+/// bounding one that was never probed (a silently dropped bound).
+fn bounded_columns<'a>(
+    key: &'a [String],
+    prune_partition: Option<&'a str>,
+    prune_key_range: bool,
+    delete_stale: bool,
+) -> Vec<&'a str> {
+    let mut cols: Vec<&str> = Vec::new();
+    if let Some(pcol) = prune_partition {
+        cols.push(pcol);
+    }
+    if prune_key_range && !delete_stale {
+        for k in key {
+            if !cols.contains(&k.as_str()) {
+                cols.push(k);
+            }
+        }
+    }
+    cols
+}
+
+/// Build the probe behind [`StagingBounds`]: `MIN`/`MAX` per bounded column,
+/// wrapped in `FORMAT('%T', …)` so BigQuery hands back each bound already in
+/// literal syntax. Aliases are positional (`lo_0`/`hi_0`, …) so results are
+/// read back by index and an awkward column name can't collide with them. A
+/// free function (not a `&self` method) so it's unit-testable without a real
+/// authenticated client, mirroring `build_merge_sql`.
+fn build_staging_bounds_sql(
+    project_id: &str,
+    dataset_id: &str,
+    staging: &str,
+    columns: &[&str],
+) -> String {
+    let projection = columns
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            format!("FORMAT('%T', MIN(`{c}`)) AS lo_{i}, FORMAT('%T', MAX(`{c}`)) AS hi_{i}")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("SELECT {projection} FROM `{project_id}`.`{dataset_id}`.`{staging}`")
+}
+
 /// Build the `MERGE` statement that upserts `staging`'s rows into `dest`,
 /// matched on `key` — see `BigQuerySink::merge_into`'s docs. A free function
 /// (not a `&self` method) so it's unit-testable without a real authenticated
@@ -1146,6 +1314,7 @@ fn build_merge_sql(
     prune_key_range: bool,
     delete_stale: bool,
     dedup_order: Option<&str>,
+    bounds: &StagingBounds,
 ) -> Result<String> {
     if key.is_empty() {
         // Should already be caught by sync.rs's prepare_target validation
@@ -1161,21 +1330,24 @@ fn build_merge_sql(
         .join(" AND ");
     // Optional partition pruning: bound the destination scan to the staging
     // batch's range on an IMMUTABLE partition column, so BigQuery reads only
-    // the touched partitions instead of the whole table. Scalar subqueries over
-    // the (small) staging table give BigQuery the pruning bounds; the caller
+    // the touched partitions instead of the whole table. The caller
     // guarantees the column is immutable-per-key (see the correctness contract
     // on `TransferConfig::merge_prune_partition_by` — a mutable column here
     // silently inserts duplicate keys).
+    //
+    // Both prunes below take their bound from `bounds` as LITERALS, resolved
+    // from staging before this statement is built, and never as
+    // `(SELECT MIN(c) FROM staging)` subqueries: BigQuery rejects a subquery
+    // that references a table inside a join predicate, at analysis time, so
+    // that form failed every merge regardless of the data. See
+    // `StagingBounds`.
+    //
     // A window bound over the staging batch's range on the IMMUTABLE prune
     // column, reused by both the ON-clause pruning and (if requested) the
     // scoped DELETE below.
-    let window_bound = prune_partition.map(|pcol| {
-        format!(
-            "T.`{pcol}` BETWEEN \
-             (SELECT MIN(`{pcol}`) FROM `{project_id}`.`{dataset_id}`.`{staging}`) \
-             AND (SELECT MAX(`{pcol}`) FROM `{project_id}`.`{dataset_id}`.`{staging}`)"
-        )
-    });
+    let window_bound = prune_partition
+        .and_then(|pcol| bounds.get(pcol).map(|(lo, hi)| (pcol, lo, hi)))
+        .map(|(pcol, lo, hi)| format!("T.`{pcol}` BETWEEN {lo} AND {hi}"));
     if let Some(bound) = &window_bound {
         on_clause.push_str(&format!(" AND {bound}"));
     }
@@ -1193,11 +1365,9 @@ fn build_merge_sql(
     // deleted-at-source rows outside the batch's key span.
     if prune_key_range && !delete_stale {
         for k in key {
-            on_clause.push_str(&format!(
-                " AND T.`{k}` BETWEEN \
-                 (SELECT MIN(`{k}`) FROM `{project_id}`.`{dataset_id}`.`{staging}`) \
-                 AND (SELECT MAX(`{k}`) FROM `{project_id}`.`{dataset_id}`.`{staging}`)"
-            ));
+            if let Some((lo, hi)) = bounds.get(k) {
+                on_clause.push_str(&format!(" AND T.`{k}` BETWEEN {lo} AND {hi}"));
+            }
         }
     }
 
@@ -1240,14 +1410,27 @@ fn build_merge_sql(
     // requires the prune column (enforced in config validation; internal error
     // here is purely defensive).
     if delete_stale {
-        let bound = window_bound.as_deref().ok_or_else(|| {
+        let pcol = prune_partition.ok_or_else(|| {
             EtlError::internal(
                 "delete_stale requested without merge_prune_partition_by (should have been validated)",
             )
         })?;
-        clauses.push(format!(
-            "WHEN NOT MATCHED BY SOURCE AND {bound} THEN DELETE"
-        ));
+        match &window_bound {
+            Some(bound) => clauses.push(format!(
+                "WHEN NOT MATCHED BY SOURCE AND {bound} THEN DELETE"
+            )),
+            // No resolvable range on the prune column means nothing was staged
+            // (or the column is all-NULL across the batch), so there is no
+            // window to replace and nothing in it to delete. Drop the clause
+            // rather than emit it unscoped — an unscoped
+            // `WHEN NOT MATCHED BY SOURCE` deletes the destination's entire
+            // history. Same outcome the subquery form had on an empty batch,
+            // where the bound evaluated to NULL and matched nothing.
+            None => tracing::debug!(
+                "delete_stale: staging '{staging}' has no '{pcol}' range; skipping the \
+                 window-scoped DELETE (nothing staged to replace)"
+            ),
+        }
     }
 
     // Deduplicate staging by `key` before merging, keeping one row per key.
@@ -1546,6 +1729,25 @@ mod tests {
             clickhouse_inner: "irrelevant".into(),
             arbitrary_precision_decimal: false,
         }
+    }
+
+    /// The literal `[MIN, MAX]` bounds a real run resolves from staging before
+    /// building the statement, spelled the way BigQuery's `FORMAT('%T', ...)`
+    /// spells them (see `StagingBounds`) — that is exactly what the probe reads
+    /// back, so these tests assert against the real shape.
+    fn bounds(pairs: &[(&str, &str, &str)]) -> StagingBounds {
+        StagingBounds(
+            pairs
+                .iter()
+                .map(|(c, lo, hi)| ((*c).to_string(), ((*lo).to_string(), (*hi).to_string())))
+                .collect(),
+        )
+    }
+
+    /// What a probe returns for an empty staging batch: `MIN`/`MAX` are NULL,
+    /// so no column has a usable range and no bound is emitted.
+    fn no_bounds() -> StagingBounds {
+        StagingBounds::default()
     }
 
     fn base_cfg() -> TransferConfig {
@@ -1909,6 +2111,7 @@ mod tests {
             false,
             false,
             None,
+            &no_bounds(),
         )
         .unwrap();
 
@@ -1949,8 +2152,20 @@ mod tests {
             col("b", DataType::Int64, false),
         ];
         let key = vec!["a".to_string(), "b".to_string()];
-        let sql =
-            build_merge_sql("p", "d", "t", "s", &key, &cols, None, false, false, None).unwrap();
+        let sql = build_merge_sql(
+            "p",
+            "d",
+            "t",
+            "s",
+            &key,
+            &cols,
+            None,
+            false,
+            false,
+            None,
+            &no_bounds(),
+        )
+        .unwrap();
         assert!(sql.contains("ON T.`a` = S.`a` AND T.`b` = S.`b`"));
     }
 
@@ -1974,17 +2189,18 @@ mod tests {
             true,
             false,
             None,
+            &bounds(&[("id", "1", "341")]),
         )
         .unwrap();
         assert!(sql.contains("ON T.`id` = S.`id`"), "{sql}");
         assert!(
-            sql.contains(
-                "AND T.`id` BETWEEN \
-                 (SELECT MIN(`id`) FROM `p`.`d`.`orders_tmp`) \
-                 AND (SELECT MAX(`id`) FROM `p`.`d`.`orders_tmp`)"
-            ),
+            sql.contains("AND T.`id` BETWEEN 1 AND 341"),
             "missing key-range bound: {sql}"
         );
+        // A literal, never a subquery over staging: BigQuery rejects
+        // "Unsupported subquery with table in join predicate" when analysing
+        // the statement, which failed every merge this feature touched.
+        assert!(!sql.contains("BETWEEN (SELECT"), "{sql}");
     }
 
     #[test]
@@ -1997,10 +2213,22 @@ mod tests {
             col("v", DataType::Float64, true),
         ];
         let key = vec!["a".to_string(), "b".to_string()];
-        let sql =
-            build_merge_sql("p", "d", "t", "s", &key, &cols, None, true, false, None).unwrap();
-        assert!(sql.contains("T.`a` BETWEEN (SELECT MIN(`a`)"), "{sql}");
-        assert!(sql.contains("T.`b` BETWEEN (SELECT MIN(`b`)"), "{sql}");
+        let sql = build_merge_sql(
+            "p",
+            "d",
+            "t",
+            "s",
+            &key,
+            &cols,
+            None,
+            true,
+            false,
+            None,
+            &bounds(&[("a", "1", "9"), ("b", "10", "99")]),
+        )
+        .unwrap();
+        assert!(sql.contains("AND T.`a` BETWEEN 1 AND 9"), "{sql}");
+        assert!(sql.contains("AND T.`b` BETWEEN 10 AND 99"), "{sql}");
     }
 
     #[test]
@@ -2010,8 +2238,21 @@ mod tests {
             col("amount", DataType::Float64, true),
         ];
         let key = vec!["id".to_string()];
-        let sql =
-            build_merge_sql("p", "d", "t", "s", &key, &cols, None, false, false, None).unwrap();
+        // Bounds are supplied, so it is the flag alone that suppresses them.
+        let sql = build_merge_sql(
+            "p",
+            "d",
+            "t",
+            "s",
+            &key,
+            &cols,
+            None,
+            false,
+            false,
+            None,
+            &bounds(&[("id", "1", "341")]),
+        )
+        .unwrap();
         assert!(sql.contains("ON T.`id` = S.`id`"), "{sql}");
         assert!(!sql.contains("BETWEEN"), "bound should be absent: {sql}");
     }
@@ -2043,6 +2284,14 @@ mod tests {
             true,
             true,
             None,
+            &bounds(&[
+                ("id", "1", "341"),
+                (
+                    "create_date",
+                    r#"TIMESTAMP "2026-08-01 00:00:00+00""#,
+                    r#"TIMESTAMP "2026-08-20 12:00:00+00""#,
+                ),
+            ]),
         )
         .unwrap();
         assert!(
@@ -2050,7 +2299,13 @@ mod tests {
             "key-range bound must not narrow a NOT MATCHED BY SOURCE delete: {sql}"
         );
         // The window bound it does require is still there.
-        assert!(sql.contains("T.`create_date` BETWEEN"), "{sql}");
+        assert!(
+            sql.contains(&format!(
+                "T.`create_date` BETWEEN {} AND {}",
+                r#"TIMESTAMP "2026-08-01 00:00:00+00""#, r#"TIMESTAMP "2026-08-20 12:00:00+00""#
+            )),
+            "{sql}"
+        );
     }
 
     #[test]
@@ -2076,19 +2331,26 @@ mod tests {
             false,
             false,
             None,
+            &bounds(&[(
+                "create_date",
+                r#"TIMESTAMP "2026-08-01 00:00:00+00""#,
+                r#"TIMESTAMP "2026-08-20 12:00:00+00""#,
+            )]),
         )
         .unwrap();
         // The join still matches on the key, AND the destination is bounded to
         // the staging batch's create_date range so BigQuery prunes partitions.
         assert!(sql.contains("ON T.`id` = S.`id`"), "{sql}");
         assert!(
-            sql.contains(
-                "AND T.`create_date` BETWEEN \
-                 (SELECT MIN(`create_date`) FROM `p`.`d`.`orders_tmp`) \
-                 AND (SELECT MAX(`create_date`) FROM `p`.`d`.`orders_tmp`)"
-            ),
+            sql.contains(&format!(
+                "AND T.`create_date` BETWEEN {} AND {}",
+                r#"TIMESTAMP "2026-08-01 00:00:00+00""#, r#"TIMESTAMP "2026-08-20 12:00:00+00""#
+            )),
             "missing partition-prune predicate: {sql}"
         );
+        // Same dialect constraint as the key-range bound: a subquery here is
+        // rejected when the statement is analysed, so it must be a literal.
+        assert!(!sql.contains("BETWEEN (SELECT"), "{sql}");
         // The pruned column is still upserted like any other non-key column.
         assert!(sql.contains("`create_date` = S.`create_date`"), "{sql}");
     }
@@ -2115,16 +2377,20 @@ mod tests {
             false,
             true,
             None,
+            &bounds(&[(
+                "create_date",
+                r#"TIMESTAMP "2026-08-01 00:00:00+00""#,
+                r#"TIMESTAMP "2026-08-20 12:00:00+00""#,
+            )]),
         )
         .unwrap();
         // The DELETE is scoped to the SAME staging window as the prune — it must
         // never delete outside the batch's create_date range.
         assert!(
-            sql.contains(
-                "WHEN NOT MATCHED BY SOURCE AND T.`create_date` BETWEEN \
-                 (SELECT MIN(`create_date`) FROM `p`.`d`.`orders_tmp`) \
-                 AND (SELECT MAX(`create_date`) FROM `p`.`d`.`orders_tmp`) THEN DELETE"
-            ),
+            sql.contains(&format!(
+                "WHEN NOT MATCHED BY SOURCE AND T.`create_date` BETWEEN {} AND {} THEN DELETE",
+                r#"TIMESTAMP "2026-08-01 00:00:00+00""#, r#"TIMESTAMP "2026-08-20 12:00:00+00""#
+            )),
             "missing window-scoped delete: {sql}"
         );
     }
@@ -2138,9 +2404,21 @@ mod tests {
             col("v", DataType::Int64, true),
         ];
         let key = vec!["id".to_string()];
-        let err = build_merge_sql("p", "d", "t", "s", &key, &cols, None, false, true, None)
-            .unwrap_err()
-            .to_string();
+        let err = build_merge_sql(
+            "p",
+            "d",
+            "t",
+            "s",
+            &key,
+            &cols,
+            None,
+            false,
+            true,
+            None,
+            &no_bounds(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("delete_stale"), "{err}");
     }
 
@@ -2148,8 +2426,20 @@ mod tests {
     fn build_merge_sql_all_columns_are_key_becomes_insert_only() {
         let cols = vec![col("id", DataType::Int64, false)];
         let key = vec!["id".to_string()];
-        let sql =
-            build_merge_sql("p", "d", "t", "s", &key, &cols, None, false, false, None).unwrap();
+        let sql = build_merge_sql(
+            "p",
+            "d",
+            "t",
+            "s",
+            &key,
+            &cols,
+            None,
+            false,
+            false,
+            None,
+            &no_bounds(),
+        )
+        .unwrap();
         assert!(
             !sql.contains("WHEN MATCHED"),
             "no columns left to update: {sql}"
@@ -2182,6 +2472,7 @@ mod tests {
             false,
             false,
             Some("write_date"),
+            &no_bounds(),
         )
         .unwrap();
         assert!(
@@ -2209,8 +2500,20 @@ mod tests {
             col("v", DataType::Int64, true),
         ];
         let key = vec!["a".to_string(), "b".to_string()];
-        let sql =
-            build_merge_sql("p", "d", "t", "s", &key, &cols, None, false, false, None).unwrap();
+        let sql = build_merge_sql(
+            "p",
+            "d",
+            "t",
+            "s",
+            &key,
+            &cols,
+            None,
+            false,
+            false,
+            None,
+            &no_bounds(),
+        )
+        .unwrap();
         assert!(
             sql.contains("PARTITION BY `a`, `b` ORDER BY `a`, `b`"),
             "{sql}"
@@ -2239,6 +2542,7 @@ mod tests {
             false,
             false,
             Some("not_a_staging_column"),
+            &no_bounds(),
         )
         .unwrap();
         assert!(!sql.contains("not_a_staging_column"), "{sql}");
@@ -2248,14 +2552,438 @@ mod tests {
     #[test]
     fn build_merge_sql_rejects_empty_key() {
         let cols = vec![col("id", DataType::Int64, false)];
-        let err = build_merge_sql("p", "d", "t", "s", &[], &cols, None, false, false, None)
-            .unwrap_err()
-            .to_string();
+        let err = build_merge_sql(
+            "p",
+            "d",
+            "t",
+            "s",
+            &[],
+            &cols,
+            None,
+            false,
+            false,
+            None,
+            &no_bounds(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("empty key"), "{err}");
         assert!(
             err.contains("quickhouse bug"),
             "must be framed as internal, not a config error: {err}"
         );
+    }
+
+    /// The text BigQuery analyses as this statement's join predicates:
+    /// everything between `ON` and the first `WHEN`, plus the search condition
+    /// of a `WHEN NOT MATCHED BY SOURCE` clause.
+    fn merge_conditions(sql: &str) -> Vec<&str> {
+        let on = sql.split(" ON ").nth(1).expect("a MERGE has an ON clause");
+        let mut conds = vec![on.split(" WHEN ").next().unwrap()];
+        if let Some(rest) = sql.split("WHEN NOT MATCHED BY SOURCE AND ").nth(1) {
+            conds.push(rest.split(" THEN ").next().unwrap());
+        }
+        conds
+    }
+
+    #[test]
+    fn build_merge_sql_never_puts_a_subquery_in_a_merge_condition() {
+        // The regression this pins down. BigQuery analyses the `ON` clause (and
+        // a `WHEN NOT MATCHED BY SOURCE` search condition) as join predicates,
+        // and rejects a subquery referencing a table in one of them outright:
+        //
+        //     Unsupported subquery with table in join predicate.
+        //
+        // That happens before it looks at any data, so the previous
+        // `BETWEEN (SELECT MIN(k) FROM staging) AND (SELECT MAX(k) FROM staging)`
+        // form failed 100% of BigQuery merges — zero-row no-ops included — for
+        // every transfer `merge_prune_key_range` (default on) or
+        // `merge_prune_partition_by` applied to. Bounds must be literals; this
+        // asserts it across every combination of the knobs that emit one.
+        let cols = vec![
+            col("id", DataType::Int64, false),
+            col(
+                "create_date",
+                DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
+            col("amount", DataType::Float64, true),
+        ];
+        let key = vec!["id".to_string()];
+        let resolved = bounds(&[
+            ("id", "1", "341"),
+            (
+                "create_date",
+                r#"TIMESTAMP "2026-08-01 00:00:00+00""#,
+                r#"TIMESTAMP "2026-08-20 12:00:00+00""#,
+            ),
+        ]);
+        for prune_partition in [None, Some("create_date")] {
+            for prune_key_range in [false, true] {
+                for delete_stale in [false, true] {
+                    // Validated as a config error long before here.
+                    if delete_stale && prune_partition.is_none() {
+                        continue;
+                    }
+                    // Both what a populated batch resolves and what an empty one
+                    // does, since the empty case is what first broke in prod.
+                    for staging_bounds in [&no_bounds(), &resolved] {
+                        let sql = build_merge_sql(
+                            "p",
+                            "d",
+                            "orders",
+                            "orders_tmp",
+                            &key,
+                            &cols,
+                            prune_partition,
+                            prune_key_range,
+                            delete_stale,
+                            None,
+                            staging_bounds,
+                        )
+                        .unwrap();
+                        for cond in merge_conditions(&sql) {
+                            assert!(
+                                !cond.contains("SELECT"),
+                                "subquery in a merge condition ({cond}) of: {sql}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn build_merge_sql_bounds_a_string_key_with_the_literal_bigquery_rendered() {
+        // A non-numeric key is bounded the same way, using the quoted form
+        // `FORMAT('%T', ...)` returns — escaping included, so quickhouse never
+        // has to quote a value itself.
+        let cols = vec![
+            col("code", DataType::Utf8, false),
+            col("v", DataType::Int64, true),
+        ];
+        let key = vec!["code".to_string()];
+        let sql = build_merge_sql(
+            "p",
+            "d",
+            "t",
+            "s",
+            &key,
+            &cols,
+            None,
+            true,
+            false,
+            None,
+            &bounds(&[("code", r#""a-001""#, r#""it's z""#)]),
+        )
+        .unwrap();
+        assert!(
+            sql.contains(r#"AND T.`code` BETWEEN "a-001" AND "it's z""#),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn build_merge_sql_skips_the_bound_when_staging_has_no_range() {
+        // An empty batch (or an all-NULL key column) leaves `MIN`/`MAX` NULL, so
+        // there is no literal to bound with. Dropping the bound is always safe —
+        // it only widens the scan — and the merge must still be emitted, since a
+        // zero-row staging table is exactly the no-op case that has to succeed.
+        let cols = vec![
+            col("id", DataType::Int64, false),
+            col("amount", DataType::Float64, true),
+        ];
+        let key = vec!["id".to_string()];
+        let sql = build_merge_sql(
+            "p",
+            "d",
+            "t",
+            "s",
+            &key,
+            &cols,
+            None,
+            true,
+            false,
+            None,
+            &no_bounds(),
+        )
+        .unwrap();
+        assert!(!sql.contains("BETWEEN"), "{sql}");
+        assert!(sql.contains("ON T.`id` = S.`id` WHEN MATCHED"), "{sql}");
+        assert!(sql.contains("WHEN NOT MATCHED THEN INSERT"), "{sql}");
+    }
+
+    #[test]
+    fn build_merge_sql_delete_stale_drops_the_delete_when_staging_has_no_window() {
+        // The DELETE is only ever allowed scoped. With no resolvable window
+        // there is also nothing staged to replace, so the clause is dropped —
+        // never emitted unscoped, which would delete the whole destination.
+        let cols = vec![
+            col("id", DataType::Int64, false),
+            col(
+                "create_date",
+                DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
+        ];
+        let key = vec!["id".to_string()];
+        let sql = build_merge_sql(
+            "p",
+            "d",
+            "orders",
+            "orders_tmp",
+            &key,
+            &cols,
+            Some("create_date"),
+            false,
+            true,
+            None,
+            &no_bounds(),
+        )
+        .unwrap();
+        assert!(
+            !sql.contains("WHEN NOT MATCHED BY SOURCE"),
+            "an unscoped delete would wipe the destination: {sql}"
+        );
+        assert!(sql.contains("WHEN NOT MATCHED THEN INSERT"), "{sql}");
+    }
+
+    #[test]
+    fn build_staging_bounds_sql_reads_min_max_as_bigquery_rendered_literals() {
+        let sql = build_staging_bounds_sql("p", "d", "orders_tmp", &["id", "create_date"]);
+        assert_eq!(
+            sql,
+            "SELECT FORMAT('%T', MIN(`id`)) AS lo_0, FORMAT('%T', MAX(`id`)) AS hi_0, \
+             FORMAT('%T', MIN(`create_date`)) AS lo_1, \
+             FORMAT('%T', MAX(`create_date`)) AS hi_1 \
+             FROM `p`.`d`.`orders_tmp`"
+        );
+    }
+
+    #[test]
+    fn bounded_columns_probes_only_what_gets_bounded() {
+        let key = vec!["id".to_string(), "line".to_string()];
+        // Nothing pruned -> nothing probed, so no extra query at all.
+        assert!(bounded_columns(&key, None, false, false).is_empty());
+        // Key-range pruning covers every key column.
+        assert_eq!(bounded_columns(&key, None, true, false), vec!["id", "line"]);
+        // The prune column comes first, and is not repeated when it is also a
+        // key column.
+        assert_eq!(
+            bounded_columns(&key, Some("id"), true, false),
+            vec!["id", "line"]
+        );
+        assert_eq!(
+            bounded_columns(&key, Some("create_date"), true, false),
+            vec!["create_date", "id", "line"]
+        );
+        // `delete_stale` suppresses the key-range bound, so only the window
+        // column is worth probing.
+        assert_eq!(
+            bounded_columns(&key, Some("create_date"), true, true),
+            vec!["create_date"]
+        );
+    }
+
+    // ---- live BigQuery ----
+    //
+    // These are the checks 0.14.0 shipped without. Everything above asserts on
+    // the *text* of the statement, and no amount of that could have caught the
+    // bug: the bound it emitted was rejected while BigQuery ANALYSED the query
+    // ("Unsupported subquery with table in join predicate"), so the only test
+    // that fails is one that hands the statement to BigQuery. Executing it once
+    // — even as a dry run — would have caught a default-on feature that broke
+    // every BigQuery incremental transfer.
+
+    /// Gate for the live tests: `QUICKHOUSE_BQ_PROJECT` and
+    /// `QUICKHOUSE_BQ_DATASET` must name a dataset this process may create,
+    /// write and drop tables in. Credentials resolve the way a real run's do
+    /// (ADC, or `GOOGLE_APPLICATION_CREDENTIALS`). Unset means skip, matching
+    /// how the Python integration tests treat an unreachable service.
+    fn live_bq_dataset() -> Option<(String, String)> {
+        let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+        match (var("QUICKHOUSE_BQ_PROJECT"), var("QUICKHOUSE_BQ_DATASET")) {
+            (Some(project), Some(dataset)) => Some((project, dataset)),
+            _ => {
+                eprintln!(
+                    "skipping live BigQuery MERGE test: set QUICKHOUSE_BQ_PROJECT and \
+                     QUICKHOUSE_BQ_DATASET to run it"
+                );
+                None
+            }
+        }
+    }
+
+    async fn live_sink(project_id: String, dataset_id: String) -> BigQuerySink {
+        BigQuerySink::new(BigQueryDestConfig {
+            project_id: Some(project_id),
+            credentials_file: None,
+            credentials_json: None,
+            dataset_id,
+            // Appends are committed, so staged rows are readable by the MERGE
+            // immediately — and it is what a real run defaults to since 0.14.
+            write_method: BigQueryWriteMethod::StorageWrite,
+        })
+        .await
+        .expect("authenticate against BigQuery")
+    }
+
+    fn temp_table(tag: &str) -> String {
+        format!(
+            "quickhouse_merge_it_{tag}_{}",
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        )
+    }
+
+    /// Executes what `merge_prune_key_range` (default on) generates, including
+    /// the zero-row case that failed first in production.
+    ///
+    /// Row counts are deliberately not asserted: a table's `num_rows` metadata
+    /// is eventually consistent, and what broke — and what this pins — is
+    /// whether BigQuery accepts and runs the statement at all.
+    #[tokio::test]
+    async fn live_merge_runs_with_key_range_pruning_on() {
+        let Some((project, dataset)) = live_bq_dataset() else {
+            return;
+        };
+        let sink = live_sink(project, dataset).await;
+        let cols = vec![
+            col("id", DataType::Int64, false),
+            col("amount", DataType::Float64, true),
+            col("name", DataType::Utf8, true),
+        ];
+        let key = vec!["id".to_string()];
+        let dest = temp_table("keyrange");
+        let staging = format!("{dest}_quickhouse_tmp");
+        let empty = format!("{dest}_empty_tmp");
+        let mut cfg = base_cfg();
+        cfg.dest_table = dest.clone();
+        cfg.key = key.clone();
+
+        // Work first, cleanup second, assert last — so a failure cannot leave
+        // scratch tables behind in the dataset.
+        let outcome = async {
+            sink.create_table(&dest, &cols, &cfg).await?;
+            sink.create_table(&staging, &cols, &cfg).await?;
+            sink.create_table(&empty, &cols, &cfg).await?;
+            let batch = sample_batch();
+            let staged = sink
+                .insert_batches(&staging, batch.schema(), &[batch])
+                .await?;
+            // Keys not in the destination yet: the INSERT branch.
+            sink.merge_into(&dest, &staging, &key, &cols, None, true, false, None)
+                .await?;
+            // The same keys again: the UPDATE branch, which is what a bound on
+            // the key range has to leave reachable.
+            sink.merge_into(&dest, &staging, &key, &cols, None, true, false, None)
+                .await?;
+            // Nothing staged at all — MIN/MAX are NULL, so there is no bound to
+            // emit. This is the run that first failed in production ("partition
+            // 'all' complete: 0 rows", then a failed merge job).
+            sink.merge_into(&dest, &empty, &key, &cols, None, true, false, None)
+                .await?;
+            Ok::<u64, EtlError>(staged)
+        }
+        .await;
+        for t in [&dest, &staging, &empty] {
+            let _ = sink.drop_table(t).await;
+        }
+        assert_eq!(outcome.expect("merge with key-range pruning"), 2);
+    }
+
+    /// The same for `merge_prune_partition_by` + `delete_stale_in_window`: the
+    /// opt-in pair that emitted the identical rejected form — in the `ON` clause
+    /// and in the `WHEN NOT MATCHED BY SOURCE` condition — and so had never
+    /// worked on BigQuery either, latent since 0.4.0 only because nobody had
+    /// adopted it.
+    #[tokio::test]
+    async fn live_merge_runs_with_partition_pruning_and_stale_delete() {
+        let Some((project, dataset)) = live_bq_dataset() else {
+            return;
+        };
+        let sink = live_sink(project, dataset).await;
+        let cols = vec![
+            col("id", DataType::Int64, false),
+            col(
+                "created_at",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
+            col("amount", DataType::Float64, true),
+        ];
+        let key = vec!["id".to_string()];
+        let dest = temp_table("window");
+        let staging = format!("{dest}_quickhouse_tmp");
+        let empty = format!("{dest}_empty_tmp");
+        let mut cfg = base_cfg();
+        cfg.dest_table = dest.clone();
+        cfg.key = key.clone();
+        // A real partitioned + clustered destination, the shape both prunes
+        // exist to exploit.
+        cfg.partition_by = Some("created_at".into());
+
+        let outcome = async {
+            sink.create_table(&dest, &cols, &cfg).await?;
+            sink.create_table(&staging, &cols, &cfg).await?;
+            sink.create_table(&empty, &cols, &cfg).await?;
+            let batch = partitioned_batch();
+            let staged = sink
+                .insert_batches(&staging, batch.schema(), &[batch])
+                .await?;
+            // `delete_stale` suppresses the key-range bound, so this exercises
+            // the window bound in both of the places it appears.
+            sink.merge_into(
+                &dest,
+                &staging,
+                &key,
+                &cols,
+                Some("created_at"),
+                true,
+                true,
+                None,
+            )
+            .await?;
+            // No window at all: the DELETE clause has to be dropped rather than
+            // emitted unscoped, which would wipe the destination.
+            sink.merge_into(
+                &dest,
+                &empty,
+                &key,
+                &cols,
+                Some("created_at"),
+                true,
+                true,
+                None,
+            )
+            .await?;
+            Ok::<u64, EtlError>(staged)
+        }
+        .await;
+        for t in [&dest, &staging, &empty] {
+            let _ = sink.drop_table(t).await;
+        }
+        assert_eq!(outcome.expect("merge with a window-scoped delete"), 2);
+    }
+
+    fn partitioned_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "created_at",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new("amount", DataType::Float64, true),
+        ]));
+        let id: ArrayRef = Arc::new(Int64Array::from(vec![1, 2]));
+        // 2026-08-20T00:00:00Z and one hour later, in microseconds.
+        let created_at: ArrayRef = Arc::new(
+            TimestampMicrosecondArray::from(vec![1_787_184_000_000_000, 1_787_187_600_000_000])
+                .with_timezone("UTC"),
+        );
+        let amount: ArrayRef = Arc::new(Float64Array::from(vec![Some(1.5), None]));
+        RecordBatch::try_new(schema, vec![id, created_at, amount]).unwrap()
     }
 
     fn sample_batch() -> RecordBatch {

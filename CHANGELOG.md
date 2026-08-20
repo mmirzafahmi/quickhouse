@@ -9,6 +9,61 @@ any breaking change is called out explicitly.
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-08-20
+
+A single-defect patch release. 0.14.0's `merge_prune_key_range` shipped on by
+default emitting SQL BigQuery refuses, so **every** BigQuery `MERGE` failed from
+the moment it was deployed. Upgrade straight past 0.14.0 if you write to
+BigQuery in `mode="incremental"`.
+
+### Fixed
+- **`merge_prune_key_range` (default `True` since 0.14.0) broke every BigQuery
+  `MERGE`.** It expressed its bound as two scalar subqueries over the staging
+  table inside the `ON` clause, and BigQuery rejects a subquery that references a
+  table in a join predicate: `Unsupported subquery with table in join predicate`.
+  That is an *analysis*-time rejection, so it did not depend on the data — every
+  incremental transfer to BigQuery failed on its first merge after 0.14.0 went
+  out, zero-row no-op runs included. Bounds are now resolved from the staging
+  batch up front and pasted in as literals, which is legal in a join predicate
+  and is also the form BigQuery prunes partitions and clustering blocks on, so
+  the feature does what it was written to do. The literals are rendered by
+  BigQuery itself (`FORMAT('%T', …)`): every type comes back in exact constant
+  syntax, and the `MIN`/`MAX` that picks a bound is evaluated by the same engine,
+  over the same table, as the `BETWEEN` that uses it.
+
+  No data was lost by the outage: the watermark is persisted only *after* a
+  successful merge, so each failed run left its cursor untouched and the next run
+  re-read the same window. Catch-up is automatic on upgrade. If you worked around
+  it by passing `merge_prune_key_range=False` on BigQuery-target syncs, you can
+  drop the override — it is no longer doing anything for you.
+- **`merge_prune_partition_by` had the identical defect, latent since 0.4.0**,
+  both in the `ON` clause and in the `WHEN NOT MATCHED BY SOURCE` condition that
+  scopes `delete_stale_in_window`. It went unnoticed only because it is opt-in;
+  anyone who had adopted it would have hit this in 0.4.0. Both knobs now use the
+  literal form.
+- An empty staging batch (or a bound column that is all-`NULL` in it) leaves
+  `MIN`/`MAX` NULL and now emits no bound at all rather than an unsatisfiable
+  one. With `delete_stale_in_window` the `WHEN NOT MATCHED BY SOURCE` clause is
+  dropped in that case — never emitted unscoped, which would delete the
+  destination's whole history — matching what the old form evaluated to on an
+  empty batch.
+
+### Added
+- **Live BigQuery `MERGE` tests that execute the generated statement**, covering
+  key-range pruning, the partition-prune + `delete_stale_in_window` pair, and the
+  zero-row case. Skipped unless `QUICKHOUSE_BQ_PROJECT` and
+  `QUICKHOUSE_BQ_DATASET` name a dataset the test may create and drop tables in.
+  Plus a credential-free assertion that no merge condition ever contains a
+  subquery, in any combination of the prune knobs. The 0.14.0 form was rejected
+  when BigQuery analysed it, so no assertion on the statement's text could have
+  caught it — only handing it to BigQuery, even as a dry run, can.
+
+### Changed
+- A merge with pruning active now runs one extra small query first: `MIN`/`MAX`
+  over the bounded columns of the staging table, which holds only the delta. Set
+  `merge_prune_key_range=False`, and leave `merge_prune_partition_by` unset, to
+  skip it.
+
 ## [0.14.0] - 2026-08-20
 
 A performance release. Three independent measurements agreed that the reader was

@@ -716,10 +716,18 @@ def sync(
     which is inside that batch's own range by construction, so no configuration
     exists in which it changes which rows merge. It pays off when the table is
     clustered by the merge key — what quickhouse's own generated DDL does — and
-    is a near-free no-op otherwise. Ignored when ``delete_stale_in_window`` is
-    set, where narrowing the ``ON`` clause would quietly reduce "replace this
-    window" to "replace this key range". Set ``False`` to restore the unbounded
-    join.
+    otherwise costs one small query against the staging table to resolve the
+    bounds. Ignored when ``delete_stale_in_window`` is set, where narrowing the
+    ``ON`` clause would quietly reduce "replace this window" to "replace this
+    key range". Set ``False`` to restore the unbounded join.
+
+    .. versionchanged:: 0.14.1
+       Both prunes now paste the resolved ``[MIN, MAX]`` into the statement as
+       literals. 0.14.0 emitted them as subqueries over the staging table, which
+       BigQuery rejects inside a join predicate (``Unsupported subquery with
+       table in join predicate``) when it analyses the query — so every
+       BigQuery ``MERGE`` failed, whatever the data. If you worked around it
+       with ``merge_prune_key_range=False``, the override is no longer needed.
 
     ``delete_stale_in_window=True`` (BigQuery incremental only) additionally
     DELETEs destination rows inside the merged window that are absent from the
