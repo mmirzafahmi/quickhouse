@@ -21,6 +21,7 @@ pub mod decode_mysql;
 pub mod error;
 pub mod host;
 pub mod memory;
+pub mod reconcile;
 pub mod sink;
 pub mod source;
 pub mod sync;
@@ -31,9 +32,10 @@ pub use config::{
     ApiColumn, AppsFlyerConfig, BigQueryConfig, BigQueryDestConfig, BigQueryWriteMethod,
     CleverTapConfig, ClickHouseConfig, Compression, DestinationConfig, HttpApiConfig, HttpFormat,
     MySqlConfig, ParquetCompression, PostgresConfig, S3ArchiveConfig, SourceConfig, SyncMode,
-    TransferConfig, TransferResult, WatermarkSeed,
+    TransferConfig, TransferResult, TransferWarning, WarningKind, WatermarkSeed,
 };
 pub use error::{EtlError, Result};
+pub use reconcile::{reconcile_keys, ReconcileConfig, ReconcileResult};
 pub use sink::{build_sink, BigQuerySink, ClickHouseSink, Sink};
 pub use sync::{run_transfer, Progress, ProgressCb, StagedInfo, StagedValidationCb};
 
@@ -52,4 +54,20 @@ pub fn run_transfer_blocking(
         .build()
         .map_err(EtlError::from)?;
     runtime.block_on(run_transfer(source_cfg, dest, cfg, progress, on_staged))
+}
+
+/// Run a keyset reconciliation to completion on a dedicated Tokio runtime.
+///
+/// The [`reconcile_keys`] counterpart to [`run_transfer_blocking`], for
+/// synchronous callers such as the Python binding.
+pub fn reconcile_keys_blocking(
+    source_cfg: SourceConfig,
+    dest: DestinationConfig,
+    cfg: ReconcileConfig,
+) -> Result<ReconcileResult> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(EtlError::from)?;
+    runtime.block_on(reconcile_keys(source_cfg, dest, cfg))
 }

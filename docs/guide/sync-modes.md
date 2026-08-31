@@ -6,7 +6,7 @@
 <div class="qh-modes">
   <a class="qh-mode qh-mode--current" href="#full-refresh" aria-current="page">
     <div class="qh-mode__name">full</div>
-    <div class="qh-mode__desc">Reload the whole table, swap it in atomically. The default.</div>
+    <div class="qh-mode__desc">Reload the whole table, swap it in atomically. Replaces what is there.</div>
   </a>
   <a class="qh-mode" href="#incremental">
     <div class="qh-mode__name">incremental</div>
@@ -21,10 +21,20 @@
 
 ## Full refresh
 
-`mode="full"` (the default) reloads the whole table into a staging table, then
-swaps it into place atomically — a crash mid-run never leaves the destination
-partial. The watermark is unused and ignored in this mode, and the returned
-`new_watermark` is `None`.
+`mode="full"` reloads the whole table into a staging table, then swaps it into
+place atomically — a crash mid-run never leaves the destination partial. The
+watermark is unused and ignored in this mode, and the returned `new_watermark`
+is `None`.
+
+```{warning}
+**`mode` used to default to `"full"`. Since 0.15.0 it is required**, because a
+full refresh *replaces* the destination and neither sink's swap is
+partition-aware: a run covering one partition destroys every other partition,
+atomically and with a success exit. Relatedly, a full refresh that would leave
+the destination with **fewer** rows than it had is now refused — pass
+`allow_full_refresh_shrink=True` if the source genuinely did lose rows, or use
+`mode="incremental"` with `key=` / `mode="append"` to add rather than replace.
+```
 
 For a **BigQuery destination** the swap runs as a query (a billed scan of the
 staged data), not a free copy job — BigQuery's copy jobs can silently skip rows
@@ -143,11 +153,107 @@ duplicate key* instead of updating. quickhouse can't detect mutability, so this
 is a deliberate opt-in; the default full scan is always correct.
 ```
 
-`delete_stale_in_window=True` (BigQuery incremental) additionally `DELETE`s
-destination rows inside the merged window that are absent from the source pull
-("replace this window"). It **requires** `merge_prune_partition_by` — the DELETE
+`merge_prune_key_range=True` (the default since 0.14.0) additionally bounds the
+scan to the batch's `[MIN, MAX]` on the merge `key` itself. That one needs no
+immutability contract — it's a tautology, since a destination row can only match
+by holding a key the batch contains.
+
+But a range only prunes as well as the changed keys cluster. On an append-only
+table the delta sits at the top of the key space and the range is narrow; on a
+table whose rows are *updated after insert* — a user profile, an order status, a
+voucher redemption — the changed keys are scattered across the whole key space,
+`[MIN, MAX]` covers nearly everything, and the bound is correct and useless at
+the same time. Measured on one such table, correctly clustered on its merge key:
+still ~half the table scanned per run.
+
+`merge_prune_key_list_max=N` (new in 0.15.0, default `0` = off) is the tighter
+form. When the batch holds at most `N` distinct key values, the bound becomes
+that exact list — `T.k IN (v1, v2, …)` — which BigQuery prunes just as well on a
+clustered table and which does *not* degrade when the keys are scattered.
+
+```python
+qh.sync(..., mode="incremental", key=["id"],
+        merge_prune_key_list_max=5_000)
+```
+
+Same tautology, no new contract. It costs one small extra query per merge, and
+if the batch turns out to hold more distinct keys than `N` the list is abandoned
+and the range bound is used — so `N` really is a ceiling on statement size.
+Single-column `key` only.
+
+```{admonition} A bound only helps if the table is clustered by the key
+:class: warning
+None of this prunes anything on a destination that isn't clustered by the merge
+key — the statement scans the whole table, every run, silently. quickhouse's own
+generated DDL clusters by `key`, so this bites tables created some other way; a
+measured 11.3 GiB unclustered table scanned ~10.4 GiB per run, 42 times in a
+week. Since 0.15.0 quickhouse **warns** in that case, as a `TransferWarning` with
+kind `"unclustered_merge_target"`.
+```
+
+(delete-stale-in-window)=
+### Converging with a source that deletes rows
+
+An incremental sync is insert-and-update only. It finds rows whose watermark
+moved; a row the source **deleted** has no watermark to move, so nothing about it
+ever reaches the destination again and it stays there forever. Against any source
+that hard-deletes as a matter of routine — an ERP cancelling reservations, a
+queue draining, a "soft delete" that is really a `DELETE` — the destination
+drifts one-directionally and without bound.
+
+It also hides well, because the distortion is lopsided. A measured production
+table carried **+1.30% phantom rows against +0.0168% on a quantity sum**: every
+COUNT-based model over-reported materially while every SUM-based one looked fine.
+Row counts alone will not tell you your exposure.
+
+There are two halves to fixing it.
+
+**Inside a sync — `delete_stale_in_window=True`.** Additionally deletes
+destination rows inside the merged window that the source pull no longer has
+("replace this window"). It **requires** `merge_prune_partition_by` — the delete
 is scoped to that immutable column's staging range so it never touches history
 outside the batch (a hard error otherwise).
+
+```python
+qh.sync(..., mode="incremental", key=["id"],
+        merge_prune_partition_by="create_date",
+        delete_stale_in_window=True)
+```
+
+- **BigQuery** expresses it as a `WHEN NOT MATCHED BY SOURCE` clause inside the
+  same `MERGE`, so it is atomic with the upsert. BigQuery reports one combined
+  affected-row count for the statement, so `rows_deleted` stays `0` there.
+- **ClickHouse** (new in 0.15.0) runs a lightweight `DELETE FROM dest WHERE
+  <window> AND key NOT IN (SELECT key FROM staging)` just before the staged rows
+  are promoted. That forces the run to stage, is *not* atomic with the insert,
+  and reports the exact count on `TransferResult.rows_deleted`.
+
+**Outside a sync — `reconcile_keys()`.** The flag above only converges the window
+a sync happened to touch. To answer "how far apart are these two right now?" for
+an arbitrary window, on its own schedule, diff the keysets:
+
+```python
+r = qh.reconcile_keys(
+    src, dst, dest_table="stock_move_line",
+    source_table="stock_move_line",
+    key="id",
+    window="create_date >= '2026-07-01' AND create_date < '2026-08-01'",
+)
+print(r.orphan_keys, r.missing_keys)   # measures; deletes nothing
+```
+
+`orphan_keys` are in the destination and gone from the source — the drift.
+`missing_keys` are in the source and absent from the destination — ordinary sync
+lag if small, an incomplete load if not. Pass `delete=True` to remove the
+orphans and get `rows_deleted` back.
+
+Measuring is the default because it's the part worth running continuously;
+deleting is the part worth approving. A reconcile is only as good as its window,
+so three guards apply: `delete=True` requires a window, `max_delete_keys` refuses
+to act above a ceiling you set, and a diff that finds *no keys in common at all*
+is refused outright — genuine drift is one-directional, so total disagreement
+means the two sides rendered the key differently or the window predicates
+disagreed, not that everything is deletable.
 
 (append-bronze-landing)=
 ## Append (bronze landing)

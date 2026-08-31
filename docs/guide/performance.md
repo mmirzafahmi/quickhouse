@@ -64,6 +64,47 @@ qh.sync(
   a DBA can see and kill it in `pg_stat_activity` (override with
   `application_name=`).
 
+## Two timeouts, and which one you actually want
+
+```{admonition} `statement_timeout_secs` bounds the whole transfer, not the query
+:class: warning
+quickhouse streams the source result set straight into the destination, so the
+statement producing it stays open from the first row read to the last one
+written. The server counts **read + decode + destination write + backpressure**
+against `statement_timeout_secs` — it is a ceiling on the transfer, not on the
+query, despite the name.
+
+Two consequences bite in production. The failure **points at the wrong
+subsystem**: a measured 0.64s source scan (EXPLAIN ANALYZE, all shared-buffer
+hits) failed 9 consecutive times against a 90s ceiling because the *destination*
+was throttling that day, and it failed as `57014 canceling statement due to
+statement timeout` — sending an operator hunting for a slow query and a missing
+index that did not exist. And **retries cannot rescue it**: every attempt
+restarts from zero against the same ceiling, so a table that crosses the line
+fails every attempt, on a condition that has nothing to do with the source.
+```
+
+`read_idle_timeout_secs` (new in 0.15.0) is the knob the name above suggests:
+fail when **no source rows arrive** for that long.
+
+```python
+qh.sync(
+    qh.Postgres(dsn, statement_timeout_secs=1800),  # guard the source database
+    dst, ...,
+    read_idle_timeout_secs=120,                     # detect a hung source
+)
+```
+
+The timer wraps the awaits on the source stream and nothing else. Time spent
+decoding, inserting, or blocked on the memory budget doesn't count toward it, so
+a slow destination can't trip it — which is what makes it safe to set tightly —
+while a genuinely hung source does. The resulting error is classified transient,
+so `retry_max_attempts` retries the whole transfer.
+
+Set both, and `statement_timeout_secs` goes back to meaning what it should: a
+guard on the source database against a runaway scan, sized for that database
+rather than for the destination's worst day.
+
 ## Safety with real, messy data
 
 - **Atomic full refresh.** A crash mid-run never leaves the destination partial
@@ -78,6 +119,73 @@ qh.sync(
 - **Messy data is coerced, not fatal.** MySQL zero-dates and out-of-range
   timestamps become `NULL` with a warning instead of aborting the run (see
   [Type mapping](type-mapping.md)).
+- **...and since 0.15.0 those warnings are data, not just log text.** Every
+  coercion quickhouse performs, plus the conditions it can only warn about
+  (rows excluded forever by a NULL watermark; a permitted full-refresh shrink;
+  an unclustered MERGE target), lands on `TransferResult.warnings` — see
+  [Failing a run on a warning](#failing-a-run-on-a-warning) below.
+
+(failing-a-run-on-a-warning)=
+## Failing a run on a warning
+
+Some things quickhouse detects can't be errors — the transfer succeeded, the
+rows landed, and stopping would be worse than continuing. But they changed what
+the destination holds, and only the caller knows whether that's acceptable.
+
+Since 0.15.0 those reach you as data on `TransferResult.warnings`, not just as
+log lines an orchestrator can't branch on:
+
+```python
+result = qh.sync(...)
+
+FATAL = {"collapsed_bool", "null_watermark", "coerced_decimal"}
+for w in result.warnings:
+    print(f"{w.kind} {w.column}: {w.count}")
+    if w.kind in FATAL:
+        raise RuntimeError(str(w))
+```
+
+Each warning carries `.kind` (stable, machine-readable — match on this, never on
+`.message`), `.column`, `.count`, `.sample` and `.message`, aggregated per
+`(kind, column)` across the run and ordered most-affected first.
+
+| `kind` | What happened |
+| --- | --- |
+| `null_watermark` | The watermark column is nullable and rows hold `NULL` there. `WHERE watermark > x` never matches `NULL`, so those rows are excluded from this and **every future** incremental run. The most dangerous one — the transfer reports success while permanently dropping rows. |
+| `collapsed_bool` | A MySQL `tinyint(1)` value outside `{0, 1}` was flattened to a boolean, losing e.g. the difference between 2 and 3. `type_overrides` can't repair it after the fact, so early detection is the only defence — see `tinyint1_as_bool=False`. |
+| `coerced_decimal` | A decimal became `NULL`: it exceeded the declared `Decimal(P,S)`, or was NaN/Infinity. Silent data loss with a correct-looking row count. |
+| `coerced_date` | A date/datetime became `NULL` — a zero-date, or a year outside ClickHouse's representable 1900–2299 window. |
+| `coerced_scalar` | An API source's scalar didn't parse as its declared type and became `NULL`. |
+| `full_refresh_shrink` | A full refresh left the destination smaller than it was, permitted by `allow_full_refresh_shrink=True`. (Without that flag the same condition is a hard error.) |
+| `unclustered_merge_target` | A BigQuery `MERGE` ran against a destination not clustered by the merge key, so the key bound pruned nothing and the statement scanned the whole table. A cost problem, not a data one. |
+
+Nothing is raised for you: these are values, and which of them should fail a
+pipeline is a decision about your data, not about quickhouse.
+
+## Where the time actually went
+
+`TransferResult` also breaks the run down by phase, so you can tell which
+subsystem to tune instead of inferring it from job metadata afterwards:
+
+```python
+r = qh.sync(...)
+print(f"read {r.read_secs:.1f}s  stage {r.stage_secs:.1f}s  promote {r.promote_secs:.1f}s")
+```
+
+- **`read_secs`** — time spent *waiting on source rows*: the awaits on the source
+  stream alone, excluding decode, insert and backpressure. Summed across parallel
+  readers, so with `parallelism > 1` it can legitimately exceed `stage_secs`;
+  compare `read_secs / parallelism` against `stage_secs`.
+- **`stage_secs`** — the streaming phase: reading, decoding and writing every row
+  into the destination (or this run's staging table).
+- **`promote_secs`** — what follows: the full-refresh swap, the incremental
+  `MERGE` or insert-select, the window-scoped delete, the watermark persist. On a
+  BigQuery destination this is usually most of the run — a measured 299,540-row
+  window spent 70–85% of its time in the `MERGE` and ~9% in the read.
+
+If `promote_secs` dominates, tune the destination DDL (clustering, the merge
+prunes above). If `read_secs / parallelism` approaches `stage_secs`, the source
+query is the bottleneck.
 
 ## Watching progress and diagnosing failures
 

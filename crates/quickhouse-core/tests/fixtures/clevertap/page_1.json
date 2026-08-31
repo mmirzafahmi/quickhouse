@@ -1,0 +1,1671 @@
+{
+  "next_cursor": "c2",
+  "records": [
+    {
+      "profile": {
+        "df": {},
+        "name": "REDACTED",
+        "push_token": "REDACTED",
+        "email": "REDACTED",
+        "phone": "REDACTED",
+        "all_identities": "REDACTED",
+        "identity": "REDACTED",
+        "profileData": {
+          "p_alive": 0.35,
+          "clv_30_day": 82728.28125,
+          "bonza_voucher": "<NA>",
+          "trx_cnt": "3",
+          "weekday_ratio": "0.7",
+          "weekend_ratio": "0.3",
+          "avg_basket_size": "47667.0",
+          "avg_customer_paid": "27833.0",
+          "fav_city": "Depok",
+          "fav_hour": "21",
+          "fav_menu": "Iced Butterscotch Sea Salt Latte",
+          "coffee_ratio": "0.0",
+          "non_coffee_ratio": "1.0",
+          "user_id": "4271050",
+          "monetary_value": 26250.0,
+          "region": "ID",
+          "points": 51,
+          "roi_group": "Low ROI",
+          "uplift_group": "High Uplift",
+          "package": "None",
+          "userdob": "2003-07-14",
+          "username": "AZIZA KAMILA",
+          "usergender": "male",
+          "userphone": "+REDACTED",
+          "useremail": "REDACTED",
+          "bonza_nov_2024": "green_cg",
+          "abs_nov_2024": "medium_basket_size_cg",
+          "bonza_dec_2024": "pink",
+          "abs_dec_2024": "medium_basket_size",
+          "bonza_jan_2025": "blue_cg",
+          "abs_jan_2025": "low_basket_size_cg",
+          "bonza_feb_2025": "green",
+          "abs_feb_2025": "low_basket_size",
+          "bonza_jun_2025": "white_cg",
+          "abs_jun_2025": "low_basket_size_cg",
+          "is_donut_eligible": "no"
+        },
+        "events": {
+          "App Launched": {
+            "count": 48,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Notification Viewed": {
+            "count": 10,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "App Uninstalled": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Charged": {
+            "count": 12,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "App Installed": {
+            "count": 2,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Notification Clicked": {
+            "count": 7,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Identity Set": {
+            "count": 4,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "App Version Changed": {
+            "count": 18,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Reachable By": {
+            "count": 5,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Browse Menu": {
+            "count": 112,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Add To Cart": {
+            "count": 79,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Checkout": {
+            "count": 461,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Order Cancel / Fail": {
+            "count": 4,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Charged Detail": {
+            "count": 32,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Order Completed": {
+            "count": 8,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Register Completed": {
+            "count": 2,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Order Paid Details": {
+            "count": 8,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "State Transitioned": {
+            "count": 23,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Home": {
+            "count": 91,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Store List": {
+            "count": 19,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Menu": {
+            "count": 209,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Webview": {
+            "count": 33,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Order Detail": {
+            "count": 41,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Order History": {
+            "count": 16,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Login": {
+            "count": 6,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load OTP": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action OTP Result": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Voucher List": {
+            "count": 38,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Save Profile": {
+            "count": 2,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Select Address": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Payment List": {
+            "count": 40,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Gopay Activate": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Select Payment": {
+            "count": 28,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Faq Order": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Select Confirm": {
+            "count": 2,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Popup Confirm": {
+            "count": 8,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Select Store": {
+            "count": 24,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Product Detail": {
+            "count": 107,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Update Product": {
+            "count": 23,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Checkout": {
+            "count": 166,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Toggle Paperbag": {
+            "count": 5,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Popup Info": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Select Courier": {
+            "count": 5,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Gopay Success": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Delete Cart": {
+            "count": 4,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Primary Address": {
+            "count": 4,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Edit Product": {
+            "count": 18,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Payment Status": {
+            "count": 23,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Use Voucher": {
+            "count": 28,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Delete Voucher": {
+            "count": 40,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Delete Product": {
+            "count": 2,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Search Store": {
+            "count": 56,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Enter Favourite": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Exit Favourite": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Order QR Code": {
+            "count": 2,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Close Receipt Info": {
+            "count": 2,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Complete Order": {
+            "count": 4,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Popup No Connection": {
+            "count": 17,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Select Cancel": {
+            "count": 6,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Profile Completed": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Verify Email Completed": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Review": {
+            "count": 2,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Order Catalog": {
+            "count": 77,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Back Catalog": {
+            "count": 10,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Pin Result": {
+            "count": 9,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Order Completed Detail": {
+            "count": 8,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Event Story Show": {
+            "count": 52,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load ShopeePay Activate": {
+            "count": 6,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load ShopeePay Detail": {
+            "count": 9,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Save Number": {
+            "count": 2,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Enter Login": {
+            "count": 4,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Skip Login": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Use Voucher Recommendation": {
+            "count": 7,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Cancel Voucher": {
+            "count": 2,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load PopUpModalViewController": {
+            "count": 9,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load BottomSheetViewController": {
+            "count": 94,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Browser": {
+            "count": 4,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Session Concluded": {
+            "count": 50,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Onboard V2": {
+            "count": 5,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Login V2": {
+            "count": 6,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Set Pin V2": {
+            "count": 5,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Confirm Warning": {
+            "count": 8,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load ShopeePay PIN Webview": {
+            "count": 3,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Confirm Courier": {
+            "count": 3,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Cancel Warning": {
+            "count": 4,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load ShopeePay Activate Webview": {
+            "count": 3,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load OTP V3": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Registered New Device": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Register V2": {
+            "count": 3,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Login Completed": {
+            "count": 3,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Voucher Generated": {
+            "count": 58,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Gopay WebView": {
+            "count": 12,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Loyalty List": {
+            "count": 4,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Account": {
+            "count": 10,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load FavoriteCatalogViewController": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Popup Warning": {
+            "count": 15,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Popup Courier Selection": {
+            "count": 5,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load SplashScreenViewController": {
+            "count": 38,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Select Country": {
+            "count": 2,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Select Country": {
+            "count": 2,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Store Search": {
+            "count": 49,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Popup Popup Change Store": {
+            "count": 6,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Decline Change Store": {
+            "count": 6,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Referral Mission Main": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Select Address": {
+            "count": 7,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load SearchAddressViewController": {
+            "count": 4,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Subscription Home": {
+            "count": 2,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Popup New User V2": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Close Popup New User V2": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Gopay Link WebView": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Open Detail Recommendation": {
+            "count": 13,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action View All Recommendation": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Gopay Active": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Recommendation Voucher Selected": {
+            "count": 10,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Upselling Select Additional": {
+            "count": 5,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load VoucherListNewViewController": {
+            "count": 14,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load VoucherListViewController": {
+            "count": 11,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Menu Category": {
+            "count": 9,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Error Toast Internet": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Load Product Show": {
+            "count": 99,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Action Product Detail": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Action Close Product Detail": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Add To Cart": {
+            "count": 15,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Product Show": {
+            "count": 129,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Product Detail": {
+            "count": 13,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Close Product Detail": {
+            "count": 16,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Login Page": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          }
+        },
+        "os_version": "26.3.1",
+        "app_version": "5.3.1",
+        "make": "Apple",
+        "model": "Iphone15,2",
+        "platform": "iOS",
+        "objectId": "REDACTED"
+      },
+      "session_props": {
+        "session_source": "Direct"
+      },
+      "ts": 20260830003232,
+      "event_props": {
+        "CT SDK Version": 70304,
+        "CT Session Id": 0,
+        "CT OS Version": "26.3.1",
+        "CT App Version": "5.3.1",
+        "CT Source": "Mobile"
+      }
+    },
+    {
+      "profile": {
+        "df": {},
+        "name": "REDACTED",
+        "push_token": "REDACTED",
+        "email": "REDACTED",
+        "phone": "REDACTED",
+        "all_identities": "REDACTED",
+        "identity": "REDACTED",
+        "profileData": {
+          "region": "ID",
+          "points": 426,
+          "package": "Signature",
+          "is_donut_eligible": "no"
+        },
+        "events": {
+          "App Launched": {
+            "count": 271,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Notification Viewed": {
+            "count": 57,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Charged": {
+            "count": 194,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "App Installed": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Notification Clicked": {
+            "count": 38,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Identity Set": {
+            "count": 3,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "App Version Changed": {
+            "count": 20,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Reachable By": {
+            "count": 3,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Browse Menu": {
+            "count": 500,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Add To Cart": {
+            "count": 317,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Checkout": {
+            "count": 1677,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Order Cancel / Fail": {
+            "count": 15,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Charged Detail": {
+            "count": 614,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Order Completed": {
+            "count": 180,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Register Completed": {
+            "count": 2,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Order Paid Details": {
+            "count": 180,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Home": {
+            "count": 576,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Store List": {
+            "count": 20,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Menu": {
+            "count": 791,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Webview": {
+            "count": 220,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Order Detail": {
+            "count": 264,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Order History": {
+            "count": 97,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Login": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load OTP": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action OTP Result": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Profile": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Save Profile": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Order History Filter": {
+            "count": 4,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Filter Order": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Address List": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Select Address": {
+            "count": 33,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Catalog Banner": {
+            "count": 5,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Payment List": {
+            "count": 69,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Select Payment": {
+            "count": 26,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Dana Webview": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Share Referral": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Faq Order": {
+            "count": 5,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Faq Detail": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action FAQ Contact": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Setting": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Select Confirm": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Voucher Detail": {
+            "count": 13,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Select Store": {
+            "count": 26,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Product Detail": {
+            "count": 485,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Update Product": {
+            "count": 59,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Checkout": {
+            "count": 470,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Confirm Order Method": {
+            "count": 13,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Toggle Paperbag": {
+            "count": 9,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Popup Info": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Select Courier": {
+            "count": 63,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Gopay Success": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load OVO Activate": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load OVO PIN Webview": {
+            "count": 3,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load OVO Success": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Delete Cart": {
+            "count": 2,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Primary Address": {
+            "count": 67,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Edit Product": {
+            "count": 39,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Payment Status": {
+            "count": 199,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Use Voucher": {
+            "count": 27,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Delete Voucher": {
+            "count": 124,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Delete Product": {
+            "count": 4,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Search Store": {
+            "count": 8,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Add Address": {
+            "count": 3,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Popup Search": {
+            "count": 7,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Enter Favourite": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Exit Favourite": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Search Product": {
+            "count": 13,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Order QR Code": {
+            "count": 4,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Courier Tracking": {
+            "count": 20,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Refresh Track Courier": {
+            "count": 2,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Courier Live Tracking": {
+            "count": 15,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Close Receipt Info": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Complete Order": {
+            "count": 6,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Popup No Connection": {
+            "count": 209,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Open Social Media": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Edit Address": {
+            "count": 2,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Refresh Live Track": {
+            "count": 49,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Profile Completed": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Verify Email Completed": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Review": {
+            "count": 18,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Order Catalog": {
+            "count": 239,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Back Catalog": {
+            "count": 20,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Pin Result": {
+            "count": 3,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Order Completed Detail": {
+            "count": 180,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Event Story Show": {
+            "count": 269,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Substory Close": {
+            "count": 14,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Whatsapp CS": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load ShopeePay Activate": {
+            "count": 2,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load ShopeePay Detail": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Gift Voucher": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Save Number": {
+            "count": 7,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Enter Login": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Use Voucher Recommendation": {
+            "count": 39,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Cancel Voucher": {
+            "count": 9,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load PopUpModalViewController": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load BottomSheetViewController": {
+            "count": 741,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Browser": {
+            "count": 50,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load SearchProductViewController": {
+            "count": 7,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Session Concluded": {
+            "count": 281,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Onboard V2": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Login V2": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Set Pin V2": {
+            "count": 2,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Select Order Method": {
+            "count": 15,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Select Recommendation Carousel": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Confirm Warning": {
+            "count": 8,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Confirm Courier": {
+            "count": 59,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Cancel Warning": {
+            "count": 8,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load ShopeePay Activate Webview": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load OTP V3": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Registered New Device": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Select Preset Additional": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Register V2": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Voucher Generated": {
+            "count": 8,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Gopay WebView": {
+            "count": 2,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Loyalty List": {
+            "count": 51,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Account": {
+            "count": 27,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load FavoriteCatalogViewController": {
+            "count": 4,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Popup Warning": {
+            "count": 18,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Popup Order Method Selection": {
+            "count": 15,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Popup Courier Selection": {
+            "count": 63,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Loyalty Info": {
+            "count": 3,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Loyalty Detail": {
+            "count": 28,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Select Country": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Select Country": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Store Search": {
+            "count": 168,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Popup Popup Change Store": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Decline Change Store": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load AddressDetailViewController": {
+            "count": 5,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Referral Mission Main": {
+            "count": 17,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Select Address": {
+            "count": 75,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load SearchAddressViewController": {
+            "count": 3,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Select Address Map": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Subscription Home": {
+            "count": 36,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Subscription Detail": {
+            "count": 17,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Subscription Checkout": {
+            "count": 22,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Popup Subscription How To Use": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Subscription Order Detail": {
+            "count": 6,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Popup Subscription More Action": {
+            "count": 2,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Popup Subscription Payment Failed": {
+            "count": 6,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Popup Subscription Payment Success": {
+            "count": 4,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Order Completed Coffee Subscription": {
+            "count": 6,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Popup New User V2": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action View Voucher": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Create Subscription": {
+            "count": 2,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Retry Subscription": {
+            "count": 8,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Gopay Link WebView": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Subs Change Payment": {
+            "count": 7,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load E-Receipt": {
+            "count": 7,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Open Detail Recommendation": {
+            "count": 186,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action View All Recommendation": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Add To Cart Recommendation": {
+            "count": 11,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Gopay Active": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Submit Review": {
+            "count": 14,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Recommendation Voucher Selected": {
+            "count": 175,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Cross Selling Select Pairing": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load VoucherListNewViewController": {
+            "count": 59,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load VoucherListViewController": {
+            "count": 69,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Add Recommendation Product": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Loyalty Category List": {
+            "count": 13,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Menu Category": {
+            "count": 115,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "load catering home": {
+            "count": 4,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Forecap Consent": {
+            "count": 7,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Forecap": {
+            "count": 6,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Forecap Completed": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Error Bottomsheet Server": {
+            "count": 5,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Error Toast Internet": {
+            "count": 22,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Redeem Loyalty": {
+            "count": 8,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Confirm Redeem Loyalty": {
+            "count": 8,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Redeem Reward Success": {
+            "count": 8,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action action catering whatsapp": {
+            "count": 1,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Select Other Method": {
+            "count": 6,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Load Product Show": {
+            "count": 1722,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Action Product Detail": {
+            "count": 66,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Action Close Product Detail": {
+            "count": 61,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Add To Cart": {
+            "count": 151,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Review Form": {
+            "count": 48,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Hide Product Taste": {
+            "count": 6,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action See More Product Taste": {
+            "count": 2,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Review Form": {
+            "count": 48,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Load Product Show": {
+            "count": 5307,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Product Detail": {
+            "count": 186,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Close Product Detail": {
+            "count": 184,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Homepage Sections Button": {
+            "count": 13,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Homepage Floating Button": {
+            "count": 2,
+            "first_seen": 0,
+            "last_seen": 0
+          },
+          "Action Catalog Mini banner Button": {
+            "count": 3,
+            "first_seen": 0,
+            "last_seen": 0
+          }
+        },
+        "os_version": "26.6.1",
+        "app_version": "5.3.1",
+        "make": "Apple",
+        "model": "Iphone14,3",
+        "platform": "iOS",
+        "objectId": "REDACTED"
+      },
+      "session_props": {
+        "session_source": "Direct"
+      },
+      "ts": 20260830010145,
+      "event_props": {
+        "CT SDK Version": 70304,
+        "CT Session Id": 0,
+        "CT OS Version": "26.6.1",
+        "CT App Version": "5.3.1",
+        "CT Source": "Mobile"
+      }
+    }
+  ],
+  "status": "success",
+  "_records_total": 4991
+}

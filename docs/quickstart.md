@@ -32,6 +32,7 @@ result = qh.sync(
     src, dst,
     dest_table="orders",
     source_table="orders",
+    mode="full",   # REPLACES orders; "incremental" or "append" to add instead
     on_progress=lambda p: print(f"{p.rows_written:,} rows @ {p.rows_per_sec:,.0f}/s"),
 )
 print(result)

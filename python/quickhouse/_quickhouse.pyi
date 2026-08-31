@@ -1,6 +1,6 @@
 """Type stubs for the compiled ``quickhouse._quickhouse`` extension module."""
 
-from typing import Callable, Mapping, Optional, Sequence, Tuple, Union
+from typing import Callable, List, Mapping, Optional, Sequence, Tuple, Union
 
 # A declared API-source schema: a list of (name, bq_type) / (name, bq_type,
 # path) tuples, or a {name: bq_type} dict.
@@ -416,14 +416,136 @@ class StagedInfo:
     dest_kind: str  # "clickhouse" | "bigquery"
     rows_written: int
 
+class TransferWarning:
+    """One structured warning from a transfer (new in 0.15.0).
+
+    A condition quickhouse detected, recovered from, and kept going past — but
+    which changed what the destination now holds. These used to reach a caller
+    only as log text, so an orchestrator could not act on one: a run that
+    flattened a column to a boolean, or excluded every NULL-watermark row
+    forever, reported success and the damage surfaced weeks later.
+
+    Nothing is raised. These are values on :class:`TransferResult`; it is the
+    caller who decides which of them should fail their pipeline::
+
+        result = quickhouse.sync(...)
+        fatal = {"collapsed_bool", "null_watermark", "coerced_decimal"}
+        for w in result.warnings:
+            if w.kind in fatal:
+                raise RuntimeError(str(w))
+
+    Named ``TransferWarning`` rather than ``Warning`` because ``Warning`` is a
+    Python builtin exception class.
+    """
+
+    kind: str
+    """Stable machine-readable kind. Match on this, never on ``message``.
+
+    - ``"collapsed_bool"`` — a MySQL ``tinyint(1)`` value outside ``{0, 1}``
+      was flattened to a boolean, losing e.g. the difference between 2 and 3.
+      See ``tinyint1_as_bool``.
+    - ``"coerced_date"`` — a date/datetime became NULL (a zero-date, or a year
+      outside ClickHouse's representable 1900-2299 window).
+    - ``"coerced_decimal"`` — a decimal became NULL (it exceeded the declared
+      ``Decimal(P,S)``, or was NaN/Infinity).
+    - ``"coerced_scalar"`` — an API source's scalar failed to parse and became
+      NULL.
+    - ``"null_watermark"`` — the watermark column is nullable and rows hold a
+      NULL there, so they are excluded from this and every future incremental
+      run. The most dangerous of these.
+    - ``"full_refresh_shrink"`` — a full refresh left the destination smaller,
+      permitted by ``allow_full_refresh_shrink``.
+    - ``"unclustered_merge_target"`` — a BigQuery ``MERGE`` ran against a
+      destination not clustered by the merge key, so the key bound pruned
+      nothing and the statement scanned the whole table. A cost problem, not a
+      data one.
+    """
+
+    column: Optional[str]
+    """The source column responsible, or ``None`` for a table-level condition."""
+
+    count: int
+    """How many values/rows tripped it. Aggregated per ``(kind, column)`` across
+    the whole run, so a badly-legacy table yields one entry with a large count
+    rather than millions of entries."""
+
+    sample: Optional[str]
+    """A representative offending value where one was free to capture at the
+    point of detection. ``None`` otherwise — an absent sample never means the
+    count is uncertain."""
+
+    message: str
+    """Human-facing text, the same sentence written to the log. Not stable;
+    match on ``kind``."""
+
 class TransferResult:
     """Summary returned by :func:`sync`."""
 
     rows_read: int
     rows_written: int
     bytes_written: int
+    rows_deleted: int
+    """Destination rows deleted by this run: the window-scoped delete of
+    ``delete_stale_in_window`` on a ClickHouse destination. ``0`` everywhere
+    else — including for a *BigQuery* ``delete_stale_in_window``, which performs
+    its delete inside the ``MERGE`` and reports only one combined affected-row
+    count for the whole statement, leaving no way to attribute the delete
+    portion. New in 0.15.0."""
+
     duration_secs: float
+    read_secs: float
+    """Cumulative time the source readers spent waiting on source rows — the
+    awaits on the source stream itself, excluding decode, insert and
+    backpressure. Summed across parallel readers, so with ``parallelism > 1``
+    it can legitimately exceed ``stage_secs``; compare
+    ``read_secs / parallelism`` against ``stage_secs`` to judge whether the
+    source or the write path is the bottleneck.
+
+    ``0.0`` for an HTTP API source (CleverTap/AppsFlyer/HttpApi): the timer
+    instruments the PostgreSQL/MySQL/BigQuery source streams, and API paging is
+    bounded by per-request HTTP timeouts instead, so ``stage_secs`` covers the
+    whole fetch-decode-insert loop there. New in 0.15.0."""
+
+    stage_secs: float
+    """Wall time of the streaming phase: reading, decoding and writing every row
+    into the destination (or this run's staging table). New in 0.15.0."""
+
+    promote_secs: float
+    """Wall time of the promotion after streaming — the full-refresh swap, the
+    incremental ``MERGE`` or insert-select, the window-scoped delete, and the
+    watermark persist. On a BigQuery destination this is usually most of the
+    run. New in 0.15.0."""
+
     new_watermark: Optional[str]
+    warnings: List[TransferWarning]
+    """Structured warnings, aggregated per ``(kind, column)`` and ordered
+    most-affected first. Empty on a clean run. New in 0.15.0."""
+
+class ReconcileResult:
+    """What a :func:`reconcile_keys` diff found, and what it did about it."""
+
+    source_keys: int
+    """Distinct keys the source holds in the window."""
+
+    dest_keys: int
+    """Distinct keys the destination holds in the window."""
+
+    orphan_keys: int
+    """Keys the destination holds that the source no longer has — the drift."""
+
+    missing_keys: int
+    """Keys the source holds that the destination does not. Usually ordinary
+    sync lag; a large number means the load itself is incomplete, which is a
+    different problem from the one this repairs."""
+
+    rows_deleted: int
+    """Destination rows actually deleted. ``0`` unless ``delete=True``. Can
+    exceed ``orphan_keys`` where the destination holds more than one row per key
+    (an un-merged ``ReplacingMergeTree``, for one)."""
+
+    orphan_sample: List[str]
+    missing_sample: List[str]
+    duration_secs: float
 
 def sync(
     source: Union[Postgres, MySQL, BigQuery, CleverTap, AppsFlyer, HttpApi],
@@ -433,7 +555,7 @@ def sync(
     source_table: Optional[str] = None,
     source_query: Optional[str] = None,
     state_key: Optional[str] = None,
-    mode: str = "full",
+    mode: str,
     watermark: Optional[str] = None,
     watermark_source_expr: Optional[str] = None,
     lookback_seconds: int = 0,
@@ -448,7 +570,9 @@ def sync(
     primary_key: Optional[Sequence[str]] = None,
     merge_prune_partition_by: Optional[str] = None,
     merge_prune_key_range: bool = True,
+    merge_prune_key_list_max: int = 0,
     delete_stale_in_window: bool = False,
+    allow_full_refresh_shrink: bool = False,
     parallelism: int = 0,
     batch_rows: int = 100_000,
     batch_bytes: int = 4_194_304,
@@ -458,6 +582,7 @@ def sync(
     partition_column: Optional[str] = None,
     partition_source_expr: Optional[str] = None,
     read_max_rows_per_sec: Optional[int] = None,
+    read_idle_timeout_secs: int = 0,
     chunk_rows: Optional[int] = None,
     retry_max_attempts: int = 1,
     column_transforms: Optional[Mapping[str, str]] = None,
@@ -532,6 +657,21 @@ def sync(
     that is missing or non-integer is a hard error rather than a silent
     fallback — an explicitly requested fan-out that quietly collapses to one
     stream is the bug this fixes.
+
+    ``mode`` is **required** (changed in 0.15.0; it used to default to
+    ``"full"``). ``"full"`` REPLACES the destination table wholesale, ``"incremental"``
+    upserts on ``key=`` or ``watermark=``, and ``"append"`` inserts without
+    deduplicating. The old default handed the most destructive of the three to
+    anyone who did not think about the argument.
+
+    ``allow_full_refresh_shrink`` (new in 0.15.0, full mode only) permits a swap
+    that would leave the destination with FEWER rows than it had. A full refresh
+    replaces the table wholesale — ClickHouse ``EXCHANGE TABLES``, BigQuery
+    ``TRUNCATE`` + ``INSERT ... SELECT`` — and **neither is partition-aware**, so
+    a run covering one partition destroys every other partition, atomically and
+    with a success exit. ``False`` (default) makes that a hard error before the
+    swap. Set ``True`` only when the source genuinely did lose rows; to add rather
+    than replace, use ``mode="incremental"`` with ``key=`` or ``mode="append"``.
 
     **Experimental features** (may change without a major-version bump, and carry
     sharper edges — read their notes before relying on them):
@@ -729,14 +869,51 @@ def sync(
        BigQuery ``MERGE`` failed, whatever the data. If you worked around it
        with ``merge_prune_key_range=False``, the override is no longer needed.
 
-    ``delete_stale_in_window=True`` (BigQuery incremental only) additionally
-    DELETEs destination rows inside the merged window that are absent from the
-    source pull (``WHEN NOT MATCHED BY SOURCE``) — "replace this window", and a
-    NULL merge key nets to a replace instead of duplicating. It **requires**
-    ``merge_prune_partition_by`` (the DELETE is scoped to that column's staging
-    ``[MIN, MAX]`` range); without it a ``WHEN NOT MATCHED BY SOURCE`` clause
-    would delete the entire destination history outside the batch, so it is a
-    hard config error.
+    ``merge_prune_key_list_max`` (new in 0.15.0, default ``0`` = off) is the
+    tighter form of the same tautology. When the staging batch holds at most
+    this many distinct merge-key values, the bound becomes that exact key *list*
+    (``T.k IN (v1, v2, ...)``) instead of a ``[MIN, MAX]`` range. Both are safe
+    for the same reason and neither can change which rows merge; they differ in
+    how well they *bind*. A range prunes in proportion to how tightly the
+    changed keys cluster — narrow on an append-only table, useless on one whose
+    rows are updated after insert (a user profile, an order status, a voucher
+    redemption), where the delta is scattered across the whole key space and
+    ``[MIN, MAX]`` covers nearly everything. A key list does not degrade that
+    way. Costs one extra small query per merge; if the batch turns out to hold
+    more distinct keys than the limit the list is abandoned and the range bound
+    is used, so the ceiling really is a ceiling on statement size. Single-column
+    ``key`` only, and ignored under ``delete_stale_in_window`` for the same
+    reason the range bound is.
+
+    quickhouse also **warns** (as a ``TransferWarning`` with kind
+    ``"unclustered_merge_target"``, new in 0.15.0) when it MERGEs into a
+    destination that is not clustered by the merge key — there the key bound
+    cannot prune anything and every run scans the whole table, which is
+    invisible from the caller's side until it shows up on a bill.
+
+    ``delete_stale_in_window=True`` (incremental only) additionally DELETEs
+    destination rows inside the merged window that are absent from the source
+    pull — "replace this window", and a NULL merge key nets to a replace instead
+    of duplicating. **This is the only way an ordinary sync converges with a
+    source that hard-deletes rows**; without it a deleted row has no watermark
+    to move, so it never reaches the destination again and stays there forever.
+    It **requires** ``merge_prune_partition_by`` (the DELETE is scoped to that
+    column's staging ``[MIN, MAX]`` range); without a window bound it would
+    delete the entire destination history outside the batch, so it is a hard
+    config error.
+
+    .. versionchanged:: 0.15.0
+       Supported for a **ClickHouse** destination as well as BigQuery. BigQuery
+       expresses it as a ``WHEN NOT MATCHED BY SOURCE`` clause inside the same
+       ``MERGE``, so it is atomic with the upsert but reports no separate
+       deleted-row count. ClickHouse runs a lightweight ``DELETE FROM dest
+       WHERE <window> AND key NOT IN (SELECT key FROM staging)`` just before the
+       staged rows are promoted — which forces the run to stage (ClickHouse
+       incremental otherwise inserts directly), is *not* atomic with the insert,
+       and reports the exact count on ``TransferResult.rows_deleted``.
+
+    To *measure* drift against a source without repairing it — including outside
+    any sync, on its own schedule — see :func:`reconcile_keys`.
 
     Internal names (defaults preserve prior behavior): ``state_table_name``
     (default ``_quickhouse_state``) is quickhouse's watermark/chunk-cursor
@@ -799,6 +976,33 @@ def sync(
       ``application_name = 'quickhouse'`` so the export is visible (and
       killable) in ``pg_stat_activity``.
 
+    Timeouts — which knob means what:
+
+    - ``statement_timeout_secs`` (on the ``Postgres``/``MySQL`` descriptor) is a
+      **server-side ceiling on the whole transfer**, despite its name. quickhouse
+      streams the source result set straight into the destination, so the
+      statement producing it stays open from the first row read to the last one
+      written, and the server counts read + decode + destination write +
+      backpressure against it. A sub-second source scan can be cancelled here
+      purely because the *destination* was slow, and it is reported as a source
+      error (``57014 canceling statement due to statement timeout``), which
+      sends an operator hunting for a slow query and a missing index that do not
+      exist. Retries cannot rescue it either: every attempt restarts from zero
+      against the same ceiling, so a table that crosses the line fails every
+      attempt.
+    - ``read_idle_timeout_secs`` (new in 0.15.0, default ``0`` = off) is the
+      thing the name above suggests: fail when **no source rows arrive** for
+      that long. The timer wraps the awaits on the source stream and nothing
+      else, so time spent decoding, inserting, or blocked on the memory budget
+      does not count toward it — a slow destination cannot trip it, which is
+      what makes it safe to set tightly. A genuinely hung source does trip it,
+      and the resulting error is classified transient so ``retry_max_attempts``
+      retries the whole transfer. Applies to the PostgreSQL, MySQL and BigQuery
+      source reads; API sources are paced by their own per-request HTTP
+      timeouts. Setting this lets ``statement_timeout_secs`` go back to being
+      sized for the source database — a guard against a runaway scan — rather
+      than for the destination's worst day.
+
     Datetime/timezone handling:
 
     - MySQL ``DATETIME``/``TIMESTAMP`` map to a UTC-aware timestamp — BigQuery
@@ -811,6 +1015,86 @@ def sync(
       encoding, not just the declared destination type, so it works on the
       Storage Write path too. PostgreSQL keeps the distinction from the source
       type: ``timestamptz`` → UTC-aware, ``timestamp`` → naive.
+    """
+    ...
+
+def reconcile_keys(
+    source: Union[Postgres, MySQL],
+    target: Union[ClickHouse, BigQuery],
+    dest_table: str,
+    *,
+    key: str,
+    source_table: Optional[str] = None,
+    source_query: Optional[str] = None,
+    window: Optional[str] = None,
+    dest_window: Optional[str] = None,
+    delete: bool = False,
+    max_delete_keys: int = 0,
+    sample_limit: int = 10,
+) -> ReconcileResult:
+    """Diff a source table's keyset against a destination's, and optionally
+    delete the rows the source no longer has. New in 0.15.0.
+
+    An incremental sync is insert-and-update only. It finds rows whose watermark
+    moved and upserts them; a row the source *deleted* has no watermark to move,
+    so nothing about it ever reaches the destination again and it stays there
+    forever. For any source that hard-deletes as a matter of routine — an ERP
+    cancelling a reservation, a queue draining, a "soft delete" that is really a
+    ``DELETE`` — the destination drifts, one-directionally, without bound.
+
+    The drift also hides well. It is lopsided: a measured production table
+    carried +1.30% phantom rows against +0.0168% on a quantity sum, so every
+    COUNT-based model over-reported materially while every SUM-based one looked
+    fine. Row counts alone will not tell you your exposure.
+
+    ``delete_stale_in_window`` on :func:`sync` prevents the drift going forward,
+    inside a sync, for the window that sync touched. This is the other half: it
+    answers "how far apart are these two right now?" for an arbitrary window, on
+    its own schedule, and repairs the difference only when asked. Measuring is
+    the part worth running continuously; deleting is the part worth approving.
+
+    ::
+
+        r = quickhouse.reconcile_keys(
+            src, dst, dest_table="stock_move_line_fki",
+            source_table="stock_move_line",
+            key="id",
+            window="create_date >= '2026-07-01' AND create_date < '2026-08-01'",
+        )
+        print(r.orphan_keys, r.missing_keys)   # measure
+        if r.orphan_keys and r.orphan_keys < 50_000:
+            quickhouse.reconcile_keys(..., delete=True, max_delete_keys=50_000)
+
+    :param key: The identifying column, present on both sides under the same
+        name. **Single column, and realistically an integer or string.** Both
+        sides render their keys as text so the diff can be a set comparison, and
+        the two renderings only agree for types with one obvious text form. An
+        integer id round-trips exactly; a timestamp does not (PostgreSQL writes
+        ``2026-08-30 12:00:00+00``, ClickHouse writes ``2026-08-30 12:00:00``)
+        and every key would read as drift in both directions. That
+        total-mismatch shape is detected and refused rather than acted on, but
+        pick a sane key and it never arises.
+    :param window: SQL predicate bounding the source read, in the source's
+        dialect. ``None`` reads the whole table — fine for measuring a small one,
+        but both keysets are held in memory, so bound anything large.
+    :param dest_window: The same bound for the destination, in the
+        *destination's* dialect. Defaults to ``window``, which is right whenever
+        the destination mirrors the source's column names.
+    :param delete: Delete the orphans. Default ``False`` — measure only.
+        Requires a window: an unbounded delete would remove every destination
+        key the source does not hold at this instant, which is a full refresh
+        with a race in it, not a reconcile.
+    :param max_delete_keys: Refuse to delete when the orphan count exceeds this
+        (``0`` = no ceiling). A reconcile is only as good as its window; this is
+        the blunt guard against a predicate that means something different on
+        each side. Set it to a few times the drift you actually expect.
+    :param sample_limit: How many orphan/missing keys to carry back as samples.
+        The counts are exact regardless.
+
+    Sources: PostgreSQL and MySQL. A BigQuery source is rejected (it is normally
+    itself a mirror rather than the system of record), as is an HTTP API source
+    (no keyset query to diff against). Destinations: both ClickHouse and
+    BigQuery.
     """
     ...
 

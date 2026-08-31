@@ -16,6 +16,16 @@ The one call that does the work.
 .. autofunction:: sync
 ```
 
+## reconcile_keys
+
+Measure — and optionally repair — the drift between a source and a destination
+synced from it. An incremental sync never removes anything, so a row the source
+hard-deletes stays in the destination forever; this is what converges the two.
+
+```{eval-rst}
+.. autofunction:: reconcile_keys
+```
+
 ## Sources
 
 Connection descriptors accepted as ``sync()``'s ``source`` argument.
@@ -47,6 +57,12 @@ Connection descriptors accepted as ``sync()``'s ``target`` argument. ``BigQuery`
 
 ```{eval-rst}
 .. autoclass:: TransferResult
+   :members:
+
+.. autoclass:: TransferWarning
+   :members:
+
+.. autoclass:: ReconcileResult
    :members:
 
 .. autoclass:: Progress

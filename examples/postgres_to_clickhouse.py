@@ -37,6 +37,7 @@ def main() -> None:
         dst,
         dest_table=dest_table,
         source_table=src_table,
+        mode="full",           # REPLACES dest_table wholesale; no longer a default
         key=["id"],            # used for ordering; not required for full refresh
         create_if_missing=True,
         parallelism=4,

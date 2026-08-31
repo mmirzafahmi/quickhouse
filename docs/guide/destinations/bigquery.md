@@ -17,7 +17,7 @@ work in either role.
 qh.sync(
     qh.BigQuery("my-project"),                                    # source
     qh.BigQuery("my-project", dataset_id="analytics"),           # destination
-    dest_table="orders", source_table="raw.orders",
+    dest_table="orders", source_table="raw.orders", mode="full",
 )
 ```
 

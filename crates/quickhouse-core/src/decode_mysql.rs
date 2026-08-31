@@ -19,7 +19,7 @@ use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use mysql_async::{Row, Value};
 
-use crate::decimal::{parse_decimal_text, rescale_mantissa, Coercion, DecimalText};
+use crate::decimal::{parse_decimal_text, rescale_mantissa, Coercion, CoercionTally, DecimalText};
 use crate::error::{EtlError, Result};
 use crate::types::{ch_range, ColumnType};
 
@@ -321,18 +321,15 @@ pub struct MySqlBatcher {
     rows_in_batch: usize,
     bytes_in_batch: usize,
     pub rows_total: u64,
-    /// Count of unrepresentable MySQL dates/datetimes (e.g. `0000-00-00`)
-    /// coerced to NULL across the whole stream — see `ColBuilder::append_value`.
-    pub invalid_dates_total: u64,
-    /// Count of DECIMAL/NEWDECIMAL values coerced to NULL because they
-    /// overflowed a `Decimal(P,S)` override's precision (see
-    /// `ColBuilder::append_value`'s `Decimal128` arm).
-    pub invalid_decimals_total: u64,
-    /// Count of `tinyint(1)` values outside `{0, 1}` flattened to a Boolean
-    /// (see `ColBuilder::append_value`'s `Bool` arms). Non-zero means the
-    /// display-width Boolean inference was wrong for this table and real
-    /// integer values were lost — pass `tinyint1_as_bool=False` to keep them.
-    pub collapsed_bools_total: u64,
+    /// Per-column counts of the values this decoder coerced: unrepresentable
+    /// dates/datetimes (e.g. `0000-00-00`), DECIMALs that overflowed a
+    /// `Decimal(P,S)` override, and `tinyint(1)` values outside `{0, 1}`
+    /// flattened to a Boolean. That last one means the display-width Boolean
+    /// inference was wrong for this table and real integer values were lost —
+    /// and now says *which column*, which is the difference between a log line
+    /// and something a caller can act on (`tinyint1_as_bool=False` to keep
+    /// them). Read back through [`Self::coercions`].
+    coercions: CoercionTally,
 }
 
 impl MySqlBatcher {
@@ -361,14 +358,36 @@ impl MySqlBatcher {
             rows_in_batch: 0,
             bytes_in_batch: 0,
             rows_total: 0,
-            invalid_dates_total: 0,
-            invalid_decimals_total: 0,
-            collapsed_bools_total: 0,
+            coercions: CoercionTally::new(columns.iter().map(|c| c.name.as_str())),
         })
     }
 
     pub fn schema(&self) -> SchemaRef {
         self.schema.clone()
+    }
+
+    /// Every `(kind, column, count)` this decoder coerced. Empty on a clean
+    /// read; `sync` turns each entry into a `TransferWarning`.
+    pub fn coercions(&self) -> Vec<(crate::config::WarningKind, String, u64)> {
+        self.coercions.entries()
+    }
+
+    /// Total values coerced to NULL for being unrepresentable dates.
+    pub fn invalid_dates_total(&self) -> u64 {
+        self.coercions
+            .total(crate::config::WarningKind::CoercedDate)
+    }
+
+    /// Total values coerced to NULL for overflowing their declared decimal.
+    pub fn invalid_decimals_total(&self) -> u64 {
+        self.coercions
+            .total(crate::config::WarningKind::CoercedDecimal)
+    }
+
+    /// Total `tinyint(1)` values outside `{0, 1}` flattened to a boolean.
+    pub fn collapsed_bools_total(&self) -> u64 {
+        self.coercions
+            .total(crate::config::WarningKind::CollapsedBool)
     }
 
     /// Append one row; returns a flushed batch if `batch_rows`/`batch_bytes` was reached.
@@ -389,12 +408,7 @@ impl MySqlBatcher {
             let coercion = builder
                 .append_value(value)
                 .map_err(|e| e.context(format!("column '{}'", self.schema.field(i).name())))?;
-            match coercion {
-                Coercion::None => {}
-                Coercion::DateRange => self.invalid_dates_total += 1,
-                Coercion::DecimalOverflow => self.invalid_decimals_total += 1,
-                Coercion::BoolCollapse => self.collapsed_bools_total += 1,
-            }
+            self.coercions.record_coercion(i, coercion);
         }
         self.rows_in_batch += 1;
         self.rows_total += 1;

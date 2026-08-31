@@ -16,7 +16,7 @@ src = quickhouse.Postgres("postgresql://user:pw@localhost:5432/shop")
 dst = quickhouse.ClickHouse("http://localhost:8123", database="analytics")
 
 result = quickhouse.sync(src, dst, dest_table="orders",
-                         source_table="orders", key=["id"])
+                         source_table="orders", mode="full", key=["id"])
 print(result)   # rows_read, rows_written, bytes_written, duration_secs, new_watermark
 ```
 
@@ -341,7 +341,7 @@ errors are surfaced verbatim rather than wrapped in something generic.
 | --- | --- |
 | `source_table` / `source_query` | Read a whole table, or a custom `SELECT` (one required) |
 | `dest_table` | Destination table name |
-| `mode` | `"full"` or `"incremental"` |
+| `mode` | `"full"`, `"incremental"` or `"append"` (**required** since 0.15.0) |
 | `watermark` | Monotonic column for incremental (e.g. `updated_at`); ignored in full mode |
 | `lookback_seconds` | Re-scan a trailing window of the watermark to catch late/edited rows; `0` disables (default) |
 | `state_key` | Pin the incremental cursor's identity (stable across `source_query` edits; distinct per watermark column). Default derives it from source+dest |

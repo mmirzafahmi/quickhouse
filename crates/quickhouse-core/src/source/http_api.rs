@@ -154,8 +154,8 @@ impl HttpApiSource {
                         .get(reqwest::header::RETRY_AFTER)
                         .and_then(|v| v.to_str().ok())
                         .and_then(|s| s.parse::<u64>().ok());
-                    let text = r.text().await.unwrap_or_default();
-                    let head = text[..text.len().min(200)].to_string();
+                    let text = r.bytes().await.unwrap_or_default();
+                    let head = crate::source::body_head(&text, 200);
                     match classify_http_status(status) {
                         HttpClass::Transient if attempt < max => {
                             let delay = retry_after

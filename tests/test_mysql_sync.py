@@ -561,3 +561,74 @@ def _mysql_scalar(mysql_conn, sql: str):
     with mysql_conn.cursor() as cur:
         cur.execute(sql)
         return cur.fetchone()[0]
+
+
+def test_collapsed_tinyint1_names_the_column_it_flattened(
+    mysql_conn, ch_client, mysql_source, ch_target, unique_name
+):
+    """MySQL's ``BOOL`` is an alias for ``tinyint(1)``, so display width is the
+    only hint quickhouse has — and a schema that doesn't follow that convention
+    (Odoo, for one) stores genuine small integers there. Those get flattened to
+    0/1, irreversibly, and ``type_overrides`` cannot repair it after the fact.
+
+    The count alone was never enough to act on: "9 columns across 8 tables were
+    genuine small integers" is a statement you can only make from per-column
+    attribution, which is what this asserts.
+    """
+    table = unique_name
+    with mysql_conn.cursor() as cur:
+        cur.execute(f"DROP TABLE IF EXISTS `{table}`")
+        cur.execute(
+            f"""
+            CREATE TABLE `{table}` (
+                id       BIGINT PRIMARY KEY,
+                x_state  TINYINT(1) NOT NULL,   -- real small integers
+                flag     TINYINT(1) NOT NULL,   -- an honest boolean
+                write_date DATETIME NOT NULL
+            )
+            """
+        )
+        cur.execute(
+            f"INSERT INTO `{table}` VALUES "
+            "(1, 0, 0, '2024-01-01'), (2, 1, 1, '2024-01-01'), "
+            "(3, 2, 0, '2024-01-01'), (4, 3, 1, '2024-01-01'), (5, 7, 0, '2024-01-01')"
+        )
+    ch_client.command(f"DROP TABLE IF EXISTS `{table}`")
+    try:
+        result = quickhouse.sync(
+            mysql_source,
+            ch_target,
+            dest_table=table,
+            source_table=table,
+            mode="full",
+            order_by=["id"],
+            create_if_missing=True,
+        )
+        by_kind = {(w.kind, w.column): w for w in result.warnings}
+        # Three values outside {0, 1}, all in x_state.
+        assert ("collapsed_bool", "x_state") in by_kind, result.warnings
+        assert by_kind[("collapsed_bool", "x_state")].count == 3
+        # ...and the honest boolean column is not implicated.
+        assert ("collapsed_bool", "flag") not in by_kind, result.warnings
+        # The run still succeeded, which is exactly why this has to be data.
+        assert result.rows_written == 5
+
+        # Re-reading with the opt-out produces no warning and keeps the values.
+        ch_client.command(f"DROP TABLE IF EXISTS `{table}`")
+        kept = quickhouse.sync(
+            mysql_source,
+            ch_target,
+            dest_table=table,
+            source_table=table,
+            mode="full",
+            order_by=["id"],
+            create_if_missing=True,
+            tinyint1_as_bool=False,
+        )
+        assert kept.warnings == []
+        got = ch_client.query(f"SELECT x_state FROM `{table}` ORDER BY id").result_rows
+        assert [r[0] for r in got] == [0, 1, 2, 3, 7]
+    finally:
+        ch_client.command(f"DROP TABLE IF EXISTS `{table}`")
+        with mysql_conn.cursor() as cur:
+            cur.execute(f"DROP TABLE IF EXISTS `{table}`")

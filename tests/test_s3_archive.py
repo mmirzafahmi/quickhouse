@@ -168,4 +168,6 @@ def test_archive_rejects_empty_bucket(pg_source):
     # validates anything. This must fail before any real connection is made.
     dst = quickhouse.ClickHouse(CH_URL, archive=quickhouse.S3Archive(bucket=""))
     with pytest.raises(RuntimeError, match="non-empty bucket"):
-        quickhouse.sync(pg_source, dst, dest_table="x", source_table="y")
+        quickhouse.sync(
+            pg_source, dst, dest_table="x", source_table="y", mode="full"
+        )

@@ -58,3 +58,14 @@ HTTP API source with a declared schema + `mode="append"` bronze landing.
 ```{literalinclude} ../examples/clevertap_bronze_append.py
 :language: python
 ```
+
+## Reconciling drift against a deleting source
+
+An incremental sync never removes anything, so a row the source hard-deletes
+stays in the destination forever. This walks the keyset diff for a bounded
+window, prints the drift, and repairs it only when asked — a shape that works as
+a scheduled check (it exits non-zero on unrepaired drift).
+
+```{literalinclude} ../examples/reconcile_drift.py
+:language: python
+```

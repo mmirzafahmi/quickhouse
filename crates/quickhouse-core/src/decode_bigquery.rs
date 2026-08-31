@@ -18,7 +18,7 @@ use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use google_cloud_bigquery::storage::row::Row;
 
-use crate::decimal::{parse_decimal_text, rescale_mantissa, Coercion, DecimalText};
+use crate::decimal::{parse_decimal_text, rescale_mantissa, Coercion, CoercionTally, DecimalText};
 use crate::error::{EtlError, Result};
 use crate::types::bigquery::type_id as id;
 use crate::types::{ch_range, ColumnType};
@@ -288,13 +288,11 @@ pub struct BigQueryBatcher {
     rows_in_batch: usize,
     bytes_in_batch: usize,
     pub rows_total: u64,
-    /// Count of valid dates/datetimes whose year fell outside ClickHouse's
-    /// representable window and were coerced to NULL (see `append_from_row`).
-    pub invalid_dates_total: u64,
-    /// Count of NUMERIC/BIGNUMERIC values coerced to NULL because they
-    /// overflowed a `Decimal(P,S)` override's precision (see
-    /// `append_from_row`'s `Decimal128` arm).
-    pub invalid_decimals_total: u64,
+    /// Per-column counts of the values this decoder coerced — dates outside
+    /// ClickHouse's representable window, and NUMERIC/BIGNUMERICs that
+    /// overflowed a `Decimal(P,S)` override (see `append_from_row`). Read back
+    /// through [`Self::coercions`].
+    coercions: CoercionTally,
 }
 
 impl BigQueryBatcher {
@@ -324,13 +322,30 @@ impl BigQueryBatcher {
             rows_in_batch: 0,
             bytes_in_batch: 0,
             rows_total: 0,
-            invalid_dates_total: 0,
-            invalid_decimals_total: 0,
+            coercions: CoercionTally::new(columns.iter().map(|c| c.name.as_str())),
         })
     }
 
     pub fn schema(&self) -> SchemaRef {
         self.schema.clone()
+    }
+
+    /// Every `(kind, column, count)` this decoder coerced. Empty on a clean
+    /// read; `sync` turns each entry into a `TransferWarning`.
+    pub fn coercions(&self) -> Vec<(crate::config::WarningKind, String, u64)> {
+        self.coercions.entries()
+    }
+
+    /// Total values coerced to NULL for being unrepresentable dates.
+    pub fn invalid_dates_total(&self) -> u64 {
+        self.coercions
+            .total(crate::config::WarningKind::CoercedDate)
+    }
+
+    /// Total values coerced to NULL for overflowing their declared decimal.
+    pub fn invalid_decimals_total(&self) -> u64 {
+        self.coercions
+            .total(crate::config::WarningKind::CoercedDecimal)
     }
 
     /// Append one row; returns a flushed batch if `batch_rows`/`batch_bytes` was reached.
@@ -341,14 +356,10 @@ impl BigQueryBatcher {
                 .append_from_row(row, i, self.type_ids[i])
                 .map_err(|e| e.context(format!("column '{}'", self.schema.field(i).name())))?;
             row_bytes += size;
-            match coercion {
-                Coercion::None => {}
-                Coercion::DateRange => self.invalid_dates_total += 1,
-                Coercion::DecimalOverflow => self.invalid_decimals_total += 1,
-                // MySQL-only (a tinyint(1) display-width inference); BigQuery
-                // has a real BOOL type, so nothing is inferred here.
-                Coercion::BoolCollapse => {}
-            }
+            // `BoolCollapse` is MySQL-only (a tinyint(1) display-width
+            // inference); BigQuery has a real BOOL type, so nothing is
+            // inferred here and the tally never sees one.
+            self.coercions.record_coercion(i, coercion);
         }
         self.rows_in_batch += 1;
         self.rows_total += 1;

@@ -20,7 +20,7 @@ use tokio::task::JoinSet;
 use crate::archive::{archive_object_key, build_s3_store, S3ArchiveWriter};
 use crate::config::{
     ApiColumn, DestinationConfig, ParquetCompression, S3ArchiveConfig, SourceConfig, SyncMode,
-    TransferConfig, TransferResult, WatermarkSeed,
+    TransferConfig, TransferResult, TransferWarning, WarningKind, WatermarkSeed,
 };
 use crate::decode::CopyDecoder;
 use crate::decode_api::{resolve_api_columns, ApiBatcher};
@@ -30,7 +30,7 @@ use crate::error::{EtlError, Result};
 use crate::memory::{MemoryBudget, Reservation};
 use crate::sink::{build_sink, Sink};
 use crate::source::appsflyer::AppsFlyerSource;
-use crate::source::clevertap::{CleverTapSource, PageStatus};
+use crate::source::clevertap::CleverTapSource;
 use crate::source::mysql::{quote_my, quote_my_table};
 use crate::source::postgres::{quote_pg, quote_pg_table};
 use crate::source::{BigQuerySource, Keyset, MySqlSource, Partition, PgSource, Source};
@@ -104,11 +104,13 @@ fn run_staged_validation(
 }
 
 /// Promote a fully-loaded staging table into the incremental destination: fire
-/// the optional gate, then either `MERGE` (destinations that stage for a real
-/// keyed upsert — BigQuery) or a plain insert-select (ClickHouse, which stages
-/// only to interpose the gate and lets `ReplacingMergeTree` dedup the promoted
-/// rows lazily, exactly as a direct insert would), then drop staging. Shared by
-/// all three transfer flows. Only called when a staging table was used.
+/// the optional gate, run the window-scoped delete where the destination needs
+/// it as a separate statement, then either `MERGE` (destinations that stage for
+/// a real keyed upsert — BigQuery) or a plain insert-select (ClickHouse, which
+/// stages to interpose the gate and/or the delete, and lets `ReplacingMergeTree`
+/// dedup the promoted rows lazily, exactly as a direct insert would), then drop
+/// staging. Shared by all three transfer flows. Only called when a staging table
+/// was used. Returns the number of destination rows deleted.
 #[allow(clippy::too_many_arguments)]
 async fn promote_staged_incremental(
     sink: &dyn Sink,
@@ -118,31 +120,136 @@ async fn promote_staged_incremental(
     columns: &[ColumnType],
     merge_prune_partition_by: Option<&str>,
     prune_key_range: bool,
+    prune_key_list_max: usize,
     delete_stale_in_window: bool,
     on_staged: &Option<StagedValidationCb>,
     rows_written: u64,
     dedup_order: Option<&str>,
-) -> Result<()> {
+    warnings: &Warnings,
+) -> Result<u64> {
     run_staged_validation(on_staged, sink, staging, rows_written)?;
+    let mut rows_deleted = 0u64;
+    // Destinations that cannot express the delete inside their upsert run it as
+    // its own statement, *before* the insert. Order is not load-bearing (the
+    // predicate subtracts the staged keys either way), but delete-then-insert
+    // keeps the window from momentarily holding both the old and new copy of an
+    // updated row.
+    if delete_stale_in_window && !sink.deletes_stale_within_merge() {
+        let window_column = merge_prune_partition_by.ok_or_else(|| {
+            EtlError::internal(
+                "delete_stale_in_window without merge_prune_partition_by (should have been \
+                 validated)",
+            )
+        })?;
+        rows_deleted = sink
+            .delete_stale_against_staging(dest_table, staging, key, window_column)
+            .await?;
+    }
     if sink.requires_staging_for_incremental() {
         tracing::info!("merging staged incremental rows into '{dest_table}'");
-        sink.merge_into(
-            dest_table,
-            staging,
-            key,
-            columns,
-            merge_prune_partition_by,
-            prune_key_range,
-            delete_stale_in_window,
-            dedup_order,
-        )
-        .await?;
+        // The clustering check is a metadata read that only ever produces a
+        // warning, so it rides alongside the MERGE rather than in front of it:
+        // a fleet running thousands of merges a week should not pay a round
+        // trip each time for a diagnostic. Overlapped with a statement that
+        // averages tens of seconds, it costs nothing at all.
+        let (merged, ()) = tokio::join!(
+            sink.merge_into(
+                dest_table,
+                staging,
+                key,
+                columns,
+                merge_prune_partition_by,
+                prune_key_range,
+                prune_key_list_max,
+                delete_stale_in_window,
+                dedup_order,
+            ),
+            warn_unclustered_merge_target(sink, dest_table, key, warnings),
+        );
+        merged?;
     } else {
         tracing::info!("inserting validated staged rows into '{dest_table}'");
         sink.insert_select(dest_table, staging, columns).await?;
     }
     sink.drop_table(staging).await?;
-    Ok(())
+    Ok(rows_deleted)
+}
+
+/// Warn when a staged `MERGE` is about to run against a destination that is not
+/// clustered by the merge key.
+///
+/// The key bound quickhouse puts on every merge is a tautology — a destination
+/// row can only match a key the batch holds — but a bound only *saves* anything
+/// if the destination is physically organised by that column. On an unclustered
+/// table it prunes nothing and the merge scans the whole thing, every run. That
+/// is invisible from the caller's side and shows up as a billing line weeks
+/// later: one production table here scanned ~10.4 GiB per run, 42 times in a
+/// week, on an 11.3 GiB table.
+///
+/// quickhouse generates clustered DDL itself (see `TransferConfig::key`), so it
+/// knows what good looks like; this only fires for a destination created some
+/// other way. Purely diagnostic — a metadata read that fails, or a destination
+/// that cannot report clustering at all, must never fail a transfer.
+/// Whether a merge on `key` can prune against a destination clustered by
+/// `clustering`.
+///
+/// True exactly when the merge key is a *prefix* of the clustering, in order.
+/// A prefix is what block pruning needs: BigQuery skips blocks on the leading
+/// clustering columns, so `CLUSTER BY id, created_at` prunes a merge on `id`
+/// just as well as `CLUSTER BY id` does, while `CLUSTER BY created_at, id`
+/// prunes it not at all. Compared case-insensitively, since BigQuery treats
+/// column names that way and a case difference is not a real mismatch.
+///
+/// Split out as a pure function so the rule is testable without a live
+/// destination — the same reason `full_refresh_shrink_verdict` is one.
+fn clustering_binds(clustering: Option<&[String]>, key: &[String]) -> bool {
+    match clustering {
+        Some(cols) if !cols.is_empty() && !key.is_empty() => key
+            .iter()
+            .enumerate()
+            .all(|(i, k)| cols.get(i).is_some_and(|c| c.eq_ignore_ascii_case(k))),
+        _ => false,
+    }
+}
+
+async fn warn_unclustered_merge_target(
+    sink: &dyn Sink,
+    dest_table: &str,
+    key: &[String],
+    warnings: &Warnings,
+) {
+    if key.is_empty() {
+        return;
+    }
+    let clustering = match sink.clustering_columns(dest_table).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::debug!("could not read clustering columns of '{dest_table}': {e}");
+            return;
+        }
+    };
+    if clustering_binds(clustering.as_deref(), key) {
+        return;
+    }
+    let have = match &clustering {
+        Some(cols) if !cols.is_empty() => format!("clustered by {}", cols.join(", ")),
+        _ => "not clustered at all".to_string(),
+    };
+    let message = format!(
+        "'{dest_table}' is {have}, but this run MERGEs on {} — so the merge's key bound cannot \
+         prune anything and every run scans the whole destination. Recreate the destination \
+         clustered by the merge key (quickhouse's own generated DDL does this) to make the \
+         bound bite.",
+        key.join(", "),
+    );
+    tracing::warn!("{message}");
+    warnings.push(TransferWarning {
+        kind: WarningKind::UnclusteredMergeTarget,
+        column: None,
+        count: 0,
+        sample: clustering.map(|c| c.join(", ")),
+        message,
+    });
 }
 
 #[derive(Default)]
@@ -150,6 +257,103 @@ struct Counters {
     rows_read: AtomicU64,
     rows_written: AtomicU64,
     bytes_written: AtomicU64,
+    /// Nanoseconds spent *awaiting source rows*, summed across every parallel
+    /// reader. Recorded around the source-stream await alone — not around
+    /// decode, insert, or the memory budget — which is what makes
+    /// `TransferResult::read_secs` answer "is the source the bottleneck?"
+    /// rather than restating the wall clock. See [`await_source`].
+    read_nanos: AtomicU64,
+}
+
+/// Run-scoped collector for the structured warnings that end up on
+/// [`TransferResult::warnings`].
+///
+/// Every condition here was already detected and already logged; what was
+/// missing was a way for the caller to *act* on one. A Dagster asset cannot
+/// fail on a `tracing::warn!`, so a transfer that flattened a column to a
+/// boolean, or excluded every NULL-watermark row forever, reported success and
+/// the damage surfaced weeks later in a completeness check.
+///
+/// Cloned into each partition task (it's an `Arc`), so concurrent readers all
+/// report into the same collector. [`Self::drain`] folds the per-partition
+/// entries into one entry per `(kind, column)`, which is the granularity a
+/// caller wants: "column `x_state` lost 412 values", not one line per partition.
+#[derive(Clone, Default)]
+struct Warnings(Arc<Mutex<Vec<TransferWarning>>>);
+
+impl Warnings {
+    fn push(&self, w: TransferWarning) {
+        self.0.lock().unwrap().push(w);
+    }
+
+    /// Take everything collected, folded per `(kind, column)` and ordered
+    /// most-affected first so a caller reading only the head sees the worst.
+    fn drain(&self) -> Vec<TransferWarning> {
+        let raw = std::mem::take(&mut *self.0.lock().unwrap());
+        let mut folded: Vec<TransferWarning> = Vec::new();
+        for w in raw {
+            match folded
+                .iter_mut()
+                .find(|f| f.kind == w.kind && f.column == w.column)
+            {
+                Some(f) => {
+                    f.count += w.count;
+                    if f.sample.is_none() {
+                        f.sample = w.sample;
+                    }
+                }
+                None => folded.push(w),
+            }
+        }
+        folded.sort_by(|a, b| {
+            b.count
+                .cmp(&a.count)
+                .then_with(|| a.kind.cmp(&b.kind))
+                .then_with(|| a.column.cmp(&b.column))
+        });
+        folded
+    }
+}
+
+/// Await one item from a source stream, recording how long that took and
+/// enforcing [`TransferConfig::read_idle_timeout_secs`].
+///
+/// The timer wraps the source await and *only* the source await. That is the
+/// whole point of the knob: a source-side `statement_timeout` is a ceiling on
+/// the entire streamed transfer (the statement's cursor stays open from the
+/// first row read to the last one written), so it fires on a slow destination
+/// and reports it as a source error. This one cannot — while the destination is
+/// throttling, the reader is blocked on the memory budget or the insert, not
+/// here, and the clock is not running.
+///
+/// Note this stays accurate when the caller polls the read concurrently with a
+/// decode (`tokio::join!`): the elapsed time is captured inside this future, at
+/// the moment the item arrives, not when the surrounding join completes.
+async fn await_source<F, T>(fut: F, counters: &Counters, idle_secs: u64, scope: &str) -> Result<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    let started = Instant::now();
+    let record = |counters: &Counters, started: Instant| {
+        counters
+            .read_nanos
+            .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    };
+    if idle_secs == 0 {
+        let out = fut.await;
+        record(counters, started);
+        return Ok(out);
+    }
+    match tokio::time::timeout(Duration::from_secs(idle_secs), fut).await {
+        Ok(out) => {
+            record(counters, started);
+            Ok(out)
+        }
+        Err(_) => {
+            record(counters, started);
+            Err(EtlError::read_idle_timeout(scope, idle_secs))
+        }
+    }
 }
 
 /// Global source-read rate limiter, shared across every parallel partition so
@@ -224,6 +428,9 @@ struct SendCtx {
     /// `Some` when `read_max_rows_per_sec` is set: a single limiter shared by
     /// all partition tasks, so the cap is an aggregate across the whole read.
     throttle: Option<Arc<ReadThrottle>>,
+    /// Run-scoped warning collector, shared by every partition so per-column
+    /// coercions from concurrent readers fold into one entry per column.
+    warnings: Warnings,
 }
 
 /// One partition's accumulator of decoded batches, so an insert carries a
@@ -532,6 +739,10 @@ async fn run_transfer_impl(
     }
 
     let started = Instant::now();
+    // One collector for the whole attempt. `run_transfer`'s retry loop calls
+    // this function afresh per attempt, so a run that eventually succeeds
+    // reports only the successful attempt's warnings.
+    let warnings = Warnings::default();
 
     let source_label = cfg
         .source_table
@@ -583,17 +794,21 @@ async fn run_transfer_impl(
             started,
             archive_info,
             staging,
+            warnings,
         )
         .await;
     }
 
-    // HTTP API sources (CleverTap/AppsFlyer): a declared schema + paginated
-    // fetch into the BigQuery sink — a separate flow from the DB partition
-    // machinery. archive is always None (BigQuery-only).
+    // HTTP API sources (CleverTap/AppsFlyer/HttpApi): a declared schema +
+    // paginated fetch into either sink (BigQuery or ClickHouse, since
+    // `bc1ab45`) — a separate flow from the DB partition machinery. archive is
+    // always None: S3 archiving is wired for DB sources only.
     if source_cfg.is_api() {
         let sink = build_sink(dest).await?;
-        return run_transfer_api(source_cfg, sink, cfg, progress, on_staged, started, staging)
-            .await;
+        return run_transfer_api(
+            source_cfg, sink, cfg, progress, on_staged, started, staging, warnings,
+        )
+        .await;
     }
 
     let source = Arc::new(match &source_cfg {
@@ -626,9 +841,19 @@ async fn run_transfer_impl(
     // deduped lazily by `ReplacingMergeTree`, exactly as a direct insert. This
     // is exactly the set of runs `requires_staging_for_incremental()` does NOT
     // already stage.
-    let force_stage_incremental = on_staged.is_some()
-        && cfg.mode == SyncMode::Incremental
-        && !sink.requires_staging_for_incremental();
+    // The same is true of a window-scoped delete on a destination whose upsert
+    // cannot express one inline: the delete subtracts the staged keys, so it
+    // needs the batch materialised in a table before any of it lands.
+    let force_stage_incremental = cfg.mode == SyncMode::Incremental
+        && !sink.requires_staging_for_incremental()
+        && (on_staged.is_some()
+            || (cfg.delete_stale_in_window && !sink.deletes_stale_within_merge()));
+    if cfg.delete_stale_in_window && !sink.supports_row_delete() {
+        return Err(EtlError::config(
+            "delete_stale_in_window is not supported by this destination (it cannot delete \
+             individual rows)",
+        ));
+    }
 
     // Keyset resumable reads (MVP) commit per chunk straight into the
     // destination, which only works where incremental inserts directly (no
@@ -663,6 +888,7 @@ async fn run_transfer_impl(
                 base_table.as_deref(),
                 base_query.as_deref(),
                 watermark.as_deref(),
+                &warnings,
             )
             .await?
         }
@@ -673,6 +899,7 @@ async fn run_transfer_impl(
                 base_table.as_deref(),
                 base_query.as_deref(),
                 watermark.as_deref(),
+                &warnings,
             )
             .await?
         }
@@ -822,7 +1049,9 @@ async fn run_transfer_impl(
             started,
             archive: archive_info.clone(),
             throttle,
+            warnings: warnings.clone(),
         };
+        let stage_started = Instant::now();
 
         let mut results = futures::stream::iter(partitions.into_iter().map(|part| {
             let source = source.clone();
@@ -872,6 +1101,11 @@ async fn run_transfer_impl(
         while let Some(r) = results.next().await {
             r?; // propagate the first partition error
         }
+        // The streaming phase ends here: every row has been read, decoded and
+        // written into the target (staging, or the destination itself).
+        // Everything after this is promotion.
+        let stage_secs = stage_started.elapsed().as_secs_f64();
+        let promote_started = Instant::now();
         tracing::info!(
             "all partitions read: {} rows written",
             counters.rows_written.load(Ordering::Relaxed)
@@ -885,6 +1119,13 @@ async fn run_transfer_impl(
                 &staging,
                 counters.rows_written.load(Ordering::Relaxed),
             )?;
+            guard_full_refresh_shrink(
+                sink.as_ref(),
+                &cfg,
+                counters.rows_written.load(Ordering::Relaxed),
+                &warnings,
+            )
+            .await?;
             tracing::info!("swapping staging table into '{}'", cfg.dest_table);
             sink.atomic_swap(&cfg.dest_table, &staging, &plan.dest_columns).await?;
             sink.drop_table(&staging).await?;
@@ -893,9 +1134,10 @@ async fn run_transfer_impl(
         // --- Incremental: validate + promote staged rows (MERGE for BigQuery,
         // insert-select for a gated ClickHouse run; direct-insert runs did not
         // stage and have nothing to promote), then persist the new watermark. ---
+        let mut rows_deleted = 0u64;
         if cfg.mode == SyncMode::Incremental {
             if used_staging {
-                promote_staged_incremental(
+                rows_deleted = promote_staged_incremental(
                     sink.as_ref(),
                     &cfg.dest_table,
                     &staging,
@@ -903,10 +1145,12 @@ async fn run_transfer_impl(
                     &plan.dest_columns,
                     cfg.merge_prune_partition_by.as_deref(),
                     cfg.merge_prune_key_range,
+                    cfg.merge_prune_key_list_max,
                     cfg.delete_stale_in_window,
                     &on_staged,
                     counters.rows_written.load(Ordering::Relaxed),
                     cfg.watermark.as_deref(),
+                    &warnings,
                 )
                 .await?;
             }
@@ -934,8 +1178,13 @@ async fn run_transfer_impl(
             rows_read: counters.rows_read.load(Ordering::Relaxed),
             rows_written: counters.rows_written.load(Ordering::Relaxed),
             bytes_written: counters.bytes_written.load(Ordering::Relaxed),
+            rows_deleted,
             duration_secs,
+            read_secs: counters.read_nanos.load(Ordering::Relaxed) as f64 / 1e9,
+            stage_secs,
+            promote_secs: promote_started.elapsed().as_secs_f64(),
             new_watermark,
+            warnings: warnings.drain(),
         })
     }
     .await;
@@ -960,6 +1209,7 @@ async fn run_transfer_bigquery(
     started: Instant,
     archive_info: Option<Arc<ArchiveRunInfo>>,
     staging: String,
+    warnings: Warnings,
 ) -> Result<TransferResult> {
     // column_transforms are injected into the SQL SELECT built for the
     // Postgres/MySQL COPY path; the BigQuery Storage Read API reads bare
@@ -1053,9 +1303,19 @@ async fn run_transfer_bigquery(
     // Force a staging table for a gated incremental run into a directly-inserting
     // destination (ClickHouse), so the gate has something to validate (see the
     // DB flow for the rationale).
-    let force_stage_incremental = on_staged.is_some()
-        && cfg.mode == SyncMode::Incremental
-        && !sink.requires_staging_for_incremental();
+    // The same is true of a window-scoped delete on a destination whose upsert
+    // cannot express one inline: the delete subtracts the staged keys, so it
+    // needs the batch materialised in a table before any of it lands.
+    let force_stage_incremental = cfg.mode == SyncMode::Incremental
+        && !sink.requires_staging_for_incremental()
+        && (on_staged.is_some()
+            || (cfg.delete_stale_in_window && !sink.deletes_stale_within_merge()));
+    if cfg.delete_stale_in_window && !sink.supports_row_delete() {
+        return Err(EtlError::config(
+            "delete_stale_in_window is not supported by this destination (it cannot delete \
+             individual rows)",
+        ));
+    }
 
     let target_table = prepare_target(
         &sink,
@@ -1091,7 +1351,9 @@ async fn run_transfer_bigquery(
             // Storage Read API is a separately-metered managed service, so this
             // path never throttles.
             throttle: None,
+            warnings: warnings.clone(),
         };
+        let stage_started = Instant::now();
 
         let mut iter = source
             .read_table::<google_cloud_bigquery::storage::row::Row>(
@@ -1113,10 +1375,14 @@ async fn run_transfer_bigquery(
             Some(info) => Some(info.writer_for("all", schema.clone())?),
             None => None,
         };
-        while let Some(row) = iter
-            .next()
-            .await
-            .map_err(|e| EtlError::other(format!("bigquery row error: {e}")))?
+        while let Some(row) = await_source(
+            iter.next(),
+            &counters,
+            cfg.read_idle_timeout_secs,
+            "bigquery read",
+        )
+        .await?
+        .map_err(|e| EtlError::other(format!("bigquery row error: {e}")))?
         {
             if let Some(batch) = batcher.append_row(&row)? {
                 if let Some(w) = archive_writer.as_mut() {
@@ -1141,8 +1407,9 @@ async fn run_transfer_bigquery(
             .rows_read
             .fetch_add(batcher.rows_total, Ordering::Relaxed);
         emit_progress(&counters, &progress, started);
-        warn_coerced_dates("bigquery read", batcher.invalid_dates_total);
-        warn_coerced_decimals("bigquery read", batcher.invalid_decimals_total);
+        report_coercions("bigquery read", batcher.coercions(), &warnings);
+        let stage_secs = stage_started.elapsed().as_secs_f64();
+        let promote_started = Instant::now();
         tracing::info!(
             "bigquery read complete: {} rows written",
             counters.rows_written.load(Ordering::Relaxed)
@@ -1155,13 +1422,21 @@ async fn run_transfer_bigquery(
                 &staging,
                 counters.rows_written.load(Ordering::Relaxed),
             )?;
+            guard_full_refresh_shrink(
+                sink.as_ref(),
+                &cfg,
+                counters.rows_written.load(Ordering::Relaxed),
+                &warnings,
+            )
+            .await?;
             tracing::info!("swapping staging table into '{}'", cfg.dest_table);
             sink.atomic_swap(&cfg.dest_table, &staging, &plan.dest_columns).await?;
             sink.drop_table(&staging).await?;
         }
+        let mut rows_deleted = 0u64;
         if cfg.mode == SyncMode::Incremental {
             if used_staging {
-                promote_staged_incremental(
+                rows_deleted = promote_staged_incremental(
                     sink.as_ref(),
                     &cfg.dest_table,
                     &staging,
@@ -1169,10 +1444,12 @@ async fn run_transfer_bigquery(
                     &plan.dest_columns,
                     cfg.merge_prune_partition_by.as_deref(),
                     cfg.merge_prune_key_range,
+                    cfg.merge_prune_key_list_max,
                     cfg.delete_stale_in_window,
                     &on_staged,
                     counters.rows_written.load(Ordering::Relaxed),
                     cfg.watermark.as_deref(),
+                    &warnings,
                 )
                 .await?;
             }
@@ -1200,8 +1477,13 @@ async fn run_transfer_bigquery(
             rows_read: counters.rows_read.load(Ordering::Relaxed),
             rows_written: counters.rows_written.load(Ordering::Relaxed),
             bytes_written: counters.bytes_written.load(Ordering::Relaxed),
+            rows_deleted,
             duration_secs,
+            read_secs: counters.read_nanos.load(Ordering::Relaxed) as f64 / 1e9,
+            stage_secs,
+            promote_secs: promote_started.elapsed().as_secs_f64(),
             new_watermark,
+            warnings: warnings.drain(),
         })
     }
     .await;
@@ -1214,8 +1496,114 @@ async fn run_transfer_bigquery(
 
 // ---- HTTP API sources (CleverTap / AppsFlyer) ----
 
-/// API sources write only to BigQuery. Reject any other destination up front
-/// with a clear config error.
+/// Refuse a full-refresh swap that would shrink the destination.
+///
+/// `atomic_swap` replaces the destination in its entirety — ClickHouse
+/// `EXCHANGE TABLES`, BigQuery `TRUNCATE` + `INSERT ... SELECT` — and neither
+/// is partition-aware. A run whose data covers less than the destination
+/// already holds therefore destroys the remainder, atomically and silently,
+/// then reports success. Comparing row counts is the one source-agnostic
+/// signal that catches every shape of it: a one-day API pull swapped over a
+/// year of history, or a one-month DB refresh swapped into a monthly-
+/// partitioned table.
+///
+/// This used to be a `tracing::warn!` on the API path only, which is why it
+/// never stopped anything: a warning does not prevent a swap, and the DB path
+/// carried the identical footgun with no warning at all.
+///
+/// `current_row_count` is best-effort by contract, so a count we cannot read
+/// must not fail the transfer — but it is logged at `warn`, because it means
+/// the guard did not actually run.
+async fn guard_full_refresh_shrink(
+    sink: &dyn Sink,
+    cfg: &TransferConfig,
+    new_rows: u64,
+    warnings: &Warnings,
+) -> Result<()> {
+    let existing = match sink.current_row_count(&cfg.dest_table).await {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!(
+                "full-refresh shrink guard could not read the current row count of '{}' ({e}); \
+                 proceeding with the swap UNCHECKED.",
+                cfg.dest_table
+            );
+            return Ok(());
+        }
+    };
+    match full_refresh_shrink_verdict(existing, new_rows, cfg.allow_full_refresh_shrink) {
+        ShrinkVerdict::Proceed => Ok(()),
+        ShrinkVerdict::ProceedWithWarning { existing, lost } => {
+            let message = format!(
+                "full-refresh will REPLACE '{}' ({existing} row(s)) with only {new_rows} row(s) — \
+                 the destination will SHRINK by {lost} row(s). Proceeding because \
+                 allow_full_refresh_shrink=True.",
+                cfg.dest_table,
+            );
+            tracing::warn!("{message}");
+            warnings.push(TransferWarning {
+                kind: WarningKind::FullRefreshShrink,
+                column: None,
+                // The rows the destination is about to lose — the number that
+                // makes "it shrank" concrete enough for a scheduler to gate on.
+                count: lost,
+                sample: None,
+                message,
+            });
+            Ok(())
+        }
+        ShrinkVerdict::Refuse { existing, lost } => Err(EtlError::config(format!(
+            "refusing full-refresh: swapping staging into '{}' would REPLACE {existing} row(s) \
+             with only {new_rows} row(s), shrinking the destination by {lost}. A full refresh \
+             replaces the table wholesale and is NOT partition-aware, so if this run covers only \
+             part of the destination the rest is destroyed. To add rows instead of replacing them \
+             use mode=\"incremental\" with key=, or mode=\"append\". If this shrink is genuinely \
+             intended, set allow_full_refresh_shrink=True.",
+            cfg.dest_table,
+        ))),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ShrinkVerdict {
+    Proceed,
+    ProceedWithWarning { existing: u64, lost: u64 },
+    Refuse { existing: u64, lost: u64 },
+}
+
+/// The decision half of [`guard_full_refresh_shrink`], split out as a pure
+/// function so it is unit-testable without an authenticated sink — the same
+/// reason `build_swap_sql` and `build_merge_sql` are free functions.
+///
+/// `existing` is `None` when the destination does not exist yet or the sink
+/// cannot report a count; neither is evidence of a shrink, so both proceed.
+fn full_refresh_shrink_verdict(
+    existing: Option<u64>,
+    new_rows: u64,
+    allow_shrink: bool,
+) -> ShrinkVerdict {
+    let Some(existing) = existing else {
+        return ShrinkVerdict::Proceed;
+    };
+    let Some(lost) = existing.checked_sub(new_rows).filter(|n| *n > 0) else {
+        return ShrinkVerdict::Proceed;
+    };
+    if allow_shrink {
+        ShrinkVerdict::ProceedWithWarning { existing, lost }
+    } else {
+        ShrinkVerdict::Refuse { existing, lost }
+    }
+}
+
+/// The declared output schema for an API source (API sources have no catalog
+/// to resolve against, so the caller declares the columns).
+///
+/// NOTE: this doc comment used to read "API sources write only to BigQuery.
+/// Reject any other destination up front with a clear config error." That gate
+/// (`ensure_api_dest_supported`) was deliberately removed in `bc1ab45` when API
+/// sources gained ClickHouse support; the comment outlived it and sat here
+/// describing a rejection that no longer exists, attached to a function that
+/// only returns a slice.
 fn api_columns_of(source_cfg: &SourceConfig) -> &[ApiColumn] {
     match source_cfg {
         SourceConfig::CleverTap(c) => &c.columns,
@@ -1316,18 +1704,11 @@ fn derive_api_window(
     }
 }
 
-fn warn_coerced_scalars(scope: &str, n: u64) {
-    if n > 0 {
-        tracing::warn!(
-            "{scope}: {n} value(s) couldn't be parsed to their declared type and were set to NULL"
-        );
-    }
-}
-
 /// Transfer from an HTTP API source (CleverTap/AppsFlyer) into any destination
 /// (BigQuery or ClickHouse). Mirrors `run_transfer_bigquery`'s
 /// staging/swap/merge/watermark tail; only the read side differs — a declared
 /// schema + paginated fetch instead of a DB read.
+#[allow(clippy::too_many_arguments)]
 async fn run_transfer_api(
     source_cfg: SourceConfig,
     sink: Arc<dyn Sink>,
@@ -1336,6 +1717,7 @@ async fn run_transfer_api(
     on_staged: Option<StagedValidationCb>,
     started: Instant,
     staging: String,
+    warnings: Warnings,
 ) -> Result<TransferResult> {
     // Without a source_table, `effective_state_key()` is empty — give the
     // incremental cursor a stable identity. A user `state_key` still wins.
@@ -1391,9 +1773,19 @@ async fn run_transfer_api(
     // destination (ClickHouse), so the gate has something to validate (see the
     // DB flow for the rationale). Append mode has no staging option and is
     // rejected up front when a gate is attached.
-    let force_stage_incremental = on_staged.is_some()
-        && cfg.mode == SyncMode::Incremental
-        && !sink.requires_staging_for_incremental();
+    // The same is true of a window-scoped delete on a destination whose upsert
+    // cannot express one inline: the delete subtracts the staged keys, so it
+    // needs the batch materialised in a table before any of it lands.
+    let force_stage_incremental = cfg.mode == SyncMode::Incremental
+        && !sink.requires_staging_for_incremental()
+        && (on_staged.is_some()
+            || (cfg.delete_stale_in_window && !sink.deletes_stale_within_merge()));
+    if cfg.delete_stale_in_window && !sink.supports_row_delete() {
+        return Err(EtlError::config(
+            "delete_stale_in_window is not supported by this destination (it cannot delete \
+             individual rows)",
+        ));
+    }
 
     let target_table = prepare_target(
         &sink,
@@ -1423,7 +1815,9 @@ async fn run_transfer_api(
             started,
             archive: None,
             throttle: None,
+            warnings: warnings.clone(),
         };
+        let stage_started = Instant::now();
         let mut batcher = ApiBatcher::new(&plan.dest_columns, &lookups, cfg.batch_rows, cfg.batch_bytes)?;
         let schema = batcher.schema();
         let mut sends: JoinSet<Result<()>> = JoinSet::new();
@@ -1435,23 +1829,83 @@ async fn run_transfer_api(
                 let from_i = crate::source::clevertap::iso_to_yyyymmdd(&from)?;
                 let to_i = crate::source::clevertap::iso_to_yyyymmdd(&to)?;
                 let mut cursor = src.create_export(&c.event_name, from_i, to_i).await?;
+                // The chain ends when a page carries no next cursor, and only
+                // then. `status` is deliberately NOT a termination signal: the
+                // live API sends "success" on every page, so the old rule —
+                // stop on the first "success" — read one page of every export
+                // and reported it clean (measured: 4,991 of 146,852 records,
+                // 3.40%, for one event-day). See the module docs.
+                let mut pages: u64 = 0;
+                let mut records_total: u64 = 0;
+                let stop: &str;
                 loop {
                     let page = src.next_page(&cursor).await?;
+                    pages += 1;
+                    records_total += page.records.len() as u64;
+                    tracing::debug!(
+                        "clevertap '{}': page {pages} status={:?} records={} next_cursor={}",
+                        c.event_name,
+                        page.status,
+                        page.records.len(),
+                        if page.next_cursor.is_some() { "yes" } else { "no" },
+                    );
                     for rec in &page.records {
                         if let Some(b) = batcher.append_record(rec)? {
                             ctx.push_batch(&mut sends, &mut insert_buf, schema.clone(), b).await;
                             reap(&mut sends, false).await?;
                         }
                     }
-                    // Records are processed above BEFORE this check, so the
-                    // terminal `success` page is never dropped.
-                    if matches!(page.status, PageStatus::Success) || page.records.is_empty() {
+                    // Records are consumed above BEFORE this check, so the
+                    // final page's rows are never dropped.
+                    let Some(next) = page.next_cursor else {
+                        stop = "no next_cursor (end of export)";
+                        break;
+                    };
+                    // A cursor that does not advance would spin forever, and an
+                    // export that genuinely ends says so by omitting the key
+                    // rather than by repeating it. Treat a repeat as the end and
+                    // say so loudly — it is the one stop reason that indicates a
+                    // vendor-side anomaly rather than a normal finish.
+                    if next == cursor {
+                        tracing::warn!(
+                            "clevertap '{}': page {pages} returned the SAME cursor it was fetched \
+                             with, so the chain is not advancing; stopping after \
+                             {records_total} record(s). This is a vendor-side anomaly — treat the \
+                             result as incomplete.",
+                            c.event_name,
+                        );
+                        stop = "cursor stopped advancing";
                         break;
                     }
-                    match page.cursor {
-                        Some(next) => cursor = next,
-                        None => break,
-                    }
+                    cursor = next;
+                }
+                tracing::info!(
+                    "clevertap '{}': read {records_total} record(s) across {pages} page(s) for \
+                     [{from}, {to}]; stopped on {stop}",
+                    c.event_name,
+                );
+                if pages == 1 {
+                    tracing::warn!(
+                        "clevertap '{}': the export ended after a SINGLE page ({records_total} \
+                         record(s)). For a busy event that is the signature of a paging failure, \
+                         not an empty day — verify against the vendor's own count before trusting \
+                         this run.",
+                        c.event_name,
+                    );
+                }
+                tracing::info!(
+                    "clevertap '{}': read {records_total} record(s) across {pages} page(s) for \
+                     [{from}, {to}]; stopped on {stop}",
+                    c.event_name,
+                );
+                if pages == 1 {
+                    tracing::warn!(
+                        "clevertap '{}': the export ended after a SINGLE page ({records_total} \
+                         record(s)). For a busy event that is the signature of a paging failure, \
+                         not an empty day — verify against the vendor's own count before trusting \
+                         this run.",
+                        c.event_name,
+                    );
                 }
             }
             SourceConfig::AppsFlyer(a) => {
@@ -1483,9 +1937,9 @@ async fn run_transfer_api(
         reap(&mut sends, true).await?;
         counters.rows_read.fetch_add(batcher.rows_total, Ordering::Relaxed);
         emit_progress(&counters, &progress, started);
-        warn_coerced_scalars("api read", batcher.invalid_scalars_total);
-        warn_coerced_dates("api read", batcher.invalid_dates_total);
-        warn_coerced_decimals("api read", batcher.invalid_decimals_total);
+        report_coercions("api read", batcher.coercions(), &warnings);
+        let stage_secs = stage_started.elapsed().as_secs_f64();
+        let promote_started = Instant::now();
         // Distinct, actionable warning for a declared DATE/TIMESTAMP column that
         // came out NULL for EVERY source value — a unit/format mismatch (e.g. a
         // packed `yyyyMMddHHmmSS` `ts` mis-declared), not real nulls.
@@ -1502,34 +1956,33 @@ async fn run_transfer_api(
         );
 
         if cfg.mode == SyncMode::Full {
-            // A full-refresh REPLACES the destination. API sources are naturally
-            // day/event-scoped, so a full run against an existing large table can
-            // silently swap 100Ms of rows away for a handful. Warn on any shrink;
-            // best-effort (a metadata lookup failure must not fail the transfer).
-            let new_rows = counters.rows_written.load(Ordering::Relaxed);
-            if let Ok(Some(existing)) = sink.current_row_count(&cfg.dest_table).await {
-                if existing > new_rows {
-                    tracing::warn!(
-                        "full-refresh will REPLACE '{}' ({existing} row(s)) with only {new_rows} row(s) \
-                         from window [{from}, {to}] — the destination will SHRINK. If you meant to \
-                         append/upsert rather than replace, use mode=\"incremental\" with key=.",
-                        cfg.dest_table
-                    );
-                }
-            }
+            // A full-refresh REPLACES the destination, and API sources are
+            // naturally day/event-scoped, so a full run against an existing
+            // large table swaps 100Ms of rows away for a handful. This used to
+            // be a `warn!` here and nothing at all on the DB path, which is why
+            // it never stopped anything; it is now a hard refusal shared by
+            // every swap site (`guard_full_refresh_shrink`).
             run_staged_validation(
                 &on_staged,
                 sink.as_ref(),
                 &staging,
                 counters.rows_written.load(Ordering::Relaxed),
             )?;
+            guard_full_refresh_shrink(
+                sink.as_ref(),
+                &cfg,
+                counters.rows_written.load(Ordering::Relaxed),
+                &warnings,
+            )
+            .await?;
             tracing::info!("swapping staging table into '{}'", cfg.dest_table);
             sink.atomic_swap(&cfg.dest_table, &staging, &plan.dest_columns).await?;
             sink.drop_table(&staging).await?;
         }
+        let mut rows_deleted = 0u64;
         if cfg.mode == SyncMode::Incremental {
             if used_staging {
-                promote_staged_incremental(
+                rows_deleted = promote_staged_incremental(
                     sink.as_ref(),
                     &cfg.dest_table,
                     &staging,
@@ -1537,10 +1990,12 @@ async fn run_transfer_api(
                     &plan.dest_columns,
                     cfg.merge_prune_partition_by.as_deref(),
                     cfg.merge_prune_key_range,
+                    cfg.merge_prune_key_list_max,
                     cfg.delete_stale_in_window,
                     &on_staged,
                     counters.rows_written.load(Ordering::Relaxed),
                     cfg.watermark.as_deref(),
+                    &warnings,
                 )
                 .await?;
             }
@@ -1579,8 +2034,13 @@ async fn run_transfer_api(
             rows_read: counters.rows_read.load(Ordering::Relaxed),
             rows_written: counters.rows_written.load(Ordering::Relaxed),
             bytes_written: counters.bytes_written.load(Ordering::Relaxed),
+            rows_deleted,
             duration_secs,
+            read_secs: counters.read_nanos.load(Ordering::Relaxed) as f64 / 1e9,
+            stage_secs,
+            promote_secs: promote_started.elapsed().as_secs_f64(),
             new_watermark,
+            warnings: warnings.drain(),
         })
     }
     .await;
@@ -1597,6 +2057,7 @@ async fn setup_postgres(
     base_table: Option<&str>,
     base_query: Option<&str>,
     watermark: Option<&str>,
+    warnings: &Warnings,
 ) -> Result<SourceSetup> {
     tracing::info!("connecting to postgres...");
     let control = s.connect().await?;
@@ -1650,7 +2111,7 @@ async fn setup_postgres(
                         cfg.watermark_source_expr.as_deref(),
                     )
                     .await?;
-                warn_on_null_watermark(w, null_count);
+                warn_on_null_watermark(w, null_count, warnings);
             }
             s.max_watermark(
                 &control,
@@ -1681,6 +2142,7 @@ async fn setup_mysql(
     base_table: Option<&str>,
     base_query: Option<&str>,
     watermark: Option<&str>,
+    warnings: &Warnings,
 ) -> Result<SourceSetup> {
     tracing::info!("connecting to mysql...");
     let mut control = s.connect().await?;
@@ -1721,7 +2183,7 @@ async fn setup_mysql(
                         cfg.watermark_source_expr.as_deref(),
                     )
                     .await?;
-                warn_on_null_watermark(w, null_count);
+                warn_on_null_watermark(w, null_count, warnings);
             }
             s.max_watermark(
                 &mut control,
@@ -1925,12 +2387,20 @@ async fn transfer_keyset_postgres(
         // Same read/parse overlap as the non-chunked path (see
         // `feed_off_reactor`): parse on the blocking pool, fetch the next chunk
         // of bytes concurrently.
-        let mut pending = stream.next().await;
+        // The idle timer wraps the source await and nothing else: it is
+        // recorded *inside* `await_source`, at the moment the chunk arrives, so
+        // the concurrent decode below neither trips it nor inflates read_secs.
+        let idle = cfg.read_idle_timeout_secs;
+        let scope = format!("partition '{}'", partition.label);
+        let mut pending = await_source(stream.next(), &ctx.counters, idle, &scope).await?;
         while let Some(bytes) = pending {
             let bytes = bytes?;
             let decoding = feed_off_reactor(decoder, bytes);
-            let (next, joined) = tokio::join!(stream.next(), decoding);
-            pending = next;
+            let (next, joined) = tokio::join!(
+                await_source(stream.next(), &ctx.counters, idle, &scope),
+                decoding
+            );
+            pending = next?;
             let (returned, decoded) = joined.map_err(decode_task_failed)?;
             decoder = returned;
             for batch in decoded? {
@@ -1973,8 +2443,7 @@ async fn transfer_keyset_postgres(
         ctx.counters
             .rows_read
             .fetch_add(rows_this_chunk, Ordering::Relaxed);
-        warn_coerced_dates("keyset read", decoder.invalid_dates_total);
-        warn_coerced_decimals("keyset read", decoder.invalid_decimals_total);
+        report_coercions("keyset read", decoder.coercions(), &ctx.warnings);
 
         if rows_this_chunk == 0 {
             break; // empty read — nothing (more) to sync
@@ -2069,12 +2538,20 @@ async fn transfer_partition_postgres(
     // Read/parse overlap: each chunk's parse runs on the blocking pool while
     // the next chunk is pulled off the socket, so the COPY stream keeps draining
     // instead of idling for the duration of every parse.
-    let mut pending = stream.next().await;
+    // The idle timer wraps the source await and nothing else: it is recorded
+    // *inside* `await_source`, at the moment the chunk arrives, so the
+    // concurrent decode below neither trips it nor inflates read_secs.
+    let idle = cfg.read_idle_timeout_secs;
+    let scope = format!("partition '{}'", partition.label);
+    let mut pending = await_source(stream.next(), &ctx.counters, idle, &scope).await?;
     while let Some(chunk) = pending {
         let chunk = chunk?;
         let decoding = feed_off_reactor(decoder, chunk);
-        let (next, joined) = tokio::join!(stream.next(), decoding);
-        pending = next;
+        let (next, joined) = tokio::join!(
+            await_source(stream.next(), &ctx.counters, idle, &scope),
+            decoding
+        );
+        pending = next?;
         let (returned, decoded) = joined.map_err(decode_task_failed)?;
         decoder = returned;
         for batch in decoded? {
@@ -2123,13 +2600,10 @@ async fn transfer_partition_postgres(
         partition.label,
         decoder.rows_total
     );
-    warn_coerced_dates(
+    report_coercions(
         &format!("partition '{}'", partition.label),
-        decoder.invalid_dates_total,
-    );
-    warn_coerced_decimals(
-        &format!("partition '{}'", partition.label),
-        decoder.invalid_decimals_total,
+        decoder.coercions(),
+        &ctx.warnings,
     );
     Ok(())
 }
@@ -2207,7 +2681,9 @@ async fn transfer_keyset_mysql(
             .ok_or_else(|| EtlError::other("mysql keyset query returned no result set"))?;
         futures::pin_mut!(stream);
 
-        while let Some(row) = stream.next().await {
+        let idle = cfg.read_idle_timeout_secs;
+        let scope = format!("partition '{}'", partition.label);
+        while let Some(row) = await_source(stream.next(), &ctx.counters, idle, &scope).await? {
             let row = row.map_err(|e| EtlError::from(e).context("reading mysql row"))?;
             if let Some(batch) = batcher.append_row(row)? {
                 let rows = batch.num_rows() as u64;
@@ -2242,9 +2718,7 @@ async fn transfer_keyset_mysql(
         ctx.counters
             .rows_read
             .fetch_add(rows_this_chunk, Ordering::Relaxed);
-        warn_coerced_dates("keyset read", batcher.invalid_dates_total);
-        warn_coerced_decimals("keyset read", batcher.invalid_decimals_total);
-        warn_collapsed_bools("keyset read", batcher.collapsed_bools_total);
+        report_coercions("keyset read", batcher.coercions(), &ctx.warnings);
 
         if rows_this_chunk == 0 {
             break;
@@ -2350,7 +2824,9 @@ async fn transfer_partition_mysql(
         .ok_or_else(|| EtlError::other("mysql query returned no result set"))?;
     futures::pin_mut!(stream);
 
-    while let Some(row) = stream.next().await {
+    let idle = cfg.read_idle_timeout_secs;
+    let scope = format!("partition '{}'", partition.label);
+    while let Some(row) = await_source(stream.next(), &ctx.counters, idle, &scope).await? {
         let row = row.map_err(|e| EtlError::from(e).context("reading mysql row"))?;
         if let Some(batch) = batcher.append_row(row)? {
             let rows = batch.num_rows() as u64;
@@ -2389,66 +2865,101 @@ async fn transfer_partition_mysql(
         partition.label,
         batcher.rows_total
     );
-    warn_coerced_dates(
+    report_coercions(
         &format!("partition '{}'", partition.label),
-        batcher.invalid_dates_total,
-    );
-    warn_coerced_decimals(
-        &format!("partition '{}'", partition.label),
-        batcher.invalid_decimals_total,
-    );
-    warn_collapsed_bools(
-        &format!("partition '{}'", partition.label),
-        batcher.collapsed_bools_total,
+        batcher.coercions(),
+        &ctx.warnings,
     );
     Ok(())
 }
 
-/// Warn (once per partition / read) when a decoder coerced date/datetime values
-/// to NULL — either zero-dates (`0000-00-00`) or valid dates outside ClickHouse's
-/// representable `[1900-01-01, 2299-12-31]` window (e.g. `9999-12-31` sentinels).
-/// Aggregated, not per-row, so a badly-legacy table can't flood the log.
-fn warn_coerced_dates(scope: &str, n: u64) {
-    if n > 0 {
-        tracing::warn!(
-            "{scope}: {n} unrepresentable or out-of-range date/datetime value(s) \
-             (zero-dates like '0000-00-00', or years outside ClickHouse's 1900–2299 \
-             window like '9999-12-31') coerced to NULL"
-        );
+/// The sentence describing one coercion kind, naming the column it happened
+/// in. Human-facing only — a caller matching behaviour matches on
+/// [`WarningKind`], which is stable; this text is not.
+fn coercion_message(kind: WarningKind, column: &str, n: u64) -> String {
+    match kind {
+        WarningKind::CoercedDate => format!(
+            "column '{column}': {n} unrepresentable or out-of-range date/datetime value(s) \
+             (zero-dates like '0000-00-00', or years outside ClickHouse's 1900-2299 window \
+             like '9999-12-31') coerced to NULL"
+        ),
+        WarningKind::CoercedDecimal => format!(
+            "column '{column}': {n} decimal value(s) coerced to NULL (value exceeded the \
+             declared Decimal(P,S) precision, or was NaN/Infinity)"
+        ),
+        WarningKind::CoercedScalar => format!(
+            "column '{column}': {n} value(s) coerced to NULL (a non-empty scalar that did not \
+             parse as the declared type)"
+        ),
+        WarningKind::CollapsedBool => format!(
+            "column '{column}': {n} tinyint(1) value(s) outside {{0, 1}} were flattened to a \
+             boolean 0/1, losing their original value. MySQL's BOOL is an alias for \
+             tinyint(1), so this column was mapped to Bool from its display width — if it \
+             actually holds small integers, pass tinyint1_as_bool=False to read it as an \
+             integer instead (note: rows already written keep the flattened value; re-sync \
+             to repair them)"
+        ),
+        // Table-level kinds are raised directly by their own call sites, which
+        // know the numbers that make them concrete.
+        WarningKind::NullWatermark
+        | WarningKind::FullRefreshShrink
+        | WarningKind::UnclusteredMergeTarget => {
+            format!("column '{column}': {n} affected row(s)")
+        }
     }
 }
 
-/// Warn (once per partition / read) when a decoder coerced a NUMERIC/DECIMAL
-/// value to NULL because it overflowed a `Decimal(P,S)` `type_overrides`
-/// entry's precision, or (Postgres only) was NaN/Infinity. Separate from
-/// [`warn_coerced_dates`] — same aggregation rationale, but a distinct
-/// message so the two coercion reasons aren't conflated under one count.
-fn warn_coerced_decimals(scope: &str, n: u64) {
-    if n > 0 {
-        tracing::warn!(
-            "{scope}: {n} decimal value(s) coerced to NULL (value exceeded the declared \
-             Decimal(P,S) precision, or was NaN/Infinity)"
-        );
+/// Log and record every per-column coercion a decoder reported for one
+/// partition/read.
+///
+/// Two audiences, one pass. The log keeps its old shape — one aggregated line
+/// per kind, so a badly-legacy table cannot flood it — but now names the
+/// columns responsible. The [`Warnings`] collector gets one structured entry
+/// per `(kind, column)`, which is what a scheduler can actually branch on:
+/// "9 columns across 8 tables were genuine small integers" is a statement you
+/// can only make from per-column data.
+fn report_coercions(scope: &str, entries: Vec<(WarningKind, String, u64)>, warnings: &Warnings) {
+    if entries.is_empty() {
+        return;
     }
-}
-
-/// Warn (once per partition / read) when a MySQL `tinyint(1)` column carried a
-/// value outside `{0, 1}` and was flattened to a Boolean. Same aggregation
-/// rationale as [`warn_coerced_dates`], but this one signals a *type-mapping*
-/// mistake rather than unrepresentable data: MySQL's `BOOL` is an alias for
-/// `tinyint(1)`, so display width is the only available hint, and a schema that
-/// doesn't follow that convention (Odoo, for one) stores genuine integers there.
-/// Non-zero here means the destination has already lost the difference between
-/// e.g. 2 and 3 — see `TransferConfig::tinyint1_as_bool` for the opt-out.
-fn warn_collapsed_bools(scope: &str, n: u64) {
-    if n > 0 {
-        tracing::warn!(
-            "{scope}: {n} tinyint(1) value(s) outside {{0, 1}} were flattened to a boolean \
-             0/1, losing their original value. MySQL's BOOL is an alias for tinyint(1), so \
-             this column was mapped to Bool from its display width — if it actually holds \
-             small integers, pass tinyint1_as_bool=False to read it as an integer instead \
-             (note: rows already written keep the flattened value; re-sync to repair them)"
-        );
+    let mut by_kind: std::collections::BTreeMap<WarningKind, Vec<(String, u64)>> =
+        std::collections::BTreeMap::new();
+    for (kind, column, count) in entries {
+        warnings.push(TransferWarning {
+            kind,
+            column: Some(column.clone()),
+            count,
+            sample: None,
+            message: coercion_message(kind, &column, count),
+        });
+        by_kind.entry(kind).or_default().push((column, count));
+    }
+    for (kind, cols) in by_kind {
+        let total: u64 = cols.iter().map(|(_, n)| n).sum();
+        let list = cols
+            .iter()
+            .map(|(c, n)| format!("{c} ({n})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let what = match kind {
+            WarningKind::CoercedDate => {
+                "unrepresentable or out-of-range date/datetime value(s) \
+                                         coerced to NULL"
+            }
+            WarningKind::CoercedDecimal => {
+                "decimal value(s) coerced to NULL (exceeded the declared Decimal(P,S), or \
+                 NaN/Infinity)"
+            }
+            WarningKind::CoercedScalar => {
+                "value(s) coerced to NULL (a non-empty scalar that did not parse)"
+            }
+            WarningKind::CollapsedBool => {
+                "tinyint(1) value(s) outside {0, 1} flattened to a boolean, losing their \
+                 original value (pass tinyint1_as_bool=False to keep them)"
+            }
+            _ => "affected value(s)",
+        };
+        tracing::warn!("{scope}: {total} {what} — by column: {list}");
     }
 }
 
@@ -2490,17 +3001,26 @@ fn watermark_column_nullable(watermark: &str, source_cols: &[ColumnType]) -> boo
 /// incomplete (the report's reproduction: 322,318 of 383,500 rows in one
 /// window, 0 errors, 0 warnings, until an independent completeness check
 /// caught it).
-fn warn_on_null_watermark(watermark: &str, null_count: i64) {
-    if null_count > 0 {
-        tracing::warn!(
-            "watermark column '{watermark}' is nullable and {null_count} row(s) currently have a \
-             NULL value there; a `WHERE {watermark} > x` predicate never matches NULL, so these \
-             rows are silently excluded from this and every future incremental run on this \
-             pipeline (this run will still report success). If they need to be synced, \
-             backfill them separately — e.g. a source_query scoped to `{watermark} IS NULL`, or \
-             a one-off mode=\"full\" load."
-        );
+fn warn_on_null_watermark(watermark: &str, null_count: i64, warnings: &Warnings) {
+    if null_count <= 0 {
+        return;
     }
+    let message = format!(
+        "watermark column '{watermark}' is nullable and {null_count} row(s) currently have a \
+         NULL value there; a `WHERE {watermark} > x` predicate never matches NULL, so these \
+         rows are silently excluded from this and every future incremental run on this \
+         pipeline (this run will still report success). If they need to be synced, \
+         backfill them separately — e.g. a source_query scoped to `{watermark} IS NULL`, or \
+         a one-off mode=\"full\" load."
+    );
+    tracing::warn!("{message}");
+    warnings.push(TransferWarning {
+        kind: WarningKind::NullWatermark,
+        column: Some(watermark.to_string()),
+        count: null_count as u64,
+        sample: None,
+        message,
+    });
 }
 
 /// Fail early (before any query touches it) if `lookback_seconds` is set but
@@ -3447,6 +3967,159 @@ mod tests {
     /// source connection), so this test needs no live source or destination.
     /// (ClickHouse incremental *without* chunk_rows is now supported via forced
     /// staging — covered by the live Python suite.)
+    fn cols(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn clustering_binds_when_the_key_leads_the_clustering() {
+        // Exactly clustered by the key.
+        assert!(clustering_binds(Some(&cols(&["id"])), &cols(&["id"])));
+        // A trailing clustering column costs nothing — BigQuery still prunes
+        // blocks on the leading field.
+        assert!(clustering_binds(
+            Some(&cols(&["id", "created_at"])),
+            &cols(&["id"])
+        ));
+        // Composite key matching the leading clustering fields, in order.
+        assert!(clustering_binds(
+            Some(&cols(&["a", "b", "c"])),
+            &cols(&["a", "b"])
+        ));
+        // Case is not a real mismatch.
+        assert!(clustering_binds(Some(&cols(&["ID"])), &cols(&["id"])));
+    }
+
+    #[test]
+    fn clustering_does_not_bind_when_the_key_is_not_the_prefix() {
+        // The production shape this warning exists for: no clustering at all,
+        // so the key bound prunes nothing and every merge full-scans.
+        assert!(!clustering_binds(None, &cols(&["id"])));
+        assert!(!clustering_binds(Some(&[]), &cols(&["id"])));
+        // Clustered by something else entirely.
+        assert!(!clustering_binds(
+            Some(&cols(&["created_at"])),
+            &cols(&["id"])
+        ));
+        // Right columns, wrong order: pruning is prefix-based, so a key that
+        // trails the clustering cannot skip blocks.
+        assert!(!clustering_binds(
+            Some(&cols(&["created_at", "id"])),
+            &cols(&["id"])
+        ));
+        // Key longer than the clustering: the tail is unpruned.
+        assert!(!clustering_binds(Some(&cols(&["a"])), &cols(&["a", "b"])));
+        // No key at all is not a binding prune.
+        assert!(!clustering_binds(Some(&cols(&["id"])), &[]));
+    }
+
+    #[test]
+    fn warnings_fold_per_kind_and_column_across_partitions() {
+        // Each partition reports its own per-column counts; a caller wants one
+        // entry per column for the run, not one per partition.
+        let w = Warnings::default();
+        for (col, n) in [("state", 3u64), ("state", 4), ("qty", 1)] {
+            w.push(TransferWarning {
+                kind: WarningKind::CollapsedBool,
+                column: Some(col.into()),
+                count: n,
+                sample: None,
+                message: col.to_string(),
+            });
+        }
+        // A different kind on the same column stays a separate entry.
+        w.push(TransferWarning {
+            kind: WarningKind::CoercedDate,
+            column: Some("state".into()),
+            count: 2,
+            sample: None,
+            message: "d".into(),
+        });
+        let out = w.drain();
+        assert_eq!(out.len(), 3, "{out:?}");
+        // Ordered most-affected first.
+        assert_eq!(out[0].kind, WarningKind::CollapsedBool);
+        assert_eq!(out[0].column.as_deref(), Some("state"));
+        assert_eq!(out[0].count, 7);
+        assert_eq!(out[1].count, 2);
+        assert_eq!(out[2].count, 1);
+        // Draining empties the collector, so a second call can't double-report.
+        assert!(w.drain().is_empty());
+    }
+
+    #[test]
+    fn a_clean_run_reports_no_warnings() {
+        let w = Warnings::default();
+        report_coercions("partition 'all'", Vec::new(), &w);
+        assert!(w.drain().is_empty());
+    }
+
+    #[test]
+    fn report_coercions_records_one_entry_per_kind_and_column() {
+        let w = Warnings::default();
+        report_coercions(
+            "partition 'all'",
+            vec![
+                (WarningKind::CollapsedBool, "x_state".to_string(), 412),
+                (WarningKind::CoercedDecimal, "amount".to_string(), 3),
+            ],
+            &w,
+        );
+        let out = w.drain();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].kind, WarningKind::CollapsedBool);
+        assert_eq!(out[0].column.as_deref(), Some("x_state"));
+        assert_eq!(out[0].count, 412);
+        // The message names the column — the thing a per-table total could not.
+        assert!(out[0].message.contains("x_state"), "{}", out[0].message);
+        // ...and points at the fix.
+        assert!(
+            out[0].message.contains("tinyint1_as_bool=False"),
+            "{}",
+            out[0].message
+        );
+    }
+
+    #[tokio::test]
+    async fn read_idle_timeout_fires_only_when_the_source_stalls() {
+        let counters = Counters::default();
+        // A source that never produces trips the timer...
+        let err = await_source(
+            tokio::time::sleep(Duration::from_secs(30)),
+            &counters,
+            1,
+            "partition 'all'",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, EtlError::ReadIdleTimeout { .. }), "{err}");
+        // ...and the message says which subsystem it is NOT, because the whole
+        // point of this knob is that a statement_timeout blamed the wrong one.
+        let msg = err.to_string();
+        assert!(msg.contains("read_idle_timeout_secs"), "{msg}");
+        assert!(msg.contains("not a destination-side stall"), "{msg}");
+        // A source that produces in time does not, and its wait is counted.
+        let before = counters.read_nanos.load(Ordering::Relaxed);
+        let v = await_source(async { 7u8 }, &counters, 1, "partition 'all'")
+            .await
+            .unwrap();
+        assert_eq!(v, 7);
+        assert!(counters.read_nanos.load(Ordering::Relaxed) >= before);
+        // Zero disables it entirely: the same never-ready future must not fail
+        // fast, so a short race against it has to time out on our side.
+        let never = await_source(
+            tokio::time::sleep(Duration::from_secs(30)),
+            &counters,
+            0,
+            "partition 'all'",
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), never)
+                .await
+                .is_err(),
+            "read_idle_timeout_secs=0 must not impose any deadline"
+        );
+    }
     #[tokio::test]
     async fn validate_with_chunk_rows_is_rejected_up_front() {
         let mut cfg = crate::config::default_test_config();
@@ -3902,6 +4575,89 @@ mod tests {
             to_date: None,
             lookback_days: 0,
         })
+    }
+
+    #[test]
+    fn full_refresh_refuses_to_shrink_the_destination_by_default() {
+        // The audited failure: a one-day API pull swapped over a year of
+        // history. `atomic_swap` is EXCHANGE TABLES / TRUNCATE+INSERT in the two
+        // sinks — neither is partition-aware — so the other 364 days are gone,
+        // atomically, with a success exit. Row counts are the one
+        // source-agnostic signal that sees it coming.
+        assert_eq!(
+            full_refresh_shrink_verdict(Some(370_900_000), 1_598_163, false),
+            ShrinkVerdict::Refuse {
+                existing: 370_900_000,
+                lost: 369_301_837
+            }
+        );
+        // Not an API-source quirk: one month refreshed into a monthly-
+        // partitioned table loses the other eleven the same way.
+        assert_eq!(
+            full_refresh_shrink_verdict(Some(1_200_000), 100_000, false),
+            ShrinkVerdict::Refuse {
+                existing: 1_200_000,
+                lost: 1_100_000
+            }
+        );
+        // Losing a single row is still losing a row.
+        assert_eq!(
+            full_refresh_shrink_verdict(Some(101), 100, false),
+            ShrinkVerdict::Refuse {
+                existing: 101,
+                lost: 1
+            }
+        );
+    }
+
+    #[test]
+    fn full_refresh_proceeds_when_it_is_not_a_shrink() {
+        // Growing, or replacing exactly, is the normal case and must stay quiet.
+        assert_eq!(
+            full_refresh_shrink_verdict(Some(100), 500, false),
+            ShrinkVerdict::Proceed
+        );
+        assert_eq!(
+            full_refresh_shrink_verdict(Some(100), 100, false),
+            ShrinkVerdict::Proceed
+        );
+        // A destination that does not exist yet, or a sink that cannot report a
+        // count, is not evidence of a shrink — a first run must not be blocked.
+        assert_eq!(
+            full_refresh_shrink_verdict(None, 0, false),
+            ShrinkVerdict::Proceed
+        );
+        // Replacing an empty table is fine even with zero rows read.
+        assert_eq!(
+            full_refresh_shrink_verdict(Some(0), 0, false),
+            ShrinkVerdict::Proceed
+        );
+        // Zero rows over a populated table is the worst case, and is refused.
+        assert_eq!(
+            full_refresh_shrink_verdict(Some(1), 0, false),
+            ShrinkVerdict::Refuse {
+                existing: 1,
+                lost: 1
+            }
+        );
+    }
+
+    #[test]
+    fn allow_full_refresh_shrink_is_an_opt_in_escape_hatch_not_a_silence() {
+        // Opting in still warns: a legitimate shrink is worth a line in the log,
+        // and this is the flag that used to be the *only* behaviour.
+        assert_eq!(
+            full_refresh_shrink_verdict(Some(1_000), 10, true),
+            ShrinkVerdict::ProceedWithWarning {
+                existing: 1_000,
+                lost: 990
+            }
+        );
+        // The flag does not invent a warning where there is no shrink.
+        assert_eq!(
+            full_refresh_shrink_verdict(Some(10), 1_000, true),
+            ShrinkVerdict::Proceed
+        );
     }
 
     #[test]

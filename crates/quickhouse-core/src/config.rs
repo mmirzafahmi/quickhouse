@@ -8,7 +8,22 @@ use std::collections::HashMap;
 pub struct PostgresConfig {
     /// libpq-style connection string, e.g. `postgresql://user:pw@host:5432/db`.
     pub dsn: String,
-    /// Statement timeout hint (seconds) applied per connection; 0 = server default.
+    /// Server-side statement timeout (seconds) set on each connection this
+    /// transfer opens; `0` = leave the server default alone.
+    ///
+    /// **Read this as a ceiling on the whole transfer, not on the query.**
+    /// quickhouse streams the source result set straight into the destination,
+    /// so the statement that produces it stays open from the first row to the
+    /// last one written. The server therefore counts read + decode +
+    /// destination write + backpressure against this timeout, and cancels the
+    /// statement — reporting a *source* error — when the total crosses it. A
+    /// sub-second source scan can fail here purely because the destination was
+    /// slow that day, and because every retry restarts from zero against the
+    /// same ceiling, `retry_max_attempts` cannot rescue it.
+    ///
+    /// Size it for the transfer, then use
+    /// [`TransferConfig::read_idle_timeout_secs`] for the thing this knob's
+    /// name suggests: failing when the *source* stops producing rows.
     pub statement_timeout_secs: u64,
     /// Path to a PEM file with extra trusted CA certificate(s) (e.g. AWS RDS's
     /// regional bundle), trusted in addition to the public webpki-roots store.
@@ -27,7 +42,22 @@ pub struct PostgresConfig {
 pub struct MySqlConfig {
     /// MySQL connection string, e.g. `mysql://user:pw@host:3306/db`.
     pub dsn: String,
-    /// Statement timeout hint (seconds) applied per connection; 0 = server default.
+    /// Server-side statement timeout (seconds) set on each connection this
+    /// transfer opens; `0` = leave the server default alone.
+    ///
+    /// **Read this as a ceiling on the whole transfer, not on the query.**
+    /// quickhouse streams the source result set straight into the destination,
+    /// so the statement that produces it stays open from the first row to the
+    /// last one written. The server therefore counts read + decode +
+    /// destination write + backpressure against this timeout, and cancels the
+    /// statement — reporting a *source* error — when the total crosses it. A
+    /// sub-second source scan can fail here purely because the destination was
+    /// slow that day, and because every retry restarts from zero against the
+    /// same ceiling, `retry_max_attempts` cannot rescue it.
+    ///
+    /// Size it for the transfer, then use
+    /// [`TransferConfig::read_idle_timeout_secs`] for the thing this knob's
+    /// name suggests: failing when the *source* stops producing rows.
     pub statement_timeout_secs: u64,
     /// Path to a PEM file with extra trusted CA certificate(s) (e.g. AWS RDS's
     /// regional bundle), trusted in addition to the public webpki-roots store.
@@ -184,9 +214,10 @@ impl SourceConfig {
         }
     }
 
-    /// Whether this is an HTTP API source (CleverTap/AppsFlyer) — those take a
-    /// declared schema + date window and bypass the DB schema-resolution /
-    /// partition machinery, writing only to BigQuery.
+    /// Whether this is an HTTP API source (CleverTap/AppsFlyer/HttpApi) —
+    /// those take a declared schema + date window and bypass the DB
+    /// schema-resolution / partition machinery. They write to either
+    /// destination (BigQuery or ClickHouse) since `bc1ab45`.
     pub fn is_api(&self) -> bool {
         matches!(
             self,
@@ -591,19 +622,90 @@ pub struct TransferConfig {
     /// batch's key span alive. Those transfers keep the partition-scoped bound
     /// they already required.
     pub merge_prune_key_range: bool,
-    /// BigQuery-destination incremental only: additionally `DELETE` destination
-    /// rows *inside the merged window* that are absent from the source pull
-    /// (`WHEN NOT MATCHED BY SOURCE`), giving "replace this window" semantics
-    /// and making a NULL merge key self-correct (net replace) instead of
-    /// duplicating on re-runs.
+    /// BigQuery-destination incremental only: when the staging batch holds at
+    /// most this many distinct merge-key values, bound the `MERGE`'s
+    /// destination scan to that exact key *list* (`T.k IN (v1, v2, …)`) instead
+    /// of the `[MIN, MAX]` range of [`Self::merge_prune_key_range`]. `0`
+    /// (default) disables it and keeps the range bound alone.
+    ///
+    /// **Why a list, when a range is already emitted.** Both are the same
+    /// tautology — a destination row can only match a key the batch contains —
+    /// so neither needs an immutability contract and neither can change which
+    /// rows merge. They differ entirely in how well they *bind*. A range bound
+    /// prunes in proportion to how tightly the changed keys cluster: on a
+    /// table whose rows are only ever appended, the delta sits at the top of
+    /// the key space and `[MIN, MAX]` is narrow. On a table whose rows are
+    /// updated after insert — a user profile, an order status, a voucher
+    /// redemption — the changed keys are scattered across the whole key space,
+    /// `[MIN, MAX]` covers nearly the entire table, and the prune is correct
+    /// and useless at the same time. A key list does not degrade that way: it
+    /// names exactly the keys in the batch, and BigQuery prunes an `IN` list
+    /// against a clustered table as well as it prunes a range.
+    ///
+    /// **What it costs.** One extra query over the staging table per merge, to
+    /// read up to `merge_prune_key_list_max + 1` distinct key values. If the
+    /// batch turns out to hold more distinct keys than the limit, the list is
+    /// abandoned and the run falls back to the range bound — so the ceiling is
+    /// a real ceiling on statement size, not just a hint. Set it to a few
+    /// thousand: large enough to cover a normal incremental delta, small
+    /// enough that the generated `IN` list stays a sane statement.
+    ///
+    /// **Applies only to a single-column `key`.** A composite key would need
+    /// an `IN UNNEST([STRUCT(…), …])` form whose pruning behaviour is not the
+    /// same; those transfers keep the per-column range bound.
+    ///
+    /// Ignored — like [`Self::merge_prune_key_range`] — when
+    /// [`Self::delete_stale_in_window`] is set, for the same reason: narrowing
+    /// the `ON` clause would strand deleted-at-source rows outside the batch's
+    /// keys.
+    pub merge_prune_key_list_max: usize,
+    /// Incremental only: additionally `DELETE` destination rows *inside the
+    /// merged window* that are absent from the source pull, giving "replace
+    /// this window" semantics and making a NULL merge key self-correct (net
+    /// replace) instead of duplicating on re-runs. This is the only way an
+    /// ordinary sync converges with a source that hard-deletes rows.
     ///
     /// **Requires `merge_prune_partition_by`** (a hard config error otherwise):
     /// the DELETE is scoped to that immutable column's `[MIN, MAX]` range in the
-    /// staging batch — the SAME bound the prune uses. Without a window bound a
-    /// `WHEN NOT MATCHED BY SOURCE` clause would delete the ENTIRE destination
-    /// history outside the delta, so it is never allowed unscoped. `false`
-    /// (default) keeps the insert-or-update-only merge.
+    /// staging batch — the SAME bound the prune uses. Without a window bound
+    /// the delete would remove the ENTIRE destination history outside the
+    /// delta, so it is never allowed unscoped. `false` (default) keeps the
+    /// insert-or-update-only merge.
+    ///
+    /// **How each destination performs it.**
+    /// - BigQuery: a `WHEN NOT MATCHED BY SOURCE AND <window>` clause inside
+    ///   the same `MERGE`, so it is atomic with the upsert. BigQuery reports
+    ///   one combined affected-row count for the statement, so
+    ///   [`TransferResult::rows_deleted`] stays `0` here.
+    /// - ClickHouse: a lightweight `DELETE FROM dest WHERE <window> AND key
+    ///   NOT IN (SELECT key FROM staging)`, run just before the staged rows are
+    ///   promoted. This forces the run to stage (ClickHouse incremental
+    ///   otherwise inserts directly), because the delete needs a materialised
+    ///   batch to subtract from. Not atomic with the insert: a reader between
+    ///   the two statements sees the window with stale rows already removed and
+    ///   the new ones not yet in. `rows_deleted` reports the exact count.
+    ///
+    /// To *measure* drift against a source without repairing it — including
+    /// outside any sync — see [`crate::reconcile::reconcile_keys`].
     pub delete_stale_in_window: bool,
+
+    /// Full-refresh only: allow the swap even when it would leave the
+    /// destination with FEWER rows than it had before.
+    ///
+    /// `mode="full"` replaces the destination wholesale — ClickHouse
+    /// `EXCHANGE TABLES`, BigQuery `TRUNCATE` + `INSERT ... SELECT`. **Neither
+    /// is partition-aware.** A run that reads one partition's worth of data and
+    /// swaps it in therefore destroys every *other* partition, atomically and
+    /// with no error. That is not an API-source quirk: a Postgres full refresh
+    /// scoped to one month, swapped into a monthly-partitioned destination,
+    /// loses the other eleven months by exactly the same code path.
+    ///
+    /// `false` (the default) turns that into a hard error *before* the swap
+    /// runs. Set `true` only when a full refresh is genuinely expected to
+    /// shrink the destination — i.e. the source really did lose rows. To add
+    /// to a destination rather than replace it, use `mode="incremental"` with
+    /// `key=`, or `mode="append"`.
+    pub allow_full_refresh_shrink: bool,
 
     // ---- parallelism / batching ----
     /// How many partitions read concurrently. `0` means "derive from the host"
@@ -722,6 +824,38 @@ pub struct TransferConfig {
     /// PostgreSQL and MySQL sources; ignored for a BigQuery source (its read
     /// path is a managed, separately-metered API).
     pub read_max_rows_per_sec: Option<u64>,
+    /// Fail the transfer when **no source rows arrive** for this many seconds.
+    /// `0` (default) disables it.
+    ///
+    /// **This is the knob that `statement_timeout_secs` is not.** A source-side
+    /// `statement_timeout` looks like a cap on query duration, but quickhouse
+    /// streams the source result set straight into the destination, so the
+    /// source statement's cursor stays open for the *entire* transfer. That
+    /// makes `statement_timeout_secs` a ceiling on read + decode + destination
+    /// write + backpressure — a source query that takes 0.6 seconds server-side
+    /// still trips it when the *destination* is throttling, and it reports the
+    /// failure as a source error (`57014 canceling statement due to statement
+    /// timeout`), pointing an operator at a query and an index that are fine.
+    /// Worse, retries cannot rescue it: every attempt restarts from zero
+    /// against the same ceiling, so a table that crosses the line fails every
+    /// attempt, on a condition that has nothing to do with the source.
+    ///
+    /// This timer measures only the awaits on the source stream itself. Time
+    /// spent decoding, inserting, or blocked on the memory budget does not
+    /// count toward it, so a slow destination never trips it — which is what
+    /// makes it safe to set tightly. A genuinely hung source does trip it,
+    /// which is the condition an operator actually wants to detect.
+    ///
+    /// The resulting error is classified transient, so `retry_max_attempts`
+    /// retries the whole transfer.
+    ///
+    /// Applies to the PostgreSQL, MySQL and BigQuery source reads. API sources
+    /// are paced by their own per-request HTTP timeouts instead.
+    ///
+    /// Setting this lets `statement_timeout_secs` go back to meaning what its
+    /// name says — a guard on the source database against a runaway scan — at
+    /// a value sized for the source rather than for the destination's worst day.
+    pub read_idle_timeout_secs: u64,
 
     // ---- 0.5.0 block (kept contiguous; append new fields here) ----
     /// Incremental + ClickHouse-destination only: read the source in
@@ -1087,14 +1221,127 @@ impl TransferConfig {
     }
 }
 
+/// What a [`TransferWarning`] is about. Every variant names a condition
+/// quickhouse detects and recovers from on its own — the transfer still
+/// succeeds — but which changes what the destination now contains. These used
+/// to be `tracing::warn!` lines only, which meant an orchestrator could not act
+/// on them: a Dagster asset reported success while a column quietly rotted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum WarningKind {
+    /// A MySQL `tinyint(1)` value outside `{0, 1}` was flattened to a boolean,
+    /// losing the difference between e.g. 2 and 3. See
+    /// [`TransferConfig::tinyint1_as_bool`].
+    CollapsedBool,
+    /// A date/datetime was coerced to NULL: a zero-date, or a year outside
+    /// ClickHouse's representable `[1900, 2299]` window.
+    CoercedDate,
+    /// A decimal was coerced to NULL: it exceeded the declared `Decimal(P,S)`
+    /// precision, or was NaN/Infinity.
+    CoercedDecimal,
+    /// An API source's scalar (int/float/bool/bytes) failed to parse -> NULL.
+    CoercedScalar,
+    /// The incremental watermark column is nullable and rows currently hold a
+    /// NULL there. `WHERE watermark > x` never matches NULL, so those rows are
+    /// excluded from this and every future incremental run — silently, and
+    /// permanently. The most dangerous condition in this list.
+    NullWatermark,
+    /// A full refresh left the destination with fewer rows than it had, and
+    /// `allow_full_refresh_shrink` permitted it. (Without that flag the same
+    /// condition is a hard error, not a warning.)
+    FullRefreshShrink,
+    /// A BigQuery `MERGE` ran against a destination that is not clustered by
+    /// the merge key, so the key-range prune had nothing to prune with and the
+    /// statement scanned the whole table. Not a data problem — a cost one.
+    UnclusteredMergeTarget,
+}
+
+impl WarningKind {
+    /// Stable machine-readable name, for a caller matching on the kind (and
+    /// what the Python binding exposes as `warning.kind`). Never reworded
+    /// without a deprecation cycle, unlike the human-facing `message`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            WarningKind::CollapsedBool => "collapsed_bool",
+            WarningKind::CoercedDate => "coerced_date",
+            WarningKind::CoercedDecimal => "coerced_decimal",
+            WarningKind::CoercedScalar => "coerced_scalar",
+            WarningKind::NullWatermark => "null_watermark",
+            WarningKind::FullRefreshShrink => "full_refresh_shrink",
+            WarningKind::UnclusteredMergeTarget => "unclustered_merge_target",
+        }
+    }
+}
+
+/// One structured warning from a transfer — the data form of what also goes to
+/// the log. Collected on [`TransferResult::warnings`] so a scheduler can *fail*
+/// a run on a signal quickhouse already computes, instead of scraping stderr.
+///
+/// Warnings are aggregated per `(kind, column)` across the whole run, not
+/// emitted per row: `count` is how many values tripped it, so a badly-legacy
+/// table yields one entry with a large count rather than millions of entries.
+#[derive(Debug, Clone)]
+pub struct TransferWarning {
+    pub kind: WarningKind,
+    /// The source column responsible, when the condition is attributable to
+    /// one. `None` for table-level conditions (a full-refresh shrink, an
+    /// unclustered merge target).
+    pub column: Option<String>,
+    /// How many values/rows tripped this condition. Table-level warnings use
+    /// the count that makes the condition concrete (rows lost to a shrink,
+    /// rows holding a NULL watermark); `0` where no count applies.
+    pub count: u64,
+    /// A representative offending value, where capturing one is free at the
+    /// point of detection. `None` otherwise — an absent sample never means the
+    /// count is uncertain.
+    pub sample: Option<String>,
+    /// Human-facing text, the same sentence written to the log. Format is not
+    /// stable; match on `kind` instead.
+    pub message: String,
+}
+
 /// Summary returned to the caller after a transfer.
+///
+/// Beyond the row/byte counters, this carries the two things a caller
+/// previously had to reconstruct from logs and follow-up queries: the
+/// structured [`warnings`](Self::warnings) quickhouse detected, and a
+/// phase breakdown of where the time went.
 #[derive(Debug, Clone, Default)]
 pub struct TransferResult {
     pub rows_read: u64,
     pub rows_written: u64,
     pub bytes_written: u64,
+    /// Destination rows deleted by this run: the window-scoped delete of
+    /// [`TransferConfig::delete_stale_in_window`] on a ClickHouse destination,
+    /// or a [`crate::reconcile::reconcile_keys`] repair. `0` everywhere else.
+    ///
+    /// **BigQuery caveat:** a BigQuery `delete_stale_in_window` performs its
+    /// delete inside the `MERGE`'s `WHEN NOT MATCHED BY SOURCE` clause, and
+    /// BigQuery reports only one combined `numDmlAffectedRows` for the whole
+    /// statement — inserts, updates and deletes together. There is no way to
+    /// attribute the delete portion, so this stays `0` for that path rather
+    /// than reporting a number that is really the merge's total.
+    pub rows_deleted: u64,
     pub duration_secs: f64,
+    /// Cumulative time the source readers spent *waiting on source rows* — the
+    /// awaits on the source stream itself, excluding decode, insert and any
+    /// backpressure. Summed across parallel readers, so with `parallelism > 1`
+    /// it can legitimately exceed [`stage_secs`](Self::stage_secs); compare
+    /// `read_secs / parallelism` against `stage_secs` to judge whether the
+    /// source or the write path is the bottleneck.
+    pub read_secs: f64,
+    /// Wall time of the streaming phase: reading, decoding and writing every
+    /// row into the destination (or into this run's staging table). Ends when
+    /// the last partition finishes.
+    pub stage_secs: f64,
+    /// Wall time of the promotion that follows the streaming phase — the
+    /// full-refresh `EXCHANGE`/swap, the incremental `MERGE` or insert-select,
+    /// the window-scoped delete, and the watermark persist. On a BigQuery
+    /// destination this is usually most of the run.
+    pub promote_secs: f64,
     pub new_watermark: Option<String>,
+    /// Structured warnings, aggregated per `(kind, column)`. Empty on a clean
+    /// run. See [`TransferWarning`].
+    pub warnings: Vec<TransferWarning>,
 }
 
 /// A default `TransferConfig` for tests in other modules (e.g. `sync`), which
@@ -1121,7 +1368,9 @@ pub(crate) fn default_test_config() -> TransferConfig {
         primary_key: vec![],
         merge_prune_partition_by: None,
         merge_prune_key_range: true,
+        merge_prune_key_list_max: 0,
         delete_stale_in_window: false,
+        allow_full_refresh_shrink: false,
         parallelism: 1,
         batch_rows: 1000,
         batch_bytes: 0,
@@ -1131,6 +1380,7 @@ pub(crate) fn default_test_config() -> TransferConfig {
         partition_column: None,
         partition_source_expr: None,
         read_max_rows_per_sec: None,
+        read_idle_timeout_secs: 0,
         chunk_rows: None,
         retry_max_attempts: 1,
         column_transforms: HashMap::new(),
@@ -1230,7 +1480,9 @@ mod tests {
             primary_key: vec![],
             merge_prune_partition_by: None,
             merge_prune_key_range: true,
+            merge_prune_key_list_max: 0,
             delete_stale_in_window: false,
+            allow_full_refresh_shrink: false,
             parallelism: 1,
             batch_rows: 1000,
             batch_bytes: 0,
@@ -1240,6 +1492,7 @@ mod tests {
             partition_column: None,
             partition_source_expr: None,
             read_max_rows_per_sec: None,
+            read_idle_timeout_secs: 0,
             chunk_rows: None,
             retry_max_attempts: 1,
             column_transforms: HashMap::new(),

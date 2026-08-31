@@ -208,6 +208,8 @@ pub trait Sink: Send + Sync {
     /// `dedup_order` names the column that breaks ties when `staging` holds
     /// more than one row for a key — the watermark, so the newest row wins.
     /// Deduplication itself is not optional; see `build_merge_sql`.
+    /// `prune_key_list_max` is the ceiling on an exact key-list bound (0 =
+    /// off); see `TransferConfig::merge_prune_key_list_max`.
     #[allow(clippy::too_many_arguments)]
     async fn merge_into(
         &self,
@@ -217,6 +219,7 @@ pub trait Sink: Send + Sync {
         _columns: &[ColumnType],
         _prune_partition: Option<&str>,
         _prune_key_range: bool,
+        _prune_key_list_max: usize,
         _delete_stale: bool,
         _dedup_order: Option<&str>,
     ) -> Result<()> {
@@ -243,7 +246,104 @@ pub trait Sink: Send + Sync {
             "insert_select: this destination does not support staged insert-select promotion",
         ))
     }
+
+    // ---- row-delete capability (0.15) ----
+
+    /// Whether this destination can delete individual rows — what backs the
+    /// window-scoped delete of `TransferConfig::delete_stale_in_window` and
+    /// `reconcile::reconcile_keys`' repair step. Default `false`: a destination
+    /// that cannot delete says so, and the caller reports a config error naming
+    /// it rather than silently skipping the delete. Pure/no I/O.
+    fn supports_row_delete(&self) -> bool {
+        false
+    }
+
+    /// Whether `delete_stale_in_window` is expressed *inside* this
+    /// destination's `merge_into` (BigQuery's `WHEN NOT MATCHED BY SOURCE`
+    /// clause) rather than as a separate statement. `true` means the sync path
+    /// must not also call [`Self::delete_stale_against_staging`] — the merge
+    /// already did it, atomically. Pure/no I/O.
+    fn deletes_stale_within_merge(&self) -> bool {
+        false
+    }
+
+    /// The destination's clustering (BigQuery) or primary-key (ClickHouse)
+    /// columns for `table`, in order — what a merge can actually prune on.
+    /// `None` when the destination does not report them or the table is
+    /// missing. Diagnostic only; a failure here must never fail a transfer.
+    async fn clustering_columns(&self, _table: &str) -> Result<Option<Vec<String>>> {
+        Ok(None)
+    }
+
+    /// Delete rows of `dest` that lie inside the staging batch's `[MIN, MAX]`
+    /// range on `window_column` but whose `key` is absent from `staging` —
+    /// "replace this window" for a destination whose merge cannot express it
+    /// inline. Returns the number of rows deleted.
+    ///
+    /// The window bound is what keeps this from deleting the destination's
+    /// entire history; an implementation that cannot resolve a bound must
+    /// delete nothing rather than fall back to an unscoped statement. An empty
+    /// staging table means there is no window to replace, so it deletes nothing
+    /// and returns `0`.
+    ///
+    /// Default: unsupported — only a destination reporting
+    /// [`Self::supports_row_delete`] is ever asked.
+    async fn delete_stale_against_staging(
+        &self,
+        _dest: &str,
+        _staging: &str,
+        _key: &[String],
+        _window_column: &str,
+    ) -> Result<u64> {
+        Err(EtlError::internal(
+            "delete_stale_against_staging: this destination does not support row deletes",
+        ))
+    }
+
+    /// Every distinct value of `key_column` in `table` matching `window` (a raw
+    /// SQL predicate in the destination's own dialect, or `None` for the whole
+    /// table), rendered as text. NULL keys are excluded — they identify no row
+    /// and cannot be reconciled against a source key.
+    ///
+    /// The text rendering is the interchange format `reconcile_keys` diffs on,
+    /// and it is the destination's job to make it comparable with what the
+    /// source produced for the same logical value (integers bare, timestamps
+    /// ISO-8601, and so on).
+    async fn distinct_keys(
+        &self,
+        _table: &str,
+        _key_column: &str,
+        _window: Option<&str>,
+    ) -> Result<Vec<String>> {
+        Err(EtlError::internal(
+            "distinct_keys: this destination does not support keyset reads",
+        ))
+    }
+
+    /// Delete rows of `table` matching `window` whose `key_column` holds one of
+    /// `keys` — the text values [`Self::distinct_keys`] returned. Returns the
+    /// number of rows deleted (which can exceed `keys.len()` where the
+    /// destination holds more than one row per key). The implementation
+    /// re-renders each key as a literal of the column's real destination type,
+    /// so no caller has to guess how to quote one.
+    async fn delete_keys(
+        &self,
+        _table: &str,
+        _key_column: &str,
+        _keys: &[String],
+        _window: Option<&str>,
+    ) -> Result<u64> {
+        Err(EtlError::internal(
+            "delete_keys: this destination does not support row deletes",
+        ))
+    }
 }
+
+/// How many keys one generated `DELETE ... IN (...)` statement carries. A
+/// reconcile can find tens of thousands of orphans; chunking keeps each
+/// statement a sane size for the destination's parser and query log, at the
+/// cost of running a few of them.
+pub(crate) const DELETE_KEY_CHUNK: usize = 10_000;
 
 /// Build the concrete sink for `dest`, boxed behind the [`Sink`] trait.
 pub async fn build_sink(dest: DestinationConfig) -> Result<Arc<dyn Sink>> {

@@ -376,6 +376,37 @@ impl MySqlSource {
             .map(|v| v.unwrap_or(0))
             .map_err(|e| EtlError::from(e).context("reading mysql null-watermark count"))
     }
+
+    /// Every distinct non-NULL value of `key`, as text, over the rows `window`
+    /// admits — the MySQL half of a `reconcile::reconcile_keys` diff. See
+    /// `PgSource::distinct_keys` for why the values come back as text.
+    pub async fn distinct_keys(
+        &self,
+        conn: &mut Conn,
+        from_table: Option<&str>,
+        base_query: Option<&str>,
+        key: &str,
+        window: Option<&str>,
+    ) -> Result<Vec<String>> {
+        let k = quote_my(key);
+        let where_sql = match window {
+            Some(w) => format!("WHERE ({w}) AND {k} IS NOT NULL"),
+            None => format!("WHERE {k} IS NOT NULL"),
+        };
+        let sql = if let Some(q) = base_query {
+            format!("SELECT DISTINCT CAST({k} AS CHAR) FROM ({q}) AS _src {where_sql}")
+        } else {
+            format!(
+                "SELECT DISTINCT CAST({k} AS CHAR) FROM {t} {where_sql}",
+                t = quote_my_table(from_table.expect("table required"))
+            )
+        };
+        let rows: Vec<Option<String>> = conn
+            .query(sql)
+            .await
+            .map_err(|e| EtlError::from(e).context("reading source keyset"))?;
+        Ok(rows.into_iter().flatten().collect())
+    }
 }
 
 fn combine_filters(a: &Option<String>, b: Option<&str>) -> Option<String> {

@@ -503,6 +503,242 @@ impl ClickHouseSink {
         self.execute(&sql).await
     }
 
+    /// The table's primary-key expression, split into columns — what a
+    /// ClickHouse read can actually skip granules on. Diagnostic; `None` when
+    /// the table is unknown to `system.tables`.
+    pub async fn primary_key_columns(&self, table: &str) -> Result<Option<Vec<String>>> {
+        let sql = format!(
+            "SELECT primary_key FROM system.tables WHERE database = '{}' AND name = '{}'",
+            escape_sql_string(&self.cfg.database),
+            escape_sql_string(table),
+        );
+        Ok(self.query_scalar(&sql).await?.map(|pk| {
+            pk.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        }))
+    }
+
+    /// The declared ClickHouse type of one column, with `Nullable(...)` and
+    /// `LowCardinality(...)` wrappers peeled off — enough to decide how a value
+    /// of it has to be written as a literal.
+    async fn bare_column_type(&self, table: &str, column: &str) -> Result<String> {
+        let sql = format!(
+            "SELECT type FROM system.columns WHERE database = '{}' AND table = '{}' AND name = '{}'",
+            escape_sql_string(&self.cfg.database),
+            escape_sql_string(table),
+            escape_sql_string(column),
+        );
+        let ty = self.query_scalar(&sql).await?.ok_or_else(|| {
+            EtlError::config(format!(
+                "column '{column}' not found on {}.{table}",
+                self.cfg.database
+            ))
+        })?;
+        let mut t = ty.trim().to_string();
+        // Peel one layer at a time: `LowCardinality(Nullable(String))` is a
+        // real declared type, so a single strip would leave `Nullable(String`.
+        loop {
+            let peeled = t
+                .strip_prefix("Nullable(")
+                .or_else(|| t.strip_prefix("LowCardinality("))
+                .and_then(|rest| rest.strip_suffix(')'));
+            match peeled {
+                Some(inner) => t = inner.trim().to_string(),
+                None => break,
+            }
+        }
+        Ok(t)
+    }
+
+    /// Render `values` (the text form [`Self::distinct_keys`] produces) as
+    /// literals of `bare_type`. A numeric column takes the value bare, but only
+    /// after it parses as a number here — a key that arrived from anywhere else
+    /// can otherwise carry arbitrary SQL into the statement. Everything else
+    /// (String, Date, DateTime, UUID, Enum, ...) takes a quoted literal, which
+    /// ClickHouse coerces to the column's type on comparison.
+    fn key_literals(bare_type: &str, column: &str, values: &[String]) -> Result<Vec<String>> {
+        let numeric = bare_type.starts_with("Int")
+            || bare_type.starts_with("UInt")
+            || bare_type.starts_with("Float")
+            || bare_type.starts_with("Decimal");
+        values
+            .iter()
+            .map(|v| {
+                if !numeric {
+                    return Ok(format!("'{}'", escape_sql_string(v)));
+                }
+                // Accepts integers, decimals and exponent forms; rejects
+                // anything else outright rather than pasting it in.
+                if v.parse::<f64>().is_ok() && !v.contains(char::is_whitespace) {
+                    Ok(v.clone())
+                } else {
+                    Err(EtlError::config(format!(
+                        "key value {v:?} is not a valid literal for the numeric column \
+                         '{column}' ({bare_type})"
+                    )))
+                }
+            })
+            .collect()
+    }
+
+    /// `WHERE` body combining an optional caller predicate with an optional
+    /// generated one. Both are already valid SQL; this only parenthesises them.
+    fn and_where(parts: &[Option<String>]) -> String {
+        let live: Vec<String> = parts.iter().flatten().map(|p| format!("({p})")).collect();
+        if live.is_empty() {
+            "1".to_string()
+        } else {
+            live.join(" AND ")
+        }
+    }
+
+    /// Rows of `table` matching `where_sql`.
+    async fn count_where(&self, table: &str, where_sql: &str) -> Result<u64> {
+        let sql = format!(
+            "SELECT count() FROM {}.{} WHERE {where_sql}",
+            ident(&self.cfg.database),
+            ident(table),
+        );
+        Ok(self
+            .query_scalar(&sql)
+            .await?
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0))
+    }
+
+    /// Distinct non-NULL values of `key_column`, as text.
+    ///
+    /// `toString` gives the same rendering the source side produces for the
+    /// same logical value (integers bare, dates/timestamps ISO-8601), which is
+    /// what makes the two keysets comparable as strings. Values are read over
+    /// the HTTP interface's TabSeparated output, so a key containing a tab or
+    /// newline would not survive the round trip — a key column of that shape is
+    /// rejected up front by `reconcile_keys` rather than silently mis-split.
+    pub async fn distinct_keys(
+        &self,
+        table: &str,
+        key_column: &str,
+        window: Option<&str>,
+    ) -> Result<Vec<String>> {
+        let k = ident(key_column);
+        let where_sql =
+            Self::and_where(&[window.map(str::to_string), Some(format!("{k} IS NOT NULL"))]);
+        let sql = format!(
+            "SELECT DISTINCT toString({k}) FROM {}.{} WHERE {where_sql}",
+            ident(&self.cfg.database),
+            ident(table),
+        );
+        self.query_column(&sql).await
+    }
+
+    /// Delete rows whose `key_column` is one of `keys`, inside `window`.
+    ///
+    /// Issued as lightweight `DELETE FROM` statements, chunked at
+    /// [`crate::sink::DELETE_KEY_CHUNK`] keys each. Row counts are read before
+    /// each chunk's delete, so the returned total is exact regardless of when
+    /// ClickHouse applies the delete mask (governed by its own
+    /// `lightweight_deletes_sync` setting — pass one through
+    /// `ClickHouse(settings=...)` to wait on replicas).
+    pub async fn delete_keys(
+        &self,
+        table: &str,
+        key_column: &str,
+        keys: &[String],
+        window: Option<&str>,
+    ) -> Result<u64> {
+        if keys.is_empty() {
+            return Ok(0);
+        }
+        let bare = self.bare_column_type(table, key_column).await?;
+        let k = ident(key_column);
+        let mut deleted = 0u64;
+        for chunk in keys.chunks(crate::sink::DELETE_KEY_CHUNK) {
+            let lits = Self::key_literals(&bare, key_column, chunk)?.join(", ");
+            let where_sql =
+                Self::and_where(&[window.map(str::to_string), Some(format!("{k} IN ({lits})"))]);
+            deleted += self.count_where(table, &where_sql).await?;
+            let sql = format!(
+                "DELETE FROM {}.{} WHERE {where_sql}",
+                ident(&self.cfg.database),
+                ident(table),
+            );
+            self.execute(&sql).await?;
+        }
+        Ok(deleted)
+    }
+
+    /// Delete destination rows inside the staging batch's window whose key the
+    /// batch does not contain — ClickHouse's half of `delete_stale_in_window`.
+    /// Returns the rows deleted.
+    ///
+    /// The window is expressed as scalar subqueries over staging
+    /// (`w BETWEEN (SELECT min(w) FROM staging) AND (SELECT max(w) FROM
+    /// staging)`) rather than as literals, so no value has to be re-rendered by
+    /// hand and the bound is computed by ClickHouse over the same table the
+    /// promotion is subtracting from. That is only sound while staging is
+    /// non-empty: `min()` over an empty ClickHouse column returns the type's
+    /// *default* (epoch, `0`) rather than NULL, which would silently bound the
+    /// delete to a window nobody asked for. Hence the row-count guard first —
+    /// an empty batch means there is no window to replace, so nothing is
+    /// deleted.
+    ///
+    /// A destination row whose key is NULL is deleted when it falls inside the
+    /// window: it can never be matched from the source, so "replace this
+    /// window" makes it stale — the same outcome BigQuery's
+    /// `WHEN NOT MATCHED BY SOURCE` produces for it.
+    pub async fn delete_stale_against_staging(
+        &self,
+        dest: &str,
+        staging: &str,
+        key: &[String],
+        window_column: &str,
+    ) -> Result<u64> {
+        if key.is_empty() {
+            return Err(EtlError::internal(
+                "delete_stale_against_staging called with an empty key (should have been \
+                 validated before staging began)",
+            ));
+        }
+        let db = ident(&self.cfg.database);
+        let staged = self.count_where(staging, "1").await?;
+        if staged == 0 {
+            tracing::info!(
+                "delete_stale_in_window: staging '{staging}' is empty, so there is no window \
+                 to replace; deleting nothing"
+            );
+            return Ok(0);
+        }
+        let w = ident(window_column);
+        let key_tuple = key.iter().map(|k| ident(k)).collect::<Vec<_>>().join(", ");
+        let staging_ref = format!("{db}.{}", ident(staging));
+        let where_sql = Self::and_where(&[
+            Some(format!(
+                "{w} >= (SELECT min({w}) FROM {staging_ref}) AND \
+                 {w} <= (SELECT max({w}) FROM {staging_ref})"
+            )),
+            Some(format!(
+                "({key_tuple}) NOT IN (SELECT {key_tuple} FROM {staging_ref})"
+            )),
+        ]);
+        let deleted = self.count_where(dest, &where_sql).await?;
+        if deleted == 0 {
+            tracing::info!(
+                "delete_stale_in_window: no rows of '{dest}' inside the staged window are \
+                 missing from the batch"
+            );
+            return Ok(0);
+        }
+        let sql = format!("DELETE FROM {db}.{} WHERE {where_sql}", ident(dest));
+        self.execute(&sql).await?;
+        tracing::info!(
+            "delete_stale_in_window: deleted {deleted} row(s) from '{dest}' that the source \
+             pull no longer has"
+        );
+        Ok(deleted)
+    }
+
     async fn check(resp: reqwest::Response) -> Result<String> {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
@@ -595,6 +831,38 @@ impl Sink for ClickHouseSink {
         rows: u64,
     ) -> Result<()> {
         ClickHouseSink::persist_chunk_cursor(self, cfg, committed, cursor, upper, rows).await
+    }
+    fn supports_row_delete(&self) -> bool {
+        true
+    }
+    async fn clustering_columns(&self, table: &str) -> Result<Option<Vec<String>>> {
+        ClickHouseSink::primary_key_columns(self, table).await
+    }
+    async fn delete_stale_against_staging(
+        &self,
+        dest: &str,
+        staging: &str,
+        key: &[String],
+        window_column: &str,
+    ) -> Result<u64> {
+        ClickHouseSink::delete_stale_against_staging(self, dest, staging, key, window_column).await
+    }
+    async fn distinct_keys(
+        &self,
+        table: &str,
+        key_column: &str,
+        window: Option<&str>,
+    ) -> Result<Vec<String>> {
+        ClickHouseSink::distinct_keys(self, table, key_column, window).await
+    }
+    async fn delete_keys(
+        &self,
+        table: &str,
+        key_column: &str,
+        keys: &[String],
+        window: Option<&str>,
+    ) -> Result<u64> {
+        ClickHouseSink::delete_keys(self, table, key_column, keys, window).await
     }
 }
 
@@ -766,6 +1034,85 @@ impl std::io::Write for ChunkWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bare_type_peels_every_wrapper_layer() {
+        // `LowCardinality(Nullable(String))` is a real declared type, so a
+        // single strip would leave the malformed `Nullable(String`.
+        let peel = |t: &str| {
+            let mut t = t.to_string();
+            loop {
+                let peeled = t
+                    .strip_prefix("Nullable(")
+                    .or_else(|| t.strip_prefix("LowCardinality("))
+                    .and_then(|rest| rest.strip_suffix(')'));
+                match peeled {
+                    Some(inner) => t = inner.trim().to_string(),
+                    None => break,
+                }
+            }
+            t
+        };
+        assert_eq!(peel("Int64"), "Int64");
+        assert_eq!(peel("Nullable(Int64)"), "Int64");
+        assert_eq!(peel("LowCardinality(Nullable(String))"), "String");
+    }
+
+    #[test]
+    fn key_literals_render_per_column_type() {
+        let n = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            ClickHouseSink::key_literals("Int64", "id", &n(&["1", "-42"])).unwrap(),
+            n(&["1", "-42"])
+        );
+        assert_eq!(
+            ClickHouseSink::key_literals("UInt32", "id", &n(&["7"])).unwrap(),
+            n(&["7"])
+        );
+        // Anything non-numeric takes a quoted literal, which ClickHouse coerces
+        // to the column's own type on comparison — a Date included.
+        assert_eq!(
+            ClickHouseSink::key_literals("String", "code", &n(&["a-1"])).unwrap(),
+            vec!["'a-1'".to_string()]
+        );
+        assert_eq!(
+            ClickHouseSink::key_literals("Date", "d", &n(&["2026-08-30"])).unwrap(),
+            vec!["'2026-08-30'".to_string()]
+        );
+        // ...and it is escaped ClickHouse's way (a doubled quote), so a quote
+        // in a key cannot close the literal.
+        assert_eq!(
+            ClickHouseSink::key_literals("String", "code", &n(&["it's"])).unwrap(),
+            vec!["'it''s'".to_string()]
+        );
+    }
+
+    #[test]
+    fn key_literals_refuse_to_paste_a_non_number_into_a_numeric_column() {
+        // A reconcile's keys come back from a destination read and go straight
+        // into a generated `IN (...)`, so this is the boundary that has to hold.
+        let bad = vec!["1 OR 1=1".to_string()];
+        let err = ClickHouseSink::key_literals("Int64", "id", &bad)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a valid literal"), "{err}");
+    }
+
+    #[test]
+    fn and_where_combines_only_the_predicates_present() {
+        assert_eq!(ClickHouseSink::and_where(&[None, None]), "1");
+        assert_eq!(
+            ClickHouseSink::and_where(&[Some("a = 1".into()), None]),
+            "(a = 1)"
+        );
+        // Each half is parenthesised, so an `OR` inside one cannot swallow the
+        // other — which for a DELETE predicate is the difference between a
+        // window and the whole table.
+        assert_eq!(
+            ClickHouseSink::and_where(&[Some("a = 1 OR b = 2".into()), Some("c = 3".into())]),
+            "(a = 1 OR b = 2) AND (c = 3)"
+        );
+    }
 
     #[test]
     fn escape_sql_string_doubles_quotes() {

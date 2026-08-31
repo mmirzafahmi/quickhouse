@@ -633,15 +633,56 @@ impl BigQuerySink {
         columns: &[ColumnType],
         prune_partition: Option<&str>,
         prune_key_range: bool,
+        prune_key_list_max: usize,
         delete_stale: bool,
         dedup_order: Option<&str>,
     ) -> Result<()> {
-        // Resolve the prune bounds up front: they go into the statement as
-        // literals, because BigQuery rejects a subquery that references a table
-        // inside a join predicate (see `StagingBounds`). Only the columns
-        // actually bounded are probed, so a transfer that prunes on nothing
-        // makes no extra call at all.
-        let bounded = bounded_columns(key, prune_partition, prune_key_range, delete_stale);
+        // Optional exact key-list bound, resolved first because it supersedes
+        // the range bound on the key columns — knowing whether it binds keeps
+        // the range probe below from reading columns nothing will use.
+        // Single-column keys only (see
+        // `TransferConfig::merge_prune_key_list_max`), and never under
+        // `delete_stale`, for the same reason the range bound is skipped there.
+        let key_list = match (prune_key_list_max, key.len(), delete_stale) {
+            (0, _, _) | (_, _, true) => None,
+            (max, 1, false) => match self.probe_staging_key_list(staging, &key[0], max).await {
+                Ok(list) => list,
+                // Same degradation rule as the range probe below: an
+                // optimization that cannot be resolved falls back to the wider
+                // bound, it does not fail a run.
+                Err(e) => {
+                    tracing::warn!(
+                        "could not resolve a staging key list for '{dest}' ({e}); \
+                         merging with the key-range bound instead"
+                    );
+                    None
+                }
+            },
+            (_, _, false) => {
+                tracing::debug!(
+                    "merge_prune_key_list_max is set but '{dest}' merges on a composite key; \
+                     using the per-column range bound instead"
+                );
+                None
+            }
+        };
+        if let Some(list) = &key_list {
+            tracing::info!(
+                "merging '{dest}' bounded to {} distinct key value(s) instead of a key range",
+                list.len()
+            );
+        }
+        // Resolve the prune bounds: they go into the statement as literals,
+        // because BigQuery rejects a subquery that references a table inside a
+        // join predicate (see `StagingBounds`). Only the columns actually
+        // bounded are probed, so a transfer that prunes on nothing makes no
+        // extra call at all.
+        let bounded = bounded_columns(
+            key,
+            prune_partition,
+            prune_key_range && key_list.is_none(),
+            delete_stale,
+        );
         let bounds = match self.probe_staging_bounds(staging, &bounded).await {
             Ok(b) => b,
             // Pruning is an optimization, so a failed probe degrades to the
@@ -670,30 +711,9 @@ impl BigQuerySink {
             delete_stale,
             dedup_order,
             &bounds,
+            key_list.as_deref(),
         )?;
-        let job = Job {
-            job_reference: JobReference {
-                project_id: self.project_id.clone(),
-                job_id: unique_job_id("merge", dest),
-                location: None,
-            },
-            configuration: JobConfiguration {
-                job: JobType::Query(JobConfigurationQuery {
-                    query,
-                    use_legacy_sql: Some(false),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let created = self
-            .client
-            .job()
-            .create(&job)
-            .await
-            .map_err(|e| EtlError::other(format!("bigquery merge job error: {e}")))?;
-        self.poll_job_until_done(created).await?;
+        self.run_query_job(query, "merge", dest).await?;
         Ok(())
     }
 
@@ -748,6 +768,233 @@ impl BigQuerySink {
             }
         }
         Ok(StagingBounds(resolved))
+    }
+
+    /// Resolve the staging batch's distinct merge-key values as GoogleSQL
+    /// literals, or `None` when a key *list* is not the right bound for this
+    /// batch — see `TransferConfig::merge_prune_key_list_max`.
+    ///
+    /// `None` means "fall back to the range bound", and it covers three cases
+    /// that are all normal rather than exceptional: an empty batch, a batch
+    /// whose key column is entirely NULL, and a batch holding more distinct
+    /// keys than `max`. The over-limit case is detected by reading `max + 1`
+    /// rows and finding the extra one, so the limit bounds the generated
+    /// statement's size for real instead of being a hint the probe might
+    /// exceed.
+    ///
+    /// Like the range bounds, the values come back through `FORMAT('%T', …)`,
+    /// so BigQuery renders every literal — quickhouse formats no types by hand
+    /// and cannot get a timestamp precision or a string escape wrong.
+    async fn probe_staging_key_list(
+        &self,
+        staging: &str,
+        key: &str,
+        max: usize,
+    ) -> Result<Option<Vec<String>>> {
+        let query = build_staging_key_list_sql(
+            &self.project_id,
+            &self.dataset_id,
+            staging,
+            key,
+            max.saturating_add(1),
+        );
+        let request = QueryRequest {
+            query,
+            ..Default::default()
+        };
+        let mut iter = self
+            .client
+            .query::<QueryRow>(&self.project_id, request)
+            .await
+            .map_err(|e| EtlError::other(format!("bigquery staging key list query error: {e}")))?;
+        let mut out = Vec::with_capacity(max.min(1024));
+        while let Some(row) = iter
+            .next()
+            .await
+            .map_err(|e| EtlError::other(format!("bigquery staging key list row error: {e}")))?
+        {
+            let v = row
+                .column::<Option<String>>(0)
+                .map_err(|e| {
+                    EtlError::other(format!("bigquery staging key list column error: {e}"))
+                })?
+                .unwrap_or_else(|| "NULL".to_string());
+            // `FORMAT('%T', NULL)` renders the bare word NULL. The probe
+            // already filters NULL keys out, so seeing one means the column
+            // is not what we think it is — drop the list rather than emit a
+            // predicate containing an unmatchable literal.
+            if v == "NULL" {
+                return Ok(None);
+            }
+            out.push(v);
+            if out.len() > max {
+                tracing::debug!(
+                    "staging '{staging}' holds more than {max} distinct '{key}' value(s); \
+                     merging with the key-range bound instead of a key list"
+                );
+                return Ok(None);
+            }
+        }
+        if out.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(out))
+    }
+
+    /// The destination table's clustering columns, in clustering order, or
+    /// `None` when it has none / is not visible. Diagnostic: it tells the
+    /// caller whether the merge's key bound can prune anything at all.
+    pub async fn clustering_columns(&self, table: &str) -> Result<Option<Vec<String>>> {
+        let query = format!(
+            "SELECT column_name FROM `{}`.`{}`.INFORMATION_SCHEMA.COLUMNS \
+             WHERE table_name = '{}' AND clustering_ordinal_position IS NOT NULL \
+             ORDER BY clustering_ordinal_position",
+            self.project_id,
+            self.dataset_id,
+            escape_sql_string(table),
+        );
+        let cols = self.query_strings(&query, "clustering columns").await?;
+        Ok(if cols.is_empty() { None } else { Some(cols) })
+    }
+
+    /// The declared BigQuery `data_type` of one column, from
+    /// `INFORMATION_SCHEMA.COLUMNS`.
+    async fn column_data_type(&self, table: &str, column: &str) -> Result<String> {
+        let query = format!(
+            "SELECT data_type FROM `{}`.`{}`.INFORMATION_SCHEMA.COLUMNS \
+             WHERE table_name = '{}' AND column_name = '{}'",
+            self.project_id,
+            self.dataset_id,
+            escape_sql_string(table),
+            escape_sql_string(column),
+        );
+        self.query_strings(&query, "column data type")
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                EtlError::config(format!(
+                    "column '{column}' not found on {}.{}.{table}",
+                    self.project_id, self.dataset_id
+                ))
+            })
+    }
+
+    /// Run `query` and collect its first column as strings. Used for the small
+    /// metadata reads (clustering, column types, key sets) — not a general row
+    /// reader.
+    async fn query_strings(&self, query: &str, what: &str) -> Result<Vec<String>> {
+        let request = QueryRequest {
+            query: query.to_string(),
+            ..Default::default()
+        };
+        let mut iter = self
+            .client
+            .query::<QueryRow>(&self.project_id, request)
+            .await
+            .map_err(|e| EtlError::other(format!("bigquery {what} query error: {e}")))?;
+        let mut out = Vec::new();
+        while let Some(row) = iter
+            .next()
+            .await
+            .map_err(|e| EtlError::other(format!("bigquery {what} row error: {e}")))?
+        {
+            if let Some(v) = row
+                .column::<Option<String>>(0)
+                .map_err(|e| EtlError::other(format!("bigquery {what} column error: {e}")))?
+            {
+                out.push(v);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Distinct non-NULL values of `key_column`, as text — the destination half
+    /// of a `reconcile_keys` diff. `CAST(... AS STRING)` so an INT64 key renders
+    /// the same way the source's own text rendering does.
+    pub async fn distinct_keys(
+        &self,
+        table: &str,
+        key_column: &str,
+        window: Option<&str>,
+    ) -> Result<Vec<String>> {
+        let query = format!(
+            "SELECT DISTINCT CAST(`{key_column}` AS STRING) FROM `{}`.`{}`.`{table}` \
+             WHERE {} AND `{key_column}` IS NOT NULL",
+            self.project_id,
+            self.dataset_id,
+            window.unwrap_or("TRUE"),
+        );
+        self.query_strings(&query, "distinct keys").await
+    }
+
+    /// Delete rows whose `key_column` is one of `keys`, inside `window`.
+    /// Chunked at [`crate::sink::DELETE_KEY_CHUNK`] keys per statement; each
+    /// chunk's affected rows are counted first so the total is exact.
+    pub async fn delete_keys(
+        &self,
+        table: &str,
+        key_column: &str,
+        keys: &[String],
+        window: Option<&str>,
+    ) -> Result<u64> {
+        if keys.is_empty() {
+            return Ok(0);
+        }
+        let data_type = self.column_data_type(table, key_column).await?;
+        let mut deleted = 0u64;
+        for chunk in keys.chunks(crate::sink::DELETE_KEY_CHUNK) {
+            let lits = bq_key_literals(&data_type, key_column, chunk)?.join(", ");
+            let predicate = format!(
+                "{} AND `{key_column}` IN ({lits})",
+                window.unwrap_or("TRUE")
+            );
+            let count_sql = format!(
+                "SELECT CAST(COUNT(*) AS STRING) FROM `{}`.`{}`.`{table}` WHERE {predicate}",
+                self.project_id, self.dataset_id,
+            );
+            deleted += self
+                .query_strings(&count_sql, "delete key count")
+                .await?
+                .first()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+            let delete_sql = format!(
+                "DELETE FROM `{}`.`{}`.`{table}` WHERE {predicate}",
+                self.project_id, self.dataset_id,
+            );
+            self.run_query_job(delete_sql, "delete", table).await?;
+        }
+        Ok(deleted)
+    }
+
+    /// Submit `query` as a job and wait for it to finish. Shared by the
+    /// `MERGE` and the `DELETE` paths so both get the same unique job id and
+    /// the same terminal-state polling.
+    async fn run_query_job(&self, query: String, prefix: &str, table: &str) -> Result<Job> {
+        let job = Job {
+            job_reference: JobReference {
+                project_id: self.project_id.clone(),
+                job_id: unique_job_id(prefix, table),
+                location: None,
+            },
+            configuration: JobConfiguration {
+                job: JobType::Query(JobConfigurationQuery {
+                    query,
+                    use_legacy_sql: Some(false),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let created = self
+            .client
+            .job()
+            .create(&job)
+            .await
+            .map_err(|e| EtlError::other(format!("bigquery {prefix} job error: {e}")))?;
+        self.poll_job_until_done(created).await
     }
 
     /// Idempotent, matching ClickHouse's `DROP TABLE IF EXISTS`: a
@@ -1024,6 +1271,7 @@ impl Sink for BigQuerySink {
         columns: &[ColumnType],
         prune_partition: Option<&str>,
         prune_key_range: bool,
+        prune_key_list_max: usize,
         delete_stale: bool,
         dedup_order: Option<&str>,
     ) -> Result<()> {
@@ -1035,10 +1283,40 @@ impl Sink for BigQuerySink {
             columns,
             prune_partition,
             prune_key_range,
+            prune_key_list_max,
             delete_stale,
             dedup_order,
         )
         .await
+    }
+    fn supports_row_delete(&self) -> bool {
+        true
+    }
+    /// BigQuery expresses the window-scoped delete as a
+    /// `WHEN NOT MATCHED BY SOURCE` clause inside its own `MERGE`, so the sync
+    /// path must not run a separate delete statement after it.
+    fn deletes_stale_within_merge(&self) -> bool {
+        true
+    }
+    async fn clustering_columns(&self, table: &str) -> Result<Option<Vec<String>>> {
+        BigQuerySink::clustering_columns(self, table).await
+    }
+    async fn distinct_keys(
+        &self,
+        table: &str,
+        key_column: &str,
+        window: Option<&str>,
+    ) -> Result<Vec<String>> {
+        BigQuerySink::distinct_keys(self, table, key_column, window).await
+    }
+    async fn delete_keys(
+        &self,
+        table: &str,
+        key_column: &str,
+        keys: &[String],
+        window: Option<&str>,
+    ) -> Result<u64> {
+        BigQuerySink::delete_keys(self, table, key_column, keys, window).await
     }
 }
 
@@ -1298,6 +1576,86 @@ fn build_staging_bounds_sql(
     format!("SELECT {projection} FROM `{project_id}`.`{dataset_id}`.`{staging}`")
 }
 
+/// Build the probe behind the key-list prune: up to `limit` distinct non-NULL
+/// values of `key` in the staging batch, each already rendered as a GoogleSQL
+/// literal by `FORMAT('%T', …)` — the same mechanism the range bounds use, for
+/// the same reason (BigQuery formats its own literals; quickhouse never has to
+/// quote a value or pick a timestamp precision).
+///
+/// `limit` is the caller's `merge_prune_key_list_max + 1`: reading one row past
+/// the ceiling is how the caller learns the batch exceeded it without counting
+/// the whole table. The `DISTINCT` is inside the subquery so the `LIMIT` caps
+/// distinct values, not raw rows. A free function (not a `&self` method) so
+/// it's unit-testable without a real authenticated client, mirroring
+/// `build_staging_bounds_sql`.
+fn build_staging_key_list_sql(
+    project_id: &str,
+    dataset_id: &str,
+    staging: &str,
+    key: &str,
+    limit: usize,
+) -> String {
+    format!(
+        "SELECT FORMAT('%T', k) FROM (SELECT DISTINCT `{key}` AS k \
+         FROM `{project_id}`.`{dataset_id}`.`{staging}` \
+         WHERE `{key}` IS NOT NULL LIMIT {limit})"
+    )
+}
+
+/// Render `values` — the text form `BigQuerySink::distinct_keys` produces — as
+/// literals of a column whose `INFORMATION_SCHEMA` `data_type` is `data_type`.
+///
+/// Unlike the merge's prune bounds, these values did not come from BigQuery's
+/// own `FORMAT('%T', …)`: a reconcile reads the destination's keys as strings,
+/// diffs them against the source's, and has to write the survivors back into a
+/// predicate. A numeric column takes the value bare, but only once it parses as
+/// a number here — otherwise a key from anywhere else could carry SQL into the
+/// statement. Types with no unambiguous literal form for a plain string are
+/// rejected rather than guessed at.
+fn bq_key_literals(data_type: &str, column: &str, values: &[String]) -> Result<Vec<String>> {
+    let t = data_type.trim().to_ascii_uppercase();
+    let numeric = matches!(
+        t.as_str(),
+        "INT64" | "INTEGER" | "NUMERIC" | "BIGNUMERIC" | "DECIMAL" | "BIGDECIMAL" | "FLOAT64"
+    );
+    // A typed literal prefix: `DATE '2026-08-30'` and friends, which is how a
+    // string has to be written to compare against these columns.
+    let prefix = match t.as_str() {
+        "STRING" => Some(""),
+        "DATE" => Some("DATE "),
+        "DATETIME" => Some("DATETIME "),
+        "TIMESTAMP" => Some("TIMESTAMP "),
+        _ => None,
+    };
+    if !numeric && prefix.is_none() {
+        return Err(EtlError::config(format!(
+            "column '{column}' has BigQuery type {data_type}, which reconcile_keys cannot \
+             write as a literal; use an INT64/NUMERIC/STRING/DATE/DATETIME/TIMESTAMP key"
+        )));
+    }
+    values
+        .iter()
+        .map(|v| {
+            if numeric {
+                if v.parse::<f64>().is_ok() && !v.contains(char::is_whitespace) {
+                    Ok(v.clone())
+                } else {
+                    Err(EtlError::config(format!(
+                        "key value {v:?} is not a valid literal for the numeric column \
+                         '{column}' ({data_type})"
+                    )))
+                }
+            } else {
+                Ok(format!(
+                    "{}'{}'",
+                    prefix.expect("checked above"),
+                    escape_sql_string(v)
+                ))
+            }
+        })
+        .collect()
+}
+
 /// Build the `MERGE` statement that upserts `staging`'s rows into `dest`,
 /// matched on `key` — see `BigQuerySink::merge_into`'s docs. A free function
 /// (not a `&self` method) so it's unit-testable without a real authenticated
@@ -1315,6 +1673,7 @@ fn build_merge_sql(
     delete_stale: bool,
     dedup_order: Option<&str>,
     bounds: &StagingBounds,
+    key_list: Option<&[String]>,
 ) -> Result<String> {
     if key.is_empty() {
         // Should already be caught by sync.rs's prepare_target validation
@@ -1351,22 +1710,41 @@ fn build_merge_sql(
     if let Some(bound) = &window_bound {
         on_clause.push_str(&format!(" AND {bound}"));
     }
-    // Key-range pruning: bound the destination scan to the staging batch's
-    // [MIN, MAX] on the merge key itself. Safe with no immutability contract
+    // Key pruning: bound the destination scan to what the staging batch
+    // actually holds on the merge key. Safe with no immutability contract
     // (unlike the partition prune above) because it's a tautology, not an
     // assumption: a destination row can only match on `T.k = S.k`, so its key
-    // already lies inside the staging batch's own range on that column. Every
-    // key column is bounded — the same argument holds per column, and it gives
-    // BigQuery more clustering fields to prune blocks on.
+    // is in the batch by construction.
     //
-    // Skipped for `delete_stale`: `WHEN NOT MATCHED BY SOURCE` only sees rows
-    // the ON clause admits, so narrowing it here would silently reduce
-    // "replace this window" to "replace this key range" and strand
-    // deleted-at-source rows outside the batch's key span.
-    if prune_key_range && !delete_stale {
-        for k in key {
-            if let Some((lo, hi)) = bounds.get(k) {
-                on_clause.push_str(&format!(" AND T.`{k}` BETWEEN {lo} AND {hi}"));
+    // Two forms of the same tautology, and the tighter one wins when it is
+    // available. An exact `IN` list names every key in the batch, so it prunes
+    // just as well whether the changed keys are clustered at the top of the key
+    // space or scattered across it. A `[MIN, MAX]` range only prunes in
+    // proportion to how tightly they cluster — on a table whose rows are
+    // updated after insert, the range covers nearly everything and the bound is
+    // correct and useless at once. The list is only ever present for a
+    // single-column key (see `merge_into`).
+    //
+    // Skipped entirely for `delete_stale`: `WHEN NOT MATCHED BY SOURCE` only
+    // sees rows the ON clause admits, so narrowing it here would silently
+    // reduce "replace this window" to "replace these keys" and strand
+    // deleted-at-source rows outside the batch.
+    let key_list = key_list.filter(|l| !l.is_empty() && key.len() == 1 && !delete_stale);
+    match key_list {
+        Some(list) => {
+            let k = &key[0];
+            on_clause.push_str(&format!(" AND T.`{k}` IN ({})", list.join(", ")));
+        }
+        None => {
+            if prune_key_range && !delete_stale {
+                // Every key column is bounded — the same argument holds per
+                // column, and it gives BigQuery more clustering fields to prune
+                // blocks on.
+                for k in key {
+                    if let Some((lo, hi)) = bounds.get(k) {
+                        on_clause.push_str(&format!(" AND T.`{k}` BETWEEN {lo} AND {hi}"));
+                    }
+                }
             }
         }
     }
@@ -1767,7 +2145,9 @@ mod tests {
             primary_key: vec![],
             merge_prune_partition_by: None,
             merge_prune_key_range: true,
+            merge_prune_key_list_max: 0,
             delete_stale_in_window: false,
+            allow_full_refresh_shrink: false,
             parallelism: 1,
             batch_rows: 1000,
             batch_bytes: 0,
@@ -1777,6 +2157,7 @@ mod tests {
             partition_column: None,
             partition_source_expr: None,
             read_max_rows_per_sec: None,
+            read_idle_timeout_secs: 0,
             chunk_rows: None,
             retry_max_attempts: 1,
             column_transforms: HashMap::new(),
@@ -1796,6 +2177,163 @@ mod tests {
             tinyint1_as_bool: true,
             numeric_as_decimal: None,
         }
+    }
+
+    fn lits(vals: &[&str]) -> Vec<String> {
+        vals.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_key_list_bound_replaces_the_key_range_bound() {
+        // The `fore_app.user` shape: correctly clustered on the merge key, but
+        // the changed keys span the whole id space, so `[MIN, MAX]` covers
+        // nearly the entire table and prunes almost nothing. A key list names
+        // exactly what the batch holds and does not degrade that way.
+        let cols = vec![
+            col("id", DataType::Int64, false),
+            col("v", DataType::Int64, true),
+        ];
+        let key = vec!["id".to_string()];
+        let sql = build_merge_sql(
+            "p",
+            "d",
+            "users",
+            "users_tmp",
+            &key,
+            &cols,
+            None,
+            true,
+            false,
+            None,
+            &bounds(&[("id", "1", "9000000")]),
+            Some(&lits(&["7", "4210", "8999999"])),
+        )
+        .unwrap();
+        assert!(sql.contains("T.`id` IN (7, 4210, 8999999)"), "{sql}");
+        // ...and the range bound is gone: an IN list already implies it, so
+        // emitting both would only make the predicate longer.
+        assert!(!sql.contains("BETWEEN"), "{sql}");
+    }
+
+    #[test]
+    fn a_key_list_is_ignored_where_it_would_change_what_merges() {
+        let cols = vec![
+            col("id", DataType::Int64, false),
+            col("created_at", DataType::Date32, false),
+            col("v", DataType::Int64, true),
+        ];
+        let list = lits(&["7", "8"]);
+        // Under delete_stale the ON clause also gates
+        // `WHEN NOT MATCHED BY SOURCE`, so narrowing it to the batch's keys
+        // would strand deleted-at-source rows — exactly the rows the feature
+        // exists to remove. Same reason the range bound is skipped there.
+        let sql = build_merge_sql(
+            "p",
+            "d",
+            "t",
+            "s",
+            &["id".to_string()],
+            &cols,
+            Some("created_at"),
+            true,
+            true,
+            None,
+            &bounds(&[("created_at", "DATE \"2026-08-01\"", "DATE \"2026-08-20\"")]),
+            Some(&list),
+        )
+        .unwrap();
+        assert!(!sql.contains("IN (7, 8)"), "{sql}");
+        // The window bound it does depend on is still there.
+        assert!(sql.contains("T.`created_at` BETWEEN"), "{sql}");
+
+        // A composite key would need an IN UNNEST([STRUCT(...)]) form whose
+        // pruning behaviour is not the same; those keep the range bound.
+        let sql = build_merge_sql(
+            "p",
+            "d",
+            "t",
+            "s",
+            &["id".to_string(), "v".to_string()],
+            &cols,
+            None,
+            true,
+            false,
+            None,
+            &bounds(&[("id", "1", "9"), ("v", "10", "99")]),
+            Some(&list),
+        )
+        .unwrap();
+        assert!(!sql.contains("IN (7, 8)"), "{sql}");
+        assert!(sql.contains("T.`id` BETWEEN 1 AND 9"), "{sql}");
+
+        // An empty list means "the probe found nothing", not "match nothing" —
+        // emitting `IN ()` would merge zero rows.
+        let sql = build_merge_sql(
+            "p",
+            "d",
+            "t",
+            "s",
+            &["id".to_string()],
+            &cols,
+            None,
+            true,
+            false,
+            None,
+            &bounds(&[("id", "1", "9")]),
+            Some(&[]),
+        )
+        .unwrap();
+        assert!(!sql.contains("IN ()"), "{sql}");
+        assert!(sql.contains("T.`id` BETWEEN 1 AND 9"), "{sql}");
+    }
+
+    #[test]
+    fn the_key_list_probe_reads_one_row_past_the_ceiling() {
+        // Reading `max + 1` distinct values is how the caller learns the batch
+        // blew the ceiling without counting the whole staging table.
+        let sql = build_staging_key_list_sql("p", "d", "users_tmp", "id", 1001);
+        assert!(sql.contains("LIMIT 1001"), "{sql}");
+        // DISTINCT inside the subquery, so the LIMIT caps distinct values
+        // rather than raw rows.
+        assert!(
+            sql.contains("SELECT DISTINCT `id` AS k FROM `p`.`d`.`users_tmp`"),
+            "{sql}"
+        );
+        assert!(sql.contains("`id` IS NOT NULL"), "{sql}");
+        // BigQuery renders the literals, exactly as the range bounds do.
+        assert!(sql.starts_with("SELECT FORMAT('%T', k)"), "{sql}");
+    }
+
+    #[test]
+    fn reconcile_key_literals_render_per_destination_type() {
+        assert_eq!(
+            bq_key_literals("INT64", "id", &lits(&["1", "-42"])).unwrap(),
+            lits(&["1", "-42"])
+        );
+        assert_eq!(
+            bq_key_literals("STRING", "code", &lits(&["a-1", "it's"])).unwrap(),
+            vec!["'a-1'".to_string(), "'it\\'s'".to_string()]
+        );
+        assert_eq!(
+            bq_key_literals("DATE", "d", &lits(&["2026-08-30"])).unwrap(),
+            vec!["DATE '2026-08-30'".to_string()]
+        );
+    }
+
+    #[test]
+    fn reconcile_key_literals_refuse_to_paste_a_non_number_into_a_numeric_column() {
+        // These keys come back from a destination read and go straight into a
+        // generated predicate, so a numeric column must not accept text.
+        let err = bq_key_literals("INT64", "id", &lits(&["1 OR 1=1"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a valid literal"), "{err}");
+        // A type with no unambiguous literal form for a plain string is
+        // rejected outright rather than guessed at.
+        let err = bq_key_literals("BYTES", "b", &lits(&["x"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("reconcile_keys cannot"), "{err}");
     }
 
     #[test]
@@ -2112,6 +2650,7 @@ mod tests {
             false,
             None,
             &no_bounds(),
+            None,
         )
         .unwrap();
 
@@ -2164,6 +2703,7 @@ mod tests {
             false,
             None,
             &no_bounds(),
+            None,
         )
         .unwrap();
         assert!(sql.contains("ON T.`a` = S.`a` AND T.`b` = S.`b`"));
@@ -2190,6 +2730,7 @@ mod tests {
             false,
             None,
             &bounds(&[("id", "1", "341")]),
+            None,
         )
         .unwrap();
         assert!(sql.contains("ON T.`id` = S.`id`"), "{sql}");
@@ -2225,6 +2766,7 @@ mod tests {
             false,
             None,
             &bounds(&[("a", "1", "9"), ("b", "10", "99")]),
+            None,
         )
         .unwrap();
         assert!(sql.contains("AND T.`a` BETWEEN 1 AND 9"), "{sql}");
@@ -2251,6 +2793,7 @@ mod tests {
             false,
             None,
             &bounds(&[("id", "1", "341")]),
+            None,
         )
         .unwrap();
         assert!(sql.contains("ON T.`id` = S.`id`"), "{sql}");
@@ -2292,6 +2835,7 @@ mod tests {
                     r#"TIMESTAMP "2026-08-20 12:00:00+00""#,
                 ),
             ]),
+            None,
         )
         .unwrap();
         assert!(
@@ -2336,6 +2880,7 @@ mod tests {
                 r#"TIMESTAMP "2026-08-01 00:00:00+00""#,
                 r#"TIMESTAMP "2026-08-20 12:00:00+00""#,
             )]),
+            None,
         )
         .unwrap();
         // The join still matches on the key, AND the destination is bounded to
@@ -2382,6 +2927,7 @@ mod tests {
                 r#"TIMESTAMP "2026-08-01 00:00:00+00""#,
                 r#"TIMESTAMP "2026-08-20 12:00:00+00""#,
             )]),
+            None,
         )
         .unwrap();
         // The DELETE is scoped to the SAME staging window as the prune — it must
@@ -2416,6 +2962,7 @@ mod tests {
             true,
             None,
             &no_bounds(),
+            None,
         )
         .unwrap_err()
         .to_string();
@@ -2438,6 +2985,7 @@ mod tests {
             false,
             None,
             &no_bounds(),
+            None,
         )
         .unwrap();
         assert!(
@@ -2473,6 +3021,7 @@ mod tests {
             false,
             Some("write_date"),
             &no_bounds(),
+            None,
         )
         .unwrap();
         assert!(
@@ -2512,6 +3061,7 @@ mod tests {
             false,
             None,
             &no_bounds(),
+            None,
         )
         .unwrap();
         assert!(
@@ -2543,6 +3093,7 @@ mod tests {
             false,
             Some("not_a_staging_column"),
             &no_bounds(),
+            None,
         )
         .unwrap();
         assert!(!sql.contains("not_a_staging_column"), "{sql}");
@@ -2564,6 +3115,7 @@ mod tests {
             false,
             None,
             &no_bounds(),
+            None,
         )
         .unwrap_err()
         .to_string();
@@ -2640,6 +3192,7 @@ mod tests {
                             delete_stale,
                             None,
                             staging_bounds,
+                            None,
                         )
                         .unwrap();
                         for cond in merge_conditions(&sql) {
@@ -2676,6 +3229,7 @@ mod tests {
             false,
             None,
             &bounds(&[("code", r#""a-001""#, r#""it's z""#)]),
+            None,
         )
         .unwrap();
         assert!(
@@ -2707,6 +3261,7 @@ mod tests {
             false,
             None,
             &no_bounds(),
+            None,
         )
         .unwrap();
         assert!(!sql.contains("BETWEEN"), "{sql}");
@@ -2740,6 +3295,7 @@ mod tests {
             true,
             None,
             &no_bounds(),
+            None,
         )
         .unwrap();
         assert!(
@@ -2816,6 +3372,14 @@ mod tests {
     }
 
     async fn live_sink(project_id: String, dataset_id: String) -> BigQuerySink {
+        // A real run gets its process-level rustls CryptoProvider from the
+        // transfer entry points (`sync::run_transfer_impl`,
+        // `reconcile::reconcile_keys`). These tests build the sink directly and
+        // so bypass both — without this they panic inside rustls before a
+        // single request leaves the process, which is not a product failure but
+        // does make the whole live suite unrunnable. Idempotent; the error just
+        // means someone else got here first.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         BigQuerySink::new(BigQueryDestConfig {
             project_id: Some(project_id),
             credentials_file: None,
@@ -2872,16 +3436,16 @@ mod tests {
                 .insert_batches(&staging, batch.schema(), &[batch])
                 .await?;
             // Keys not in the destination yet: the INSERT branch.
-            sink.merge_into(&dest, &staging, &key, &cols, None, true, false, None)
+            sink.merge_into(&dest, &staging, &key, &cols, None, true, 0, false, None)
                 .await?;
             // The same keys again: the UPDATE branch, which is what a bound on
             // the key range has to leave reachable.
-            sink.merge_into(&dest, &staging, &key, &cols, None, true, false, None)
+            sink.merge_into(&dest, &staging, &key, &cols, None, true, 0, false, None)
                 .await?;
             // Nothing staged at all — MIN/MAX are NULL, so there is no bound to
             // emit. This is the run that first failed in production ("partition
             // 'all' complete: 0 rows", then a failed merge job).
-            sink.merge_into(&dest, &empty, &key, &cols, None, true, false, None)
+            sink.merge_into(&dest, &empty, &key, &cols, None, true, 0, false, None)
                 .await?;
             Ok::<u64, EtlError>(staged)
         }
@@ -2889,7 +3453,150 @@ mod tests {
         for t in [&dest, &staging, &empty] {
             let _ = sink.drop_table(t).await;
         }
-        assert_eq!(outcome.expect("merge with key-range pruning"), 2);
+        // `insert_batches` returns an approximate wire-BYTES count, not a row
+        // count (see the `Sink` trait). This asserted `== 2` — a row count —
+        // and that is precisely why every one of these live tests failed the
+        // first time they were ever executed: the assertion was written
+        // alongside a test nobody could run. What this pins is that BigQuery
+        // accepted and ran every statement above; see the test docs for why
+        // row counts are deliberately not asserted.
+        let bytes = outcome.expect("merge with key-range pruning");
+        assert!(bytes > 0, "the staging insert should have sent some bytes");
+    }
+
+    /// The 0.15 additions: the exact key-list bound
+    /// (`merge_prune_key_list_max`) and the clustering probe that now rides
+    /// alongside every merge.
+    ///
+    /// This is the test whose absence let 0.14.0 ship. `build_merge_sql`'s unit
+    /// tests assert on statement *text*, and text cannot tell you whether
+    /// BigQuery accepts the statement — 0.14.0's `BETWEEN (SELECT MIN(k) ...)`
+    /// form was perfectly reasonable text that BigQuery rejects at analysis
+    /// time, so every unit test passed while 100% of production merges failed.
+    /// A key list is a new predicate shape in the `ON` clause and has to be
+    /// handed to the real engine at least once.
+    ///
+    /// Row counts are deliberately not asserted, matching the tests above: a
+    /// table's `num_rows` metadata is eventually consistent, and what this pins
+    /// is whether BigQuery accepts and runs the statement at all.
+    #[tokio::test]
+    async fn live_merge_runs_with_a_key_list_bound() {
+        let Some((project, dataset)) = live_bq_dataset() else {
+            return;
+        };
+        let sink = live_sink(project, dataset).await;
+        let cols = vec![
+            col("id", DataType::Int64, false),
+            col("amount", DataType::Float64, true),
+            col("name", DataType::Utf8, true),
+        ];
+        let key = vec!["id".to_string()];
+        let dest = temp_table("keylist");
+        let staging = format!("{dest}_quickhouse_tmp");
+        let empty = format!("{dest}_empty_tmp");
+        let mut cfg = base_cfg();
+        cfg.dest_table = dest.clone();
+        cfg.key = key.clone();
+
+        let outcome = async {
+            sink.create_table(&dest, &cols, &cfg).await?;
+            sink.create_table(&staging, &cols, &cfg).await?;
+            sink.create_table(&empty, &cols, &cfg).await?;
+            let batch = sample_batch();
+            let staged = sink
+                .insert_batches(&staging, batch.schema(), &[batch])
+                .await?;
+            // A ceiling comfortably above the batch, so the list actually
+            // binds: this is the `T.id IN (…)` form reaching the engine.
+            sink.merge_into(&dest, &staging, &key, &cols, None, true, 1_000, false, None)
+                .await?;
+            // Again, to exercise the UPDATE branch through the same bound — an
+            // over-narrow key predicate would fall through to
+            // WHEN NOT MATCHED and duplicate the key instead of updating it.
+            sink.merge_into(&dest, &staging, &key, &cols, None, true, 1_000, false, None)
+                .await?;
+            // A ceiling BELOW the batch's distinct-key count: the probe reads
+            // one row past the limit, abandons the list, and the run has to
+            // degrade to the range bound rather than emit a truncated `IN`.
+            sink.merge_into(&dest, &staging, &key, &cols, None, true, 1, false, None)
+                .await?;
+            // An empty batch resolves no list and no range — no bound at all.
+            sink.merge_into(&dest, &empty, &key, &cols, None, true, 1_000, false, None)
+                .await?;
+            // The clustering probe runs concurrently with every merge above;
+            // call it directly too, so a broken INFORMATION_SCHEMA query is a
+            // failure here rather than a silently swallowed `debug!`.
+            let clustering = sink.clustering_columns(&dest).await?;
+            assert_eq!(
+                clustering.as_deref(),
+                Some(&["id".to_string()][..]),
+                "quickhouse's own generated DDL must cluster by the merge key — \
+                 if this drifts, every merge silently full-scans"
+            );
+            // And the destination is not reported as clustered by something
+            // else, which is what would make the warning fire spuriously.
+            Ok::<u64, EtlError>(staged)
+        }
+        .await;
+        for t in [&dest, &staging, &empty] {
+            let _ = sink.drop_table(t).await;
+        }
+        // Bytes, not rows — see `live_merge_runs_with_key_range_pruning_on`.
+        let bytes = outcome.expect("merge with a key-list bound");
+        assert!(bytes > 0, "the staging insert should have sent some bytes");
+    }
+
+    #[tokio::test]
+    async fn live_reconcile_deletes_only_the_orphans_in_the_window() {
+        // `reconcile_keys`' BigQuery half: `distinct_keys` must render keys the
+        // same way a source does, and `delete_keys` must write them back as
+        // correctly typed literals. Both are new in 0.15 and neither is
+        // provable from statement text.
+        let Some((project, dataset)) = live_bq_dataset() else {
+            return;
+        };
+        let sink = live_sink(project, dataset).await;
+        let cols = vec![
+            col("id", DataType::Int64, false),
+            col("amount", DataType::Float64, true),
+            col("name", DataType::Utf8, true),
+        ];
+        let dest = temp_table("reconcile");
+        let mut cfg = base_cfg();
+        cfg.dest_table = dest.clone();
+        cfg.key = vec!["id".to_string()];
+
+        let outcome = async {
+            sink.create_table(&dest, &cols, &cfg).await?;
+            let batch = sample_batch();
+            sink.insert_batches(&dest, batch.schema(), &[batch]).await?;
+            // Text rendering: an INT64 key must come back as bare digits, or a
+            // diff against a source's own text keys finds nothing in common.
+            let mut keys = sink.distinct_keys(&dest, "id", None).await?;
+            keys.sort();
+            assert!(
+                keys.iter().all(|k| k.parse::<i64>().is_ok()),
+                "INT64 keys must render as plain integers, got {keys:?}"
+            );
+            assert!(!keys.is_empty(), "sample batch should have landed rows");
+            // Delete exactly one key, scoped by a window, and check the count.
+            let one = vec![keys[0].clone()];
+            let deleted = sink.delete_keys(&dest, "id", &one, Some("TRUE")).await?;
+            assert_eq!(deleted, 1, "one key, one row");
+            let after = sink.distinct_keys(&dest, "id", None).await?;
+            assert!(
+                !after.contains(&keys[0]),
+                "the deleted key must be gone; {after:?} still has {}",
+                keys[0]
+            );
+            // A window that excludes the key deletes nothing.
+            let untouched = sink.delete_keys(&dest, "id", &after, Some("FALSE")).await?;
+            assert_eq!(untouched, 0, "a window matching no rows deletes nothing");
+            Ok::<(), EtlError>(())
+        }
+        .await;
+        let _ = sink.drop_table(&dest).await;
+        outcome.expect("reconcile against BigQuery");
     }
 
     /// The same for `merge_prune_partition_by` + `delete_stale_in_window`: the
@@ -2940,6 +3647,7 @@ mod tests {
                 &cols,
                 Some("created_at"),
                 true,
+                0,
                 true,
                 None,
             )
@@ -2953,6 +3661,7 @@ mod tests {
                 &cols,
                 Some("created_at"),
                 true,
+                0,
                 true,
                 None,
             )
@@ -2963,7 +3672,9 @@ mod tests {
         for t in [&dest, &staging, &empty] {
             let _ = sink.drop_table(t).await;
         }
-        assert_eq!(outcome.expect("merge with a window-scoped delete"), 2);
+        // Bytes, not rows — see `live_merge_runs_with_key_range_pruning_on`.
+        let bytes = outcome.expect("merge with a window-scoped delete");
+        assert!(bytes > 0, "the staging insert should have sent some bytes");
     }
 
     fn partitioned_batch() -> RecordBatch {

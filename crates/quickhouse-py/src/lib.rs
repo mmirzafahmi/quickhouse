@@ -322,7 +322,7 @@ fn parse_columns(
     Ok(out)
 }
 
-/// CleverTap Data Export API source (events). BigQuery-only destination.
+/// CleverTap Data Export API source (events). Writes to BigQuery or ClickHouse.
 ///
 /// `columns` declares the output schema (list of `(name, bq_type)` /
 /// `(name, bq_type, dotted_path)` tuples, or a `{name: bq_type}` dict); `path`
@@ -386,7 +386,7 @@ impl CleverTap {
     }
 }
 
-/// AppsFlyer raw-data Pull API source (CSV report). BigQuery-only destination.
+/// AppsFlyer raw-data Pull API source (CSV report). Writes to BigQuery or ClickHouse.
 ///
 /// `columns` declares the output schema; each column reads the CSV header equal
 /// to its `path` (or its `name`). Auth is the V2.0 `api_token`. The Pull API has
@@ -866,6 +866,59 @@ impl StagedInfo {
 }
 
 /// Summary returned by `sync`.
+/// One structured warning from a transfer — a condition quickhouse detected,
+/// recovered from, and kept going past, but which changed what the destination
+/// now holds.
+///
+/// Named `TransferWarning`, not `Warning`, because `Warning` is a Python
+/// builtin exception class and shadowing it in a caller's namespace would be a
+/// trap. These are values, not exceptions: nothing is raised, and it is the
+/// caller who decides whether any of them should fail their run.
+#[pyclass]
+struct TransferWarning {
+    /// Stable machine-readable kind, e.g. `"collapsed_bool"`. Match on this;
+    /// `message` is human-facing and its wording is not stable.
+    #[pyo3(get)]
+    kind: String,
+    /// Source column responsible, or `None` for a table-level condition.
+    #[pyo3(get)]
+    column: Option<String>,
+    /// How many values/rows tripped the condition.
+    #[pyo3(get)]
+    count: u64,
+    /// A representative offending value where one was free to capture.
+    #[pyo3(get)]
+    sample: Option<String>,
+    #[pyo3(get)]
+    message: String,
+}
+
+#[pymethods]
+impl TransferWarning {
+    fn __repr__(&self) -> String {
+        format!(
+            "TransferWarning(kind={:?}, column={:?}, count={}, sample={:?})",
+            self.kind, self.column, self.count, self.sample
+        )
+    }
+
+    fn __str__(&self) -> String {
+        self.message.clone()
+    }
+}
+
+impl TransferWarning {
+    fn from_core(w: &core::TransferWarning) -> Self {
+        Self {
+            kind: w.kind.as_str().to_string(),
+            column: w.column.clone(),
+            count: w.count,
+            sample: w.sample.clone(),
+            message: w.message.clone(),
+        }
+    }
+}
+
 #[pyclass]
 struct TransferResult {
     #[pyo3(get)]
@@ -875,23 +928,92 @@ struct TransferResult {
     #[pyo3(get)]
     bytes_written: u64,
     #[pyo3(get)]
+    rows_deleted: u64,
+    #[pyo3(get)]
     duration_secs: f64,
     #[pyo3(get)]
+    read_secs: f64,
+    #[pyo3(get)]
+    stage_secs: f64,
+    #[pyo3(get)]
+    promote_secs: f64,
+    #[pyo3(get)]
     new_watermark: Option<String>,
+    #[pyo3(get)]
+    warnings: Vec<Py<TransferWarning>>,
 }
 
 #[pymethods]
 impl TransferResult {
     fn __repr__(&self) -> String {
         format!(
-            "TransferResult(rows_read={}, rows_written={}, bytes_written={}, duration_secs={:.3}, new_watermark={:?})",
+            "TransferResult(rows_read={}, rows_written={}, bytes_written={}, rows_deleted={}, \
+             duration_secs={:.3}, read_secs={:.3}, stage_secs={:.3}, promote_secs={:.3}, \
+             new_watermark={:?}, warnings={})",
             self.rows_read,
             self.rows_written,
             self.bytes_written,
+            self.rows_deleted,
             self.duration_secs,
-            self.new_watermark
+            self.read_secs,
+            self.stage_secs,
+            self.promote_secs,
+            self.new_watermark,
+            self.warnings.len(),
         )
     }
+}
+
+/// What a `reconcile_keys()` diff found, and what it did about it.
+#[pyclass]
+struct ReconcileResult {
+    #[pyo3(get)]
+    source_keys: u64,
+    #[pyo3(get)]
+    dest_keys: u64,
+    #[pyo3(get)]
+    orphan_keys: u64,
+    #[pyo3(get)]
+    missing_keys: u64,
+    #[pyo3(get)]
+    rows_deleted: u64,
+    #[pyo3(get)]
+    orphan_sample: Vec<String>,
+    #[pyo3(get)]
+    missing_sample: Vec<String>,
+    #[pyo3(get)]
+    duration_secs: f64,
+}
+
+#[pymethods]
+impl ReconcileResult {
+    fn __repr__(&self) -> String {
+        format!(
+            "ReconcileResult(source_keys={}, dest_keys={}, orphan_keys={}, missing_keys={}, \
+             rows_deleted={}, duration_secs={:.3})",
+            self.source_keys,
+            self.dest_keys,
+            self.orphan_keys,
+            self.missing_keys,
+            self.rows_deleted,
+            self.duration_secs,
+        )
+    }
+}
+
+/// `mode` has no safe default, so there isn't one.
+///
+/// It used to default to `"full"`, which means "replace the destination
+/// wholesale" — the single most destructive of the three modes, handed to
+/// anyone who did not think about the argument. Against a partitioned table a
+/// full refresh scoped to one partition destroys the rest. Requiring the caller
+/// to name the mode costs one keyword and removes a footgun that fires silently.
+fn require_mode(mode: Option<String>) -> PyResult<String> {
+    mode.ok_or_else(|| {
+        PyRuntimeError::new_err(
+            "sync() requires mode=: \"full\" REPLACES the destination table (and is not              partition-aware, so a partial run destroys the rest), \"incremental\" upserts on key=              or watermark=, \"append\" inserts without deduplicating. This used to default to              \"full\"; it no longer does, because that default silently replaced tables nobody              meant to replace.",
+        )
+    })
 }
 
 fn parse_mode(mode: &str) -> PyResult<core::SyncMode> {
@@ -947,7 +1069,7 @@ fn parse_parquet_compression(c: &str) -> PyResult<core::ParquetCompression> {
     source_table=None,
     source_query=None,
     state_key=None,
-    mode="full".to_string(),
+    mode=None,
     watermark=None,
     watermark_source_expr=None,
     lookback_seconds=0,
@@ -962,7 +1084,9 @@ fn parse_parquet_compression(c: &str) -> PyResult<core::ParquetCompression> {
     primary_key=None,
     merge_prune_partition_by=None,
     merge_prune_key_range=true,
+    merge_prune_key_list_max=0,
     delete_stale_in_window=false,
+    allow_full_refresh_shrink=false,
     parallelism=0,
     batch_rows=100_000,
     batch_bytes=4_194_304,
@@ -972,6 +1096,7 @@ fn parse_parquet_compression(c: &str) -> PyResult<core::ParquetCompression> {
     partition_column=None,
     partition_source_expr=None,
     read_max_rows_per_sec=None,
+    read_idle_timeout_secs=0,
     chunk_rows=None,
     retry_max_attempts=1,
     column_transforms=None,
@@ -999,7 +1124,7 @@ fn sync(
     source_table: Option<String>,
     source_query: Option<String>,
     state_key: Option<String>,
-    mode: String,
+    mode: Option<String>,
     watermark: Option<String>,
     watermark_source_expr: Option<String>,
     lookback_seconds: u64,
@@ -1014,7 +1139,9 @@ fn sync(
     primary_key: Option<Vec<String>>,
     merge_prune_partition_by: Option<String>,
     merge_prune_key_range: bool,
+    merge_prune_key_list_max: usize,
     delete_stale_in_window: bool,
+    allow_full_refresh_shrink: bool,
     parallelism: usize,
     batch_rows: usize,
     batch_bytes: usize,
@@ -1024,6 +1151,7 @@ fn sync(
     partition_column: Option<String>,
     partition_source_expr: Option<String>,
     read_max_rows_per_sec: Option<u64>,
+    read_idle_timeout_secs: u64,
     chunk_rows: Option<usize>,
     retry_max_attempts: u32,
     column_transforms: Option<HashMap<String, String>>,
@@ -1062,7 +1190,7 @@ fn sync(
         source_query,
         dest_table,
         state_key,
-        mode: parse_mode(&mode)?,
+        mode: parse_mode(&require_mode(mode)?)?,
         watermark,
         watermark_source_expr,
         lookback_seconds,
@@ -1076,7 +1204,9 @@ fn sync(
         primary_key: primary_key.unwrap_or_default(),
         merge_prune_partition_by,
         merge_prune_key_range,
+        merge_prune_key_list_max,
         delete_stale_in_window,
+        allow_full_refresh_shrink,
         parallelism,
         batch_rows,
         batch_bytes,
@@ -1086,6 +1216,7 @@ fn sync(
         partition_column,
         partition_source_expr,
         read_max_rows_per_sec,
+        read_idle_timeout_secs,
         chunk_rows,
         retry_max_attempts,
         column_transforms: column_transforms.unwrap_or_default(),
@@ -1146,12 +1277,89 @@ fn sync(
         })
         .map_err(map_err)?;
 
+    // Warnings are re-boxed as Python objects here rather than lazily, so a
+    // caller can hold onto `result.warnings` after the GIL is handed back.
+    let warnings = result
+        .warnings
+        .iter()
+        .map(|w| Py::new(py, TransferWarning::from_core(w)))
+        .collect::<PyResult<Vec<_>>>()?;
     Ok(TransferResult {
         rows_read: result.rows_read,
         rows_written: result.rows_written,
         bytes_written: result.bytes_written,
+        rows_deleted: result.rows_deleted,
         duration_secs: result.duration_secs,
+        read_secs: result.read_secs,
+        stage_secs: result.stage_secs,
+        promote_secs: result.promote_secs,
         new_watermark: result.new_watermark,
+        warnings,
+    })
+}
+
+/// Diff a source table's keyset against a destination's, and optionally delete
+/// the rows the source no longer has.
+///
+/// An incremental sync never removes anything: a row hard-deleted at the source
+/// has no watermark to move, so the destination keeps it forever. This measures
+/// that drift for a bounded window, and repairs it only when `delete=True`.
+#[pyfunction]
+#[pyo3(signature = (
+    source,
+    target,
+    dest_table,
+    *,
+    key,
+    source_table=None,
+    source_query=None,
+    window=None,
+    dest_window=None,
+    delete=false,
+    max_delete_keys=0,
+    sample_limit=10,
+))]
+#[allow(clippy::too_many_arguments)]
+fn reconcile_keys(
+    py: Python<'_>,
+    source: AnySource,
+    target: AnyDestination,
+    dest_table: String,
+    key: String,
+    source_table: Option<String>,
+    source_query: Option<String>,
+    window: Option<String>,
+    dest_window: Option<String>,
+    delete: bool,
+    max_delete_keys: u64,
+    sample_limit: usize,
+) -> PyResult<ReconcileResult> {
+    init_logging();
+    let source_cfg: core::SourceConfig = source.into();
+    let dest_cfg = target.into_config()?;
+    let cfg = core::ReconcileConfig {
+        source_table,
+        source_query,
+        dest_table,
+        key,
+        window,
+        dest_window,
+        delete,
+        max_delete_keys,
+        sample_limit,
+    };
+    let result = py
+        .allow_threads(|| core::reconcile_keys_blocking(source_cfg, dest_cfg, cfg))
+        .map_err(map_err)?;
+    Ok(ReconcileResult {
+        source_keys: result.source_keys,
+        dest_keys: result.dest_keys,
+        orphan_keys: result.orphan_keys,
+        missing_keys: result.missing_keys,
+        rows_deleted: result.rows_deleted,
+        orphan_sample: result.orphan_sample,
+        missing_sample: result.missing_sample,
+        duration_secs: result.duration_secs,
     })
 }
 
@@ -1174,7 +1382,10 @@ fn _quickhouse(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Progress>()?;
     m.add_class::<StagedInfo>()?;
     m.add_class::<TransferResult>()?;
+    m.add_class::<TransferWarning>()?;
+    m.add_class::<ReconcileResult>()?;
     m.add_function(wrap_pyfunction!(sync, m)?)?;
+    m.add_function(wrap_pyfunction!(reconcile_keys, m)?)?;
     m.add_function(wrap_pyfunction!(version, m)?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())

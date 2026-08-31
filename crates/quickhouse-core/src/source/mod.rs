@@ -30,6 +30,22 @@ pub enum Source {
     BigQuery(BigQuerySource),
 }
 
+/// The first `max` **bytes** of a response body, rendered for an error message.
+///
+/// Slicing a `String`/`&str` at a fixed byte offset panics when that offset
+/// lands inside a multi-byte UTF-8 sequence, so `&body[..200]` on a vendor
+/// error message containing any non-ASCII character crashes the process
+/// instead of producing the error it was building. Truncating the *bytes* and
+/// then lossily decoding cannot panic and cannot split a codepoint.
+pub(crate) fn body_head(bytes: &[u8], max: usize) -> String {
+    let end = bytes.len().min(max);
+    let mut s = String::from_utf8_lossy(&bytes[..end]).into_owned();
+    if bytes.len() > end {
+        s.push('\u{2026}');
+    }
+    s
+}
+
 /// Split the inclusive range `[lo, hi]` into up to `n` roughly-equal
 /// partitions, each rendered as a `"{quoted_col} >= start AND {quoted_col} <=
 /// end"` predicate over the already-quoted column expression. Shared by
@@ -66,6 +82,26 @@ pub(crate) fn range_partitions(lo: i128, hi: i128, n: usize, quoted_col: &str) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn body_head_never_panics_on_multibyte_boundaries() {
+        // The bug this guards: `&body[..body.len().min(200)]` on a String
+        // panics when byte 200 falls inside a UTF-8 sequence. A vendor error
+        // message in any non-Latin script did exactly that.
+        let body = "\u{00d7}".repeat(300); // 2 bytes/char -> byte 201 splits one
+        let _ = body_head(body.as_bytes(), 201);
+        // A cut landing mid-sequence yields the replacement char, not a panic.
+        let cut = body_head("h\u{00e9}llo".as_bytes(), 2);
+        assert!(cut.starts_with('h'), "{cut:?}");
+        // Short bodies pass through untouched, with no ellipsis.
+        assert_eq!(body_head(b"short", 200), "short");
+        assert_eq!(body_head(b"", 200), "");
+        // Truncation is marked.
+        assert!(body_head(b"abcdef", 3).starts_with("abc"));
+        assert!(body_head(b"abcdef", 3).ends_with('\u{2026}'));
+        // Invalid UTF-8 degrades rather than panicking.
+        assert!(!body_head(&[0xff, 0xfe, 0x00], 200).is_empty());
+    }
 
     #[test]
     fn range_partitions_terminates_when_hi_is_i64_max() {

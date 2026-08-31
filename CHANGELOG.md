@@ -9,6 +9,334 @@ any breaking change is called out explicitly.
 
 ## [Unreleased]
 
+## [0.15.0] — 2026-08-31
+
+Four things a production fleet could see and quickhouse could not: a destination
+that silently diverges from a source that deletes rows, a timeout knob that
+measures the wrong subsystem, a MERGE prune that is correct and useless at the
+same time, and every silent-corruption signal reaching the caller only as log
+text.
+
+### Verified against live services
+
+Every path below was exercised against a real service before release, which is
+new: 0.14.1's `MERGE` fix shipped with its live tests unrun, and 0.14.0's
+outage was caused by a change no live test covered.
+
+- **BigQuery** — the four live `MERGE`/reconcile tests now pass against a real
+  dataset. They had **never once been executed**, and running them surfaced two
+  bugs in the harness itself: the live sink bypassed the entry points that
+  install rustls' `CryptoProvider` (so every test panicked before a request left
+  the process), and the assertions compared `insert_batches`' approximate
+  wire-**bytes** return against a row count of 2. Both fixed; the suite now
+  covers the default-on key-range prune, the new key-list prune and its
+  over-limit fallback, the partition prune with `WHEN NOT MATCHED BY SOURCE`,
+  the clustering probe, and `reconcile_keys`' `distinct_keys`/`delete_keys`.
+- **CleverTap** — 146,864 records across 32 pages at 100.00% coverage against an
+  independent raw walk of the same window.
+- **PostgreSQL/MySQL → ClickHouse** — the window-scoped delete and
+  `reconcile_keys` measure/repair cycle, end to end against live services
+  (`tests/test_reconcile.py`), including the assertion that an ordinary
+  incremental sync does *not* remove a hard-deleted row.
+
+### Fixed — CleverTap paging (the contract is no longer disputed)
+
+- **The CleverTap events source could not read a single page, and the two
+  contract defects behind the "reads one page" symptom are both confirmed and
+  fixed.** Verified live against sg1 on 2026-08-31; the captured chain is
+  committed as fixtures in `crates/quickhouse-core/tests/fixtures/clevertap/`
+  and the tests now run against those rather than against hand-written JSON that
+  restated the code's own assumptions.
+
+  Three separate defects, each independently fatal:
+
+  1. **The cursor was percent-encoded before being sent.** CleverTap hands it
+     back *already* encoded — an observed cursor is ~1,900 characters of
+     alphanumerics plus `%2B`, `%2F` and `%3D` and nothing else. Encoding it
+     again turns `%2B` into `%252B`, and the vendor answers every such request
+     with HTTP **200** carrying
+     `{"status":"fail","error":"Incorrect Usage","code":3}`. This was a total
+     outage of the source, not a truncation: **no page ever loaded.** The
+     encoding was added for a sound-sounding reason — an opaque base64-ish
+     token "routinely contains `+`, `/` and `=`" — which is true of the decoded
+     token and never of the wire form.
+  2. **The next cursor was read from `cursor` on data pages, which key it
+     `next_cursor`.** A data page carries no `cursor` key at all, so the parsed
+     cursor was always `None`. (The *create* response does key it `cursor` —
+     that asymmetry is real, and both are now accepted in both places.)
+  3. **`status == "success"` was treated as terminal.** Every real page says
+     `"success"`, final or not; `"partial"` is never sent. The chain ends when
+     `next_cursor` is absent, and only then — the real terminal page of a
+     32-page export is literally `{"status":"success"}`, with no `records` key.
+
+  Defects 2 and 3 produce the identical symptom, which is why a short table
+  could never say which was at fault and why the rule was deliberately frozen
+  pending evidence. Measured on the captured account, the old rule would have
+  read **4,991 of 146,852 records (3.40%)** for one event-day and reported it a
+  clean success. After the fix, the same window reads 146,864 records across 32
+  pages at 100.00% coverage against an independent raw walk.
+
+- **Two vendor states that arrive as HTTP 200 with a `fail` body are now
+  retried instead of failing the transfer**: `code: 2` ("export still
+  materialising") and an `error` of "Too many requests". Bounded retries against
+  the same cursor. Both are asserted by the production audit; neither was
+  reproduced during capture, so this is the defensive reading — it costs a
+  bounded wait if they never occur and prevents a spurious hard failure if they
+  do.
+
+- **A cursor that stops advancing now ends the chain with a loud warning**
+  rather than spinning forever.
+
+### Added — CleverTap benchmarking and contract tooling
+
+- **`benchmarks/bench_clevertap.py`** benchmarks the source against a real
+  account in two lanes over the same window: a tolerant raw walk that
+  establishes ground truth, and `sync()` timed against it. The headline is
+  **coverage**, not throughput, because a truncated read produces a
+  great-looking rows/s figure that describes nothing — at less than full
+  coverage it says so and points at the capture tooling. Reads credentials from
+  Secret Manager or the environment, never printing them.
+- **`crates/quickhouse-core/tests/fixtures/clevertap/capture.py` now works.**
+  Three bugs kept it from ever writing a fixture: it double-encoded the cursor
+  like the source did; its scrubber substituted an *email-shaped* placeholder
+  for emails and a *10-digit* placeholder for digit runs, so its own leak check
+  rejected what it had just written; and long identifiers arriving as JSON
+  numbers or floats bypassed the string-only scrubber (a float's shortest
+  round-trip rendering reads as a 16-digit run). It also now redacts opaque
+  tokens by *shape* — a real capture surfaced a 64-character `push_token` that
+  every key-name and digit rule waved through — and truncates `records` to a
+  couple of rows (recording the true count as `_records_total`), so a fixture
+  proving a cursor key is 44 KB rather than 3 MB.
+
+### Added — deletes and reconciliation
+
+- **`reconcile_keys()`: measure, and optionally repair, drift against a source
+  that hard-deletes.** An incremental sync is insert-and-update only. It finds
+  rows whose watermark moved; a row the source *deleted* has no watermark to
+  move, so nothing about it ever reaches the destination again and it stays
+  there forever. For an ERP cancelling reservations, a queue draining, or a
+  "soft delete" that is really a `DELETE`, the destination drifts
+  one-directionally and without bound, and there was no supported way to detect
+  it or repair it.
+
+  The drift also hides well, because it is lopsided: a measured production table
+  carried **+1.30% phantom rows against +0.0168% on a quantity sum**, so every
+  COUNT-based model over-reported materially while every SUM-based one looked
+  fine. Row counts alone do not tell you the exposure.
+
+  `reconcile_keys()` reads the source's keyset over a bounded window, reads the
+  destination's over the same window, and reports `orphan_keys` (in the
+  destination, gone from the source — the drift) and `missing_keys` (in the
+  source, absent from the destination — sync lag, or an incomplete load). With
+  `delete=True` it removes the orphans and reports `rows_deleted`. Measuring is
+  the default because it is the part worth running continuously; deleting is the
+  part worth approving.
+
+  Guards, because a reconcile is only as good as its window: `delete=True`
+  requires a window (an unbounded delete is a full refresh with a race in it, not
+  a reconcile); `max_delete_keys` refuses to act above a ceiling you set; and a
+  diff that finds *no keys in common at all* is refused outright rather than
+  reported as 100% drift — genuine drift is one-directional, so total
+  disagreement means the two sides rendered the key differently or the window
+  predicates disagreed, not that everything is deletable.
+
+  PostgreSQL and MySQL sources, ClickHouse and BigQuery destinations,
+  single-column keys.
+
+- **`delete_stale_in_window=True` now works for a ClickHouse destination**, not
+  just BigQuery — the in-sync half of the same problem. BigQuery expresses it as
+  a `WHEN NOT MATCHED BY SOURCE` clause inside its own `MERGE` (atomic with the
+  upsert, but BigQuery reports one combined affected-row count for the statement,
+  so no separate delete count is attributable). ClickHouse runs a lightweight
+  `DELETE FROM dest WHERE <window> AND key NOT IN (SELECT key FROM staging)` just
+  before the staged rows are promoted: this forces the run to stage (ClickHouse
+  incremental otherwise inserts directly, and the delete needs a materialised
+  batch to subtract from), is *not* atomic with the insert, and reports the exact
+  count. It still requires `merge_prune_partition_by` to scope the window — an
+  unscoped delete would remove the destination's entire history outside the
+  batch. Setting the flag against a ClickHouse destination previously did
+  nothing at all, silently.
+
+### Added — timeouts that measure what their names say
+
+- **`read_idle_timeout_secs` (default `0` = off): fail when *no source rows
+  arrive* for that long.** `statement_timeout_secs` reads as a cap on query
+  duration, but quickhouse streams the source result set straight into the
+  destination, so the statement producing it stays open from the first row read
+  to the last one written. The server therefore counts read + decode +
+  destination write + backpressure against it. Measured here: a **0.64s**
+  server-side sequential scan (EXPLAIN ANALYZE, all shared-buffer hits) failed
+  **9 consecutive times** against a 90s `statement_timeout_secs`, because the
+  BigQuery Storage Write path was throttling that day — and it failed as
+  `57014 canceling statement due to statement timeout`, sending an operator
+  hunting for a slow query and a missing index that did not exist. Retries were
+  structurally unable to help: every attempt restarts from zero against the same
+  ceiling.
+
+  The new timer wraps the awaits on the source stream and nothing else. Time
+  spent decoding, inserting, or blocked on the memory budget does not count, so
+  a slow destination cannot trip it — which is what makes it safe to set
+  tightly — while a genuinely hung source does. The resulting error is
+  classified transient, so `retry_max_attempts` retries the whole transfer.
+  PostgreSQL, MySQL and BigQuery source reads.
+
+- **`statement_timeout_secs`' docstring now says what it actually bounds.** It
+  is a ceiling on the whole streamed transfer, not on the source statement, and
+  it says so — along with the reason a retry cannot rescue a table that crosses
+  it.
+
+### Added — MERGE pruning that binds
+
+- **`merge_prune_key_list_max` (default `0` = off): bound a BigQuery `MERGE` to
+  the batch's exact key list instead of its key range.** `merge_prune_key_range`
+  (on by default since 0.14.0) is sound and it is a tautology — a destination row
+  can only match a key the batch holds. But its *effectiveness* collapses when
+  the changed rows are scattered across the key space rather than clustered at
+  the top of it, which is the normal shape for any table whose rows are updated
+  after insert.
+
+  Measured across 7 days of production MERGEs: 12,718 statements, 1.451 TiB
+  billed, 12.98 hours of MERGE time. One table — correctly clustered on its merge
+  key — still scanned roughly half of itself per run and accounted for 2.34 of
+  those hours, because its updates span the whole id range and so `[MIN, MAX]`
+  covers nearly the entire table. The prune was correct and useless at once.
+
+  When the staging batch holds at most `merge_prune_key_list_max` distinct key
+  values, the bound becomes `T.k IN (v1, v2, …)` instead. Same tautology, no
+  immutability contract, and it does not degrade when the keys are scattered.
+  Costs one small extra query per merge; if the batch exceeds the ceiling the
+  list is abandoned and the range bound is used, so the limit really bounds the
+  generated statement. Single-column keys only (a composite would need an
+  `IN UNNEST([STRUCT(…)])` form whose pruning behaviour is not the same), and
+  skipped under `delete_stale_in_window` for the same reason the range bound is.
+  Off by default: 0.14.0 shipped a default-on prune change that broke every
+  BigQuery merge, and this one earns its default in the field first.
+
+- **quickhouse now warns when it MERGEs into a destination that is not clustered
+  by the merge key.** There the key bound has nothing to prune with and every run
+  scans the whole table — invisible from the caller's side until it appears on a
+  bill. In the same 7 days, one unclustered 11.3 GiB table scanned ~10.4 GiB per
+  run across 42 runs: **0.428 TiB**, the single largest MERGE cost measured.
+  quickhouse generates clustered DDL itself, so it knows what good looks like;
+  this only fires for a destination created some other way. Surfaces as a
+  `TransferWarning` with kind `"unclustered_merge_target"`.
+
+### Added — `TransferResult` you can act on
+
+- **`TransferResult.warnings: list[TransferWarning]`.** Every silent-corruption
+  signal quickhouse already computes reached the caller only as log text, where
+  an orchestrator could not act on it: a Dagster asset succeeded while a column
+  rotted. Each warning carries `.kind` (stable, machine-readable), `.column`,
+  `.count`, `.sample` and `.message`, aggregated per `(kind, column)` across the
+  run and ordered most-affected first. Nothing is raised — these are values, and
+  the caller decides which should fail their pipeline.
+
+  The kinds: `collapsed_bool` (a MySQL `tinyint(1)` outside `{0,1}` flattened,
+  losing e.g. 2 vs 3), `null_watermark` (rows excluded from this and every future
+  incremental run, permanently — the most dangerous one), `coerced_decimal`,
+  `coerced_date`, `coerced_scalar`, `full_refresh_shrink`, and
+  `unclustered_merge_target`.
+
+- **Coercions are now attributed per column, not just counted per table.** The
+  four decoders tracked a handful of scalar totals, which was enough to log a
+  sentence and not enough to act on — "9 columns across 8 tables were genuine
+  small integers flattened to `1`" cannot be reconstructed from a per-table
+  total. The column index was already in hand at every increment site, so
+  attribution is free; the log lines now name the columns too.
+
+- **`TransferResult.read_secs` / `.stage_secs` / `.promote_secs`.**
+  `duration_secs` alone could not tell a caller whether to tune the source query,
+  the insert path, or the destination DDL — that had to be reconstructed from
+  BigQuery job metadata after the fact, and not at all for a ClickHouse
+  destination. `read_secs` is the time spent *waiting on source rows* (the source
+  awaits alone, excluding decode, insert and backpressure), summed across
+  parallel readers; `stage_secs` is the streaming phase's wall time;
+  `promote_secs` is the swap / `MERGE` / insert-select / delete / watermark
+  persist that follows.
+
+- **`TransferResult.rows_deleted`**, for the ClickHouse window-scoped delete and
+  a `reconcile_keys` repair. `0` for a BigQuery `delete_stale_in_window`, which
+  performs its delete inside the `MERGE` and reports only one combined
+  affected-row count — there is no way to attribute the delete portion, so this
+  reports `0` rather than a number that is really the merge's total.
+
+
+### Changed — BREAKING
+- **`mode=` is now required.** It used to default to `"full"`, which REPLACES the
+  destination table wholesale — the most destructive of the three modes, handed
+  to anyone who did not think about the argument. `sync()` now raises unless you
+  name `"full"`, `"incremental"` or `"append"`.
+- **A full refresh that would shrink the destination is now refused.**
+  `mode="full"` resolves to `atomic_swap` — ClickHouse `EXCHANGE TABLES`,
+  BigQuery `TRUNCATE` + `INSERT ... SELECT` — and **neither is partition-aware**.
+  A run covering one partition therefore destroyed every other partition,
+  atomically, and exited successfully. This was previously a `tracing::warn!` on
+  the API path only (and nothing at all on the DB path), so it never stopped
+  anything: a Postgres full refresh scoped to one month, swapped into a
+  monthly-partitioned table, lost the other eleven by the identical code path.
+  The new `guard_full_refresh_shrink` runs before *every* swap site. Set
+  `allow_full_refresh_shrink=True` for a shrink that is genuinely intended, or
+  use `mode="incremental"` with `key=` / `mode="append"` to add rather than
+  replace. A row count the sink cannot report is logged and does not block.
+
+### Added
+- CleverTap contract-capture tooling, because the paging contract is disputed
+  (see below): `crates/quickhouse-core/tests/fixtures/clevertap/capture.py`
+  captures and scrubs real pages into fixtures, and
+  `examples/clevertap_contract_probe.py` walks a whole export chain and reports
+  what each candidate termination rule *would* have read, as a percentage of the
+  real chain. Both read-only.
+
+### Fixed
+- **CleverTap/HTTP-API error paths could panic on a non-ASCII response body.**
+  Both sources built their error message with `&body[..body.len().min(200)]`,
+  which slices a `String` at a fixed *byte* offset and panics outright when that
+  offset falls inside a multi-byte UTF-8 sequence. Any sufficiently long vendor
+  error message in a non-Latin script crashed the process instead of producing
+  the error it was assembling. Replaced with a shared `source::body_head` that
+  truncates bytes and decodes lossily.
+- **CleverTap paging cursors are now percent-encoded.** The data-page URL was
+  built by interpolation (`?cursor={cursor}`); an opaque vendor cursor
+  containing `+`, `/`, `=` or `&` was silently corrupted on the wire — `+`
+  decodes server-side as a space, and `&` truncates the parameter outright.
+  Now built with `Url::query_pairs_mut`, matching `appsflyer::report_url`.
+- **A CleverTap page whose `records` field is present but not an array is now an
+  error** rather than a silent zero-row page. The previous
+  `.and_then(as_array).unwrap_or_default()` turned a vendor protocol change into
+  an invisible empty read that the caller reported as a clean success.
+
+### Changed
+- **CleverTap page errors now carry `code` and the full `error` value.** A
+  `{"status":"fail","code":2}` response used to render as `unexpected status
+  'fail' ` — a dangling empty field, with the one value indicating whether the
+  condition is retryable dropped entirely, along with any non-string `error`.
+  The response body head is now echoed too.
+- **The CleverTap paging loop logs what it read and why it stopped**: page
+  count, records per page, and the termination reason. It warns when it stops
+  while still holding an unfollowed cursor, and when an export ends after a
+  single page — the signature of a paging failure rather than an empty day.
+  Every exit from this loop was previously a bare `break` that logged nothing.
+
+### Documentation
+- **The CleverTap paging contract is recorded as disputed and unverified.** The
+  module previously asserted a contract "verified live against the sg1 region";
+  a later production audit asserts a materially different one for the same
+  region (`next_cursor` rather than `cursor`, `status:"success"` on every page,
+  `code:2` as retryable, HTTP-200-shaped throttling). Neither is reproducible
+  from this repository — there is no captured page or fixture, and the unit
+  tests were hand-written from the same assumption as the code they test. The
+  termination rule is deliberately left unchanged pending a captured raw page
+  rather than swapped for an equally unverified one.
+- Removed stale "BigQuery-only destination" claims left over from before
+  `bc1ab45` (API sources gained ClickHouse support). One of them was
+  load-bearing: `decode_api.rs` justified its *absence* of a `ch_range` clamp on
+  the destination being BigQuery, which stopped being true. That is now recorded
+  as a KNOWN GAP — an API source declaring a DATE/TIMESTAMP value outside
+  ClickHouse's representable window is passed through rather than nulled with a
+  counter, unlike every other decode path.
+- Deleted an orphaned comment on `api_columns_of` describing a destination
+  rejection (`ensure_api_dest_supported`) that was removed a release earlier.
+
 ## [0.14.1] - 2026-08-20
 
 A single-defect patch release. 0.14.0's `merge_prune_key_range` shipped on by

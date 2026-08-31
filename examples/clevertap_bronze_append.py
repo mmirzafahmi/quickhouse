@@ -15,7 +15,7 @@ Prerequisites
 -------------
 - `pip install quickhouse`
 - CleverTap Account ID + Passcode, and the destination is real BigQuery
-  (API sources are BigQuery-only today). ADC or a key file for auth.
+  (API sources also support ClickHouse). ADC or a key file for auth.
 
 Environment variables:
     CT_ACCOUNT_ID, CT_PASSCODE          (required)

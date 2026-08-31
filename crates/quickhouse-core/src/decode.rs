@@ -22,7 +22,7 @@ use arrow_array::types::{Decimal128Type, DecimalType};
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 
-use crate::decimal::{rescale_mantissa, Coercion};
+use crate::decimal::{rescale_mantissa, Coercion, CoercionTally};
 use crate::error::{EtlError, Result};
 use crate::types::{ch_range, oid, ColumnType};
 
@@ -404,13 +404,11 @@ pub struct CopyDecoder {
     batch_bytes: usize,
     /// Total rows decoded across the whole stream.
     pub rows_total: u64,
-    /// Count of valid dates/datetimes whose year fell outside ClickHouse's
-    /// representable window and were coerced to NULL (see `ColBuilder::append_value`).
-    pub invalid_dates_total: u64,
-    /// Count of `numeric` values coerced to NULL because they overflowed a
-    /// `Decimal(P,S)` override's precision, or were NaN/Infinity (see
-    /// `ColBuilder::append_value`'s `Decimal128` arm).
-    pub invalid_decimals_total: u64,
+    /// Per-column counts of the values this decoder coerced — dates outside
+    /// ClickHouse's representable window, and `numeric`s that overflowed a
+    /// `Decimal(P,S)` override or were NaN/Infinity (see
+    /// `ColBuilder::append_value`). Read back through [`Self::coercions`].
+    coercions: CoercionTally,
 }
 
 impl CopyDecoder {
@@ -443,13 +441,30 @@ impl CopyDecoder {
             batch_rows,
             batch_bytes,
             rows_total: 0,
-            invalid_dates_total: 0,
-            invalid_decimals_total: 0,
+            coercions: CoercionTally::new(columns.iter().map(|c| c.name.as_str())),
         })
     }
 
     pub fn schema(&self) -> SchemaRef {
         self.schema.clone()
+    }
+
+    /// Every `(kind, column, count)` this decoder coerced. Empty on a clean
+    /// read; `sync` turns each entry into a `TransferWarning`.
+    pub fn coercions(&self) -> Vec<(crate::config::WarningKind, String, u64)> {
+        self.coercions.entries()
+    }
+
+    /// Total values coerced to NULL for being unrepresentable dates.
+    pub fn invalid_dates_total(&self) -> u64 {
+        self.coercions
+            .total(crate::config::WarningKind::CoercedDate)
+    }
+
+    /// Total values coerced to NULL for overflowing their declared decimal.
+    pub fn invalid_decimals_total(&self) -> u64 {
+        self.coercions
+            .total(crate::config::WarningKind::CoercedDecimal)
     }
 
     /// Feed a chunk of the COPY stream; returns any batches completed by it.
@@ -589,14 +604,10 @@ impl CopyDecoder {
                         .map_err(|err| {
                             err.context(format!("column '{}'", self.schema.field(i).name()))
                         })?;
-                    match coercion {
-                        Coercion::None => {}
-                        Coercion::DateRange => self.invalid_dates_total += 1,
-                        Coercion::DecimalOverflow => self.invalid_decimals_total += 1,
-                        // MySQL-only (a tinyint(1) display-width inference);
-                        // Postgres has a real `bool` type, so no such guess.
-                        Coercion::BoolCollapse => {}
-                    }
+                    // `BoolCollapse` is MySQL-only (a tinyint(1) display-width
+                    // inference); Postgres has a real `bool` type, so no such
+                    // guess, and the tally simply never sees one here.
+                    self.coercions.record_coercion(i, coercion);
                 }
             }
         }

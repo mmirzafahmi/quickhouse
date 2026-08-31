@@ -10,6 +10,7 @@
 //! S)` override with `P > 38` as a config error rather than silently
 //! falling back to the lossy `Float64` decode this module exists to fix).
 
+use crate::config::WarningKind;
 use crate::error::{EtlError, Result};
 
 /// Parse the literal ClickHouse `"Decimal(P, S)"` `type_overrides` syntax
@@ -178,6 +179,99 @@ pub(crate) enum Coercion {
     /// Only the MySQL decoder produces this (it's the only source whose type
     /// mapping infers Boolean from a display width rather than a real type).
     BoolCollapse,
+}
+
+/// Per-column counts of the lossy coercions a decoder applied, so a warning can
+/// say *which* column lost data rather than only how many values did.
+///
+/// The count used to be a handful of scalar totals per decoder, which was
+/// enough to log a sentence and not enough to act on: a report of "9 columns
+/// across 8 tables were genuine small integers flattened to a boolean" cannot
+/// be reconstructed from a per-table total. Attribution is free here — the
+/// column index is already in hand at every increment site — and it is what
+/// turns these into the structured `TransferWarning`s on `TransferResult`.
+///
+/// Fixed-width per column (one `[u64; SLOTS]`), so recording is an indexed
+/// increment on a hot per-value path with no hashing and no allocation.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CoercionTally {
+    names: Vec<String>,
+    counts: Vec<[u64; Self::SLOTS]>,
+}
+
+impl CoercionTally {
+    const SLOTS: usize = 4;
+
+    fn slot(kind: WarningKind) -> Option<usize> {
+        match kind {
+            WarningKind::CoercedDate => Some(0),
+            WarningKind::CoercedDecimal => Some(1),
+            WarningKind::CollapsedBool => Some(2),
+            WarningKind::CoercedScalar => Some(3),
+            // Table-level conditions are raised by `sync`, never tallied here.
+            WarningKind::NullWatermark
+            | WarningKind::FullRefreshShrink
+            | WarningKind::UnclusteredMergeTarget => None,
+        }
+    }
+
+    fn kind_of(slot: usize) -> WarningKind {
+        match slot {
+            0 => WarningKind::CoercedDate,
+            1 => WarningKind::CoercedDecimal,
+            2 => WarningKind::CollapsedBool,
+            _ => WarningKind::CoercedScalar,
+        }
+    }
+
+    pub(crate) fn new<'a>(names: impl IntoIterator<Item = &'a str>) -> Self {
+        let names: Vec<String> = names.into_iter().map(str::to_string).collect();
+        let counts = vec![[0u64; Self::SLOTS]; names.len()];
+        Self { names, counts }
+    }
+
+    /// Record one coerced value in column `col`. An out-of-range index is
+    /// ignored rather than panicking: a miscounted diagnostic must never take
+    /// a transfer down.
+    pub(crate) fn record(&mut self, col: usize, kind: WarningKind) {
+        if let (Some(slot), Some(row)) = (Self::slot(kind), self.counts.get_mut(col)) {
+            row[slot] += 1;
+        }
+    }
+
+    /// Record whatever a decoder's per-value append reported. `Coercion::None`
+    /// is the overwhelmingly common case and costs one match arm.
+    pub(crate) fn record_coercion(&mut self, col: usize, c: Coercion) {
+        match c {
+            Coercion::None => {}
+            Coercion::DateRange => self.record(col, WarningKind::CoercedDate),
+            Coercion::DecimalOverflow => self.record(col, WarningKind::CoercedDecimal),
+            Coercion::BoolCollapse => self.record(col, WarningKind::CollapsedBool),
+        }
+    }
+
+    /// Total across every column for one kind — what the old scalar counters
+    /// held, now derived rather than tracked separately.
+    pub(crate) fn total(&self, kind: WarningKind) -> u64 {
+        match Self::slot(kind) {
+            Some(slot) => self.counts.iter().map(|c| c[slot]).sum(),
+            None => 0,
+        }
+    }
+
+    /// Every non-zero `(kind, column, count)`, in column order then kind order.
+    pub(crate) fn entries(&self) -> Vec<(WarningKind, String, u64)> {
+        let mut out = Vec::new();
+        for (i, row) in self.counts.iter().enumerate() {
+            for (slot, &n) in row.iter().enumerate() {
+                if n > 0 {
+                    let name = self.names.get(i).cloned().unwrap_or_default();
+                    out.push((Self::kind_of(slot), name, n));
+                }
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]

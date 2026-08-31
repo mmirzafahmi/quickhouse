@@ -11,7 +11,7 @@
 //! certificates don't chain to any public root.
 
 use bytes::Bytes;
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ClientConfig, RootCertStore};
 use tokio_postgres::Client;
@@ -460,6 +460,55 @@ impl PgSource {
         };
         let row = client.query_one(&sql, &[]).await?;
         Ok(row.get::<_, i64>(0))
+    }
+
+    /// Every distinct non-NULL value of `key`, as text, over the rows `window`
+    /// admits — the source half of a `reconcile::reconcile_keys` diff.
+    ///
+    /// `::text` rather than a typed read, because the two sides of the diff have
+    /// to be comparable as strings and the destination renders its own keys the
+    /// same way (`toString` / `CAST(… AS STRING)`). That holds exactly for the
+    /// integer and string keys reconciliation is meant for; see
+    /// `ReconcileConfig::key` for why other types are a bad idea here.
+    ///
+    /// Streamed rather than collected by the driver, so a multi-million-key
+    /// table costs one `String` per key instead of a fully materialised
+    /// `Vec<Row>` holding every raw wire buffer alongside it.
+    pub async fn distinct_keys(
+        &self,
+        client: &Client,
+        from_table: Option<&str>,
+        base_query: Option<&str>,
+        key: &str,
+        window: Option<&str>,
+    ) -> Result<Vec<String>> {
+        let k = quote_pg(key);
+        let where_sql = match window {
+            Some(w) => format!("WHERE ({w}) AND {k} IS NOT NULL"),
+            None => format!("WHERE {k} IS NOT NULL"),
+        };
+        let sql = if let Some(q) = base_query {
+            format!("SELECT DISTINCT ({k})::text FROM ({q}) AS _src {where_sql}")
+        } else {
+            format!(
+                "SELECT DISTINCT ({k})::text FROM {t} {where_sql}",
+                t = quote_pg_table(from_table.expect("table required"))
+            )
+        };
+        let params: [&(dyn tokio_postgres::types::ToSql + Sync); 0] = [];
+        let stream = client
+            .query_raw(&sql, params)
+            .await
+            .map_err(|e| EtlError::from(e).context("reading source keyset"))?;
+        futures::pin_mut!(stream);
+        let mut out = Vec::new();
+        while let Some(row) = stream.next().await {
+            let row = row.map_err(|e| EtlError::from(e).context("reading source keyset row"))?;
+            if let Some(v) = row.get::<_, Option<String>>(0) {
+                out.push(v);
+            }
+        }
+        Ok(out)
     }
 }
 

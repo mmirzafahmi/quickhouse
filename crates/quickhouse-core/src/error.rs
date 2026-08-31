@@ -49,6 +49,18 @@ pub enum EtlError {
     #[error("configuration error: {0}")]
     Config(String),
 
+    /// The source produced no rows for `idle_secs` while quickhouse was waiting
+    /// on it — `TransferConfig::read_idle_timeout_secs`. Deliberately distinct
+    /// from a source-side `statement_timeout` cancel: this one can only fire
+    /// while the *source* stream is idle, never because the destination was
+    /// slow, so the message can say what it means without hedging.
+    #[error(
+        "source read for {scope} produced no rows for {idle_secs}s \
+         (read_idle_timeout_secs); the source stopped producing — this is not a \
+         destination-side stall, which this timer deliberately cannot see"
+    )]
+    ReadIdleTimeout { scope: String, idle_secs: u64 },
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -176,6 +188,12 @@ impl EtlError {
     pub fn internal(msg: impl Into<String>) -> Self {
         EtlError::Internal(msg.into())
     }
+    pub fn read_idle_timeout(scope: impl Into<String>, idle_secs: u64) -> Self {
+        EtlError::ReadIdleTimeout {
+            scope: scope.into(),
+            idle_secs,
+        }
+    }
 
     /// True only for a *transient source-read* failure that's worth retrying
     /// the whole transfer (see `TransferConfig::retry_max_attempts`). Recurses
@@ -187,6 +205,10 @@ impl EtlError {
             EtlError::Postgres(e) => pg_error_is_transient(e),
             EtlError::MySql(e) => mysql_error_is_transient(e),
             EtlError::Context { source, .. } => source.is_transient_source(),
+            // A stalled source is exactly the case a whole-transfer retry is
+            // for: the next attempt opens a fresh connection and re-reads the
+            // same window from scratch.
+            EtlError::ReadIdleTimeout { .. } => true,
             _ => false,
         }
     }

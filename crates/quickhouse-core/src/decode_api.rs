@@ -13,8 +13,18 @@
 //! missing key or JSON null → NULL (not counted); an unparseable scalar → NULL
 //! plus the matching counter (`invalid_scalars`/`invalid_dates`/`invalid_decimals`).
 //! Every declared column is Nullable, since external data routinely omits keys.
-//! The destination is BigQuery-only, whose DATE/TIMESTAMP range spans
-//! 0001–9999, so — unlike `decode_bigquery` — there is no `ch_range` clamp.
+//! There is no `ch_range` clamp here, unlike every other decode path
+//! (`decode.rs`, `decode_bigquery.rs`, `decode_mysql.rs`). The stated
+//! justification was "the destination is BigQuery-only, whose
+//! DATE/TIMESTAMP range spans 0001–9999" — which stopped being true in
+//! `bc1ab45`, when API sources gained ClickHouse as a destination.
+//!
+//! KNOWN GAP: an API source declaring a DATE/TIMESTAMP column whose value
+//! falls outside ClickHouse's representable window ([`crate::types::ch_range`])
+//! is passed through rather than nulled, so it is rejected or wrapped at the
+//! sink instead of being coerced to NULL with a counter like every other
+//! source. Unreachable while the destination is BigQuery; reachable today
+//! for an API -> ClickHouse transfer.
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -30,8 +40,8 @@ use base64::Engine;
 use chrono::{DateTime, NaiveDate, NaiveDateTime};
 use serde_json::Value;
 
-use crate::config::ApiColumn;
-use crate::decimal::{parse_decimal_text, rescale_mantissa, DecimalText};
+use crate::config::{ApiColumn, WarningKind};
+use crate::decimal::{parse_decimal_text, rescale_mantissa, CoercionTally, DecimalText};
 use crate::error::{EtlError, Result};
 use crate::types::bigquery::{canonical_bq_type_name, map_type, parse_bq_type_name};
 use crate::types::ColumnType;
@@ -406,9 +416,10 @@ pub struct ApiBatcher {
     rows_in_batch: usize,
     bytes_in_batch: usize,
     pub rows_total: u64,
-    pub invalid_scalars_total: u64,
-    pub invalid_dates_total: u64,
-    pub invalid_decimals_total: u64,
+    /// Per-column counts of the values this batcher coerced to NULL — scalars
+    /// that failed to parse, dates/timestamps that failed to parse, and
+    /// NUMERICs that overflowed. Read back through [`Self::coercions`].
+    coercions: CoercionTally,
     /// Per-column output name (aligned to `builders`), for diagnostics.
     col_names: Vec<String>,
     /// Whether column `i` is a declared DATE/TIMESTAMP (temporal) column.
@@ -458,9 +469,7 @@ impl ApiBatcher {
             rows_in_batch: 0,
             bytes_in_batch: 0,
             rows_total: 0,
-            invalid_scalars_total: 0,
-            invalid_dates_total: 0,
-            invalid_decimals_total: 0,
+            coercions: CoercionTally::new(col_names.iter().map(String::as_str)),
             col_names,
             col_temporal,
             col_attempted: vec![0; n],
@@ -494,6 +503,27 @@ impl ApiBatcher {
         self.schema.clone()
     }
 
+    /// Every `(kind, column, count)` this batcher coerced. Empty on a clean
+    /// read; `sync` turns each entry into a `TransferWarning`.
+    pub fn coercions(&self) -> Vec<(WarningKind, String, u64)> {
+        self.coercions.entries()
+    }
+
+    /// Total non-empty scalars that failed to parse and became NULL.
+    pub fn invalid_scalars_total(&self) -> u64 {
+        self.coercions.total(WarningKind::CoercedScalar)
+    }
+
+    /// Total date/timestamp values that failed to parse and became NULL.
+    pub fn invalid_dates_total(&self) -> u64 {
+        self.coercions.total(WarningKind::CoercedDate)
+    }
+
+    /// Total NUMERIC values that overflowed or failed to parse and became NULL.
+    pub fn invalid_decimals_total(&self) -> u64 {
+        self.coercions.total(WarningKind::CoercedDecimal)
+    }
+
     /// Append one record; returns a flushed batch if the batch limit was reached.
     pub fn append_record(&mut self, rec: &Value) -> Result<Option<RecordBatch>> {
         let mut row_bytes = 0usize;
@@ -506,9 +536,9 @@ impl ApiBatcher {
             row_bytes += size;
             match coercion {
                 ApiCoercion::None => {}
-                ApiCoercion::Scalar => self.invalid_scalars_total += 1,
-                ApiCoercion::Date => self.invalid_dates_total += 1,
-                ApiCoercion::Decimal => self.invalid_decimals_total += 1,
+                ApiCoercion::Scalar => self.coercions.record(i, WarningKind::CoercedScalar),
+                ApiCoercion::Date => self.coercions.record(i, WarningKind::CoercedDate),
+                ApiCoercion::Decimal => self.coercions.record(i, WarningKind::CoercedDecimal),
             }
             if self.col_temporal[i] && attempted {
                 self.col_attempted[i] += 1;
@@ -653,7 +683,7 @@ mod tests {
             .unwrap();
         assert_eq!(ids.value(0), 5);
         assert!(ids.is_null(1), "unparseable int -> null");
-        assert_eq!(b.invalid_scalars_total, 1);
+        assert_eq!(b.invalid_scalars_total(), 1);
         let email = batch
             .column(1)
             .as_any()
@@ -762,9 +792,9 @@ mod tests {
         let (mut b, _) = batcher();
         b.append_record(&serde_json::json!({})).unwrap();
         b.finish().unwrap();
-        assert_eq!(b.invalid_scalars_total, 0);
-        assert_eq!(b.invalid_dates_total, 0);
-        assert_eq!(b.invalid_decimals_total, 0);
+        assert_eq!(b.invalid_scalars_total(), 0);
+        assert_eq!(b.invalid_dates_total(), 0);
+        assert_eq!(b.invalid_decimals_total(), 0);
     }
 
     #[test]
@@ -780,6 +810,6 @@ mod tests {
         b.append_record(&serde_json::json!({"n": "123456789012345678901234567890"}))
             .unwrap();
         b.finish().unwrap();
-        assert_eq!(b.invalid_decimals_total, 1);
+        assert_eq!(b.invalid_decimals_total(), 1);
     }
 }
