@@ -117,13 +117,35 @@ pub struct ColumnType {
 
 impl ColumnType {
     /// The ClickHouse type as it should appear in DDL, applying nullability.
+    ///
+    /// `LowCardinality` is the one wrapper that has to go on the *outside*:
+    /// ClickHouse spells a nullable dictionary column
+    /// `LowCardinality(Nullable(T))` and rejects `Nullable(LowCardinality(T))`
+    /// outright (`Code: 43 ILLEGAL_TYPE_OF_ARGUMENT`, at `CREATE TABLE` time).
+    /// Reached by a nullable `LowCardinality` column read from a ClickHouse
+    /// source, and by a `type_overrides={col: "LowCardinality(String)"}` on any
+    /// nullable column.
     pub fn clickhouse_type(&self) -> String {
-        if self.nullable {
-            format!("Nullable({})", self.clickhouse_inner)
-        } else {
-            self.clickhouse_inner.clone()
+        if !self.nullable {
+            return self.clickhouse_inner.clone();
         }
+        if let Some(inner) = strip_low_cardinality(&self.clickhouse_inner) {
+            // Already spelled with the Nullable inside — leave it alone rather
+            // than double-wrapping.
+            if inner.starts_with("Nullable(") {
+                return self.clickhouse_inner.clone();
+            }
+            return format!("LowCardinality(Nullable({inner}))");
+        }
+        format!("Nullable({})", self.clickhouse_inner)
     }
+}
+
+/// `LowCardinality(T)` -> `Some("T")`, anything else -> `None`. Matches only
+/// when the closing paren ends the string, so a nested occurrence inside a
+/// larger type can't be mistaken for a wrapper around the whole thing.
+fn strip_low_cardinality(t: &str) -> Option<&str> {
+    t.strip_prefix("LowCardinality(")?.strip_suffix(')')
 }
 
 /// Resolve a PostgreSQL OID to (Arrow type, ClickHouse inner type).
@@ -452,6 +474,273 @@ pub mod mysql {
     }
 }
 
+/// ClickHouse type-name <-> Arrow <-> ClickHouse type mapping, for reading
+/// *from* ClickHouse.
+///
+/// Unlike every other source, the schema arrives as a **type name string**
+/// (`DESCRIBE` output), not a numeric wire code — so there is no small integer
+/// to reuse for `ColumnType::type_id` and we assign our own stable constants,
+/// the same way [`super::bigquery`] does.
+///
+/// The read path is ClickHouse's own `FORMAT ArrowStream`, so the decoder is
+/// Arrow IPC rather than a hand-written wire decoder (see
+/// `crate::decode_clickhouse`). What makes that safe is that the SELECT casts
+/// every column to a ClickHouse type whose Arrow output type is fixed and
+/// documented — see [`arrow_to_ch_cast_type`], which is the other half of this
+/// mapping and must stay in lockstep with it.
+pub mod clickhouse {
+    use arrow_schema::{DataType, TimeUnit};
+    use std::sync::Arc;
+
+    /// Our own stable identifiers for the ClickHouse type families we read.
+    /// Only meaningful to this source (`ColumnType::type_id`'s contract).
+    pub mod type_id {
+        pub const BOOL: u32 = 1;
+        pub const INT8: u32 = 2;
+        pub const INT16: u32 = 3;
+        pub const INT32: u32 = 4;
+        pub const INT64: u32 = 5;
+        pub const UINT8: u32 = 6;
+        pub const UINT16: u32 = 7;
+        pub const UINT32: u32 = 8;
+        pub const UINT64: u32 = 9;
+        pub const FLOAT32: u32 = 10;
+        pub const FLOAT64: u32 = 11;
+        pub const DECIMAL: u32 = 12;
+        pub const STRING: u32 = 13;
+        pub const UUID: u32 = 14;
+        pub const DATE: u32 = 15;
+        pub const DATETIME: u32 = 16;
+        pub const ENUM: u32 = 17;
+        pub const IP: u32 = 18;
+    }
+
+    /// One resolved ClickHouse source column.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct ChColumn {
+        pub type_id: u32,
+        pub arrow: DataType,
+        /// The ClickHouse type to declare at the destination — the source's own
+        /// declared type with any `Nullable(...)` wrapper stripped, so a
+        /// ClickHouse -> ClickHouse copy reproduces `UUID`, `IPv4`,
+        /// `LowCardinality(String)`, `Enum8(...)` and friends verbatim rather
+        /// than flattening every one of them to `String`.
+        pub clickhouse_inner: String,
+        pub nullable: bool,
+        /// True for `Decimal*` — the `arbitrary_precision_decimal` flag, which
+        /// gates `numeric_as_decimal` / the exact-`Decimal(P,S)` promotion.
+        pub arbitrary_precision_decimal: bool,
+    }
+
+    /// Whether a resolved column can be split into numeric ranges for parallel
+    /// partitioning (the ClickHouse analogue of
+    /// `crate::source::mysql::is_range_partitionable`). `UInt64` is included
+    /// even though its upper half overflows `i64`: the MIN/MAX probe reads the
+    /// bounds as text and parses them into `i128`, so the emitted range
+    /// predicates stay exact.
+    pub fn is_range_partitionable(id: u32) -> bool {
+        use type_id as t;
+        matches!(
+            id,
+            t::INT8 | t::INT16 | t::INT32 | t::INT64 | t::UINT8 | t::UINT16 | t::UINT32 | t::UINT64
+        )
+    }
+
+    /// Split `Nullable(T)` into `(T, true)`, anything else into `(t, false)`.
+    /// `LowCardinality(Nullable(T))` is normalised to `LowCardinality(T)` +
+    /// nullable, so the destination keeps the dictionary encoding.
+    fn split_nullable(t: &str) -> (String, bool) {
+        let t = t.trim();
+        if let Some(inner) = strip_wrapper(t, "Nullable") {
+            return (inner.trim().to_string(), true);
+        }
+        if let Some(inner) = strip_wrapper(t, "LowCardinality") {
+            let (inner, nullable) = split_nullable(inner);
+            return (format!("LowCardinality({inner})"), nullable);
+        }
+        (t.to_string(), false)
+    }
+
+    /// `strip_wrapper("Nullable(Int32)", "Nullable") == Some("Int32")`. Matches
+    /// only when the closing paren is the *last* character, so a nested
+    /// occurrence (`Map(String, Nullable(Int8))`) can't be mistaken for a
+    /// wrapper around the whole type.
+    fn strip_wrapper<'a>(t: &'a str, name: &str) -> Option<&'a str> {
+        let rest = t.strip_prefix(name)?;
+        let rest = rest.strip_prefix('(')?;
+        rest.strip_suffix(')')
+    }
+
+    /// The type name with any parameter list removed: `Decimal(18, 4)` ->
+    /// `Decimal`, `DateTime64(3, 'UTC')` -> `DateTime64`, `String` -> `String`.
+    fn base_name(t: &str) -> &str {
+        match t.find('(') {
+            Some(i) => t[..i].trim_end(),
+            None => t,
+        }
+    }
+
+    /// The comma-separated arguments inside a parameterised type name, trimmed.
+    /// Only ever called on types whose arguments cannot themselves be a
+    /// comma-bearing nested type (`Decimal`, `DateTime`, `DateTime64`).
+    fn args(t: &str) -> Vec<&str> {
+        let Some(open) = t.find('(') else {
+            return Vec::new();
+        };
+        let Some(close) = t.rfind(')') else {
+            return Vec::new();
+        };
+        if close <= open + 1 {
+            return Vec::new();
+        }
+        t[open + 1..close].split(',').map(str::trim).collect()
+    }
+
+    /// Strip the single quotes ClickHouse renders a timezone argument with.
+    fn unquote(s: &str) -> &str {
+        s.trim().trim_matches('\'')
+    }
+
+    /// The implied precision of the fixed-width `Decimal32/64/128(S)` spellings.
+    fn sized_decimal_precision(base: &str) -> Option<u8> {
+        match base {
+            "Decimal32" => Some(9),
+            "Decimal64" => Some(18),
+            "Decimal128" => Some(38),
+            _ => None,
+        }
+    }
+
+    /// Resolve one `DESCRIBE`-reported ClickHouse type name into the Arrow type
+    /// we decode it as, the ClickHouse type to declare at the destination, and
+    /// its nullability. `None` for a type this source can't read yet —
+    /// `Array`/`Map`/`Tuple`/`Nested`/`JSON`/`Variant`/`Dynamic`, the 256-bit
+    /// integers and `Decimal256` (all still reachable through a `source_query`
+    /// that casts them to `String`).
+    ///
+    /// Datetimes always resolve tz-aware: a ClickHouse `DateTime`/`DateTime64`
+    /// is an absolute instant on the wire (epoch seconds/ticks) whatever the
+    /// timezone in its type name, which only decides how it is *rendered*. That
+    /// matches the MySQL source's default and lands in a BigQuery `TIMESTAMP`
+    /// rather than a `DATETIME`; `type_overrides={col: "DATETIME"}` is the
+    /// per-column opt-out, exactly as it is there.
+    pub fn map_ch_type(declared: &str) -> Option<ChColumn> {
+        use type_id as id;
+        let (inner, nullable) = split_nullable(declared);
+        // A LowCardinality column decodes as its own underlying type; the
+        // wrapper only survives into `clickhouse_inner`, for the DDL.
+        let payload = strip_wrapper(&inner, "LowCardinality").unwrap_or(&inner);
+        let base = base_name(payload);
+
+        let (type_id, arrow) = match base {
+            "Bool" | "Boolean" => (id::BOOL, DataType::Boolean),
+            "Int8" => (id::INT8, DataType::Int8),
+            "Int16" => (id::INT16, DataType::Int16),
+            "Int32" => (id::INT32, DataType::Int32),
+            "Int64" => (id::INT64, DataType::Int64),
+            "UInt8" => (id::UINT8, DataType::UInt8),
+            "UInt16" => (id::UINT16, DataType::UInt16),
+            "UInt32" => (id::UINT32, DataType::UInt32),
+            "UInt64" => (id::UINT64, DataType::UInt64),
+            "Float32" => (id::FLOAT32, DataType::Float32),
+            "Float64" => (id::FLOAT64, DataType::Float64),
+            "String" | "FixedString" => (id::STRING, DataType::Utf8),
+            "UUID" => (id::UUID, DataType::Utf8),
+            "IPv4" | "IPv6" => (id::IP, DataType::Utf8),
+            "Enum" | "Enum8" | "Enum16" => (id::ENUM, DataType::Utf8),
+            "Date" | "Date32" => (id::DATE, DataType::Date32),
+            "DateTime" | "DateTime64" => {
+                // The timezone argument is the last one (`DateTime('UTC')`,
+                // `DateTime64(3, 'UTC')`); absent means the server timezone,
+                // normalised to UTC here since the stored value is an absolute
+                // instant either way. The `contains('/')` test is what keeps
+                // `DateTime64(3)`'s precision digit from being read as a
+                // timezone name.
+                let tz = args(payload)
+                    .last()
+                    .map(|a| unquote(a))
+                    .filter(|a| a.contains('/') || a.eq_ignore_ascii_case("UTC"))
+                    .map(Arc::<str>::from)
+                    .unwrap_or_else(|| Arc::from("UTC"));
+                (
+                    id::DATETIME,
+                    DataType::Timestamp(TimeUnit::Microsecond, Some(tz)),
+                )
+            }
+            "Decimal" | "Decimal32" | "Decimal64" | "Decimal128" => {
+                let a = args(payload);
+                let (p, s) = match (sized_decimal_precision(base), a.as_slice()) {
+                    // Decimal32(S) / Decimal64(S) / Decimal128(S)
+                    (Some(p), [s]) => (p, s.parse::<i8>().ok()?),
+                    // Decimal(P, S)
+                    (None, [p, s]) => (p.parse::<u8>().ok()?, s.parse::<i8>().ok()?),
+                    _ => return None,
+                };
+                // Decimal128 is the widest exact decimal the rest of the crate
+                // handles (see decimal.rs); anything wider has no lossless
+                // Arrow home here.
+                if p == 0 || p > 38 || s < 0 || (s as u8) > p {
+                    return None;
+                }
+                (id::DECIMAL, DataType::Decimal128(p, s))
+            }
+            _ => return None,
+        };
+
+        Some(ChColumn {
+            type_id,
+            arrow,
+            clickhouse_inner: inner,
+            nullable,
+            arbitrary_precision_decimal: type_id == id::DECIMAL,
+        })
+    }
+
+    /// The ClickHouse type to `CAST` a column to so its `FORMAT ArrowStream`
+    /// output lands as exactly `arrow` — the other half of [`map_ch_type`], and
+    /// the reason the read path needs no hand-written wire decoder.
+    ///
+    /// Several ClickHouse types do *not* round-trip through Arrow as their
+    /// obvious counterpart, which is what this exists to paper over: `Date` is
+    /// written as `UINT16` and `DateTime` as `UINT32` (only `Date32` and
+    /// `DateTime64` produce Arrow `DATE32`/`TIMESTAMP`), `FixedString` becomes
+    /// `FIXED_SIZE_BINARY`, `Enum8`/`Enum16` become their backing
+    /// `INT8`/`INT16`, and a `DateTime64(P)`'s Arrow time unit follows `P`
+    /// rather than being microseconds. Casting first makes the output type a
+    /// function of the *destination* column type alone, so `type_overrides` and
+    /// `column_transform_types` are honoured for free.
+    ///
+    /// `None` for an Arrow type with no ClickHouse spelling — the caller leaves
+    /// such a column uncast and lets `decode_clickhouse` adapt whatever arrives.
+    pub fn arrow_to_ch_cast_type(arrow: &DataType) -> Option<String> {
+        Some(match arrow {
+            DataType::Boolean => "Bool".to_string(),
+            DataType::Int8 => "Int8".to_string(),
+            DataType::Int16 => "Int16".to_string(),
+            DataType::Int32 => "Int32".to_string(),
+            DataType::Int64 => "Int64".to_string(),
+            DataType::UInt8 => "UInt8".to_string(),
+            DataType::UInt16 => "UInt16".to_string(),
+            DataType::UInt32 => "UInt32".to_string(),
+            DataType::UInt64 => "UInt64".to_string(),
+            DataType::Float32 => "Float32".to_string(),
+            DataType::Float64 => "Float64".to_string(),
+            // `Binary` has no separate ClickHouse spelling — `String` is both.
+            // It arrives as Arrow `Utf8` (the SELECT sets
+            // `output_format_arrow_string_as_string=1`) and `decode_clickhouse`
+            // casts it the rest of the way.
+            DataType::Utf8 | DataType::Binary => "String".to_string(),
+            DataType::Date32 => "Date32".to_string(),
+            DataType::Timestamp(_, tz) => {
+                let tz = tz.as_deref().unwrap_or("UTC");
+                format!("DateTime64(6, '{}')", tz.replace('\'', "\\'"))
+            }
+            DataType::Decimal128(p, s) => format!("Decimal({p}, {s})"),
+            _ => return None,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -648,5 +937,219 @@ mod tests {
         // Not produced by any current decoder (all three sources map TIME to
         // Utf8 text, not Arrow Time64) — confirms there's no silent gap.
         assert_eq!(a2b(&DataType::Time64(TimeUnit::Microsecond)), None);
+    }
+
+    #[test]
+    fn nullable_low_cardinality_wraps_the_other_way_round() {
+        // ClickHouse rejects `Nullable(LowCardinality(String))` outright
+        // (Code: 43) — the only legal spelling is with Nullable on the inside.
+        let c = ColumnType {
+            name: "tag".into(),
+            type_id: 0,
+            nullable: true,
+            arrow: DataType::Utf8,
+            clickhouse_inner: "LowCardinality(String)".into(),
+            arbitrary_precision_decimal: false,
+        };
+        assert_eq!(c.clickhouse_type(), "LowCardinality(Nullable(String))");
+        // Not nullable: untouched.
+        let c = ColumnType {
+            nullable: false,
+            ..c
+        };
+        assert_eq!(c.clickhouse_type(), "LowCardinality(String)");
+        // Already spelled with Nullable inside: not double-wrapped.
+        let c = ColumnType {
+            nullable: true,
+            clickhouse_inner: "LowCardinality(Nullable(String))".into(),
+            ..c
+        };
+        assert_eq!(c.clickhouse_type(), "LowCardinality(Nullable(String))");
+        // A type that merely mentions LowCardinality inside is not a wrapper
+        // around the whole thing, and keeps the ordinary outer Nullable.
+        let c = ColumnType {
+            nullable: true,
+            clickhouse_inner: "Map(LowCardinality(String), UInt8)".into(),
+            ..c
+        };
+        assert_eq!(
+            c.clickhouse_type(),
+            "Nullable(Map(LowCardinality(String), UInt8))"
+        );
+    }
+
+    #[test]
+    fn ch_maps_the_scalar_types_and_unwraps_nullable() {
+        use crate::types::clickhouse::map_ch_type;
+        let c = map_ch_type("Int32").unwrap();
+        assert_eq!(c.arrow, DataType::Int32);
+        assert_eq!(c.clickhouse_inner, "Int32");
+        assert!(!c.nullable);
+
+        let c = map_ch_type("Nullable(String)").unwrap();
+        assert_eq!(c.arrow, DataType::Utf8);
+        // The Nullable wrapper is stripped from the DDL type and moved onto
+        // the flag — `ColumnType::clickhouse_type()` re-applies it.
+        assert_eq!(c.clickhouse_inner, "String");
+        assert!(c.nullable);
+
+        // Types with no Arrow counterpart of their own still round-trip into
+        // the destination DDL rather than flattening to String.
+        for (declared, inner) in [
+            ("UUID", "UUID"),
+            ("IPv4", "IPv4"),
+            ("FixedString(16)", "FixedString(16)"),
+            ("Enum8('a' = 1, 'b' = 2)", "Enum8('a' = 1, 'b' = 2)"),
+        ] {
+            let c = map_ch_type(declared).unwrap();
+            assert_eq!(c.arrow, DataType::Utf8, "{declared}");
+            assert_eq!(c.clickhouse_inner, inner, "{declared}");
+        }
+    }
+
+    #[test]
+    fn ch_low_cardinality_keeps_the_wrapper_but_not_the_nullable() {
+        use crate::types::clickhouse::map_ch_type;
+        let c = map_ch_type("LowCardinality(Nullable(String))").unwrap();
+        assert_eq!(c.arrow, DataType::Utf8);
+        assert!(c.nullable);
+        // Nullable moves out of the middle of the type, so the destination
+        // column stays dictionary-encoded instead of becoming a plain String.
+        assert_eq!(c.clickhouse_inner, "LowCardinality(String)");
+    }
+
+    #[test]
+    fn ch_datetimes_are_always_tz_aware() {
+        use crate::types::clickhouse::map_ch_type;
+        use arrow_schema::TimeUnit;
+        // A bare DateTime carries no timezone in its name, but the stored
+        // value is an absolute instant, so it resolves as UTC rather than naive.
+        for declared in ["DateTime", "DateTime64(3)", "DateTime64(9)"] {
+            let c = map_ch_type(declared).unwrap();
+            assert_eq!(
+                c.arrow,
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                "{declared}"
+            );
+        }
+        // A named timezone is carried through to the Arrow type.
+        let c = map_ch_type("DateTime64(3, 'Asia/Jakarta')").unwrap();
+        assert_eq!(
+            c.arrow,
+            DataType::Timestamp(TimeUnit::Microsecond, Some("Asia/Jakarta".into()))
+        );
+        // Regression guard: the precision digit of `DateTime64(3)` is the last
+        // argument too, and must not be read as a timezone name.
+        assert_eq!(
+            map_ch_type("DateTime64(3)").unwrap().arrow,
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        );
+    }
+
+    #[test]
+    fn ch_decimals_resolve_exact_precision_and_scale() {
+        use crate::types::clickhouse::map_ch_type;
+        let c = map_ch_type("Decimal(18, 4)").unwrap();
+        assert_eq!(c.arrow, DataType::Decimal128(18, 4));
+        assert!(c.arbitrary_precision_decimal);
+        // The fixed-width spellings carry their precision implicitly.
+        assert_eq!(
+            map_ch_type("Decimal64(6)").unwrap().arrow,
+            DataType::Decimal128(18, 6)
+        );
+        assert_eq!(
+            map_ch_type("Decimal32(2)").unwrap().arrow,
+            DataType::Decimal128(9, 2)
+        );
+        // Wider than Decimal128 has no lossless Arrow home here.
+        assert!(map_ch_type("Decimal256(10)").is_none());
+        assert!(map_ch_type("Decimal(40, 2)").is_none());
+    }
+
+    #[test]
+    fn ch_rejects_the_types_this_source_cannot_read() {
+        use crate::types::clickhouse::map_ch_type;
+        for declared in [
+            "Array(String)",
+            "Map(String, UInt64)",
+            "Tuple(UInt8, String)",
+            "JSON",
+            "Int256",
+            "Nothing",
+        ] {
+            assert!(
+                map_ch_type(declared).is_none(),
+                "{declared} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn ch_cast_targets_pin_the_arrow_output_type() {
+        use crate::types::clickhouse::arrow_to_ch_cast_type as cast;
+        use arrow_schema::TimeUnit;
+        // The four that exist because ClickHouse's Arrow writer does NOT use
+        // the obvious counterpart: Date -> UINT16 and DateTime -> UINT32, and a
+        // DateTime64's unit follows its own precision.
+        assert_eq!(cast(&DataType::Date32).unwrap(), "Date32");
+        assert_eq!(
+            cast(&DataType::Timestamp(
+                TimeUnit::Microsecond,
+                Some("UTC".into())
+            ))
+            .unwrap(),
+            "DateTime64(6, 'UTC')"
+        );
+        // A naive destination timestamp still has to name a timezone for
+        // ClickHouse; UTC keeps the instant unchanged.
+        assert_eq!(
+            cast(&DataType::Timestamp(TimeUnit::Microsecond, None)).unwrap(),
+            "DateTime64(6, 'UTC')"
+        );
+        assert_eq!(
+            cast(&DataType::Decimal128(18, 4)).unwrap(),
+            "Decimal(18, 4)"
+        );
+        // Binary has no ClickHouse spelling of its own — it rides in as String
+        // and `decode_clickhouse` finishes the conversion.
+        assert_eq!(cast(&DataType::Binary).unwrap(), "String");
+        assert_eq!(cast(&DataType::Utf8).unwrap(), "String");
+    }
+
+    #[test]
+    fn ch_round_trips_every_mapped_type_through_its_cast_target() {
+        use crate::types::clickhouse::{arrow_to_ch_cast_type, map_ch_type};
+        // Every type `map_ch_type` accepts must have a cast target, or
+        // `select_sql` would silently fall back to reading it uncast.
+        for declared in [
+            "Bool",
+            "Int8",
+            "Int16",
+            "Int32",
+            "Int64",
+            "UInt8",
+            "UInt16",
+            "UInt32",
+            "UInt64",
+            "Float32",
+            "Float64",
+            "String",
+            "FixedString(4)",
+            "UUID",
+            "IPv6",
+            "Enum16('x' = 1)",
+            "Date",
+            "Date32",
+            "DateTime",
+            "DateTime64(6, 'UTC')",
+            "Decimal(10, 2)",
+        ] {
+            let c = map_ch_type(declared).unwrap_or_else(|| panic!("{declared} should map"));
+            assert!(
+                arrow_to_ch_cast_type(&c.arrow).is_some(),
+                "{declared} -> {:?} has no cast target",
+                c.arrow
+            );
+        }
     }
 }

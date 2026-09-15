@@ -4,7 +4,9 @@
     quickhouse run job.toml
 
 `run` executes a single :func:`quickhouse.sync` from a TOML job file with three
-tables — ``[source]``, ``[target]``, and ``[sync]``. ``type`` selects the engine;
+tables — ``[source]``, ``[target]``, and ``[sync]``. ``type`` selects the engine
+(``postgres`` | ``mysql`` | ``bigquery`` | ``clickhouse`` | ``clevertap`` |
+``appsflyer`` for a source, ``clickhouse`` | ``bigquery`` for a target);
 every other key maps straight to that descriptor's constructor / to ``sync()``'s
 keyword arguments. String values are passed through :func:`os.path.expandvars`,
 so ``${ENV_VAR}`` lets you keep credentials out of the file.
@@ -41,6 +43,7 @@ _SOURCES = {
     "postgres": qh.Postgres,
     "mysql": qh.MySQL,
     "bigquery": qh.BigQuery,
+    "clickhouse": qh.ClickHouse,
     "clevertap": qh.CleverTap,
     "appsflyer": qh.AppsFlyer,
 }

@@ -1,7 +1,8 @@
 //! quickhouse-core — the Rust engine behind the `quickhouse` Python package.
 //!
-//! Streams large PostgreSQL, MySQL, or BigQuery tables into ClickHouse or
-//! BigQuery: native wire protocol (or, for BigQuery, the Storage Read API) ->
+//! Streams large PostgreSQL, MySQL, BigQuery or ClickHouse tables into
+//! ClickHouse or BigQuery: native wire protocol (or, for BigQuery, the Storage
+//! Read API; for ClickHouse, `FORMAT ArrowStream` over HTTP) ->
 //! Apache Arrow -> the destination's native ingestion path (ClickHouse
 //! `FORMAT ArrowStream`, or BigQuery's `insertAll` streaming insert), with
 //! parallel range partitioning, bounded memory, auto DDL, and full-refresh /
@@ -17,6 +18,7 @@ mod decimal;
 pub mod decode;
 pub mod decode_api;
 pub mod decode_bigquery;
+pub mod decode_clickhouse;
 pub mod decode_mysql;
 pub mod error;
 pub mod host;
@@ -30,9 +32,10 @@ pub mod types;
 
 pub use config::{
     ApiColumn, AppsFlyerConfig, BigQueryConfig, BigQueryDestConfig, BigQueryWriteMethod,
-    CleverTapConfig, ClickHouseConfig, Compression, DestinationConfig, HttpApiConfig, HttpFormat,
-    MySqlConfig, ParquetCompression, PostgresConfig, S3ArchiveConfig, SourceConfig, SyncMode,
-    TransferConfig, TransferResult, TransferWarning, WarningKind, WatermarkSeed,
+    CleverTapConfig, ClickHouseConfig, ClickHouseSourceConfig, Compression, DestinationConfig,
+    HttpApiConfig, HttpFormat, MySqlConfig, ParquetCompression, PostgresConfig, S3ArchiveConfig,
+    SourceConfig, SyncMode, TransferConfig, TransferResult, TransferWarning, WarningKind,
+    WatermarkSeed,
 };
 pub use error::{EtlError, Result};
 pub use reconcile::{reconcile_keys, ReconcileConfig, ReconcileResult};

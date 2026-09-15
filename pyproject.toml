@@ -4,8 +4,8 @@ build-backend = "maturin"
 
 [project]
 name = "quickhouse"
-version = "0.15.0"
-description = "Fast ETL with a Rust engine (parallel, bounded-memory, Arrow-based): PostgreSQL/MySQL/BigQuery and CleverTap/AppsFlyer API sources into ClickHouse or BigQuery."
+version = "0.16.0"
+description = "Fast ETL with a Rust engine (parallel, bounded-memory, Arrow-based): PostgreSQL/MySQL/BigQuery/ClickHouse and CleverTap/AppsFlyer API sources into ClickHouse or BigQuery."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }

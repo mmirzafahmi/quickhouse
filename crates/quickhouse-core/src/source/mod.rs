@@ -1,11 +1,13 @@
 pub mod appsflyer;
 pub mod bigquery;
 pub mod clevertap;
+pub mod clickhouse;
 pub mod http_api;
 pub mod mysql;
 pub mod postgres;
 
 pub use bigquery::BigQuerySource;
+pub use clickhouse::ClickHouseSource;
 pub use mysql::MySqlSource;
 pub use postgres::{Partition, PgSource};
 
@@ -28,6 +30,7 @@ pub enum Source {
     Postgres(PgSource),
     MySql(MySqlSource),
     BigQuery(BigQuerySource),
+    ClickHouse(ClickHouseSource),
 }
 
 /// The first `max` **bytes** of a response body, rendered for an error message.

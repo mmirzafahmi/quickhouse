@@ -19,7 +19,7 @@ head-to-head against other tools, see the [Benchmark](benchmark.md) page.
       <div class="qh-params__name">parallelism</div>
       <div class="qh-params__type">int</div>
     </div>
-    <p class="qh-params__desc">Number of concurrent read streams. The source table is split into ranges read in parallel (Postgres/MySQL); for BigQuery it's a server-side stream hint.</p>
+    <p class="qh-params__desc">Number of concurrent read streams. The source table is split into ranges read in parallel (Postgres/MySQL/ClickHouse); for BigQuery it's a server-side stream hint.</p>
   </div>
   <div>
     <div>
@@ -58,7 +58,7 @@ qh.sync(
 )
 ```
 
-- `read_max_rows_per_sec` applies to PostgreSQL and MySQL; it's ignored for a
+- `read_max_rows_per_sec` applies to PostgreSQL, MySQL and ClickHouse; it's ignored for a
   BigQuery source (its read path is a separately-metered managed API).
 - The Postgres connection reports itself as `application_name = 'quickhouse'`, so
   a DBA can see and kill it in `pg_stat_activity` (override with

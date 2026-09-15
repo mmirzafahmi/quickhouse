@@ -145,6 +145,28 @@ pub fn plan(
     cfg: &TransferConfig,
     dest_kind: DestKind,
 ) -> Result<SelectPlan> {
+    plan_with(source, cfg, dest_kind, true)
+}
+
+/// [`plan`], with control over whether the reading source's decoder can turn an
+/// otherwise-valid value into NULL (see [`may_coerce_to_null`]).
+///
+/// Every hand-written decoder can — a zero-date, an out-of-`ch_range` year, a
+/// decimal past its declared precision — so `plan` passes `true` and every
+/// `Date32`/`Timestamp`/`Decimal128` destination column is widened to nullable
+/// regardless of the source's own `NOT NULL`. The ClickHouse source is the one
+/// that can't: it reads Arrow the server already produced, from values the
+/// server already holds inside ClickHouse's own representable window, through a
+/// `CAST` that is exact or a hard error rather than a silent NULL. Passing
+/// `false` there is what keeps a ClickHouse -> ClickHouse copy from quietly
+/// re-typing every date and decimal column to `Nullable(...)` on the way
+/// through.
+pub fn plan_with(
+    source: &[ColumnType],
+    cfg: &TransferConfig,
+    dest_kind: DestKind,
+    source_may_coerce_to_null: bool,
+) -> Result<SelectPlan> {
     // 1. Apply include (allowlist) then exclude (denylist) on source names.
     let included: Vec<&ColumnType> = source
         .iter()
@@ -356,7 +378,7 @@ pub fn plan(
             // this, a null watermark value fails the Arrow schema-consistency
             // check ("declared non-nullable but contains null values").
             c.nullable
-                || may_coerce_to_null(&arrow)
+                || (source_may_coerce_to_null && may_coerce_to_null(&arrow))
                 || (is_watermark && dest_kind != DestKind::ClickHouse)
         };
         dest_columns.push(ColumnType {

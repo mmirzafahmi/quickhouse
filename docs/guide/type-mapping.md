@@ -47,6 +47,21 @@ the Storage Write path too.
 PostgreSQL keeps the distinction natively: `timestamptz` → UTC-aware,
 `timestamp` → naive.
 
+## ClickHouse as a source
+
+Read back from ClickHouse, a type that has no counterpart in the other engines
+is kept rather than flattened: `UUID`, `IPv4`/`IPv6`, `Enum8`/`Enum16`,
+`FixedString(N)` and `LowCardinality(...)` are recreated as themselves at a
+ClickHouse destination (and land as `STRING` in BigQuery). `Decimal(P, S)` is
+read exactly, without the `Float64` round-trip the other engines' unparameterised
+decimals take. `Date`, `Date32`, `DateTime` and `DateTime64(P[, tz])` all resolve
+to a UTC-aware timestamp, since a ClickHouse datetime is an absolute instant
+whatever timezone its type names.
+
+`Array`, `Map`, `Tuple`, `Nested`, `JSON`, the 256-bit integers and `Decimal256`
+aren't readable yet — each is a clear error naming the column. Cast it to
+`String` in a `source_query`, or `exclude` it.
+
 ## Out-of-range and zero dates
 
 Out-of-range dates, and MySQL zero-dates like `0000-00-00`, coerce to `NULL`
@@ -57,7 +72,8 @@ with a warning rather than failing the transfer.
 `column_transforms` *(experimental)* applies a per-column SQL value transform in
 the source `SELECT`, over `source_table=` (so range partitioning is preserved,
 unlike `source_query=`). It changes the value, not the resolved type — pair it
-with `type_overrides` if the type must change too. PostgreSQL and MySQL only.
+with `type_overrides` if the type must change too. PostgreSQL, MySQL and
+ClickHouse only.
 
 ```python
 qh.sync(..., source_table="orders",

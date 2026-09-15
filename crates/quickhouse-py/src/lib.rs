@@ -1,9 +1,9 @@
 //! PyO3 bindings for quickhouse-core.
 //!
 //! Exposes `Postgres`, `MySQL`, `BigQuery`, `ClickHouse`, `sync(...)`, and the
-//! result/progress types. `BigQuery` doubles as either a source or a
-//! destination for `sync()` (see its doc comment); `ClickHouse` is
-//! destination-only. The transfer runs on a Tokio runtime inside
+//! result/progress types. `BigQuery` and `ClickHouse` each double as either a
+//! source or a destination for `sync()` (see their doc comments). The transfer
+//! runs on a Tokio runtime inside
 //! `Python::allow_threads`, so the GIL is released for the duration and only
 //! re-acquired to fire `on_progress`.
 //!
@@ -538,13 +538,14 @@ impl HttpApi {
     }
 }
 
-/// Accepts `Postgres`, `MySQL`, `BigQuery`, `CleverTap`, `AppsFlyer`, or
-/// `HttpApi` as `sync()`'s `source` argument.
+/// Accepts `Postgres`, `MySQL`, `BigQuery`, `ClickHouse`, `CleverTap`,
+/// `AppsFlyer`, or `HttpApi` as `sync()`'s `source` argument.
 #[derive(FromPyObject)]
 enum AnySource {
     Postgres(Postgres),
     MySQL(MySQL),
     BigQuery(BigQuery),
+    ClickHouse(ClickHouse),
     CleverTap(CleverTap),
     AppsFlyer(AppsFlyer),
     HttpApi(HttpApi),
@@ -574,6 +575,18 @@ impl From<AnySource> for core::SourceConfig {
                 credentials_json: b.credentials_json,
                 // dataset_id is a target-only field (see BigQuery's doc comment) — ignored here.
             }),
+            AnySource::ClickHouse(c) => {
+                core::SourceConfig::ClickHouse(core::ClickHouseSourceConfig {
+                    url: c.url,
+                    database: c.database,
+                    user: c.user,
+                    password: c.password,
+                    statement_timeout_secs: c.statement_timeout_secs,
+                    settings: c.settings,
+                    // compression/archive/insert_dedup_token are write-path
+                    // fields (see ClickHouse's doc comment) — ignored here.
+                })
+            }
             AnySource::CleverTap(c) => core::SourceConfig::CleverTap(core::CleverTapConfig {
                 base_url: c.base_url,
                 account_id: c.account_id,
@@ -672,7 +685,19 @@ impl S3Archive {
     }
 }
 
-/// Where to write to.
+/// ClickHouse connection descriptor — usable as either a `source` or a
+/// `target` for `sync()`, like `BigQuery`.
+///
+/// `url`, `database`, `user`, `password` and `settings` apply in both roles.
+/// `compression`, `archive` and `insert_dedup_token` are write-path only and
+/// are ignored when this is plugged in as a `source=`; `statement_timeout_secs`
+/// is read-path only and is ignored as a `target=`.
+///
+/// As a source, reads go over the same HTTP interface in `FORMAT ArrowStream`,
+/// which makes ClickHouse -> ClickHouse (a cross-cluster or cross-database
+/// copy) and ClickHouse -> BigQuery (publishing a mart into a warehouse) both
+/// ordinary transfers with the full partition / incremental / chunk-resume
+/// machinery behind them.
 #[pyclass]
 #[derive(Clone)]
 struct ClickHouse {
@@ -684,12 +709,13 @@ struct ClickHouse {
     archive: Option<S3Archive>,
     settings: BTreeMap<String, String>,
     insert_dedup_token: bool,
+    statement_timeout_secs: u64,
 }
 
 #[pymethods]
 impl ClickHouse {
     #[new]
-    #[pyo3(signature = (url, *, database="default".to_string(), user="default".to_string(), password="".to_string(), compression="zstd".to_string(), archive=None, settings=None, insert_dedup_token=false))]
+    #[pyo3(signature = (url, *, database="default".to_string(), user="default".to_string(), password="".to_string(), compression="zstd".to_string(), archive=None, settings=None, insert_dedup_token=false, statement_timeout_secs=0))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         url: String,
@@ -700,6 +726,7 @@ impl ClickHouse {
         archive: Option<S3Archive>,
         settings: Option<BTreeMap<String, String>>,
         insert_dedup_token: bool,
+        statement_timeout_secs: u64,
     ) -> Self {
         ClickHouse {
             url,
@@ -710,6 +737,7 @@ impl ClickHouse {
             archive,
             settings: settings.unwrap_or_default(),
             insert_dedup_token,
+            statement_timeout_secs,
         }
     }
 
@@ -722,6 +750,14 @@ impl ClickHouse {
 }
 
 /// Accepts `ClickHouse` or `BigQuery` as `sync()`'s `target` argument.
+///
+/// `#[allow(clippy::large_enum_variant)]`: the `ClickHouse` descriptor is a few
+/// hundred bytes wider than the `BigQuery` one (mostly its optional
+/// `S3Archive`), and the obvious fix — boxing the variant — doesn't apply here,
+/// since `FromPyObject` is derived and pyo3 has no `Box<T>` extraction to
+/// derive through. One short-lived value per `sync()` call; not worth a
+/// hand-written extractor.
+#[allow(clippy::large_enum_variant)]
 #[derive(FromPyObject)]
 enum AnyDestination {
     ClickHouse(ClickHouse),
@@ -1059,7 +1095,8 @@ fn parse_parquet_compression(c: &str) -> PyResult<core::ParquetCompression> {
     }
 }
 
-/// Transfer one table from PostgreSQL, MySQL, or BigQuery into ClickHouse or BigQuery.
+/// Transfer one table from PostgreSQL, MySQL, BigQuery or ClickHouse into
+/// ClickHouse or BigQuery.
 #[pyfunction]
 #[pyo3(signature = (
     source,

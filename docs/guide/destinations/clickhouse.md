@@ -4,6 +4,10 @@ A ClickHouse destination writes through the HTTP interface with streaming
 compressed inserts. The DDL knobs it accepts are on the
 [Destinations index](index.md#destination-ddl).
 
+The same class is also a [source](../sources/databases.md#clickhouse-as-a-source);
+`compression`, `archive` and `insert_dedup_token` below are write-path only and
+are ignored in that role.
+
 ## S3 archive
 
 A ClickHouse destination can also archive every synced batch to S3 as a data

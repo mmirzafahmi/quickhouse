@@ -1,6 +1,6 @@
 //! Transfer orchestration: schema resolution -> DDL -> parallel partitioned
 //! stream/decode/insert -> (full) atomic swap or (incremental) watermark
-//! persist. Each source engine (Postgres, MySQL, ...) plugs in via the
+//! persist. Each source engine (Postgres, MySQL, ClickHouse, ...) plugs in via the
 //! [`Source`] enum; everything downstream of "decode into Arrow batches" is
 //! source-agnostic.
 
@@ -25,15 +25,19 @@ use crate::config::{
 use crate::decode::CopyDecoder;
 use crate::decode_api::{resolve_api_columns, ApiBatcher};
 use crate::decode_bigquery::BigQueryBatcher;
+use crate::decode_clickhouse::ChArrowDecoder;
 use crate::decode_mysql::MySqlBatcher;
 use crate::error::{EtlError, Result};
 use crate::memory::{MemoryBudget, Reservation};
 use crate::sink::{build_sink, Sink};
 use crate::source::appsflyer::AppsFlyerSource;
 use crate::source::clevertap::CleverTapSource;
+use crate::source::clickhouse::quote_ch_table;
 use crate::source::mysql::{quote_my, quote_my_table};
 use crate::source::postgres::{quote_pg, quote_pg_table};
-use crate::source::{BigQuerySource, Keyset, MySqlSource, Partition, PgSource, Source};
+use crate::source::{
+    BigQuerySource, ClickHouseSource, Keyset, MySqlSource, Partition, PgSource, Source,
+};
 use crate::transform::{self, SelectPlan};
 use crate::types::bigquery::arrow_to_bigquery_type;
 use crate::types::ColumnType;
@@ -828,6 +832,7 @@ async fn run_transfer_impl(
             my.client_cert_file.clone(),
             my.client_key_file.clone(),
         )),
+        SourceConfig::ClickHouse(ch) => Source::ClickHouse(ClickHouseSource::new(ch)?),
         SourceConfig::BigQuery(_) => unreachable!("handled via early return above"),
         SourceConfig::CleverTap(_) | SourceConfig::AppsFlyer(_) | SourceConfig::HttpApi(_) => {
             unreachable!("API sources handled via early return above")
@@ -903,6 +908,17 @@ async fn run_transfer_impl(
             )
             .await?
         }
+        Source::ClickHouse(s) => {
+            setup_clickhouse(
+                s,
+                &cfg,
+                base_table.as_deref(),
+                base_query.as_deref(),
+                watermark.as_deref(),
+                &warnings,
+            )
+            .await?
+        }
         Source::BigQuery(_) => {
             unreachable!("BigQuery is handled via the early return in run_transfer")
         }
@@ -918,7 +934,12 @@ async fn run_transfer_impl(
         partitions.len()
     );
 
-    let plan: SelectPlan = transform::plan(&source_cols, &cfg, sink.dest_kind())?;
+    // The ClickHouse source is the only one whose decode path cannot invent a
+    // NULL (see `transform::plan_with`), so it is the only one whose NOT NULL
+    // date/decimal columns stay NOT NULL at the destination.
+    let source_may_coerce = !matches!(source.as_ref(), Source::ClickHouse(_));
+    let plan: SelectPlan =
+        transform::plan_with(&source_cols, &cfg, sink.dest_kind(), source_may_coerce)?;
     let plan = Arc::new(plan);
 
     // --- Incremental: read watermark state, build the "since last run" filter,
@@ -974,6 +995,13 @@ async fn run_transfer_impl(
                 cfg.lookback_seconds,
             ),
             Source::MySql(_) => build_watermark_filter_mysql(
+                watermark,
+                source_expr,
+                last.as_deref(),
+                effective_upper.as_deref(),
+                cfg.lookback_seconds,
+            ),
+            Source::ClickHouse(_) => build_watermark_filter_clickhouse(
                 watermark,
                 source_expr,
                 last.as_deref(),
@@ -1080,6 +1108,20 @@ async fn run_transfer_impl(
                     }
                     Source::MySql(s) => {
                         transfer_partition_mysql(
+                            s,
+                            &plan,
+                            &cfg,
+                            &ctx,
+                            base_table.as_deref(),
+                            base_query.as_deref(),
+                            extra_filter.as_deref(),
+                            part,
+                            chunk_plan.as_ref().as_ref(),
+                        )
+                        .await
+                    }
+                    Source::ClickHouse(s) => {
+                        transfer_partition_clickhouse(
                             s,
                             &plan,
                             &cfg,
@@ -2873,6 +2915,353 @@ async fn transfer_partition_mysql(
     Ok(())
 }
 
+async fn setup_clickhouse(
+    s: &ClickHouseSource,
+    cfg: &TransferConfig,
+    base_table: Option<&str>,
+    base_query: Option<&str>,
+    watermark: Option<&str>,
+    warnings: &Warnings,
+) -> Result<SourceSetup> {
+    tracing::info!("resolving clickhouse source schema...");
+    // `source_query` wins, matching `ClickHouseSource::select_sql` and
+    // `source_table`'s documented contract — see the equivalent comment in
+    // `setup_postgres` for the mis-decode this inversion caused.
+    let schema_probe = match (base_table, base_query) {
+        (_, Some(q)) => q.to_string(),
+        (Some(t), None) => format!("SELECT * FROM {}", quote_ch_table(t)),
+        (None, None) => unreachable!("validated above"),
+    };
+    if base_table.is_some() && base_query.is_some() {
+        tracing::warn!(
+            "both source_table and source_query are set; source_table is ignored — \
+             schema and data both come from source_query"
+        );
+    }
+    let source_cols = s
+        .resolve_columns(&schema_probe, &cfg.include, &cfg.exclude)
+        .await?;
+    tracing::debug!("clickhouse schema resolved");
+
+    // Only needed for incremental mode — see `setup_mysql` for why full
+    // refresh deliberately skips the probe entirely.
+    let snapshot_max = if cfg.mode == SyncMode::Incremental {
+        if let Some(w) = watermark {
+            ensure_watermark_column(w, &source_cols)?;
+            ensure_lookback_compatible(w, cfg.lookback_seconds, &source_cols)?;
+            if watermark_column_nullable(w, &source_cols) {
+                let null_count = s
+                    .count_null_watermark(
+                        base_table,
+                        base_query,
+                        w,
+                        cfg.watermark_source_expr.as_deref(),
+                    )
+                    .await?;
+                warn_on_null_watermark(w, null_count, warnings);
+            }
+            s.max_watermark(
+                base_table,
+                base_query,
+                w,
+                cfg.watermark_source_expr.as_deref(),
+            )
+            .await?
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let partitions = compute_partitions_clickhouse(s, cfg, &source_cols).await?;
+    Ok(SourceSetup {
+        source_cols,
+        snapshot_max,
+        partitions,
+    })
+}
+
+async fn compute_partitions_clickhouse(
+    source: &ClickHouseSource,
+    cfg: &TransferConfig,
+    source_cols: &[ColumnType],
+) -> Result<Vec<Partition>> {
+    let single = vec![Partition {
+        label: "all".into(),
+        predicate: None,
+    }];
+
+    if cfg.chunk_rows.is_some() {
+        return Ok(single);
+    }
+    if cfg.parallelism <= 1 {
+        return Ok(single);
+    }
+
+    let (from_table, base_query) = match partition_target(cfg) {
+        Some(t) => t,
+        None => return Ok(single),
+    };
+
+    let part_col = cfg
+        .partition_column
+        .clone()
+        .or_else(|| cfg.key.first().cloned());
+    let part_col = match part_col {
+        Some(c) => c,
+        None => return Ok(single),
+    };
+    let source_expr = cfg.partition_source_expr.as_deref();
+    let (type_id, nullable) = match partition_key_type(
+        source_cols,
+        &part_col,
+        source_expr,
+        crate::types::clickhouse::is_range_partitionable,
+    )? {
+        Some(t) => t,
+        None => return Ok(single),
+    };
+
+    source
+        .range_partitions(
+            from_table,
+            base_query,
+            &part_col,
+            source_expr,
+            type_id,
+            cfg.parallelism,
+            nullable,
+        )
+        .await
+}
+
+/// Keyset-chunked resumable read for a ClickHouse source — the ClickHouse
+/// analogue of [`transfer_keyset_mysql`]: bounded `SELECT ... WHERE key >
+/// cursor ORDER BY key LIMIT N` chunks, each made durable before its cursor is
+/// persisted.
+#[allow(clippy::too_many_arguments)]
+async fn transfer_keyset_clickhouse(
+    source: &ClickHouseSource,
+    plan: &SelectPlan,
+    cfg: &TransferConfig,
+    ctx: &SendCtx,
+    base_table: Option<&str>,
+    base_query: Option<&str>,
+    extra_filter: Option<&str>,
+    chunk: &ChunkPlan,
+) -> Result<()> {
+    let col_quoted = crate::ddl::quote_ident(&chunk.keyset_col);
+    let mut cursor = chunk.start_cursor.clone();
+    let partition = Partition {
+        label: "keyset".into(),
+        predicate: None,
+    };
+    let schema = ChArrowDecoder::new(&plan.dest_columns, cfg.batch_bytes).schema();
+    let mut archive_writer = match &ctx.archive {
+        Some(info) => Some(info.writer_for("keyset", schema.clone())?),
+        None => None,
+    };
+    tracing::info!(
+        "keyset chunked read starting on '{}' (chunk_rows={}, resume_cursor={:?})",
+        chunk.keyset_col,
+        chunk.limit,
+        cursor
+    );
+
+    loop {
+        let keyset = Keyset {
+            col_quoted: col_quoted.clone(),
+            cursor: cursor.clone(),
+            limit: chunk.limit,
+        };
+        let select_sql = source.select_sql(
+            &plan.source_columns,
+            &plan.source_select_exprs,
+            &plan.dest_columns,
+            base_table,
+            base_query,
+            &partition,
+            extra_filter,
+            Some(keyset),
+        );
+        tracing::debug!("keyset chunk: {select_sql}");
+        let mut decoder = ChArrowDecoder::new(&plan.dest_columns, cfg.batch_bytes);
+        let mut sends: JoinSet<Result<()>> = JoinSet::new();
+        let mut insert_buf = InsertBuffer::new(cfg.insert_bytes);
+        let mut cursor_candidate: Option<i128> = None;
+
+        let resp = source.stream_arrow(&select_sql, cfg.batch_rows).await?;
+        let body = resp.bytes_stream();
+        futures::pin_mut!(body);
+
+        let idle = cfg.read_idle_timeout_secs;
+        let scope = format!("partition '{}'", partition.label);
+        while let Some(part) = await_source(body.next(), &ctx.counters, idle, &scope).await? {
+            let part = part.map_err(EtlError::from)?;
+            for batch in decoder.feed(part)? {
+                let rows = batch.num_rows() as u64;
+                if let Some(k) = last_int_key(&batch, chunk.keyset_idx)? {
+                    cursor_candidate = Some(cursor_candidate.map_or(k, |c| c.max(k)));
+                }
+                if let Some(w) = archive_writer.as_mut() {
+                    w.write(&batch).await?;
+                }
+                ctx.push_batch(&mut sends, &mut insert_buf, schema.clone(), batch)
+                    .await;
+                reap(&mut sends, false).await?;
+                if let Some(t) = &ctx.throttle {
+                    t.acquire(rows).await;
+                }
+            }
+        }
+        decoder.finish()?;
+        ctx.flush(&mut sends, &mut insert_buf, schema.clone()).await;
+        reap(&mut sends, true).await?;
+
+        let rows_this_chunk = decoder.rows_total;
+        ctx.counters
+            .rows_read
+            .fetch_add(rows_this_chunk, Ordering::Relaxed);
+
+        if rows_this_chunk == 0 {
+            break;
+        }
+        let next = cursor_candidate.ok_or_else(|| {
+            EtlError::other(format!(
+                "keyset column '{}' produced no usable value in a non-empty chunk (NULL key?); \
+                 refusing to advance the cursor to avoid skipping rows",
+                chunk.keyset_col
+            ))
+        })?;
+        let cur = next.to_string();
+        ctx.sink
+            .persist_chunk_cursor(
+                cfg,
+                chunk.committed.as_deref(),
+                &cur,
+                chunk.effective_upper.as_deref().unwrap_or(""),
+                ctx.counters.rows_written.load(Ordering::Relaxed),
+            )
+            .await?;
+        cursor = Some(cur);
+        emit_progress(&ctx.counters, &ctx.progress, ctx.started);
+
+        if (rows_this_chunk as usize) < chunk.limit {
+            break;
+        }
+    }
+    if let Some(w) = archive_writer.take() {
+        w.close().await?;
+    }
+    tracing::info!(
+        "keyset chunked read complete: {} rows read",
+        ctx.counters.rows_read.load(Ordering::Relaxed)
+    );
+    Ok(())
+}
+
+/// Read one partition from a ClickHouse source.
+///
+/// Structurally the same loop as [`transfer_partition_mysql`], with one
+/// difference worth naming: there is no per-row decode step. The body of the
+/// HTTP response *is* an Arrow IPC stream, so each chunk of bytes goes straight
+/// into [`ChArrowDecoder`] and comes back out as finished `RecordBatch`es —
+/// which is also why `read_idle_timeout_secs` here measures the gap between
+/// response *chunks* rather than between rows. On a ClickHouse server those are
+/// the same thing at any meaningful scale (a block is flushed as it is
+/// produced), but a read stalled inside a single block is not something this
+/// timer can see.
+#[allow(clippy::too_many_arguments)]
+async fn transfer_partition_clickhouse(
+    source: &ClickHouseSource,
+    plan: &SelectPlan,
+    cfg: &TransferConfig,
+    ctx: &SendCtx,
+    base_table: Option<&str>,
+    base_query: Option<&str>,
+    extra_filter: Option<&str>,
+    partition: Partition,
+    chunk: Option<&ChunkPlan>,
+) -> Result<()> {
+    if let Some(cp) = chunk {
+        return transfer_keyset_clickhouse(
+            source,
+            plan,
+            cfg,
+            ctx,
+            base_table,
+            base_query,
+            extra_filter,
+            cp,
+        )
+        .await;
+    }
+    tracing::info!("partition '{}' starting", partition.label);
+    let select_sql = source.select_sql(
+        &plan.source_columns,
+        &plan.source_select_exprs,
+        &plan.dest_columns,
+        base_table,
+        base_query,
+        &partition,
+        extra_filter,
+        None,
+    );
+    tracing::debug!("partition {}: {select_sql}", partition.label);
+
+    let mut decoder = ChArrowDecoder::new(&plan.dest_columns, cfg.batch_bytes);
+    let schema = decoder.schema();
+    let mut sends: JoinSet<Result<()>> = JoinSet::new();
+    let mut insert_buf = InsertBuffer::new(cfg.insert_bytes);
+    let mut archive_writer = match &ctx.archive {
+        Some(info) => Some(info.writer_for(&partition.label, schema.clone())?),
+        None => None,
+    };
+
+    let resp = source.stream_arrow(&select_sql, cfg.batch_rows).await?;
+    let body = resp.bytes_stream();
+    futures::pin_mut!(body);
+
+    let idle = cfg.read_idle_timeout_secs;
+    let scope = format!("partition '{}'", partition.label);
+    while let Some(part) = await_source(body.next(), &ctx.counters, idle, &scope).await? {
+        let part = part.map_err(EtlError::from)?;
+        for batch in decoder.feed(part)? {
+            let rows = batch.num_rows() as u64;
+            if let Some(w) = archive_writer.as_mut() {
+                w.write(&batch).await?;
+            }
+            ctx.push_batch(&mut sends, &mut insert_buf, schema.clone(), batch)
+                .await;
+            reap(&mut sends, false).await?; // surface any upload error promptly
+                                            // Pace the read: pausing before pulling more of the
+                                            // response body applies backpressure to the HTTP
+                                            // stream, slowing the server-side scan.
+            if let Some(t) = &ctx.throttle {
+                t.acquire(rows).await;
+            }
+        }
+    }
+    decoder.finish()?;
+    if let Some(w) = archive_writer.take() {
+        w.close().await?;
+    }
+    ctx.flush(&mut sends, &mut insert_buf, schema.clone()).await;
+    reap(&mut sends, true).await?; // wait for all uploads before returning
+
+    ctx.counters
+        .rows_read
+        .fetch_add(decoder.rows_total, Ordering::Relaxed);
+    emit_progress(&ctx.counters, &ctx.progress, ctx.started);
+    tracing::info!(
+        "partition '{}' complete: {} rows",
+        partition.label,
+        decoder.rows_total
+    );
+    Ok(())
+}
+
 /// The sentence describing one coercion kind, naming the column it happened
 /// in. Human-facing only — a caller matching behaviour matches on
 /// [`WarningKind`], which is stable; this text is not.
@@ -3571,6 +3960,52 @@ fn build_watermark_filter_mysql(
     let lower = last.map(|l| lookback_lower_bound_mysql(l, lookback_seconds));
     let upper = snapshot_max.map(quote_mysql_literal);
     build_watermark_filter(&col, lower, upper)
+}
+
+/// ClickHouse uses backtick identifier quoting and MySQL-style backslash
+/// escaping in string literals, so both halves of the filter are built the same
+/// way as MySQL's — only the lookback arithmetic differs (see
+/// [`lookback_lower_bound_clickhouse`]). Kept as its own function rather than
+/// aliased onto the MySQL one so that divergence stays a one-line change here.
+fn build_watermark_filter_clickhouse(
+    watermark: &str,
+    source_expr: Option<&str>,
+    last: Option<&str>,
+    snapshot_max: Option<&str>,
+    lookback_seconds: u64,
+) -> Option<String> {
+    let col = source_expr
+        .map(str::to_string)
+        .unwrap_or_else(|| crate::ddl::quote_ident(watermark));
+    let lower = last.map(|l| lookback_lower_bound_clickhouse(l, lookback_seconds));
+    let upper = snapshot_max.map(quote_clickhouse_literal);
+    build_watermark_filter(&col, lower, upper)
+}
+
+/// ClickHouse treats backslash as an active escape inside `'...'` (and also
+/// accepts the doubled-quote convention), so — same failure mode as the MySQL
+/// and BigQuery literal quoters — backslash has to be escaped first or a
+/// trailing one would escape the literal's own closing quote.
+fn quote_clickhouse_literal(m: &str) -> String {
+    format!("'{}'", m.replace('\\', "\\\\").replace('\'', "''"))
+}
+
+/// Widen `last`'s lower bound by `lookback_seconds` using ClickHouse's own
+/// parse-and-subtract, a same-engine round trip: the tracked watermark string
+/// was produced by this source's `toString(max(col))`, so the engine that wrote
+/// it is the one that reads it back. `lookback_seconds == 0` returns the plain
+/// quoted literal, byte-identical to the non-lookback filter.
+///
+/// The `'UTC'` is not a reinterpretation of the value: `ensure_lookback_compatible`
+/// has already restricted this path to a date/timestamp watermark, and every
+/// ClickHouse datetime this source resolves is tz-aware UTC (see
+/// `types::clickhouse::map_ch_type`).
+fn lookback_lower_bound_clickhouse(last: &str, lookback_seconds: u64) -> String {
+    let l = last.replace('\\', "\\\\").replace('\'', "''");
+    if lookback_seconds == 0 {
+        return format!("'{l}'");
+    }
+    format!("(toDateTime64('{l}', 6, 'UTC') - INTERVAL {lookback_seconds} SECOND)")
 }
 
 /// Postgres, under the default `standard_conforming_strings = on`, treats

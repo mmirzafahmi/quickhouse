@@ -37,6 +37,8 @@ Connection descriptors accepted as ``sync()``'s ``source`` argument.
 
 .. autoclass:: BigQuery
 
+.. autoclass:: ClickHouse
+
 .. autoclass:: CleverTap
 
 .. autoclass:: AppsFlyer
@@ -45,11 +47,10 @@ Connection descriptors accepted as ``sync()``'s ``source`` argument.
 ## Destinations
 
 Connection descriptors accepted as ``sync()``'s ``target`` argument. ``BigQuery``
-(above) also works as a destination when constructed with ``dataset_id``.
+(above) also works as a destination when constructed with ``dataset_id``, and
+``ClickHouse`` (above) works in either role.
 
 ```{eval-rst}
-.. autoclass:: ClickHouse
-
 .. autoclass:: S3Archive
 ```
 

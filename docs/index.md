@@ -10,7 +10,7 @@ sd_hide_title: true
     <div class="qh-hero__pitch">
       <p class="qh-hero__eyebrow">Python API · Rust engine</p>
       <h1>Move whole tables in <em>one</em> function call.</h1>
-      <p class="qh-hero__sub">PostgreSQL, MySQL, or BigQuery into ClickHouse or BigQuery. Native wire
+      <p class="qh-hero__sub">PostgreSQL, MySQL, BigQuery, or ClickHouse into ClickHouse or BigQuery. Native wire
       protocols straight into Apache Arrow — no per-row Python, flat memory.</p>
     </div>
     <div class="qh-hero__actions">

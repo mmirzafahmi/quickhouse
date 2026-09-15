@@ -1,5 +1,5 @@
-"""quickhouse — fast PostgreSQL/MySQL/BigQuery ETL into ClickHouse or BigQuery,
-powered by a Rust engine.
+"""quickhouse — fast PostgreSQL/MySQL/BigQuery/ClickHouse ETL into ClickHouse or
+BigQuery, powered by a Rust engine.
 
 The heavy lifting (wire-protocol decoding, Arrow batching, parallel streaming,
 and destination ingestion) runs in native Rust. This module is a thin, typed
@@ -33,6 +33,13 @@ class works for either role:
 
 >>> dst_bq = quickhouse.BigQuery("my-gcp-project", dataset_id="analytics")
 >>> quickhouse.sync(src, dst_bq, dest_table="orders", source_table="orders")
+
+:class:`quickhouse.ClickHouse` is dual-role too, so a ClickHouse table can be
+the ``source`` — a cross-cluster copy, or publishing a mart into BigQuery:
+
+>>> src_ch = quickhouse.ClickHouse("http://ch-a:8123", database="raw")
+>>> dst_ch = quickhouse.ClickHouse("http://ch-b:8123", database="analytics")
+>>> quickhouse.sync(src_ch, dst_ch, dest_table="orders", source_table="orders")
 
 For a tqdm progress bar instead of a print callback (``pip install quickhouse[progress]``):
 

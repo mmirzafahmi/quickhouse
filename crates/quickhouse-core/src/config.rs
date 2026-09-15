@@ -90,6 +90,36 @@ pub struct BigQueryConfig {
     pub credentials_json: Option<String>,
 }
 
+/// Where to read from, when the source is ClickHouse itself.
+///
+/// The same fields as [`ClickHouseConfig`] minus the write-path ones, so a
+/// single `quickhouse.ClickHouse(...)` descriptor serves as either end of a
+/// transfer: ClickHouse -> ClickHouse (a cross-cluster or cross-database copy),
+/// or ClickHouse -> BigQuery (publishing a mart into a warehouse).
+#[derive(Debug, Clone)]
+pub struct ClickHouseSourceConfig {
+    /// Base HTTP(S) URL of the ClickHouse server, e.g. `http://host:8123`.
+    pub url: String,
+    pub database: String,
+    pub user: String,
+    pub password: String,
+    /// Server-side `max_execution_time` (seconds) applied to every request this
+    /// source makes; `0` = leave the server default alone.
+    ///
+    /// The same whole-transfer ceiling the other SQL sources' statement
+    /// timeouts are — read + decode + destination write all count against it,
+    /// because the SELECT stays open from the first row to the last one
+    /// written. See [`PostgresConfig::statement_timeout_secs`] for the longer
+    /// version, and [`TransferConfig::read_idle_timeout_secs`] for the knob
+    /// that fails only on a stalled *source*.
+    pub statement_timeout_secs: u64,
+    /// Arbitrary ClickHouse settings sent as URL query parameters on every
+    /// request this source makes — the read-side twin of
+    /// [`ClickHouseConfig::settings`]. Applied *after* the settings quickhouse
+    /// chooses for the Arrow read path, so an explicit value always wins.
+    pub settings: std::collections::BTreeMap<String, String>,
+}
+
 /// One declared output column for an HTTP API source. API responses have no
 /// catalog to resolve a schema from, so the user declares the destination
 /// column `name`, its BigQuery type (`bq_type` — a BigQuery type-name string:
@@ -194,6 +224,7 @@ pub enum SourceConfig {
     Postgres(PostgresConfig),
     MySql(MySqlConfig),
     BigQuery(BigQueryConfig),
+    ClickHouse(ClickHouseSourceConfig),
     CleverTap(CleverTapConfig),
     AppsFlyer(AppsFlyerConfig),
     HttpApi(HttpApiConfig),
@@ -208,6 +239,7 @@ impl SourceConfig {
             SourceConfig::Postgres(_) => "postgres",
             SourceConfig::MySql(_) => "mysql",
             SourceConfig::BigQuery(_) => "bigquery",
+            SourceConfig::ClickHouse(_) => "clickhouse",
             SourceConfig::CleverTap(_) => "clevertap",
             SourceConfig::AppsFlyer(_) => "appsflyer",
             SourceConfig::HttpApi(_) => "http",

@@ -1,9 +1,10 @@
 # Sources
 
 Every transfer is `sync(source, target, ...)`. A **source** is a `Postgres`,
-`MySQL`, `BigQuery`, `CleverTap`, or `AppsFlyer` connection descriptor. The same
-`BigQuery` class also works as a [destination](../destinations/index.md); everything
-else about the call is identical regardless of which engines you use.
+`MySQL`, `BigQuery`, `ClickHouse`, `CleverTap`, or `AppsFlyer` connection
+descriptor. The `BigQuery` and `ClickHouse` classes each also work as a
+[destination](../destinations/index.md); everything else about the call is
+identical regardless of which engines you use.
 
 ```python
 import quickhouse as qh
@@ -11,6 +12,7 @@ import quickhouse as qh
 qh.Postgres("postgresql://user:pw@host:5432/db")
 qh.MySQL("mysql://user:pw@host:3306/db", require_tls=True)
 qh.BigQuery("my-gcp-project")                       # source_table="dataset.table"
+qh.ClickHouse("http://ch-a:8123", database="raw")   # ClickHouse reads too
 ```
 
 For the exact constructor signatures see the [API reference](../../api.md).
@@ -19,7 +21,7 @@ For the exact constructor signatures see the [API reference](../../api.md).
 <div class="qh-modes">
   <a class="qh-mode qh-mode--current" href="databases.html">
     <div class="qh-mode__name">Databases</div>
-    <div class="qh-mode__desc">PostgreSQL, MySQL and BigQuery, read over their native wire protocols.</div>
+    <div class="qh-mode__desc">PostgreSQL, MySQL, BigQuery and ClickHouse, read over their native wire protocols.</div>
   </a>
   <a class="qh-mode" href="http-apis.html">
     <div class="qh-mode__name">HTTP APIs</div>
@@ -109,6 +111,13 @@ contents, or Application Default Credentials (ADC):
 Neither set: falls back to Application Default Credentials. The same
 credentials work whether `BigQuery` is used as a source or a
 [destination](../destinations/bigquery.md).
+
+**ClickHouse** authenticates with the same `user` / `password` it does as a
+[destination](../destinations/clickhouse.md) — one class, either role:
+
+```python
+qh.ClickHouse("https://host:8443", database="raw", user="reader", password="…")
+```
 
 ```{toctree}
 :hidden:

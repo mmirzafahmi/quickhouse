@@ -6,7 +6,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.15.0"
+version = "0.16.0"
 edition = "2021"
 license = "MIT"
 authors = ["quickhouse contributors"]
@@ -17,7 +17,14 @@ rust-version = "1.75"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-serde_json-1", "with-uuid-1"] }
 futures = "0.3"
-arrow = { version = "53", features = ["ipc"] }
+# `ipc_compression` is not optional for the ClickHouse *source*: ClickHouse
+# compresses its `FORMAT ArrowStream` buffers with LZ4 by default
+# (`output_format_arrow_compression_method = 'lz4_frame'`), and without the
+# feature every read fails with "lz4 IPC decompression requires the lz4
+# feature". It also enables zstd, so a server configured for that is readable
+# too. Writers are unaffected — IPC compression is opt-in per `IpcWriteOptions`,
+# and the ClickHouse sink doesn't ask for it.
+arrow = { version = "53", features = ["ipc", "ipc_compression"] }
 arrow-array = "53"
 arrow-schema = "53"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "gzip"] }

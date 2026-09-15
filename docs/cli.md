@@ -43,7 +43,7 @@ key = ["id"]
       <div class="qh-params__name">[source]</div>
       <div class="qh-params__type">type =</div>
     </div>
-    <p class="qh-params__desc"><code>postgres</code>, <code>mysql</code>, <code>bigquery</code>, <code>clevertap</code>, <code>appsflyer</code></p>
+    <p class="qh-params__desc"><code>postgres</code>, <code>mysql</code>, <code>bigquery</code>, <code>clickhouse</code>, <code>clevertap</code>, <code>appsflyer</code></p>
   </div>
   <div>
     <div>

@@ -101,6 +101,15 @@ def mysql_source():
 
 
 @pytest.fixture
+def ch_source():
+    import quickhouse
+
+    # The same class as `ch_target` — the descriptor is dual-role, so a
+    # ClickHouse -> ClickHouse test needs no separate source type.
+    return quickhouse.ClickHouse(CH_URL, database=CH_DB, user=CH_USER, password=CH_PASSWORD)
+
+
+@pytest.fixture
 def ch_target():
     import quickhouse
 

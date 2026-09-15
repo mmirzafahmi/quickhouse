@@ -1,6 +1,6 @@
 # quickhouse
 
-**Move tables from PostgreSQL, MySQL, or BigQuery into ClickHouse or BigQuery — fast, in one function call.**
+**Move tables from PostgreSQL, MySQL, BigQuery, or ClickHouse into ClickHouse or BigQuery — fast, in one function call.**
 
 quickhouse is a small, typed Python API on top of a native Rust engine. You
 hand it a source, a destination, and a table name; it figures out the schema,
@@ -29,7 +29,7 @@ print(result)   # rows_read, rows_written, bytes_written, duration_secs, new_wat
 ### When to use quickhouse
 
 Reach for it when you want to move whole tables — full refresh or incremental —
-from PostgreSQL/MySQL/BigQuery into ClickHouse or BigQuery, fast, from your own
+from PostgreSQL/MySQL/BigQuery/ClickHouse into ClickHouse or BigQuery, fast, from your own
 Python jobs with almost no setup. It fits cron/Airflow/Dagster tasks and one-off
 backfills well.
 
@@ -45,12 +45,15 @@ source↔destination pairs — quickhouse deliberately supports a focused, fast 
 | PostgreSQL | ✅ | ✅ |
 | MySQL | ✅ | ✅ |
 | BigQuery | ✅ | ✅ |
+| ClickHouse | ✅ | ✅ |
 | CleverTap (HTTP API) | ✅ | ✅ |
 | AppsFlyer (HTTP API) | ✅ | ✅ |
 
-ClickHouse is a destination only; BigQuery is both a source and a destination.
-Some knobs are engine-specific: `column_transforms` / `read_max_rows_per_sec`
-apply to the PostgreSQL and MySQL sources; `merge_prune_partition_by` /
+BigQuery and ClickHouse are each both a source and a destination — so a
+cross-cluster ClickHouse copy, or publishing a ClickHouse mart into BigQuery,
+is an ordinary `sync()`. Some knobs are engine-specific: `column_transforms` /
+`read_max_rows_per_sec` apply to the PostgreSQL, MySQL and ClickHouse sources;
+`merge_prune_partition_by` /
 `delete_stale_in_window` apply to BigQuery-destination incremental syncs; S3
 archival applies to ClickHouse destinations.
 
@@ -135,6 +138,7 @@ everything else about `sync()` stays the same:
 qh.Postgres("postgresql://user:pw@host:5432/db")
 qh.MySQL("mysql://user:pw@host:3306/db", require_tls=True)
 qh.BigQuery("my-gcp-project")                       # source_table="dataset.table"
+qh.ClickHouse("http://ch-a:8123", database="raw")   # ClickHouse reads too
 
 # destinations
 qh.ClickHouse("http://host:8123", database="analytics")
@@ -350,7 +354,7 @@ errors are surfaced verbatim rather than wrapped in something generic.
 | `merge_prune_partition_by` | BigQuery incremental: prune the MERGE's destination scan to the staging range on this column. Only safe for an *immutable* partition column (e.g. `created_at`) — never a mutable `updated_at` (would insert dup keys) |
 | `chunk_rows` | Read in keyset-ordered chunks of N rows, committing the cursor per chunk so a mid-read failure resumes. Incremental + ClickHouse dest only; keyset column must be a unique NOT-NULL integer. `None` = one read (default) |
 | `retry_max_attempts` | Re-run the whole transfer on a transient *source* error (PG recovery-conflict/cancel; MySQL gone-away/lock-wait/deadlock). `1` = no retry (default) |
-| `column_transforms` | Per-column SQL value transforms over `source_table=` (e.g. `{"ts":"ts AT TIME ZONE 'UTC'"}`), preserving range partitioning. Postgres/MySQL only |
+| `column_transforms` | Per-column SQL value transforms over `source_table=` (e.g. `{"ts":"ts AT TIME ZONE 'UTC'"}`), preserving range partitioning. Postgres/MySQL/ClickHouse only |
 | `evolve_schema` | Auto-`ADD COLUMN` (Nullable) when the source has a column the destination lacks, instead of erroring. ADD-only. Default `False` |
 | `key` | Dedup key (required for BigQuery incremental) |
 | `create_if_missing` | Auto-create the destination table (default `True`) |
@@ -358,7 +362,7 @@ errors are surfaced verbatim rather than wrapped in something generic.
 | `parallelism` | Concurrent read streams |
 | `batch_rows` / `batch_bytes` | Per-batch size knobs (rows, or estimated bytes) |
 | `max_memory_bytes` | Hard ceiling on total in-flight memory; decoding blocks when hit (default 512 MiB, `0` = unbounded) |
-| `read_max_rows_per_sec` | Cap the aggregate source read rate to be gentle on a small DB; `None` = unlimited (default). Postgres/MySQL only |
+| `read_max_rows_per_sec` | Cap the aggregate source read rate to be gentle on a small DB; `None` = unlimited (default). Postgres/MySQL/ClickHouse only |
 | `type_overrides` | Force a destination column type, e.g. `{"qty": "Decimal(18, 3)"}` |
 | `rename`, `include`, `exclude` | Column renames and allow/deny lists |
 | `on_progress` | Progress callback |

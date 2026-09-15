@@ -1,8 +1,8 @@
 # Destinations
 
 Every transfer is `sync(source, target, ...)`. A **destination** is a
-`ClickHouse` or `BigQuery` connection descriptor. The same `BigQuery` class
-also works as a [source](../sources/index.md); everything else about the call is
+`ClickHouse` or `BigQuery` connection descriptor. Both classes also work as a
+[source](../sources/index.md); everything else about the call is
 identical regardless of which engines you use.
 
 ```python

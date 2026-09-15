@@ -44,7 +44,7 @@ use std::time::Instant;
 use crate::config::{DestinationConfig, SourceConfig};
 use crate::error::{EtlError, Result};
 use crate::sink::build_sink;
-use crate::source::{MySqlSource, PgSource};
+use crate::source::{ClickHouseSource, MySqlSource, PgSource};
 
 /// What to reconcile, and whether to repair it.
 #[derive(Debug, Clone)]
@@ -171,10 +171,10 @@ impl ReconcileConfig {
 /// Diff a source table's keyset against a destination's, and optionally delete
 /// the destination rows the source no longer has. See the module docs.
 ///
-/// Sources: PostgreSQL and MySQL. A BigQuery or HTTP-API source is rejected —
-/// the first is normally itself a mirror rather than the system of record, and
-/// the second has no keyset query to speak of. Destinations: both ClickHouse
-/// and BigQuery.
+/// Sources: PostgreSQL, MySQL and ClickHouse. A BigQuery or HTTP-API source is
+/// rejected — the first is normally itself a mirror rather than the system of
+/// record, and the second has no keyset query to speak of. Destinations: both
+/// ClickHouse and BigQuery.
 pub async fn reconcile_keys(
     source_cfg: SourceConfig,
     dest: DestinationConfig,
@@ -352,10 +352,21 @@ async fn read_source_keys(source_cfg: &SourceConfig, cfg: &ReconcileConfig) -> R
                 )
                 .await
         }
+        SourceConfig::ClickHouse(ch) => {
+            let source = ClickHouseSource::new(ch)?;
+            source
+                .distinct_keys(
+                    cfg.source_table.as_deref(),
+                    cfg.source_query.as_deref(),
+                    &cfg.key,
+                    cfg.window.as_deref(),
+                )
+                .await
+        }
         other => Err(EtlError::config(format!(
-            "reconcile_keys does not support a {} source (PostgreSQL and MySQL only): a \
-             BigQuery source is normally itself a mirror rather than the system of record, \
-             and an HTTP API source has no keyset query to diff against",
+            "reconcile_keys does not support a {} source (PostgreSQL, MySQL and ClickHouse \
+             only): a BigQuery source is normally itself a mirror rather than the system of \
+             record, and an HTTP API source has no keyset query to diff against",
             other.kind(),
         ))),
     }

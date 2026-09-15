@@ -8,7 +8,7 @@
 # environment (e.g. export PG_DSN=postgresql://user:pw@host:5432/db).
 
 [source]
-type = "postgres"          # postgres | mysql | bigquery | clevertap | appsflyer
+type = "postgres"          # postgres | mysql | bigquery | clickhouse | clevertap | appsflyer
 dsn = "${PG_DSN}"
 
 [target]

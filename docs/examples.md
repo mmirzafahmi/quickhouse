@@ -10,6 +10,7 @@ variables and documents them in its module docstring.
 | `postgres_to_clickhouse.py` | The minimal call — full-refresh a Postgres table into ClickHouse, with a progress callback. |
 | `incremental_sync.py` | Watermark-based incremental sync (idempotent; run it twice). |
 | `mysql_to_bigquery.py` | Same `sync()`, different engines — MySQL → BigQuery. |
+| `clickhouse_to_clickhouse.py` | ClickHouse as a *source* — a cross-cluster/cross-database copy. |
 | `clevertap_bronze_append.py` | HTTP API source with a declared schema + `mode="append"` bronze landing. |
 
 ## Running against the local stack
@@ -48,6 +49,15 @@ Watermark-based incremental sync (idempotent; run it twice).
 Same `sync()`, different engines — MySQL → BigQuery.
 
 ```{literalinclude} ../examples/mysql_to_bigquery.py
+:language: python
+```
+
+## ClickHouse → ClickHouse
+
+ClickHouse as a *source* — a cross-cluster or cross-database copy, with the
+same partition / incremental machinery as any other database source.
+
+```{literalinclude} ../examples/clickhouse_to_clickhouse.py
 :language: python
 ```
 

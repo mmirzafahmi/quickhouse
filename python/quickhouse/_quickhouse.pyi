@@ -336,14 +336,50 @@ class HttpApi:
     ) -> None: ...
 
 class ClickHouse:
-    """ClickHouse destination connection descriptor.
+    """ClickHouse connection descriptor — usable as either a source or a target.
+
+    As a **source**, reads go over the same HTTP interface in ClickHouse's own
+    ``FORMAT ArrowStream``, with the full partition / incremental / chunk-resume
+    machinery behind them. That makes ClickHouse → ClickHouse (a cross-cluster
+    or cross-database copy) and ClickHouse → BigQuery (publishing a mart into a
+    warehouse) ordinary transfers::
+
+        src = qh.ClickHouse("http://ch-a:8123", database="raw")
+        dst = qh.ClickHouse("http://ch-b:8123", database="analytics")
+        qh.sync(src, dst, dest_table="orders", source_table="orders",
+                mode="incremental", watermark="updated_at", key=["id"])
+
+    ``url``, ``database``, ``user``, ``password`` and ``settings`` apply in both
+    roles. ``compression``, ``archive`` and ``insert_dedup_token`` are write-path
+    only and are ignored as a ``source=``; ``statement_timeout_secs`` is
+    read-path only and is ignored as a ``target=``.
+
+    Types read from a ClickHouse source keep their declared type at the
+    destination where one exists — ``UUID``, ``IPv4``/``IPv6``, ``Enum8``/
+    ``Enum16``, ``FixedString`` and ``LowCardinality(...)`` all survive a
+    ClickHouse → ClickHouse copy rather than flattening to ``String``.
+    ``Array``/``Map``/``Tuple``/``JSON``, 256-bit integers and ``Decimal256``
+    are not readable yet; cast them to ``String`` in a ``source_query``, or
+    ``exclude`` them.
 
     Parameters
     ----------
     url:
         Base HTTP(S) URL, e.g. ``http://host:8123``.
     database, user, password:
-        Target database and credentials.
+        Database and credentials (the source database, or the target one).
+    statement_timeout_secs:
+        *Source only.* Server-side ``max_execution_time`` (seconds) applied to
+        every request this source makes; ``0`` (default) leaves the server
+        default alone. Like the other sources' statement timeouts this is a
+        ceiling on the **whole transfer**, not on the query — the SELECT stays
+        open from the first row read to the last one written, so a slow
+        destination can trip it. Size it for the transfer and use
+        ``read_idle_timeout_secs`` to fail on a stalled source. Equivalent to
+        ``settings={"max_execution_time": "..."}``, which still wins if both
+        are set.
+
+        .. versionadded:: 0.16.0
     compression:
         HTTP insert body compression: ``"zstd"`` (default), ``"gzip"``, or
         ``"none"``. zstd-fast is faster than gzip at a similar/better ratio;
@@ -355,10 +391,13 @@ class ClickHouse:
         disables this entirely.
     settings:
         Arbitrary ClickHouse settings, sent as URL query parameters on **every**
-        request this destination makes (DDL, inserts, reads, swaps) — the HTTP
-        interface's own per-request settings mechanism. Names are passed through
-        verbatim; ClickHouse itself rejects an unknown one. Avoid ``database``,
-        which is already sent.
+        request this descriptor makes (as a target: DDL, inserts, reads, swaps;
+        as a source: ``DESCRIBE``, the bounds probes and the bulk read) — the
+        HTTP interface's own per-request settings mechanism. Names are passed
+        through verbatim; ClickHouse itself rejects an unknown one. Avoid
+        ``database``, which is already sent. As a source these are applied last,
+        so an explicit value always wins over one quickhouse picked for the
+        Arrow read path.
 
         This reaches server-side behaviour no client-side knob can, e.g.
         ``{"select_sequential_consistency": "1"}`` to stop the post-swap
@@ -394,6 +433,7 @@ class ClickHouse:
         archive: Optional[S3Archive] = None,
         settings: Optional[Mapping[str, str]] = None,
         insert_dedup_token: bool = False,
+        statement_timeout_secs: int = 0,
     ) -> None: ...
 
 class Progress:
@@ -502,7 +542,7 @@ class TransferResult:
     source or the write path is the bottleneck.
 
     ``0.0`` for an HTTP API source (CleverTap/AppsFlyer/HttpApi): the timer
-    instruments the PostgreSQL/MySQL/BigQuery source streams, and API paging is
+    instruments the PostgreSQL/MySQL/BigQuery/ClickHouse source streams, and API paging is
     bounded by per-request HTTP timeouts instead, so ``stage_secs`` covers the
     whole fetch-decode-insert loop there. New in 0.15.0."""
 
@@ -548,7 +588,7 @@ class ReconcileResult:
     duration_secs: float
 
 def sync(
-    source: Union[Postgres, MySQL, BigQuery, CleverTap, AppsFlyer, HttpApi],
+    source: Union[Postgres, MySQL, BigQuery, ClickHouse, CleverTap, AppsFlyer, HttpApi],
     target: Union[ClickHouse, BigQuery],
     dest_table: str,
     *,
@@ -601,12 +641,13 @@ def sync(
     on_progress: Optional[Callable[[Progress], None]] = None,
     validate: Optional[Callable[[StagedInfo], None]] = None,
 ) -> TransferResult:
-    """Transfer one table from PostgreSQL, MySQL, or BigQuery into ClickHouse
-    or BigQuery.
+    """Transfer one table from PostgreSQL, MySQL, BigQuery or ClickHouse into
+    ClickHouse or BigQuery.
 
-    ``source`` may be a ``Postgres``, ``MySQL``, or ``BigQuery`` connection
-    descriptor; ``target`` may be a ``ClickHouse`` or ``BigQuery`` one (the
-    same ``BigQuery`` class works for either role — see its doc comment).
+    ``source`` may be a ``Postgres``, ``MySQL``, ``BigQuery`` or ``ClickHouse``
+    connection descriptor; ``target`` may be a ``ClickHouse`` or ``BigQuery``
+    one (the same ``BigQuery`` and ``ClickHouse`` classes work for either role
+    — see their doc comments).
     Everything else about the call is identical regardless of which engines
     are used. Either ``source_table`` or ``source_query`` must be provided.
     For ``mode="incremental"``, ``watermark`` is required and only rows newer
@@ -621,11 +662,11 @@ def sync(
     If ``watermark`` allows NULL and any current row has one, a
     ``WHERE watermark > x`` predicate never matches it — that row is silently
     excluded from every incremental run, forever, even though the transfer
-    still reports success. A PostgreSQL/MySQL source logs a warning (with the
-    row count) when this is detected; consider a non-nullable watermark, or a
-    separate backfill of the ``NULL`` rows.
+    still reports success. A PostgreSQL/MySQL/ClickHouse source logs a warning
+    (with the row count) when this is detected; consider a non-nullable
+    watermark, or a separate backfill of the ``NULL`` rows.
 
-    ``watermark_source_expr`` (PostgreSQL/MySQL sources only) is a raw SQL
+    ``watermark_source_expr`` (PostgreSQL/MySQL/ClickHouse sources only) is a raw SQL
     expression substituted for ``watermark`` when building the incremental
     filter and the boundary-max probe — the projected ``watermark`` output is
     left untouched. Needed when ``source_query`` computes ``watermark`` from
@@ -639,7 +680,7 @@ def sync(
     under a second name (e.g. ``write_date AS write_date_raw``) and set
     ``watermark_source_expr="write_date_raw"``.
 
-    ``partition_source_expr`` (new in 0.14.0; PostgreSQL/MySQL sources only) is
+    ``partition_source_expr`` (new in 0.14.0; PostgreSQL/MySQL/ClickHouse sources only) is
     the same idea applied to parallel reads, and it is what makes
     ``parallelism`` mean anything for a custom query. Range partitioning needs a
     key column it can probe ``MIN``/``MAX`` on and bound with an indexable
@@ -966,8 +1007,8 @@ def sync(
       produce as fast as the client consumes, that pause pushes back on the
       server-side scan itself, so the source does proportionally less work —
       not just quickhouse. ``None`` (default) reads as fast as possible.
-      Applies to PostgreSQL and MySQL sources; ignored for a BigQuery source
-      (its read path is a separately-metered managed API). For the lightest
+      Applies to the PostgreSQL, MySQL and ClickHouse sources; ignored for a
+      BigQuery source (its read path is a separately-metered managed API). For the lightest
       possible footprint on a small instance, combine a modest
       ``read_max_rows_per_sec`` with ``parallelism=1`` (one connection, one
       scan), ``mode="incremental"`` (reads only new rows, not the whole
@@ -997,9 +1038,11 @@ def sync(
       does not count toward it — a slow destination cannot trip it, which is
       what makes it safe to set tightly. A genuinely hung source does trip it,
       and the resulting error is classified transient so ``retry_max_attempts``
-      retries the whole transfer. Applies to the PostgreSQL, MySQL and BigQuery
-      source reads; API sources are paced by their own per-request HTTP
-      timeouts. Setting this lets ``statement_timeout_secs`` go back to being
+      retries the whole transfer. Applies to the PostgreSQL, MySQL, BigQuery and
+      ClickHouse source reads; API sources are paced by their own per-request
+      HTTP timeouts. (For a ClickHouse source it measures the gap between
+      response chunks rather than between rows — the same thing at any
+      meaningful scale, since a block is flushed as it is produced.) Setting this lets ``statement_timeout_secs`` go back to being
       sized for the source database — a guard against a runaway scan — rather
       than for the destination's worst day.
 
@@ -1019,7 +1062,7 @@ def sync(
     ...
 
 def reconcile_keys(
-    source: Union[Postgres, MySQL],
+    source: Union[Postgres, MySQL, ClickHouse],
     target: Union[ClickHouse, BigQuery],
     dest_table: str,
     *,
@@ -1091,10 +1134,10 @@ def reconcile_keys(
     :param sample_limit: How many orphan/missing keys to carry back as samples.
         The counts are exact regardless.
 
-    Sources: PostgreSQL and MySQL. A BigQuery source is rejected (it is normally
-    itself a mirror rather than the system of record), as is an HTTP API source
-    (no keyset query to diff against). Destinations: both ClickHouse and
-    BigQuery.
+    Sources: PostgreSQL, MySQL and ClickHouse. A BigQuery source is rejected (it
+    is normally itself a mirror rather than the system of record), as is an HTTP
+    API source (no keyset query to diff against). Destinations: both ClickHouse
+    and BigQuery.
     """
     ...
 

@@ -9,6 +9,135 @@ any breaking change is called out explicitly.
 
 ## [Unreleased]
 
+## [0.16.0] — 2026-09-15
+
+ClickHouse could be written to but not read from, which made the one transfer a
+ClickHouse shop most obviously wants — moving a table from one cluster or
+database to another — the only one quickhouse couldn't do. It can now, and it
+turns out to be the *simplest* source in the crate rather than the fourth
+variation on a wire decoder: ClickHouse speaks Arrow natively in both
+directions.
+
+### Added — ClickHouse as a source
+
+- **`quickhouse.ClickHouse(...)` now works as `sync()`'s `source=` as well as
+  its `target=`**, the way `BigQuery` already did. That makes a cross-cluster or
+  cross-database ClickHouse copy, and publishing a ClickHouse mart into
+  BigQuery, ordinary transfers rather than something to script by hand:
+
+  ```python
+  src = qh.ClickHouse("http://ch-a:8123", database="raw")
+  dst = qh.ClickHouse("http://ch-b:8123", database="analytics")
+  qh.sync(src, dst, dest_table="orders", source_table="orders",
+          mode="incremental", watermark="updated_at", key=["id"], parallelism=4)
+  ```
+
+  Everything the Postgres and MySQL sources support works here: range
+  partitioning across `parallelism` connections, full-refresh and incremental
+  modes, `chunk_rows` resumable reads, `lookback_seconds`,
+  `partition_source_expr` / `watermark_source_expr`, `column_transforms`,
+  `read_max_rows_per_sec`, the S3 Parquet archive, and `reconcile_keys`.
+
+- **No new wire decoder.** ClickHouse serves `FORMAT ArrowStream`, so reads go
+  straight into the Arrow IPC decoder the rest of the crate already moves rows
+  in — the one source that needs no hand-written protocol decoding. What makes
+  that safe is that every projected column is `CAST` server-side to a ClickHouse
+  type whose Arrow output type is pinned: ClickHouse's Arrow writer emits `Date`
+  as `UINT16`, `DateTime` as `UINT32`, `Enum8` as its backing `INT8`,
+  `FixedString` as `FIXED_SIZE_BINARY`, and a `DateTime64(P)` at `P`'s own time
+  unit, none of which the destination schema expects. The cast target is derived
+  from the *destination* column, so `type_overrides`, `numeric_as_decimal` and
+  `column_transform_types` are honoured with no extra machinery.
+
+- **Types that only ClickHouse has survive a ClickHouse → ClickHouse copy.**
+  `UUID`, `IPv4`/`IPv6`, `Enum8`/`Enum16`, `FixedString(N)` and
+  `LowCardinality(...)` are recreated as themselves at the destination rather
+  than flattened to `String` (and land as `STRING` in BigQuery).
+  `LowCardinality(Nullable(T))` keeps its dictionary encoding, with the
+  nullability lifted out to where the rest of the pipeline expects it.
+  `Decimal(P, S)` is read exactly — no `Float64` round-trip, unlike the other
+  engines' unparameterised decimals. `Date`, `Date32`, `DateTime` and
+  `DateTime64(P[, tz])` all resolve UTC-aware, since a ClickHouse datetime is an
+  absolute instant whatever timezone its type names;
+  `type_overrides={"col": "DATETIME"}` is the per-column opt-out, as it is for
+  MySQL.
+
+- **Unsupported types fail loudly, naming the column.** `Array`, `Map`, `Tuple`,
+  `Nested`, `JSON`, the 256-bit integers and `Decimal256` are rejected during
+  schema resolution with the workaround in the message (`exclude=`, or a
+  `source_query` that casts to `String`) — never silently dropped. And here
+  `exclude=["col"]` genuinely works: the ClickHouse source drops an unmappable
+  column that the transfer was never going to carry instead of failing the run.
+  (The error's advice has always been false for the other sources, where column
+  selection happens well after schema resolution has already errored — unchanged
+  here, but ClickHouse is where it bites, since `Array` and `Map` columns are
+  ordinary in a real schema rather than exotic.)
+
+- **`NOT NULL` survives a ClickHouse → ClickHouse copy.** Every other source's
+  decoder can turn an otherwise-valid value into NULL — a zero-date, a year
+  outside ClickHouse's window, a decimal past its declared precision — so the
+  planner widens every `Date`/`DateTime`/`Decimal` destination column to
+  `Nullable(...)` defensively. This source reads Arrow the server already
+  produced, from values already inside ClickHouse's representable window,
+  through a `CAST` that is exact or a hard error; `transform::plan_with` lets it
+  say so, and those columns stay as declared.
+
+- Three smaller things the source has to get right, each of which would
+  otherwise be a quiet wrong answer rather than an error:
+  - The schema probe is `DESCRIBE (SELECT * FROM t)`, not `DESCRIBE TABLE t`.
+    The latter also reports `MATERIALIZED`, `ALIAS` and `EPHEMERAL` columns,
+    which `SELECT *` does not return — resolving those would leave the
+    destination with columns no row ever fills.
+  - ClickHouse's `max()`/`min()` over zero rows return the column type's
+    *default* (the epoch, or `0`) rather than SQL NULL, so the watermark and
+    partition-bound probes count rows alongside the aggregate. Without that, an
+    empty source persists a 1970 watermark as though it had genuinely read up
+    to there.
+  - A response body that ends mid-IPC-message is an error, not a short read. A
+    server aborting after the `200` has already been sent arrives as a clean
+    EOF, which would otherwise look like a successful partial transfer — and get
+    swapped into place.
+
+- `quickhouse.ClickHouse(...)` gains `statement_timeout_secs` (the server's
+  `max_execution_time`, read-path only), matching the other sources. Like
+  theirs, it is a ceiling on the whole transfer rather than on the query; use
+  `read_idle_timeout_secs` for the source-stalled case. `settings={...}` still
+  wins over it.
+
+- The CLI job file accepts `type = "clickhouse"` under `[source]`, and
+  `examples/clickhouse_to_clickhouse.py` shows the round trip.
+
+- `tests/test_clickhouse_source.py` runs the whole path against a live
+  ClickHouse 24.8 (the one in `docker-compose.yml`) — full refresh across four
+  read partitions, incremental idempotency, the empty-source watermark,
+  `chunk_rows` keyset chunking at a row count deliberately not a multiple of the
+  chunk size, `lookback_seconds` re-reading a row restated exactly at the
+  committed watermark, a `source_query` with a `column_transforms` value
+  transform, the unsupported-type error and its `exclude=` escape hatch,
+  `reconcile_keys`, and the type round trip column by column. Two of those tests caught real bugs before this shipped:
+  the missing LZ4 feature and the `Nullable(LowCardinality(...))` DDL below.
+
+### Fixed
+
+- **A nullable `LowCardinality` column generated invalid DDL.**
+  `ColumnType::clickhouse_type()` wrapped it as
+  `Nullable(LowCardinality(String))`, which ClickHouse rejects outright
+  (`Code: 43 ILLEGAL_TYPE_OF_ARGUMENT`) — the only legal spelling puts `Nullable`
+  on the inside. Reachable before this release through
+  `type_overrides={col: "LowCardinality(String)"}` on any nullable column, and
+  unavoidably by every nullable low-cardinality column read from a ClickHouse
+  source.
+
+### Changed
+
+- The `arrow` dependency gains the `ipc_compression` feature. ClickHouse
+  compresses its `FORMAT ArrowStream` buffers with LZ4 by default, and without
+  the feature every read of a ClickHouse source fails on the first buffer with
+  *"lz4 IPC decompression requires the lz4 feature"*. No new crate enters the
+  dependency graph — `lz4_flex` and `zstd` were already there. Writers are
+  unaffected: IPC compression is opt-in per `IpcWriteOptions`, and the ClickHouse
+  sink doesn't ask for it.
+
 ## [0.15.0] — 2026-08-31
 
 Four things a production fleet could see and quickhouse could not: a destination
@@ -912,7 +1041,11 @@ config change, but it is a different BigQuery API call
 - Initial release: parallel, bounded-memory PostgreSQL → ClickHouse transfer with
   automatic DDL, full-refresh and incremental modes, and type mapping.
 
-[Unreleased]: https://github.com/mmirzafahmi/quickhouse/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/mmirzafahmi/quickhouse/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/mmirzafahmi/quickhouse/compare/v0.15.0...v0.16.0
+[0.15.0]: https://github.com/mmirzafahmi/quickhouse/compare/v0.14.1...v0.15.0
+[0.14.1]: https://github.com/mmirzafahmi/quickhouse/compare/v0.14.0...v0.14.1
+[0.14.0]: https://github.com/mmirzafahmi/quickhouse/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/mmirzafahmi/quickhouse/compare/v0.12.1...v0.13.0
 [0.12.1]: https://github.com/mmirzafahmi/quickhouse/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/mmirzafahmi/quickhouse/compare/v0.11.0...v0.12.0
