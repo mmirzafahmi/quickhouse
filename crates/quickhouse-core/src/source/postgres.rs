@@ -18,7 +18,7 @@ use tokio_postgres::Client;
 use tokio_postgres_rustls::MakeRustlsConnect;
 
 use crate::error::{EtlError, Result};
-use crate::source::Keyset;
+use crate::source::{Keyset, ProbeCost};
 use crate::types::{map_oid, oid, ColumnType};
 
 fn load_extra_ca_certs(roots: &mut RootCertStore, path: &str) -> Result<()> {
@@ -254,6 +254,35 @@ impl PgSource {
         Ok(rows.into_iter().map(|r| r.get::<_, String>(0)).collect())
     }
 
+    /// Ask the planner what `sql` would cost, without running it.
+    ///
+    /// `EXPLAIN` without `ANALYZE` plans only — no rows are read — so this is
+    /// safe to call against a query that would otherwise be a full sequential
+    /// scan, which is exactly the case it exists to detect. See
+    /// [`crate::source::explain`] for why the planner is asked instead of the
+    /// catalog: it sees through a `source_query`'s derived table, where a
+    /// `pg_index` lookup has no base relation to consult at all.
+    ///
+    /// Any failure — including this EXPLAIN itself being cancelled by a
+    /// standby recovery conflict — yields [`ProbeCost::Unknown`], which skips
+    /// the probe rather than running it.
+    pub async fn explain_cost(&self, client: &Client, sql: &str) -> ProbeCost {
+        let explain = super::explain::pg_explain_sql(sql);
+        match client.query_one(&explain, &[]).await {
+            Ok(row) => match row.try_get::<_, serde_json::Value>(0) {
+                Ok(v) => super::explain::parse_pg_cost(&v.to_string()),
+                Err(e) => {
+                    tracing::debug!("EXPLAIN returned an unreadable plan: {e}");
+                    ProbeCost::Unknown
+                }
+            },
+            Err(e) => {
+                tracing::debug!("EXPLAIN failed, treating the probe as too costly: {e}");
+                ProbeCost::Unknown
+            }
+        }
+    }
+
     /// Compute range partitions over `column`, either for a base table
     /// (`from_table`) or for a wrapped `source_query` (`base_query`). Falls back
     /// to a single partition when the column is not an integer or has no rows.
@@ -418,19 +447,30 @@ impl PgSource {
         watermark: &str,
         source_expr: Option<&str>,
     ) -> Result<Option<String>> {
+        let sql = Self::max_watermark_sql(from_table, base_query, watermark, source_expr);
+        let row = client.query_one(&sql, &[]).await?;
+        Ok(row.get::<_, Option<String>>(0))
+    }
+
+    /// The SQL [`Self::max_watermark`] would run. Exposed so a caller can
+    /// `EXPLAIN` the exact statement before deciding to pay for it.
+    pub fn max_watermark_sql(
+        from_table: Option<&str>,
+        base_query: Option<&str>,
+        watermark: &str,
+        source_expr: Option<&str>,
+    ) -> String {
         let w = source_expr
             .map(str::to_string)
             .unwrap_or_else(|| quote_pg(watermark));
-        let sql = if let Some(q) = base_query {
+        if let Some(q) = base_query {
             format!("SELECT max({w})::text FROM ({q}) AS _src")
         } else {
             format!(
                 "SELECT max({w})::text FROM {t}",
                 t = quote_pg_table(from_table.expect("table required"))
             )
-        };
-        let row = client.query_one(&sql, &[]).await?;
-        Ok(row.get::<_, Option<String>>(0))
+        }
     }
 
     /// Count rows whose watermark value is NULL. A `WHERE wm > x` predicate
@@ -447,19 +487,29 @@ impl PgSource {
         watermark: &str,
         source_expr: Option<&str>,
     ) -> Result<i64> {
+        let sql = Self::count_null_watermark_sql(from_table, base_query, watermark, source_expr);
+        let row = client.query_one(&sql, &[]).await?;
+        Ok(row.get::<_, i64>(0))
+    }
+
+    /// The SQL [`Self::count_null_watermark`] would run, for `EXPLAIN`.
+    pub fn count_null_watermark_sql(
+        from_table: Option<&str>,
+        base_query: Option<&str>,
+        watermark: &str,
+        source_expr: Option<&str>,
+    ) -> String {
         let w = source_expr
             .map(str::to_string)
             .unwrap_or_else(|| quote_pg(watermark));
-        let sql = if let Some(q) = base_query {
+        if let Some(q) = base_query {
             format!("SELECT count(*) FROM ({q}) AS _src WHERE {w} IS NULL")
         } else {
             format!(
                 "SELECT count(*) FROM {t} WHERE {w} IS NULL",
                 t = quote_pg_table(from_table.expect("table required"))
             )
-        };
-        let row = client.query_one(&sql, &[]).await?;
-        Ok(row.get::<_, i64>(0))
+        }
     }
 
     /// Every distinct non-NULL value of `key`, as text, over the rows `window`

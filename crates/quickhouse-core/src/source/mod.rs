@@ -2,12 +2,14 @@ pub mod appsflyer;
 pub mod bigquery;
 pub mod clevertap;
 pub mod clickhouse;
+pub mod explain;
 pub mod http_api;
 pub mod mysql;
 pub mod postgres;
 
 pub use bigquery::BigQuerySource;
 pub use clickhouse::ClickHouseSource;
+pub use explain::{ProbeCost, DEFAULT_PROBE_MAX_COST};
 pub use mysql::MySqlSource;
 pub use postgres::{Partition, PgSource};
 

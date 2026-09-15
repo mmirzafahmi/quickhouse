@@ -4,7 +4,7 @@
 //! [`Source`] enum; everything downstream of "decode into Arrow batches" is
 //! source-agnostic.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -35,12 +35,15 @@ use crate::source::clevertap::CleverTapSource;
 use crate::source::clickhouse::quote_ch_table;
 use crate::source::mysql::{quote_my, quote_my_table};
 use crate::source::postgres::{quote_pg, quote_pg_table};
+use crate::source::ProbeCost;
 use crate::source::{
     BigQuerySource, ClickHouseSource, Keyset, MySqlSource, Partition, PgSource, Source,
 };
 use crate::transform::{self, SelectPlan};
 use crate::types::bigquery::arrow_to_bigquery_type;
 use crate::types::ColumnType;
+use arrow_array::Array;
+use arrow_schema::TimeUnit;
 use google_cloud_bigquery::http::table::TableFieldType;
 
 /// Live progress snapshot passed to the optional callback.
@@ -269,6 +272,117 @@ struct Counters {
     read_nanos: AtomicU64,
 }
 
+/// Accumulates the largest watermark value actually read, across every
+/// partition, so the cursor can be taken from the stream instead of from a
+/// `MAX(watermark)` probe that would sequentially scan the whole table.
+///
+/// The maximum is folded as the raw Arrow integer (microseconds since epoch, or
+/// days for a `Date32`) rather than as text. Comparing the rendered strings
+/// would be subtly wrong: PostgreSQL's own `timestamp::text` drops trailing
+/// zeros (`.100000` renders as `.1`), so lexicographic order over mixed-width
+/// renderings does not match chronological order. Folding integers and
+/// rendering once at the end avoids the question entirely.
+struct WatermarkTracker {
+    /// Index of the watermark column in each decoded batch. `SelectPlan`'s
+    /// `source_columns` and `dest_columns` are parallel, so this position is
+    /// valid even when `rename` gives the destination column another name.
+    idx: usize,
+    unit: WatermarkUnit,
+    /// `i64::MIN` is the "nothing seen yet" sentinel. A real watermark can
+    /// never be that value: as microseconds it is ~292,000 years before the
+    /// epoch, outside every date type this crate can decode.
+    max: AtomicI64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatermarkUnit {
+    /// `Timestamp(_, None)` — rendered as a naive `YYYY-MM-DD HH:MM:SS.ffffff`.
+    NaiveMicros,
+    /// `Timestamp(_, Some(tz))` — rendered with a `+00` offset, matching what
+    /// PostgreSQL's `timestamptz::text` produces for a UTC session.
+    UtcMicros,
+    /// `Date32` — days since epoch, rendered `YYYY-MM-DD`.
+    Days,
+}
+
+impl WatermarkTracker {
+    /// `None` when the watermark is not a type whose maximum can be folded and
+    /// rendered back into a comparable SQL literal, or is not in the projection.
+    fn new(watermark: &str, plan: &SelectPlan) -> Option<Self> {
+        let idx = plan.source_columns.iter().position(|c| c == watermark)?;
+        let unit = match plan.dest_columns.get(idx).map(|c| &c.arrow)? {
+            DataType::Timestamp(TimeUnit::Microsecond, None) => WatermarkUnit::NaiveMicros,
+            DataType::Timestamp(TimeUnit::Microsecond, Some(_)) => WatermarkUnit::UtcMicros,
+            DataType::Date32 => WatermarkUnit::Days,
+            _ => return None,
+        };
+        Some(Self {
+            idx,
+            unit,
+            max: AtomicI64::new(i64::MIN),
+        })
+    }
+
+    /// Fold this batch's watermark column into the running maximum. NULLs are
+    /// skipped — they are exactly the rows a `>` predicate never matches, and
+    /// letting one influence the cursor would be meaningless.
+    fn observe(&self, batch: &RecordBatch) {
+        let Some(col) = batch.columns().get(self.idx) else {
+            return;
+        };
+        let mut local = i64::MIN;
+        match self.unit {
+            WatermarkUnit::NaiveMicros | WatermarkUnit::UtcMicros => {
+                let Some(a) = col
+                    .as_any()
+                    .downcast_ref::<arrow_array::TimestampMicrosecondArray>()
+                else {
+                    return;
+                };
+                for i in 0..a.len() {
+                    if !a.is_null(i) {
+                        local = local.max(a.value(i));
+                    }
+                }
+            }
+            WatermarkUnit::Days => {
+                let Some(a) = col.as_any().downcast_ref::<arrow_array::Date32Array>() else {
+                    return;
+                };
+                for i in 0..a.len() {
+                    if !a.is_null(i) {
+                        local = local.max(a.value(i) as i64);
+                    }
+                }
+            }
+        }
+        if local > i64::MIN {
+            self.max.fetch_max(local, Ordering::Relaxed);
+        }
+    }
+
+    /// Render the observed maximum as the SQL literal the next run's filter
+    /// will compare against. `None` when no non-NULL row was read, which
+    /// correctly leaves the cursor where it was.
+    fn render(&self) -> Option<String> {
+        let v = self.max.load(Ordering::Relaxed);
+        if v == i64::MIN {
+            return None;
+        }
+        match self.unit {
+            WatermarkUnit::NaiveMicros => chrono::DateTime::from_timestamp_micros(v)
+                .map(|dt| dt.naive_utc().format("%Y-%m-%d %H:%M:%S%.6f").to_string()),
+            WatermarkUnit::UtcMicros => chrono::DateTime::from_timestamp_micros(v).map(|dt| {
+                dt.naive_utc()
+                    .format("%Y-%m-%d %H:%M:%S%.6f+00")
+                    .to_string()
+            }),
+            WatermarkUnit::Days => chrono::DateTime::from_timestamp(v * 86_400, 0)
+                .map(|dt| dt.naive_utc().date().format("%Y-%m-%d").to_string()),
+        }
+    }
+}
+
 /// Run-scoped collector for the structured warnings that end up on
 /// [`TransferResult::warnings`].
 ///
@@ -435,6 +549,10 @@ struct SendCtx {
     /// Run-scoped warning collector, shared by every partition so per-column
     /// coercions from concurrent readers fold into one entry per column.
     warnings: Warnings,
+    /// `Some` when the incremental cursor is taken from the read stream rather
+    /// than from a `MAX(watermark)` probe. Shared by every partition, so the
+    /// maximum folds across all of them.
+    watermark_max: Option<Arc<WatermarkTracker>>,
 }
 
 /// One partition's accumulator of decoded batches, so an insert carries a
@@ -511,6 +629,11 @@ impl SendCtx {
         schema: SchemaRef,
         batch: RecordBatch,
     ) {
+        // Fold the watermark before the batch is handed on: this is the one
+        // point every decoded batch from every partition passes through.
+        if let Some(t) = &self.watermark_max {
+            t.observe(&batch);
+        }
         let size = batch.get_array_memory_size();
         let reservation = match self.budget.try_reserve(size) {
             Some(r) => r,
@@ -635,6 +758,10 @@ struct SourceSetup {
     source_cols: Vec<ColumnType>,
     snapshot_max: Option<String>,
     partitions: Vec<Partition>,
+    /// The `MAX(watermark)` probe was too costly to run, so this run reads with
+    /// no frozen upper bound and takes its cursor from the stream instead. See
+    /// [`plan_watermark_probes`].
+    stream_max_cursor: bool,
 }
 
 /// Run one table transfer end to end.
@@ -898,6 +1025,18 @@ async fn run_transfer_impl(
     let base_query = cfg.source_query.clone();
     let watermark = cfg.watermark.clone();
 
+    // Read the persisted cursor up front: `setup_*` needs it to tell a first
+    // run (no cursor yet) from an ongoing one, which is what decides whether
+    // the nullable-watermark completeness scan is worth paying for. Re-read
+    // below for the filter itself — it is a single-row lookup in the
+    // destination's state table, not a source scan.
+    let committed_cursor = if cfg.mode == SyncMode::Incremental {
+        sink.read_last_watermark(&cfg).await?
+    } else {
+        None
+    };
+    let first_run = committed_cursor.is_none();
+
     // --- Resolve source schema, incremental snapshot max, and partitions,
     // all on one control connection. ---
     let setup = match source.as_ref() {
@@ -908,6 +1047,7 @@ async fn run_transfer_impl(
                 base_table.as_deref(),
                 base_query.as_deref(),
                 watermark.as_deref(),
+                first_run,
                 &warnings,
             )
             .await?
@@ -919,6 +1059,7 @@ async fn run_transfer_impl(
                 base_table.as_deref(),
                 base_query.as_deref(),
                 watermark.as_deref(),
+                first_run,
                 &warnings,
             )
             .await?
@@ -942,6 +1083,7 @@ async fn run_transfer_impl(
         source_cols,
         snapshot_max,
         partitions,
+        stream_max_cursor,
     } = setup;
     tracing::info!(
         "resolved {} source column(s); computed {} partition(s) for parallel read",
@@ -957,9 +1099,30 @@ async fn run_transfer_impl(
         transform::plan_with(&source_cols, &cfg, sink.dest_kind(), source_may_coerce)?;
     let plan = Arc::new(plan);
 
+    // When the `MAX(watermark)` probe was skipped as too costly, the cursor has
+    // to come from the rows this run actually reads. Built here because it
+    // needs the resolved plan (for the watermark's column position and type),
+    // and consumed after the streaming phase.
+    let watermark_tracker = match (stream_max_cursor, cfg.watermark.as_deref()) {
+        (true, Some(w)) => WatermarkTracker::new(w, &plan).map(Arc::new),
+        _ => None,
+    };
+    if stream_max_cursor && watermark_tracker.is_none() {
+        // Nothing can fold this watermark into a cursor (excluded from the
+        // projection, or a type with no orderable Arrow representation). The
+        // planner said MAX is expensive, but running with no cursor at all
+        // would stall the pipeline permanently, so pay for it.
+        return Err(EtlError::config(format!(
+            "watermark column '{}' could not be tracked through the read stream, and the \
+             MAX(watermark) probe was skipped as too costly. Either include the watermark \
+             column in the transfer, or set probe_max_cost=0 to probe unconditionally.",
+            cfg.watermark.as_deref().unwrap_or("?")
+        )));
+    }
+
     // --- Incremental: read watermark state, build the "since last run" filter,
     // and (for chunked reads) the keyset resume plan. ---
-    let (extra_filter, new_watermark, chunk_plan) = if cfg.mode == SyncMode::Incremental {
+    let (extra_filter, mut new_watermark, chunk_plan) = if cfg.mode == SyncMode::Incremental {
         let watermark = cfg.watermark.as_ref().unwrap();
         // The committed cursor from the last fully-successful run (None first run).
         let committed = sink.read_last_watermark(&cfg).await?;
@@ -1093,6 +1256,7 @@ async fn run_transfer_impl(
             archive: archive_info.clone(),
             throttle,
             warnings: warnings.clone(),
+            watermark_max: watermark_tracker.clone(),
         };
         let stage_started = Instant::now();
 
@@ -1210,6 +1374,20 @@ async fn run_transfer_impl(
                     &warnings,
                 )
                 .await?;
+            }
+            // With no frozen upper bound, the cursor is the largest watermark
+            // this run actually read. `None` means no non-NULL row was read, so
+            // the cursor correctly stays where it was. Assigned to the outer
+            // binding, not shadowed, so `TransferResult::new_watermark` reports
+            // the value that was actually persisted.
+            if let Some(t) = &watermark_tracker {
+                new_watermark = t.render();
+                match &new_watermark {
+                    Some(w) => tracing::info!("watermark taken from the read stream: {w}"),
+                    None => tracing::info!(
+                        "no rows read, so no watermark to advance to (cursor unchanged)"
+                    ),
+                }
             }
             if let Some(w) = &new_watermark {
                 if cfg.advance_watermark {
@@ -1409,6 +1587,7 @@ async fn run_transfer_bigquery(
             // path never throttles.
             throttle: None,
             warnings: warnings.clone(),
+            watermark_max: None,
         };
         let stage_started = Instant::now();
 
@@ -1873,6 +2052,7 @@ async fn run_transfer_api(
             archive: None,
             throttle: None,
             warnings: warnings.clone(),
+            watermark_max: None,
         };
         let stage_started = Instant::now();
         let mut batcher = ApiBatcher::new(&plan.dest_columns, &lookups, cfg.batch_rows, cfg.batch_bytes)?;
@@ -2237,6 +2417,7 @@ async fn run_transfer_frame(
             archive: None,
             throttle: None,
             warnings: warnings.clone(),
+            watermark_max: None,
         };
         let stage_started = Instant::now();
         let schema: SchemaRef = Arc::new(Schema::new(
@@ -2365,6 +2546,8 @@ async fn setup_postgres(
     base_table: Option<&str>,
     base_query: Option<&str>,
     watermark: Option<&str>,
+    // No cursor persisted yet — this run reads the table from scratch anyway.
+    first_run: bool,
     warnings: &Warnings,
 ) -> Result<SourceSetup> {
     tracing::info!("connecting to postgres...");
@@ -2405,30 +2588,56 @@ async fn setup_postgres(
     // skip it in full-refresh so a watermark column left set alongside
     // mode="full" can't add a spurious query or fail on an aggregate edge
     // case (e.g. an empty table's MAX() being NULL) for a result nothing uses.
+    let mut stream_max_cursor = false;
     let snapshot_max = if cfg.mode == SyncMode::Incremental {
         if let Some(w) = watermark {
             ensure_watermark_column(w, &source_cols)?;
             ensure_lookback_compatible(w, cfg.lookback_seconds, &source_cols)?;
-            if watermark_column_nullable(w, &source_cols) {
+            let nullable = watermark_column_nullable(w, &source_cols);
+            let expr = cfg.watermark_source_expr.as_deref();
+            // Ask the planner what each probe would cost before paying for it.
+            // EXPLAIN plans only — nothing is executed — and unlike a catalog
+            // lookup it sees straight through a `source_query`'s derived table.
+            let count_sql = PgSource::count_null_watermark_sql(base_table, base_query, w, expr);
+            let max_sql = PgSource::max_watermark_sql(base_table, base_query, w, expr);
+            let count_cost = if nullable {
+                s.explain_cost(&control, &count_sql).await
+            } else {
+                // Never run for a NOT NULL column, so its cost is moot.
+                ProbeCost::Known(0.0)
+            };
+            let max_cost = s.explain_cost(&control, &max_sql).await;
+            let probes = plan_watermark_probes(
+                count_cost.clone(),
+                max_cost.clone(),
+                cfg.probe_max_cost,
+                first_run,
+                cfg.lookback_seconds,
+            );
+            warn_on_costly_watermark(
+                w,
+                probes,
+                count_cost,
+                max_cost,
+                nullable,
+                cfg.lookback_seconds,
+                warnings,
+            );
+            if nullable && probes.count_nulls {
                 let null_count = s
-                    .count_null_watermark(
-                        &control,
-                        base_table,
-                        base_query,
-                        w,
-                        cfg.watermark_source_expr.as_deref(),
-                    )
+                    .count_null_watermark(&control, base_table, base_query, w, expr)
                     .await?;
                 warn_on_null_watermark(w, null_count, warnings);
             }
-            s.max_watermark(
-                &control,
-                base_table,
-                base_query,
-                w,
-                cfg.watermark_source_expr.as_deref(),
-            )
-            .await?
+            stream_max_cursor = probes.stream_max;
+            if probes.stream_max {
+                // No frozen upper bound: the filter is `wm > committed` alone,
+                // and the cursor comes from the rows actually read.
+                None
+            } else {
+                s.max_watermark(&control, base_table, base_query, w, expr)
+                    .await?
+            }
         } else {
             None
         }
@@ -2441,6 +2650,7 @@ async fn setup_postgres(
         source_cols,
         snapshot_max,
         partitions,
+        stream_max_cursor,
     })
 }
 
@@ -2450,6 +2660,8 @@ async fn setup_mysql(
     base_table: Option<&str>,
     base_query: Option<&str>,
     watermark: Option<&str>,
+    // No cursor persisted yet — this run reads the table from scratch anyway.
+    first_run: bool,
     warnings: &Warnings,
 ) -> Result<SourceSetup> {
     tracing::info!("connecting to mysql...");
@@ -2477,30 +2689,51 @@ async fn setup_mysql(
     // skip it in full-refresh so a watermark column left set alongside
     // mode="full" can't add a spurious query or fail on an aggregate edge
     // case (e.g. an empty table's MAX() being NULL) for a result nothing uses.
+    let mut stream_max_cursor = false;
     let snapshot_max = if cfg.mode == SyncMode::Incremental {
         if let Some(w) = watermark {
             ensure_watermark_column(w, &source_cols)?;
             ensure_lookback_compatible(w, cfg.lookback_seconds, &source_cols)?;
-            if watermark_column_nullable(w, &source_cols) {
+            // See the equivalent block in `setup_postgres`.
+            let nullable = watermark_column_nullable(w, &source_cols);
+            let expr = cfg.watermark_source_expr.as_deref();
+            let count_sql = MySqlSource::count_null_watermark_sql(base_table, base_query, w, expr);
+            let max_sql = MySqlSource::max_watermark_sql(base_table, base_query, w, expr);
+            let count_cost = if nullable {
+                s.explain_cost(&mut control, &count_sql).await
+            } else {
+                ProbeCost::Known(0.0)
+            };
+            let max_cost = s.explain_cost(&mut control, &max_sql).await;
+            let probes = plan_watermark_probes(
+                count_cost.clone(),
+                max_cost.clone(),
+                cfg.probe_max_cost,
+                first_run,
+                cfg.lookback_seconds,
+            );
+            warn_on_costly_watermark(
+                w,
+                probes,
+                count_cost,
+                max_cost,
+                nullable,
+                cfg.lookback_seconds,
+                warnings,
+            );
+            if nullable && probes.count_nulls {
                 let null_count = s
-                    .count_null_watermark(
-                        &mut control,
-                        base_table,
-                        base_query,
-                        w,
-                        cfg.watermark_source_expr.as_deref(),
-                    )
+                    .count_null_watermark(&mut control, base_table, base_query, w, expr)
                     .await?;
                 warn_on_null_watermark(w, null_count, warnings);
             }
-            s.max_watermark(
-                &mut control,
-                base_table,
-                base_query,
-                w,
-                cfg.watermark_source_expr.as_deref(),
-            )
-            .await?
+            stream_max_cursor = probes.stream_max;
+            if probes.stream_max {
+                None
+            } else {
+                s.max_watermark(&mut control, base_table, base_query, w, expr)
+                    .await?
+            }
         } else {
             None
         }
@@ -2513,6 +2746,7 @@ async fn setup_mysql(
         source_cols,
         snapshot_max,
         partitions,
+        stream_max_cursor,
     })
 }
 
@@ -3245,6 +3479,10 @@ async fn setup_clickhouse(
         source_cols,
         snapshot_max,
         partitions,
+        // ClickHouse reads are not gated on probe cost: its sparse primary
+        // index makes both probes cheap, and there is no seq-scan cliff to
+        // detect.
+        stream_max_cursor: false,
     })
 }
 
@@ -3558,7 +3796,8 @@ fn coercion_message(kind: WarningKind, column: &str, n: u64) -> String {
         // know the numbers that make them concrete.
         WarningKind::NullWatermark
         | WarningKind::FullRefreshShrink
-        | WarningKind::UnclusteredMergeTarget => {
+        | WarningKind::UnclusteredMergeTarget
+        | WarningKind::UnindexedWatermark => {
             format!("column '{column}': {n} affected row(s)")
         }
     }
@@ -3646,6 +3885,126 @@ fn watermark_column_nullable(watermark: &str, source_cols: &[ColumnType]) -> boo
         .find(|c| c.name == watermark)
         .expect("ensure_watermark_column already validated the watermark column exists")
         .nullable
+}
+
+/// Which setup-phase watermark probes to run, decided from what the planner
+/// says each would cost.
+///
+/// An incremental run probes the watermark column before any data moves:
+/// `MAX(watermark)` for the snapshot bound, and on a nullable column
+/// `count(*) WHERE watermark IS NULL` for the completeness check. Served by an
+/// index both are trivial (measured planner costs 0.65 and 2.07); unserved both
+/// are full sequential scans (3,031,034 and 3,031,091 for the same probes on a
+/// 14.9 GB table, 56.65s and 57.19s of wall clock, on every scheduled run).
+///
+/// Two earlier approaches were tried and rejected, both for measured reasons:
+///
+/// * **Bounding the `IS NULL` count with a `LIMIT`.** When no row is NULL — the
+///   common case — the planner must still scan everything to prove it, for
+///   identical cost. Skipping is the only lever.
+/// * **Reading `pg_index` to find the leading btree columns.** That cannot see
+///   through a `source_query`'s derived table, so the check was inert for
+///   exactly the transfers that needed it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct WatermarkProbePlan {
+    /// Run `count_null_watermark` (only ever considered for a nullable column).
+    count_nulls: bool,
+    /// Skip the `MAX(watermark)` bound and take the cursor from the read
+    /// stream instead. Requires a lookback window — see [`plan_watermark_probes`].
+    stream_max: bool,
+    /// At least one probe was too costly to run — emit `UnindexedWatermark`.
+    warn_costly: bool,
+}
+
+/// Decide the probe plan from the two planner estimates.
+///
+/// `first_run` matters for the completeness count: a first run reads the whole
+/// table anyway, so one more scan is a marginal cost paid once — and it is the
+/// moment the NULL-watermark condition matters most, since a pipeline that
+/// starts out excluding rows excludes them forever. Ongoing runs skip it, where
+/// the same scan is pure overhead repeated on every schedule tick.
+///
+/// `lookback_seconds` gates replacing `MAX(watermark)` with the stream-observed
+/// maximum. Without the frozen upper bound, rows written mid-read with high
+/// watermarks are read too, so the cursor can land above the `MAX` a frozen
+/// bound would have used — and anything in that widened band that was *not*
+/// read is then skipped. A lookback exceeding the read's own duration re-covers
+/// that band on the next run. With no lookback there is nothing to re-cover it,
+/// so the `MAX` scan is paid for instead.
+fn plan_watermark_probes(
+    count_cost: ProbeCost,
+    max_cost: ProbeCost,
+    threshold: f64,
+    first_run: bool,
+    lookback_seconds: u64,
+) -> WatermarkProbePlan {
+    let count_too_dear = count_cost.should_skip(threshold);
+    let max_too_dear = max_cost.should_skip(threshold);
+    WatermarkProbePlan {
+        count_nulls: first_run || !count_too_dear,
+        stream_max: max_too_dear && lookback_seconds > 0,
+        warn_costly: count_too_dear || max_too_dear,
+    }
+}
+
+/// Report a watermark column the planner says is expensive to probe, naming the
+/// evidence and everything that was skipped because of it.
+///
+/// Deliberately explicit when the NULL-watermark completeness check did not
+/// run: reporting a skipped check as a clean one is how the condition
+/// [`warn_on_null_watermark`] exists to catch goes unnoticed.
+fn warn_on_costly_watermark(
+    watermark: &str,
+    plan: WatermarkProbePlan,
+    count_cost: ProbeCost,
+    max_cost: ProbeCost,
+    nullable: bool,
+    lookback_seconds: u64,
+    warnings: &Warnings,
+) {
+    if !plan.warn_costly {
+        return;
+    }
+    let evidence = if max_cost.should_skip(f64::MIN_POSITIVE) {
+        max_cost.describe()
+    } else {
+        count_cost.describe()
+    };
+    let mut message = format!(
+        "watermark column '{watermark}' cannot be probed cheaply — {evidence}. The incremental \
+         filter `WHERE {watermark} > x` therefore scans the whole table on every run"
+    );
+    if plan.stream_max {
+        message.push_str(
+            ". quickhouse skipped the MAX(watermark) snapshot scan and took the cursor from the \
+             rows it actually read instead",
+        );
+    } else if lookback_seconds == 0 {
+        message.push_str(
+            ". The MAX(watermark) snapshot scan still ran: taking the cursor from the read \
+             stream instead needs lookback_seconds > 0, so that a row written mid-read is \
+             re-covered by the next run",
+        );
+    }
+    if nullable && !plan.count_nulls {
+        message.push_str(&format!(
+            ". quickhouse also skipped the nullable-watermark completeness count, which is a \
+             full scan too. Note that SKIPPED the check behind the null_watermark warning: if \
+             any row holds a NULL {watermark}, it is being silently excluded from this and \
+             every future incremental run and this run cannot tell you"
+        ));
+    }
+    message.push_str(&format!(
+        ". The durable fix is an index: CREATE INDEX CONCURRENTLY ON <table> ({watermark})."
+    ));
+    tracing::warn!("{message}");
+    warnings.push(TransferWarning {
+        kind: WarningKind::UnindexedWatermark,
+        column: Some(watermark.to_string()),
+        count: 0,
+        sample: None,
+        message,
+    });
 }
 
 /// Bug report B3: a `WHERE watermark > x` predicate never matches a NULL
@@ -4821,6 +5180,164 @@ mod tests {
             "read_idle_timeout_secs=0 must not impose any deadline"
         );
     }
+    const CHEAP: ProbeCost = ProbeCost::Known(2.07);
+    const DEAR: ProbeCost = ProbeCost::Known(3_031_034.0);
+    const T: f64 = crate::source::DEFAULT_PROBE_MAX_COST;
+
+    #[test]
+    fn cheap_probes_are_all_still_run() {
+        // The backward-compatibility guard: where the planner says both probes
+        // are index lookups, nothing changes and nothing is reported.
+        let p = plan_watermark_probes(CHEAP, CHEAP, T, false, 86_400);
+        assert!(p.count_nulls);
+        assert!(!p.stream_max, "a cheap MAX must still be used as the bound");
+        assert!(!p.warn_costly);
+    }
+
+    #[test]
+    fn costly_probes_are_skipped_on_an_ongoing_run() {
+        let p = plan_watermark_probes(DEAR, DEAR, T, false, 86_400);
+        assert!(
+            !p.count_nulls,
+            "a full-scan count is pure overhead per tick"
+        );
+        assert!(
+            p.stream_max,
+            "a full-scan MAX should give way to the stream"
+        );
+        assert!(p.warn_costly);
+    }
+
+    #[test]
+    fn a_first_run_still_pays_for_the_completeness_count() {
+        // It reads the whole table anyway, and this is the moment the
+        // NULL-watermark condition matters most: a pipeline that starts out
+        // excluding rows excludes them forever.
+        let p = plan_watermark_probes(DEAR, DEAR, T, true, 86_400);
+        assert!(p.count_nulls);
+        assert!(p.warn_costly, "the cost is still worth reporting");
+    }
+
+    #[test]
+    fn stream_max_requires_a_lookback_window() {
+        // Without a trailing re-scan nothing re-covers a row written mid-read
+        // that the scan had already passed, so the MAX scan is paid for.
+        let p = plan_watermark_probes(DEAR, DEAR, T, false, 0);
+        assert!(!p.stream_max);
+        assert!(p.warn_costly);
+    }
+
+    #[test]
+    fn an_unreachable_planner_skips_rather_than_scans() {
+        // The inverse of the earlier bug, where a cancelled probe silently
+        // upgraded the plan to "run the full scan and say nothing".
+        let p = plan_watermark_probes(ProbeCost::Unknown, ProbeCost::Unknown, T, false, 86_400);
+        assert!(!p.count_nulls);
+        assert!(p.stream_max);
+        assert!(p.warn_costly);
+    }
+
+    #[test]
+    fn zero_threshold_restores_unconditional_probing() {
+        let p = plan_watermark_probes(DEAR, DEAR, 0.0, false, 86_400);
+        assert!(p.count_nulls);
+        assert!(!p.stream_max);
+        assert!(!p.warn_costly);
+    }
+
+    #[test]
+    fn the_warning_names_the_evidence_and_the_skipped_check() {
+        let warnings = Warnings::default();
+        let p = plan_watermark_probes(DEAR, DEAR, T, false, 86_400);
+        warn_on_costly_watermark("write_date", p, DEAR, DEAR, true, 86_400, &warnings);
+        let out = warnings.drain();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].kind, WarningKind::UnindexedWatermark);
+        assert_eq!(out[0].column.as_deref(), Some("write_date"));
+        // The planner estimate must be quoted, so an operator can act on it.
+        assert!(out[0].message.contains("3031034"), "{}", out[0].message);
+        assert!(out[0].message.contains("SKIPPED"), "{}", out[0].message);
+        assert!(out[0].message.contains("CREATE INDEX CONCURRENTLY"));
+    }
+
+    #[test]
+    fn no_warning_when_both_probes_are_cheap() {
+        let warnings = Warnings::default();
+        let p = plan_watermark_probes(CHEAP, CHEAP, T, false, 86_400);
+        warn_on_costly_watermark("write_date", p, CHEAP, CHEAP, true, 86_400, &warnings);
+        assert!(warnings.drain().is_empty());
+    }
+
+    #[test]
+    fn the_warning_omits_the_skip_note_for_a_not_null_watermark() {
+        // Nothing was skipped, because the count never runs on a NOT NULL
+        // column — the warning must not claim a lost check.
+        let warnings = Warnings::default();
+        let p = plan_watermark_probes(ProbeCost::Known(0.0), DEAR, T, false, 86_400);
+        warn_on_costly_watermark(
+            "write_date",
+            p,
+            ProbeCost::Known(0.0),
+            DEAR,
+            false,
+            86_400,
+            &warnings,
+        );
+        let out = warnings.drain();
+        assert_eq!(out.len(), 1);
+        assert!(
+            !out[0].message.contains("SKIPPED the check"),
+            "{}",
+            out[0].message
+        );
+    }
+
+    #[test]
+    fn watermark_renders_at_fixed_width_and_orders_chronologically() {
+        // PostgreSQL's own timestamp::text drops trailing zeros (.100000 -> .1),
+        // so a stored cursor and a freshly rendered one can differ as STRINGS
+        // while being equal as timestamps. Rendering at fixed width is what
+        // makes the values we generate mutually comparable; the server casts
+        // the literal either way, which is what keeps them interchangeable with
+        // cursors written by earlier versions.
+        let t = WatermarkTracker {
+            idx: 0,
+            unit: WatermarkUnit::NaiveMicros,
+            max: AtomicI64::new(0),
+        };
+        // 2024-01-01T00:00:00.100000Z
+        t.max.store(1_704_067_200_100_000, Ordering::Relaxed);
+        assert_eq!(t.render().as_deref(), Some("2024-01-01 00:00:00.100000"));
+        t.max.store(1_704_067_200_000_000, Ordering::Relaxed);
+        assert_eq!(t.render().as_deref(), Some("2024-01-01 00:00:00.000000"));
+        t.max.store(1_704_067_200_123_456, Ordering::Relaxed);
+        assert_eq!(t.render().as_deref(), Some("2024-01-01 00:00:00.123456"));
+        // Fixed width means lexicographic order matches chronological order.
+        assert!("2024-01-01 00:00:00.000000" < "2024-01-01 00:00:00.100000");
+    }
+
+    #[test]
+    fn nothing_read_means_no_cursor_advance() {
+        // The sentinel must not render as a date ~292,000 years before the
+        // epoch; it must leave the cursor exactly where it was.
+        let t = WatermarkTracker {
+            idx: 0,
+            unit: WatermarkUnit::NaiveMicros,
+            max: AtomicI64::new(i64::MIN),
+        };
+        assert_eq!(t.render(), None);
+    }
+
+    #[test]
+    fn a_date_watermark_renders_as_a_bare_date() {
+        let t = WatermarkTracker {
+            idx: 0,
+            unit: WatermarkUnit::Days,
+            max: AtomicI64::new(19_723), // 2024-01-01
+        };
+        assert_eq!(t.render().as_deref(), Some("2024-01-01"));
+    }
+
     #[tokio::test]
     async fn validate_with_chunk_rows_is_rejected_up_front() {
         let mut cfg = crate::config::default_test_config();

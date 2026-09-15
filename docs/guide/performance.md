@@ -64,6 +64,59 @@ qh.sync(
   a DBA can see and kill it in `pg_stat_activity` (override with
   `application_name=`).
 
+## When the watermark column has no index
+
+An incremental run probes the watermark column before any data moves: a
+`MAX(watermark)` to pin the window's upper bound, and — on a nullable column —
+a `count(*) WHERE watermark IS NULL` to catch rows a `>` predicate would
+silently exclude forever. With an index both are trivial. Without one, each is
+a full sequential scan of the whole table, **every run**.
+
+Measured against a PostgreSQL 16 standby, on a 14.9 GB table:
+
+| Probe | Unindexed | Indexed (same server) |
+| --- | --- | --- |
+| `count(*) WHERE wm IS NULL` | 56.65s (planner cost 3,031,034) | cost 2.07 |
+| `MAX(wm)` | 57.19s (cost 3,031,091) | cost 0.65 |
+
+quickhouse asks the planner what each would cost — `EXPLAIN`, never `ANALYZE`,
+so nothing is executed — and skips those above `probe_max_cost`. Asking the
+planner rather than the catalog matters: an index lookup has no base table to
+consult when the transfer reads through a `source_query`, whereas `EXPLAIN`
+plans the real statement.
+
+When the `MAX` probe is skipped, the cursor is taken from the rows actually
+read. That needs `lookback_seconds > 0` — see below.
+
+```{admonition} The skipped check is a real check
+:class: warning
+Where the nullable-watermark completeness count is skipped, quickhouse can no
+longer tell you whether rows hold a NULL watermark — and such rows are excluded
+from this and every future incremental run. The `unindexed_watermark` warning
+says so, and quotes the estimate that caused it. A **first** run still pays for
+the count. Treat the warning as a prompt to add the index:
+
+    CREATE INDEX CONCURRENTLY ON your_table (your_watermark_column);
+```
+
+```{admonition} Why the stream cursor needs a lookback
+:class: note
+Without the frozen upper bound, rows written mid-read with high watermarks are
+read too, so the cursor can land *above* the `MAX` that bound would have used —
+and anything in that widened band which was not read would then be skipped. A
+lookback exceeding the read's own duration re-covers it on the next run. With
+`lookback_seconds=0` quickhouse pays for the `MAX` scan rather than take that
+risk.
+```
+
+The filter itself still scans — nothing but an index fixes that. On a hot
+standby the cost is not only time: a multi-second scan is a candidate for
+`max_standby_streaming_delay` cancellation (`SQLSTATE 40001, canceling
+statement due to conflict with recovery`). Retrying does not rescue it — every
+attempt restarts from zero against the same ceiling and re-pays the same scan,
+and the backoff schedule is far shorter than the conflict window. Remove the
+scan, or raise the standby's tolerance.
+
 ## Two timeouts, and which one you actually want
 
 ```{admonition} `statement_timeout_secs` bounds the whole transfer, not the query

@@ -211,7 +211,8 @@ impl CoercionTally {
             // Table-level conditions are raised by `sync`, never tallied here.
             WarningKind::NullWatermark
             | WarningKind::FullRefreshShrink
-            | WarningKind::UnclusteredMergeTarget => None,
+            | WarningKind::UnclusteredMergeTarget
+            | WarningKind::UnindexedWatermark => None,
         }
     }
 

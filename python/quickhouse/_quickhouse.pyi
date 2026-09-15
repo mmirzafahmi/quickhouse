@@ -499,6 +499,14 @@ class TransferWarning:
       destination not clustered by the merge key, so the key bound pruned
       nothing and the statement scanned the whole table. A cost problem, not a
       data one.
+    - ``"unindexed_watermark"`` — the planner estimated a setup-phase
+      watermark probe as too costly to run (see ``probe_max_cost``), meaning
+      ``WHERE watermark > x`` has no index to use and scans the whole table
+      every run. The message quotes the estimate. **Read it**: where the
+      nullable-watermark completeness count was skipped, the condition behind
+      ``"null_watermark"`` would go undetected. A first run still pays for that
+      count, since it reads the whole table anyway. The durable fix is an index
+      on the watermark column.
     """
 
     column: Optional[str]
@@ -628,6 +636,7 @@ def sync(
     read_idle_timeout_secs: int = 0,
     chunk_rows: Optional[int] = None,
     retry_max_attempts: int = 1,
+    probe_max_cost: float = 50_000.0,
     column_transforms: Optional[Mapping[str, str]] = None,
     column_transform_types: Optional[Mapping[str, str]] = None,
     evolve_schema: bool = False,
@@ -787,6 +796,22 @@ def sync(
 
     Robustness & schema:
 
+    - ``probe_max_cost`` (default ``50_000.0``, ``0`` disables) skips a
+      setup-phase watermark probe when the query planner estimates it would
+      cost more than this. An incremental run probes the watermark column
+      before any data moves — ``MAX(watermark)`` for the snapshot bound, and on
+      a nullable column ``count(*) WHERE watermark IS NULL`` for the
+      completeness check. Served by an index both are trivial; unserved both
+      are full sequential scans of the whole table, on *every* run. Measured on
+      a 14.9 GB table with no index on the watermark: 56.65s and 57.19s, versus
+      planner costs of 2.07 and 0.65 for the same probes on an indexed column.
+      quickhouse asks with ``EXPLAIN`` (never ``ANALYZE`` — nothing is
+      executed), which unlike an index lookup sees straight through a
+      ``source_query``. When the ``MAX`` probe is skipped the cursor is taken
+      from the rows actually read instead, which requires
+      ``lookback_seconds > 0``. Cost units are each engine's own and mean
+      nothing absolute; the default separates the two measured populations.
+      Skipping is reported as ``"unindexed_watermark"``.
     - ``retry_max_attempts`` (default ``1`` = no retry) re-runs the whole
       transfer on a *transient source* error — PostgreSQL hot-standby recovery
       conflict / statement cancel, MySQL server-gone-away / lock-wait / deadlock.

@@ -985,6 +985,34 @@ pub struct TransferConfig {
     /// `1` (default) = no retry, byte-identical to before. Sink/write-side
     /// retries are separate and always on (see `sink::backoff_delay`).
     pub retry_max_attempts: u32,
+    /// Skip a setup-phase watermark probe when the planner estimates it will
+    /// cost more than this. `0` disables the gate, running every probe
+    /// unconditionally as before.
+    ///
+    /// **What this protects against.** An incremental run probes the watermark
+    /// column before any data moves: `MAX(watermark)` for the snapshot bound,
+    /// and on a nullable column `count(*) WHERE watermark IS NULL` for the
+    /// completeness check. Served by an index they are trivial; unserved they
+    /// are full sequential scans of the whole table, on every scheduled run.
+    /// Measured on a 14.9 GB Odoo table whose watermark has no index: 56.65s
+    /// and 57.19s respectively, against planner costs of 2.07 and 0.65 for the
+    /// same probes on an indexed column. On a hot standby they are worse than
+    /// slow — three of six measured runs were cancelled outright by
+    /// `max_standby_streaming_delay` (`SQLSTATE 40001`), which ends the
+    /// transfer.
+    ///
+    /// **Why a planner estimate rather than an index lookup.** Reading
+    /// `pg_index` cannot see through a `source_query` — there is no base table
+    /// to look up — so the check would be inert for exactly the non-trivial
+    /// transfers that need it. `EXPLAIN` (never `ANALYZE`, so nothing is
+    /// executed) plans the real query and reports what will actually happen.
+    ///
+    /// The default sits between the two regimes measured on real hardware:
+    /// indexed probes cost 0.65–8.49, unindexed ones 1.6M–11.2M. Cost units are
+    /// each engine's own and are not comparable between them, nor to wall-clock
+    /// time; the value is chosen to separate those measured populations, not to
+    /// mean anything absolute.
+    pub probe_max_cost: f64,
     /// Per-column SQL value transforms applied in the source `SELECT`
     /// (source-column name -> expression, e.g. `"CAST(x AS TEXT)"`,
     /// `"col AT TIME ZONE 'UTC'"`, `"ROUND(amt, 9)"`). Applied over
@@ -1461,6 +1489,14 @@ pub enum WarningKind {
     /// `allow_full_refresh_shrink` permitted it. (Without that flag the same
     /// condition is a hard error, not a warning.)
     FullRefreshShrink,
+    /// The incremental watermark column has no btree index leading with it, so
+    /// `WHERE watermark > x` cannot use one and every incremental run scans the
+    /// whole table. quickhouse drops the probes it can (the `MAX(watermark)`
+    /// snapshot bound, the nullable-watermark completeness count) to avoid
+    /// paying for that scan two extra times, which is what this warning
+    /// reports. Not a data problem on its own — a cost one, plus the
+    /// completeness check it had to skip.
+    UnindexedWatermark,
     /// A BigQuery `MERGE` ran against a destination that is not clustered by
     /// the merge key, so the key-range prune had nothing to prune with and the
     /// statement scanned the whole table. Not a data problem — a cost one.
@@ -1480,6 +1516,7 @@ impl WarningKind {
             WarningKind::NullWatermark => "null_watermark",
             WarningKind::FullRefreshShrink => "full_refresh_shrink",
             WarningKind::UnclusteredMergeTarget => "unclustered_merge_target",
+            WarningKind::UnindexedWatermark => "unindexed_watermark",
         }
     }
 }
@@ -1595,6 +1632,7 @@ pub(crate) fn default_test_config() -> TransferConfig {
         read_idle_timeout_secs: 0,
         chunk_rows: None,
         retry_max_attempts: 1,
+        probe_max_cost: crate::source::DEFAULT_PROBE_MAX_COST,
         column_transforms: HashMap::new(),
         column_transform_types: HashMap::new(),
         evolve_schema: false,
@@ -1707,6 +1745,7 @@ mod tests {
             read_idle_timeout_secs: 0,
             chunk_rows: None,
             retry_max_attempts: 1,
+            probe_max_cost: crate::source::DEFAULT_PROBE_MAX_COST,
             column_transforms: HashMap::new(),
             column_transform_types: HashMap::new(),
             evolve_schema: false,

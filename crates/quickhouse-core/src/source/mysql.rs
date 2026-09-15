@@ -16,7 +16,7 @@ use mysql_async::prelude::*;
 use mysql_async::{ClientIdentity, Conn, Opts, OptsBuilder, SslOpts, Value};
 
 use crate::error::{EtlError, Result};
-use crate::source::Keyset;
+use crate::source::{Keyset, ProbeCost};
 use crate::types::{mysql::map_mysql_type, ColumnType};
 
 use super::Partition;
@@ -174,6 +174,27 @@ impl MySqlSource {
         Ok(cols)
     }
 
+    /// Ask the optimizer what `sql` would cost, without running it. See
+    /// [`crate::source::PgSource::explain_cost`] for the rationale.
+    ///
+    /// MySQL omits `cost_info` for shapes its optimizer resolves away — notably
+    /// `MAX()` over an indexed column — and for some derived-table queries. In
+    /// that case [`ProbeCost::AccessPath`] carries whether any step is a full
+    /// scan (`access_type: ALL`) instead. Cost is preferred where available
+    /// because access type alone is not sufficient: a measured probe on a real
+    /// table reported `access_type: ref` at a cost of 3,951,736.
+    pub async fn explain_cost(&self, conn: &mut Conn, sql: &str) -> ProbeCost {
+        let explain = super::explain::mysql_explain_sql(sql);
+        match conn.query_first::<String, _>(explain).await {
+            Ok(Some(json)) => super::explain::parse_mysql_cost(&json),
+            Ok(None) => ProbeCost::Unknown,
+            Err(e) => {
+                tracing::debug!("EXPLAIN failed, treating the probe as too costly: {e}");
+                ProbeCost::Unknown
+            }
+        }
+    }
+
     /// Compute range partitions over `column`, either for a base table
     /// (`from_table`) or for a wrapped `source_query` (`base_query`). Falls back
     /// to a single partition when the column isn't an integer type or has no
@@ -328,17 +349,7 @@ impl MySqlSource {
         watermark: &str,
         source_expr: Option<&str>,
     ) -> Result<Option<String>> {
-        let w = source_expr
-            .map(str::to_string)
-            .unwrap_or_else(|| quote_my(watermark));
-        let sql = if let Some(q) = base_query {
-            format!("SELECT CAST(MAX({w}) AS CHAR) FROM ({q}) AS _src")
-        } else {
-            format!(
-                "SELECT CAST(MAX({w}) AS CHAR) FROM {t}",
-                t = quote_my_table(from_table.expect("table required"))
-            )
-        };
+        let sql = Self::max_watermark_sql(from_table, base_query, watermark, source_expr);
         // MAX() over an empty table (or an all-NULL column) returns one row
         // whose value is SQL NULL — must be requested as `Option<String>`,
         // not `String`, or mysql_common panics converting NULL to a bare
@@ -347,6 +358,27 @@ impl MySqlSource {
             .await
             .map(|row| row.flatten())
             .map_err(|e| EtlError::from(e).context("reading mysql max watermark"))
+    }
+
+    /// The SQL [`Self::max_watermark`] would run. Exposed so a caller can
+    /// `EXPLAIN` the exact statement before deciding to pay for it.
+    pub fn max_watermark_sql(
+        from_table: Option<&str>,
+        base_query: Option<&str>,
+        watermark: &str,
+        source_expr: Option<&str>,
+    ) -> String {
+        let w = source_expr
+            .map(str::to_string)
+            .unwrap_or_else(|| quote_my(watermark));
+        if let Some(q) = base_query {
+            format!("SELECT CAST(MAX({w}) AS CHAR) FROM ({q}) AS _src")
+        } else {
+            format!(
+                "SELECT CAST(MAX({w}) AS CHAR) FROM {t}",
+                t = quote_my_table(from_table.expect("table required"))
+            )
+        }
     }
 
     /// Count rows whose watermark value is NULL — see
@@ -360,21 +392,31 @@ impl MySqlSource {
         watermark: &str,
         source_expr: Option<&str>,
     ) -> Result<i64> {
+        let sql = Self::count_null_watermark_sql(from_table, base_query, watermark, source_expr);
+        conn.query_first::<i64, _>(sql)
+            .await
+            .map(|v| v.unwrap_or(0))
+            .map_err(|e| EtlError::from(e).context("reading mysql null-watermark count"))
+    }
+
+    /// The SQL [`Self::count_null_watermark`] would run, for `EXPLAIN`.
+    pub fn count_null_watermark_sql(
+        from_table: Option<&str>,
+        base_query: Option<&str>,
+        watermark: &str,
+        source_expr: Option<&str>,
+    ) -> String {
         let w = source_expr
             .map(str::to_string)
             .unwrap_or_else(|| quote_my(watermark));
-        let sql = if let Some(q) = base_query {
+        if let Some(q) = base_query {
             format!("SELECT count(*) FROM ({q}) AS _src WHERE {w} IS NULL")
         } else {
             format!(
                 "SELECT count(*) FROM {t} WHERE {w} IS NULL",
                 t = quote_my_table(from_table.expect("table required"))
             )
-        };
-        conn.query_first::<i64, _>(sql)
-            .await
-            .map(|v| v.unwrap_or(0))
-            .map_err(|e| EtlError::from(e).context("reading mysql null-watermark count"))
+        }
     }
 
     /// Every distinct non-NULL value of `key`, as text, over the rows `window`

@@ -261,6 +261,7 @@ mod tests {
             read_idle_timeout_secs: 0,
             chunk_rows: None,
             retry_max_attempts: 1,
+            probe_max_cost: crate::source::DEFAULT_PROBE_MAX_COST,
             column_transforms: HashMap::new(),
             column_transform_types: HashMap::new(),
             evolve_schema: false,

@@ -9,6 +9,72 @@ any breaking change is called out explicitly.
 
 ## [Unreleased]
 
+## [0.18.0] — 2026-09-15
+
+### Performance — incremental runs whose watermark has no index
+
+An incremental run probes the watermark column before any data moves: a
+`MAX(watermark)` snapshot bound, and on a nullable column a
+`count(*) WHERE watermark IS NULL` completeness check. Both assumed an index
+that quickhouse never verified. Without one, each is a full sequential scan of
+the whole table, on every scheduled run.
+
+Measured against a PostgreSQL 16 hot standby:
+
+| Table | Probe | Result |
+| --- | --- | --- |
+| `account_move` 14.9 GB | `count(*) IS NULL` | 56.65s |
+| `account_move` | `MAX(write_date)` | 57.19s |
+| `sale_order` 19.4 GB | `count(*) IS NULL` | **cancelled at 37.51s — `SQLSTATE 40001`** |
+| `mail_message` 56.7 GB | `MAX(write_date)` | **cancelled at 78.63s — `SQLSTATE 40001`** |
+
+Three of six measured probe runs were killed by the standby's
+`max_standby_streaming_delay` (`canceling statement due to conflict with
+recovery`), which ends the transfer. On the same server, where the watermark
+*is* indexed, the same two probes plan at cost 2.07 and 0.65.
+
+**Added — `probe_max_cost`** (default `50000`, `0` disables). Before running
+either probe, quickhouse asks the planner what it would cost — `EXPLAIN
+(FORMAT JSON)` on PostgreSQL, `EXPLAIN FORMAT=JSON` on MySQL, never `ANALYZE`,
+so nothing is executed — and skips it when the estimate exceeds this.
+
+Two design points, both settled by measurement rather than reasoning:
+
+- **The planner, not the catalog.** An index lookup in `pg_index` cannot see
+  through a `source_query`'s derived table, so such a check is inert for
+  exactly the non-trivial transfers that need it. `EXPLAIN` has no blind spot:
+  through a production-shaped `source_query` wrapper it still reported cost
+  3,031,034 for an unindexed probe and 2.07 for an indexed one.
+- **Cost, not plan shape.** A MySQL probe reporting `access_type: ref` —
+  nominally an indexed access — measured a cost of 3,951,736. "Is it a full
+  scan?" waves that through.
+
+An `EXPLAIN` that fails or is itself cancelled counts as *too costly*, not as
+cheap: when the planner cannot be reached, the full-scan query is the one thing
+that must not then be attempted.
+
+**Changed — the cursor can now come from the read stream.** When the
+`MAX(watermark)` probe is skipped, the run reads with no frozen upper bound and
+persists the largest watermark value it actually read. This requires
+`lookback_seconds > 0`: without the frozen bound the cursor can land above the
+`MAX` that bound would have used, and a trailing re-scan is what re-covers
+anything written mid-read. With no lookback configured, the `MAX` scan is paid
+for instead. The maximum is folded as the raw Arrow integer and rendered once,
+so PostgreSQL's habit of dropping trailing zeros in `timestamp::text` cannot
+affect ordering.
+
+**Changed — the nullable-watermark completeness count is conditional.** It runs
+when cheap, and on a **first** run regardless — that run reads the whole table
+anyway, and it is the moment the condition matters most, since a pipeline that
+starts out excluding rows excludes them forever. Bounding it with a `LIMIT`
+instead was measured and does not work: with no NULL row the planner must still
+scan everything to prove it, for identical cost.
+
+**Added — `WarningKind::UnindexedWatermark`** (`"unindexed_watermark"`). Quotes
+the planner's estimate, and states plainly when the completeness check was
+skipped — reporting a skipped check as a clean one is how that condition goes
+unnoticed.
+
 ## [0.17.0] — 2026-09-15
 
 A DataFrame was the one thing quickhouse could not move. You could point it at
@@ -1155,7 +1221,8 @@ config change, but it is a different BigQuery API call
 - Initial release: parallel, bounded-memory PostgreSQL → ClickHouse transfer with
   automatic DDL, full-refresh and incremental modes, and type mapping.
 
-[Unreleased]: https://github.com/mmirzafahmi/quickhouse/compare/v0.17.0...HEAD
+[Unreleased]: https://github.com/mmirzafahmi/quickhouse/compare/v0.18.0...HEAD
+[0.18.0]: https://github.com/mmirzafahmi/quickhouse/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/mmirzafahmi/quickhouse/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/mmirzafahmi/quickhouse/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/mmirzafahmi/quickhouse/compare/v0.14.1...v0.15.0
