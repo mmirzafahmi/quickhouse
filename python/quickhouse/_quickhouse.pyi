@@ -588,7 +588,10 @@ class ReconcileResult:
     duration_secs: float
 
 def sync(
-    source: Union[Postgres, MySQL, BigQuery, ClickHouse, CleverTap, AppsFlyer, HttpApi],
+    # `bytes` is accepted privately: it is how quickhouse.from_pandas() hands an
+    # already-serialized Arrow IPC stream to the engine. Not part of the public
+    # API — use from_pandas() rather than building the bytes yourself.
+    source: Union[Postgres, MySQL, BigQuery, ClickHouse, CleverTap, AppsFlyer, HttpApi, bytes],
     target: Union[ClickHouse, BigQuery],
     dest_table: str,
     *,

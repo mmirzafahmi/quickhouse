@@ -44,6 +44,18 @@ Connection descriptors accepted as ``sync()``'s ``source`` argument.
 .. autoclass:: AppsFlyer
 ```
 
+## DataFrames
+
+Writing an in-memory pandas/polars/pyarrow frame. See the
+[DataFrames guide](guide/sources/dataframes.md). Requires
+`pip install quickhouse[pandas]`.
+
+```{eval-rst}
+.. autofunction:: from_pandas
+
+.. autoclass:: QuickhouseWarning
+```
+
 ## Destinations
 
 Connection descriptors accepted as ``sync()``'s ``target`` argument. ``BigQuery``

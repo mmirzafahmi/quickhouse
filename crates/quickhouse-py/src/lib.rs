@@ -538,8 +538,41 @@ impl HttpApi {
     }
 }
 
+/// The serialized Arrow IPC stream `quickhouse.from_pandas` produces.
+///
+/// A hand-written extractor rather than `Vec<u8>`: the derived one would accept
+/// any sequence of small ints, so a caller passing something odd would be
+/// matched here instead of failing against the real descriptors.
+///
+/// The bytes are copied out while the GIL is still held. pyo3 0.22 offers
+/// `PyBackedBytes`, which would avoid the copy, but it keeps a `Py<PyBytes>`
+/// alive — and this module's whole boundary discipline (see the module docs) is
+/// that no live Python object crosses `allow_threads`. The copy is the price of
+/// that, and it is paid once.
+struct FrameBytes(Vec<u8>);
+
+impl<'py> FromPyObject<'py> for FrameBytes {
+    fn extract_bound(ob: &Bound<'py, PyAny>) -> PyResult<Self> {
+        Ok(FrameBytes(
+            ob.downcast::<pyo3::types::PyBytes>()
+                .map_err(|_| {
+                    PyRuntimeError::new_err(
+                        "expected a connection descriptor (Postgres, MySQL, BigQuery, ClickHouse, \
+                         CleverTap, AppsFlyer, HttpApi) as the sync() source",
+                    )
+                })?
+                .as_bytes()
+                .to_vec(),
+        ))
+    }
+}
+
 /// Accepts `Postgres`, `MySQL`, `BigQuery`, `ClickHouse`, `CleverTap`,
 /// `AppsFlyer`, or `HttpApi` as `sync()`'s `source` argument.
+///
+/// `Frame` is private and undocumented: it is how `quickhouse.from_pandas`
+/// hands an already-serialized DataFrame to the engine, and it is last so every
+/// real descriptor is tried first.
 #[derive(FromPyObject)]
 enum AnySource {
     Postgres(Postgres),
@@ -549,6 +582,7 @@ enum AnySource {
     CleverTap(CleverTap),
     AppsFlyer(AppsFlyer),
     HttpApi(HttpApi),
+    Frame(FrameBytes),
 }
 
 impl From<AnySource> for core::SourceConfig {
@@ -622,6 +656,10 @@ impl From<AnySource> for core::SourceConfig {
                 from_date: h.from_date,
                 to_date: h.to_date,
                 lookback_days: h.lookback_days,
+            }),
+            AnySource::Frame(b) => core::SourceConfig::Arrow(core::ArrowFrameConfig {
+                ipc: b.0.into(),
+                label: None,
             }),
         }
     }

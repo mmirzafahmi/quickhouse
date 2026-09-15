@@ -62,6 +62,34 @@ whatever timezone its type names.
 aren't readable yet — each is a clear error naming the column. Cast it to
 `String` in a `source_query`, or `exclude` it.
 
+## DataFrames
+
+`from_pandas` normalises what it safely can and refuses the rest by name. The
+conversions are applied in Python, before anything reaches the engine:
+
+| incoming | becomes | note |
+|---|---|---|
+| `datetime64[ns]` (and `[s]`/`[ms]`) | `DateTime64(6)` | quickhouse standardises on microseconds. Real sub-microsecond digits **raise** rather than truncating — round with `.dt.floor('us')` |
+| tz-aware, named zone | `DateTime64(6, 'Asia/Jakarta')` | carried through |
+| tz-aware, fixed offset (`+07:00`) | `DateTime64(6, 'UTC')` + warning | ClickHouse's `DateTime64` takes a zone *name*; the instant is unchanged |
+| naive `datetime64` | `DateTime64(6)` — **naive** | an unplaced wall clock stays unplaced, as with PostgreSQL `timestamp` |
+| `category` | the value type | dictionary-decoded; expands in memory |
+| `Int64`/`boolean`/`string` (nullable extension dtypes) | `Nullable(Int64)` etc. | stays an integer, so ids above 2^53 remain exact |
+| `Decimal` objects | `Decimal(P, S)` | precision inferred from the values present — pin it with `type_overrides` for a stable DDL across runs |
+| `float16` | `Float32` | lossless |
+| `date64`, `time32`/`time64` | `Date32`, `String` | TIME as text, matching every other source |
+| `large_string`, `string_view`, `large_binary` | `String`, `String` | the `pd.ArrowDtype` / polars family |
+
+Refused, naming the column and the fix: values outside the 1900–2299 window
+(checked with one vectorised pass, rather than letting the server reject the
+insert partway through), nested `list`/`struct`/`map`, `Decimal256`, durations
+and intervals, all-null columns, duplicate column names, and non-string column
+names.
+
+Note `NaN` in a float column is a *value*, not a null: ClickHouse stores a NaN,
+BigQuery converts it to NULL. Use `pd.NA` (or a nullable dtype) if you mean
+missing.
+
 ## Out-of-range and zero dates
 
 Out-of-range dates, and MySQL zero-dates like `0000-00-00`, coerce to `NULL`

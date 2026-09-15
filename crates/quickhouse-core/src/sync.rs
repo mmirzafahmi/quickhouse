@@ -19,8 +19,8 @@ use tokio::task::JoinSet;
 
 use crate::archive::{archive_object_key, build_s3_store, S3ArchiveWriter};
 use crate::config::{
-    ApiColumn, DestinationConfig, ParquetCompression, S3ArchiveConfig, SourceConfig, SyncMode,
-    TransferConfig, TransferResult, TransferWarning, WarningKind, WatermarkSeed,
+    ApiColumn, DestinationConfig, ParquetCompression, S3ArchiveConfig, SourceConfig, SourceShape,
+    SyncMode, TransferConfig, TransferResult, TransferWarning, WarningKind, WatermarkSeed,
 };
 use crate::decode::CopyDecoder;
 use crate::decode_api::{resolve_api_columns, ApiBatcher};
@@ -718,12 +718,13 @@ async fn run_transfer_impl(
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let mut cfg = cfg;
-    // API sources have no source_table/source_query and reject a few DB-only
-    // knobs; validate them under the API rules.
-    if source_cfg.is_api() {
-        cfg.validate_api()?;
-    } else {
-        cfg.validate()?;
+    // Each source shape has its own rules: an API source has no
+    // source_table/source_query and rejects a few DB-only knobs, and a frame
+    // additionally has no source to filter, partition, pace or resume against.
+    match source_cfg.shape() {
+        SourceShape::Api => cfg.validate_api()?,
+        SourceShape::Frame => cfg.validate_frame()?,
+        SourceShape::Db => cfg.validate()?,
     }
     // Drop mode-irrelevant fields (e.g. a watermark passed with mode="full")
     // so the config that runs matches what's effective — see normalize().
@@ -815,6 +816,19 @@ async fn run_transfer_impl(
         .await;
     }
 
+    // An in-memory Arrow frame: the schema arrives with the data and there is
+    // nothing to connect to, so — like the API flow above — this returns before
+    // any of the partition machinery is built. archive is None for the same
+    // reason it is there (S3 archiving is wired for DB sources only).
+    if let SourceConfig::Arrow(frame) = &source_cfg {
+        let frame = frame.clone();
+        let sink = build_sink(dest).await?;
+        return run_transfer_frame(
+            frame, sink, cfg, progress, on_staged, started, staging, warnings,
+        )
+        .await;
+    }
+
     let source = Arc::new(match &source_cfg {
         SourceConfig::Postgres(pg) => Source::Postgres(PgSource::new(
             pg.dsn.clone(),
@@ -837,6 +851,7 @@ async fn run_transfer_impl(
         SourceConfig::CleverTap(_) | SourceConfig::AppsFlyer(_) | SourceConfig::HttpApi(_) => {
             unreachable!("API sources handled via early return above")
         }
+        SourceConfig::Arrow(_) => unreachable!("frame sources handled via early return above"),
     });
     let sink = build_sink(dest).await?;
 
@@ -2082,6 +2097,257 @@ async fn run_transfer_api(
             stage_secs,
             promote_secs: promote_started.elapsed().as_secs_f64(),
             new_watermark,
+            warnings: warnings.drain(),
+        })
+    }
+    .await;
+
+    if outcome.is_err() && used_staging {
+        cleanup_staging(&cleanup_sink, &cleanup_staging_name).await;
+    }
+    outcome
+}
+
+/// Transfer an in-memory Arrow frame (`quickhouse.from_pandas`) into either
+/// destination.
+///
+/// Structurally the API flow with the fetching removed: the schema arrives with
+/// the data, so there is no catalog to probe, no window to derive, no cursor to
+/// resume and no connection to open. What is left is decode -> push -> promote,
+/// sharing `prepare_target`, `SendCtx` and the promotion tail with every other
+/// source.
+///
+/// The frame is decoded with `StreamReader` rather than
+/// [`crate::decode_clickhouse::ChArrowDecoder`] on purpose. That decoder is
+/// push-based because an HTTP body arrives in arbitrary chunks, and it copies
+/// every chunk (`Buffer::from_vec(chunk.to_vec())`) to own it — correct there,
+/// and a pointless full copy of a buffer we already hold. `StreamReader` also
+/// takes a column projection natively, which is what makes `include=`/`exclude=`
+/// free here.
+#[allow(clippy::too_many_arguments)]
+async fn run_transfer_frame(
+    frame: crate::config::ArrowFrameConfig,
+    sink: Arc<dyn Sink>,
+    mut cfg: TransferConfig,
+    progress: Option<ProgressCb>,
+    on_staged: Option<StagedValidationCb>,
+    started: Instant,
+    staging: String,
+    warnings: Warnings,
+) -> Result<TransferResult> {
+    use std::io::Cursor;
+
+    use arrow::ipc::reader::StreamReader;
+    use arrow_schema::{Field, Schema};
+
+    // Without a source_table, `effective_state_key()` is empty — give the
+    // incremental cursor a stable identity. A user `state_key` still wins, and
+    // so does an explicit frame label.
+    if cfg.state_key.is_none() {
+        cfg.state_key = Some(
+            frame
+                .label
+                .as_ref()
+                .map(|l| format!("frame:{l}"))
+                .unwrap_or_else(|| format!("frame:{}", cfg.dest_table)),
+        );
+    }
+
+    // Schema probe: `try_new` reads the stream's leading schema message and
+    // stops, so this costs one message, not a decode of the whole frame.
+    let incoming = StreamReader::try_new(Cursor::new(&frame.ipc[..]), None)
+        .map_err(|e| {
+            EtlError::decode(format!(
+                "the frame is not a readable Arrow IPC stream ({e}). It is produced by \
+                 quickhouse's own Python layer, so this generally means the bytes were \
+                 truncated or built by something else."
+            ))
+        })?
+        .schema();
+    let source_cols = crate::types::arrow_frame::columns_from_arrow_schema(&incoming)?;
+
+    // `true`, unlike the ClickHouse source. A frame carries no NOT NULL
+    // constraint — pandas has no such concept, so a `nullable: false` here is a
+    // claim about *this* frame that the next one breaks (run 1 has no nulls in
+    // `amount`, run 2 does, and the second fails the Arrow schema-consistency
+    // check). `key`/`order_by`/`primary_key`/`not_null` still force NOT NULL
+    // where it is actually required.
+    let plan: SelectPlan = transform::plan_with(&source_cols, &cfg, sink.dest_kind(), true)?;
+    let plan = Arc::new(plan);
+
+    // `include=`/`exclude=` become an Arrow column projection, applied by the
+    // reader itself. `transform::plan` has already validated every name.
+    let projection: Option<Vec<usize>> = if plan.source_columns.len() == incoming.fields().len() {
+        None
+    } else {
+        Some(
+            plan.source_columns
+                .iter()
+                .map(|n| {
+                    incoming.index_of(n).map_err(|_| {
+                        EtlError::internal(format!(
+                            "column '{n}' survived planning but is not in the frame schema"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+        )
+    };
+
+    // Identical to the DB and API flows: a gated incremental run into a
+    // directly-inserting destination needs a staging table for the gate to
+    // validate, and so does a window-scoped delete the upsert cannot express.
+    let force_stage_incremental = cfg.mode == SyncMode::Incremental
+        && !sink.requires_staging_for_incremental()
+        && (on_staged.is_some()
+            || (cfg.delete_stale_in_window && !sink.deletes_stale_within_merge()));
+    if cfg.delete_stale_in_window && !sink.supports_row_delete() {
+        return Err(EtlError::config(
+            "delete_stale_in_window is not supported by this destination (it cannot delete \
+             individual rows)",
+        ));
+    }
+
+    let target_table = prepare_target(
+        &sink,
+        &cfg,
+        &plan.dest_columns,
+        &staging,
+        force_stage_incremental,
+    )
+    .await?;
+    let used_staging = target_table != cfg.dest_table;
+    let cleanup_sink = sink.clone();
+    let cleanup_staging_name = staging.clone();
+
+    let outcome: Result<TransferResult> = async move {
+        tracing::info!(
+            "quickhouse: transferring a {}-byte Arrow frame into {}",
+            frame.ipc.len(),
+            target_table
+        );
+        let counters = Arc::new(Counters::default());
+        let ctx = SendCtx {
+            sink: sink.clone(),
+            budget: MemoryBudget::new(cfg.max_memory_bytes),
+            target_table: Arc::new(target_table),
+            counters: counters.clone(),
+            progress: progress.clone(),
+            started,
+            archive: None,
+            throttle: None,
+            warnings: warnings.clone(),
+        };
+        let stage_started = Instant::now();
+        let schema: SchemaRef = Arc::new(Schema::new(
+            plan.dest_columns
+                .iter()
+                .map(|c| Field::new(&c.name, c.arrow.clone(), c.nullable))
+                .collect::<Vec<_>>(),
+        ));
+        let mut sends: JoinSet<Result<()>> = JoinSet::new();
+        let mut insert_buf = InsertBuffer::new(cfg.insert_bytes);
+        let mut rows_read = 0u64;
+
+        let mut reader = StreamReader::try_new(Cursor::new(&frame.ipc[..]), projection)
+            .map_err(EtlError::from)?;
+        for batch in reader.by_ref() {
+            let batch = crate::decode_clickhouse::adapt_to_plan(
+                batch.map_err(EtlError::from)?,
+                &schema,
+                "the frame",
+            )?;
+            rows_read += batch.num_rows() as u64;
+            for slice in crate::decode_clickhouse::split_to_bytes(batch, cfg.batch_bytes) {
+                ctx.push_batch(&mut sends, &mut insert_buf, schema.clone(), slice)
+                    .await;
+                reap(&mut sends, false).await?;
+            }
+        }
+        // A stream that stops without its end-of-stream marker is a truncated
+        // frame, not a short one. Left unchecked it would swap a partial table
+        // into place and report success.
+        if !reader.is_finished() {
+            return Err(EtlError::decode(
+                "the Arrow IPC stream ended without an end-of-stream marker — the frame was \
+                 serialized incompletely, so an unknown number of rows are missing",
+            ));
+        }
+        ctx.flush(&mut sends, &mut insert_buf, schema.clone()).await;
+        reap(&mut sends, true).await?;
+        counters.rows_read.fetch_add(rows_read, Ordering::Relaxed);
+        emit_progress(&counters, &progress, started);
+        let stage_secs = stage_started.elapsed().as_secs_f64();
+        let promote_started = Instant::now();
+        tracing::info!(
+            "frame read complete: {} rows written",
+            counters.rows_written.load(Ordering::Relaxed)
+        );
+
+        if cfg.mode == SyncMode::Full {
+            run_staged_validation(
+                &on_staged,
+                sink.as_ref(),
+                &staging,
+                counters.rows_written.load(Ordering::Relaxed),
+            )?;
+            guard_full_refresh_shrink(
+                sink.as_ref(),
+                &cfg,
+                counters.rows_written.load(Ordering::Relaxed),
+                &warnings,
+            )
+            .await?;
+            tracing::info!("swapping staging table into '{}'", cfg.dest_table);
+            sink.atomic_swap(&cfg.dest_table, &staging, &plan.dest_columns)
+                .await?;
+            sink.drop_table(&staging).await?;
+        }
+        let mut rows_deleted = 0u64;
+        if cfg.mode == SyncMode::Incremental && used_staging {
+            // `cfg.watermark` is the dedup ordering column and is normally
+            // `None` here: incremental from a frame upserts on `key`, and both
+            // destinations already fall back to ordering by the key list. Pass
+            // it through anyway, so a caller who *did* nominate one gets
+            // last-wins ordering rather than an arbitrary winner.
+            rows_deleted = promote_staged_incremental(
+                sink.as_ref(),
+                &cfg.dest_table,
+                &staging,
+                &cfg.key,
+                &plan.dest_columns,
+                cfg.merge_prune_partition_by.as_deref(),
+                cfg.merge_prune_key_range,
+                cfg.merge_prune_key_list_max,
+                cfg.delete_stale_in_window,
+                &on_staged,
+                counters.rows_written.load(Ordering::Relaxed),
+                cfg.watermark.as_deref(),
+                &warnings,
+            )
+            .await?;
+        }
+        // Append inserts straight into the destination: no staging, no merge,
+        // no swap. And a frame has no resumable cursor to persist either way —
+        // which is why there is no `persist_watermark` call anywhere in this
+        // flow, unlike the API one.
+
+        let duration_secs = started.elapsed().as_secs_f64();
+        tracing::info!(
+            "transfer complete: {} rows in {:.2}s",
+            counters.rows_written.load(Ordering::Relaxed),
+            duration_secs
+        );
+        Ok(TransferResult {
+            rows_read: counters.rows_read.load(Ordering::Relaxed),
+            rows_written: counters.rows_written.load(Ordering::Relaxed),
+            bytes_written: counters.bytes_written.load(Ordering::Relaxed),
+            rows_deleted,
+            duration_secs,
+            read_secs: counters.read_nanos.load(Ordering::Relaxed) as f64 / 1e9,
+            stage_secs,
+            promote_secs: promote_started.elapsed().as_secs_f64(),
+            new_watermark: None,
             warnings: warnings.drain(),
         })
     }

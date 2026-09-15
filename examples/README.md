@@ -9,6 +9,7 @@ environment variables and documents them in its module docstring.
 | [`incremental_sync.py`](incremental_sync.py) | Watermark-based incremental sync (idempotent; run it twice). |
 | [`mysql_to_bigquery.py`](mysql_to_bigquery.py) | Same `sync()`, different engines — MySQL → BigQuery (real BigQuery). |
 | [`clickhouse_to_clickhouse.py`](clickhouse_to_clickhouse.py) | ClickHouse as a *source* — a cross-cluster/cross-database copy. |
+| [`pandas_to_clickhouse.py`](pandas_to_clickhouse.py) | A DataFrame as a source — `from_pandas()`, all three modes. |
 | [`clevertap_bronze_append.py`](clevertap_bronze_append.py) | HTTP API source with a declared schema + `mode="append"` bronze landing. |
 
 ## Running against the local stack

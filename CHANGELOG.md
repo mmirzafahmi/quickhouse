@@ -9,6 +9,120 @@ any breaking change is called out explicitly.
 
 ## [Unreleased]
 
+## [0.17.0] — 2026-09-15
+
+A DataFrame was the one thing quickhouse could not move. You could point it at
+four databases and three APIs, but not at the frame already sitting in front of
+you — which meant dropping out to `to_sql`, a hand-rolled `clickhouse-connect`
+insert, or `pandas_gbq`, each of which gives up the type guarantees this crate
+is most exacting about.
+
+### Added — `quickhouse.from_pandas`
+
+- **`from_pandas(df, target, dest_table=..., mode=...)`** writes an in-memory
+  frame into ClickHouse or BigQuery. Everything after the frame is the `sync()`
+  you already know: `**sync_kwargs` is forwarded verbatim, so `engine`,
+  `order_by`, `partition_by`, `type_overrides`, `include`/`exclude`,
+  `on_progress` and `validate` all work unchanged, and the return value is the
+  same `TransferResult` with the same warnings. `pip install
+  'quickhouse[pandas]'`.
+
+- **pandas is the headline, not the requirement.** The conversion is Arrow, so a
+  `pyarrow.Table` or `RecordBatch`, a `polars.DataFrame`, a DuckDB relation, or
+  anything exposing the Arrow PyCapsule interface (`__arrow_c_stream__`) goes
+  through the same call. All three are tested against a live ClickHouse and
+  asserted to produce byte-identical destination tables.
+
+- **`mode="incremental"` needs no watermark**, which no other source can say. A
+  database source needs one to know where to resume *reading*; a frame does not,
+  because the caller already holds every row — the frame IS the delta. `key`
+  takes over the watermark's old job of making incremental meaningful and is
+  required in its place, with an error that says so rather than failing later in
+  DDL generation. `full` and `append` work too; `append` is now legal for a
+  frame as well as an API source.
+
+- **Rows sharing a key within one frame are deduped last-wins, with a warning.**
+  Neither destination can order duplicates inside a single batch without a
+  version column — ClickHouse keeps whichever part merged last, BigQuery
+  whichever row `ROW_NUMBER` saw first. Resolving it in Python, before any SQL
+  is generated, is what makes "upsert" true rather than nearly true. Pass
+  `watermark=` to order by a column instead.
+
+### The type contract
+
+Normalisation happens in Python, where the *pandas* dtype behind an Arrow type
+is still visible — so the message can say "column 'ts' is datetime64[ns]; round
+it with `.dt.floor('us')`" instead of "Timestamp(Nanosecond, None) is
+unsupported". Rust keeps a matching closed allow-list as the backstop.
+
+- Converted: nanosecond (and second/millisecond) timestamps → microseconds,
+  categoricals → their values, nullable `Int64`/`boolean`/`string` extension
+  dtypes, `Decimal` objects → exact `Decimal(P, S)`, `float16` → `Float32`,
+  `date64` → `Date32`, time-of-day → text, and the
+  `large_string`/`string_view`/`large_binary` family that `pd.ArrowDtype` and
+  polars produce.
+- A **fixed-offset timezone** (`+07:00`) is converted to UTC with a warning:
+  ClickHouse's `DateTime64` takes a zone *name* and rejects an offset outright.
+  The instant is preserved; only the rendering zone changes.
+- A **naive** `datetime64` stays naive (`DateTime64(6)`), the way PostgreSQL's
+  `timestamp` does — not silently relabelled UTC.
+- Refused by column name, with the fix: sub-microsecond precision, values
+  outside ClickHouse's 1900–2299 window (caught with one vectorised pass, rather
+  than letting the server abort the insert partway through), nested
+  `list`/`struct`/`map`, `Decimal256`, durations and intervals, all-null
+  columns, duplicate column names and non-string column names.
+- The **index is dropped by default**, with a warning when it looked meaningful
+  (a `MultiIndex`, a named index, anything but a plain `RangeIndex`). pandas'
+  own `to_sql` writes it, so the difference is worth hearing about. `index=True`
+  brings it back as properly-named columns — never pyarrow's
+  `__index_level_0__`.
+
+### Internals
+
+- Transport is an Arrow IPC stream of bytes, which keeps the binding's standing
+  invariant intact: no live Python object crosses `Python::allow_threads`. The
+  zero-copy alternative (the `arrow` crate's `pyarrow` feature) was deliberately
+  not taken — `FFI_ArrowArray`'s `Drop` re-enters CPython, and the transfer runs
+  on a multi-threaded Tokio runtime, so a batch dropped on a worker would take
+  the GIL from a thread Python has never seen.
+- `SourceConfig::Arrow` holds `Arc<[u8]>`, because `run_transfer` clones the
+  source config once per retry attempt — including the first. `Debug` is
+  hand-written and prints a byte count; the derived one would have dumped the
+  caller's entire frame into a tracing span.
+- `validate_impl`'s `is_api: bool` became a three-variant `SourceShape` enum. Two
+  bools would have made a four-state truth table out of a three-state question,
+  and the two impossible states are exactly where a silent validation gap lives.
+- Knobs that cannot apply to a frame — `source_table`, `source_query`,
+  `chunk_rows`, `lookback_seconds`, `read_max_rows_per_sec`,
+  `read_idle_timeout_secs`, `partition_column`, `partition_source_expr`,
+  `watermark_source_expr`, `seed_watermark`, `retry_max_attempts` — are rejected
+  with a message naming the knob and why, never silently ignored. That
+  enforcement lives in Rust, so a kwarg added to `sync()` later is still caught
+  without the Python layer knowing about it.
+- `ChArrowDecoder`'s schema-adaptation and byte-splitting are now free functions
+  shared with the frame path. The frame reads through `StreamReader` instead of
+  the push-based decoder: that one copies every chunk it is handed (right for an
+  HTTP body, pure waste for a buffer already in hand) and takes a column
+  projection natively, which is what makes `include=`/`exclude=` free here.
+
+### Known limits
+
+- **`from_pandas` is not bounded-memory.** The frame is in RAM by definition;
+  expect a transient peak of roughly 3–4x its Arrow footprint while it is
+  converted, serialized and decoded. Split a very large frame and use
+  `mode="append"`.
+- `Decimal` precision and scale are inferred from the values present, so two
+  runs of differently-distributed data can produce different DDL. Pin it with
+  `type_overrides={"amount": "Decimal(18, 4)"}`.
+- `NaN` in a float column is a *value*, not a null: ClickHouse stores a NaN,
+  BigQuery converts it to NULL. Use `pd.NA` or a nullable dtype for missing.
+- **Reading a table back into a DataFrame (`to_pandas`) is not implemented.** It
+  is a genuinely different problem — an in-process collector is shared across
+  retry attempts, `max_memory_bytes` stops bounding anything once batches are
+  accumulated rather than sent, and pandas' `datetime64[ns]` range is *narrower*
+  than the window this library deliberately supports on write. Planned for
+  0.18.0 with its own guards.
+
 ## [0.16.0] — 2026-09-15
 
 ClickHouse could be written to but not read from, which made the one transfer a
@@ -1041,7 +1155,8 @@ config change, but it is a different BigQuery API call
 - Initial release: parallel, bounded-memory PostgreSQL → ClickHouse transfer with
   automatic DDL, full-refresh and incremental modes, and type mapping.
 
-[Unreleased]: https://github.com/mmirzafahmi/quickhouse/compare/v0.16.0...HEAD
+[Unreleased]: https://github.com/mmirzafahmi/quickhouse/compare/v0.17.0...HEAD
+[0.17.0]: https://github.com/mmirzafahmi/quickhouse/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/mmirzafahmi/quickhouse/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/mmirzafahmi/quickhouse/compare/v0.14.1...v0.15.0
 [0.14.1]: https://github.com/mmirzafahmi/quickhouse/compare/v0.14.0...v0.14.1

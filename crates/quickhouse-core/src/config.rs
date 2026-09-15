@@ -218,6 +218,41 @@ pub struct HttpApiConfig {
     pub lookback_days: u32,
 }
 
+/// Read from an in-memory DataFrame, handed in as a serialized Arrow IPC
+/// stream. Backs `quickhouse.from_pandas`.
+///
+/// Nothing here knows about Python: the binding's Python layer converts
+/// pandas/polars/pyarrow/DuckDB to a `pyarrow.Table`, normalises its schema to
+/// the types this crate maps, and serializes it. That keeps the architecture's
+/// standing invariant — no live Python object crosses `Python::allow_threads` —
+/// intact for the first source that has one to begin with.
+#[derive(Clone)]
+pub struct ArrowFrameConfig {
+    /// A complete Arrow IPC **stream**: schema message, record batches, then
+    /// the end-of-stream marker.
+    ///
+    /// `Arc<[u8]>` rather than `Vec<u8>` because [`crate::sync::run_transfer`]
+    /// clones the whole `SourceConfig` once per retry attempt — including the
+    /// first. A `Vec` here would deep-copy the caller's entire frame on a code
+    /// path that exists for source errors a frame source cannot produce.
+    pub ipc: std::sync::Arc<[u8]>,
+    /// Optional caller-supplied label, used for log lines and the persisted
+    /// state key. `None` falls back to the destination table name.
+    pub label: Option<String>,
+}
+
+/// Hand-written, never derived: `SourceConfig` is `Debug`-formatted into
+/// tracing spans and error context, and a derived impl would dump the caller's
+/// entire serialized frame — potentially gigabytes — into a single log line.
+impl std::fmt::Debug for ArrowFrameConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ArrowFrameConfig")
+            .field("ipc_bytes", &self.ipc.len())
+            .field("label", &self.label)
+            .finish()
+    }
+}
+
 /// Which engine/API to read from.
 #[derive(Debug, Clone)]
 pub enum SourceConfig {
@@ -228,6 +263,39 @@ pub enum SourceConfig {
     CleverTap(CleverTapConfig),
     AppsFlyer(AppsFlyerConfig),
     HttpApi(HttpApiConfig),
+    Arrow(ArrowFrameConfig),
+}
+
+/// How a source is *read*, as opposed to which engine it is — the axis
+/// [`TransferConfig::validate_impl`] and [`crate::sync`]'s dispatcher actually
+/// branch on.
+///
+/// This was a `bool` (`is_api`) until the DataFrame source arrived and made it a
+/// three-way question. An enum rather than a second bool on purpose: two bools
+/// make a four-state truth table out of a three-state one, and the two
+/// impossible states are exactly where a silent validation gap would live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceShape {
+    /// Postgres/MySQL/BigQuery/ClickHouse: a connection, a schema to probe, and
+    /// (for the first two and the last) partitions to fan out over.
+    Db,
+    /// CleverTap/AppsFlyer/HttpApi: a declared schema and a paginated date
+    /// window, with no catalog to probe.
+    Api,
+    /// An in-memory Arrow frame: the schema arrives with the data, and there is
+    /// no source to connect to, filter, partition or pace.
+    Frame,
+}
+
+impl SourceShape {
+    /// The noun to use in a validation error message about this shape.
+    pub fn label(&self) -> &'static str {
+        match self {
+            SourceShape::Db => "a database source",
+            SourceShape::Api => "an API source",
+            SourceShape::Frame => "a DataFrame source",
+        }
+    }
 }
 
 impl SourceConfig {
@@ -243,6 +311,21 @@ impl SourceConfig {
             SourceConfig::CleverTap(_) => "clevertap",
             SourceConfig::AppsFlyer(_) => "appsflyer",
             SourceConfig::HttpApi(_) => "http",
+            SourceConfig::Arrow(_) => "arrow",
+        }
+    }
+
+    /// How this source is read — see [`SourceShape`].
+    pub fn shape(&self) -> SourceShape {
+        match self {
+            SourceConfig::CleverTap(_) | SourceConfig::AppsFlyer(_) | SourceConfig::HttpApi(_) => {
+                SourceShape::Api
+            }
+            SourceConfig::Arrow(_) => SourceShape::Frame,
+            SourceConfig::Postgres(_)
+            | SourceConfig::MySql(_)
+            | SourceConfig::BigQuery(_)
+            | SourceConfig::ClickHouse(_) => SourceShape::Db,
         }
     }
 
@@ -251,15 +334,12 @@ impl SourceConfig {
     /// schema-resolution / partition machinery. They write to either
     /// destination (BigQuery or ClickHouse) since `bc1ab45`.
     pub fn is_api(&self) -> bool {
-        matches!(
-            self,
-            SourceConfig::CleverTap(_) | SourceConfig::AppsFlyer(_) | SourceConfig::HttpApi(_)
-        )
+        self.shape() == SourceShape::Api
     }
 
-    /// A stable identity string for an API source's incremental cursor in
-    /// `_quickhouse_state` (API sources have no `source_table`). `None` for a
-    /// non-API source.
+    /// A stable identity string for a source that has no `source_table` to key
+    /// its `_quickhouse_state` cursor on — the API sources, and a DataFrame.
+    /// `None` for a source that does have one.
     pub fn api_state_identity(&self) -> Option<String> {
         match self {
             SourceConfig::CleverTap(c) => Some(format!("clevertap:{}", c.event_name)),
@@ -269,6 +349,7 @@ impl SourceConfig {
                     .clone()
                     .unwrap_or_else(|| format!("http:{}", h.url)),
             ),
+            SourceConfig::Arrow(f) => f.label.as_ref().map(|l| format!("frame:{l}")),
             _ => None,
         }
     }
@@ -1115,54 +1196,85 @@ impl TransferConfig {
             .or_else(|| self.key.first().cloned())
     }
 
-    /// Validation for a DB source (Postgres/MySQL/BigQuery) — byte-identical to
-    /// the original `validate`.
+    /// Validation for a DB source (Postgres/MySQL/BigQuery/ClickHouse) —
+    /// byte-identical to the original `validate`.
     pub fn validate(&self) -> crate::error::Result<()> {
-        self.validate_impl(false)
+        self.validate_impl(SourceShape::Db)
     }
 
     /// Validation for an HTTP API source (CleverTap/AppsFlyer): no
     /// `source_table`/`source_query` is expected (the "what to read" lives on
     /// the source descriptor), and a few DB-only knobs are rejected.
     pub fn validate_api(&self) -> crate::error::Result<()> {
-        self.validate_impl(true)
+        self.validate_impl(SourceShape::Api)
     }
 
-    fn validate_impl(&self, is_api: bool) -> crate::error::Result<()> {
+    /// Validation for an in-memory DataFrame source. Shares the API source's
+    /// "no table, no SQL" rules and adds its own: there is no source to
+    /// connect to, so nothing about filtering, partitioning, pacing or
+    /// resuming applies — and incremental upserts on `key` alone, with no
+    /// watermark, because the frame you passed *is* the delta.
+    pub fn validate_frame(&self) -> crate::error::Result<()> {
+        self.validate_impl(SourceShape::Frame)
+    }
+
+    fn validate_impl(&self, shape: SourceShape) -> crate::error::Result<()> {
         use crate::error::EtlError;
-        if !is_api && self.source_table.is_none() && self.source_query.is_none() {
+        let noun = shape.label();
+        if shape == SourceShape::Db && self.source_table.is_none() && self.source_query.is_none() {
             return Err(EtlError::config(
                 "either source_table or source_query must be set",
             ));
         }
-        if is_api {
+        // Everything that is not a database read shares these: there is no SQL
+        // for a transform to live in, and no cursor to chunk or widen.
+        if shape != SourceShape::Db {
             if !self.column_transforms.is_empty() {
-                return Err(EtlError::config(
-                    "column_transforms is not supported for an API source (declare the columns instead)",
-                ));
+                return Err(EtlError::config(format!(
+                    "column_transforms is not supported for {noun} (there is no source SQL for the \
+                     expression to live in)"
+                )));
             }
             if !self.column_transform_types.is_empty() {
-                return Err(EtlError::config(
-                    "column_transform_types is not supported for an API source (it overrides the \
-                     decode type for a column_transforms entry, which is itself unsupported here)",
-                ));
+                return Err(EtlError::config(format!(
+                    "column_transform_types is not supported for {noun} (it overrides the decode \
+                     type for a column_transforms entry, which is itself unsupported here)"
+                )));
             }
             if self.chunk_rows.is_some() {
-                return Err(EtlError::config(
-                    "chunk_rows (keyset resumable reads) is not supported for an API source",
-                ));
+                return Err(EtlError::config(format!(
+                    "chunk_rows (keyset resumable reads) is not supported for {noun}"
+                )));
             }
             if self.lookback_seconds > 0 {
-                return Err(EtlError::config(
-                    "lookback_seconds is not supported for an API source",
-                ));
+                return Err(EtlError::config(format!(
+                    "lookback_seconds is not supported for {noun}"
+                )));
             }
         }
-        if matches!(self.mode, SyncMode::Incremental | SyncMode::Append) && self.watermark.is_none()
+        // A DataFrame source is exempt: a watermark drives a *resumable read
+        // window*, and a frame has no read to resume — the caller already holds
+        // every row. Incremental from a frame upserts on `key` instead, which
+        // the rule below makes mandatory in its place.
+        if matches!(self.mode, SyncMode::Incremental | SyncMode::Append)
+            && self.watermark.is_none()
+            && shape != SourceShape::Frame
         {
             return Err(EtlError::config(
                 "watermark column is required for incremental and append mode (it drives the \
                  resumable date window)",
+            ));
+        }
+        if shape == SourceShape::Frame
+            && self.mode == SyncMode::Incremental
+            && self.key.is_empty()
+            && self.watermark.is_none()
+        {
+            return Err(EtlError::config(
+                "incremental from a DataFrame upserts on key= alone, so key is required: \
+                 key=[\"id\"]. There is no watermark to resume from — the frame you passed IS \
+                 the delta. (Pass watermark= as well if you want it used as the version column \
+                 for dedup ordering.)",
             ));
         }
         if self.lookback_seconds > 0 && self.mode != SyncMode::Incremental {
@@ -1170,11 +1282,17 @@ impl TransferConfig {
                 "lookback_seconds only applies to incremental mode",
             ));
         }
-        // Append is a bronze-landing write for API sources only.
-        if self.mode == SyncMode::Append && !is_api {
+        // Append is a bronze-landing write: no staging, no merge, no swap. It
+        // makes sense wherever the caller already knows the rows are new — an
+        // API window, or a frame they just built.
+        if self.mode == SyncMode::Append && shape == SourceShape::Db {
             return Err(EtlError::config(
-                "append mode is currently supported only for HTTP API sources (CleverTap/AppsFlyer)",
+                "append mode is currently supported only for HTTP API sources \
+                 (CleverTap/AppsFlyer) and DataFrame sources",
             ));
+        }
+        if shape == SourceShape::Frame {
+            self.validate_frame_only()?;
         }
         // seed_watermark / advance_watermark drive the resumable cursor, which
         // both incremental and append use (append inserts instead of merging).
@@ -1248,6 +1366,68 @@ impl TransferConfig {
                      would delete the ENTIRE destination history outside the current batch",
                 ));
             }
+        }
+        Ok(())
+    }
+
+    /// The knobs that mean nothing when the source is a frame already sitting in
+    /// memory. Every one of these would otherwise be silently ignored, which is
+    /// the failure mode this crate spends the most effort avoiding — so each
+    /// names the knob *and* why it cannot apply.
+    ///
+    /// Deliberately **not** rejected, and simply ignored instead:
+    /// `parallelism` (the read is single-stream, but the *write* side still
+    /// fans out through `SendCtx::flush`'s `JoinSet`), `application_name`
+    /// (Postgres-only), `tinyint1_as_bool` (MySQL-only) and `batch_rows` (the
+    /// frame's own batch boundaries decide). Rejecting those would break a
+    /// caller passing one shared kwargs dict to several transfers.
+    fn validate_frame_only(&self) -> crate::error::Result<()> {
+        use crate::error::EtlError;
+        let reject = |msg: &str| -> crate::error::Result<()> { Err(EtlError::config(msg)) };
+        if self.source_table.is_some() || self.source_query.is_some() {
+            return reject(
+                "source_table/source_query do not apply to a DataFrame source: it reads the frame \
+                 you passed, not a table or a query. Filter the frame itself before handing it \
+                 over.",
+            );
+        }
+        if self.partition_source_expr.is_some() || self.watermark_source_expr.is_some() {
+            return reject(
+                "partition_source_expr/watermark_source_expr do not apply to a DataFrame source: \
+                 there is no source query for an expression to resolve against.",
+            );
+        }
+        if self.partition_column.is_some() {
+            return reject(
+                "partition_column does not apply to a DataFrame source: the frame is decoded \
+                 single-stream from its own Arrow batches, so there is no range to split.",
+            );
+        }
+        if self.read_max_rows_per_sec.is_some() {
+            return reject(
+                "read_max_rows_per_sec does not apply to a DataFrame source: there is no source \
+                 server to be gentle to — the rows are already in memory.",
+            );
+        }
+        if self.read_idle_timeout_secs > 0 {
+            return reject(
+                "read_idle_timeout_secs does not apply to a DataFrame source: there is no source \
+                 stream that can stall.",
+            );
+        }
+        if self.seed_watermark != WatermarkSeed::None || !self.advance_watermark {
+            return reject(
+                "seed_watermark/advance_watermark do not apply to a DataFrame source: it has no \
+                 resumable cursor to seed or advance.",
+            );
+        }
+        if self.retry_max_attempts > 1 {
+            return reject(
+                "retry_max_attempts does not apply to a DataFrame source: a whole-transfer retry \
+                 exists to re-read a source that failed transiently, and there is nothing to \
+                 re-read — the bytes are already in memory, so a retry would only redo the DDL. \
+                 Destination blips are already retried at the insert layer.",
+            );
         }
         Ok(())
     }
@@ -1658,6 +1838,128 @@ mod tests {
         c.seed_watermark = WatermarkSeed::CurrentMax;
         c.normalize();
         assert_eq!(c.seed_watermark, WatermarkSeed::None);
+    }
+
+    /// A config shaped the way `from_pandas` builds one: no source table, and
+    /// (for incremental) a key but no watermark.
+    fn frame_cfg(mode: SyncMode) -> TransferConfig {
+        let mut c = cfg(mode, None);
+        c.source_table = None;
+        c
+    }
+
+    #[test]
+    fn frame_incremental_needs_no_watermark_but_does_need_a_key() {
+        // The whole point: the frame IS the delta, so there is no window to
+        // resume and nothing for a watermark to mean.
+        frame_cfg(SyncMode::Incremental).validate_frame().unwrap();
+        frame_cfg(SyncMode::Append).validate_frame().unwrap();
+        frame_cfg(SyncMode::Full).validate_frame().unwrap();
+
+        // ...but `key` takes over the watermark's old job of making the
+        // relaxation safe, so a keyless incremental is refused here rather than
+        // much later, in DDL generation, with a vaguer message.
+        let mut c = frame_cfg(SyncMode::Incremental);
+        c.key = vec![];
+        let err = c.validate_frame().unwrap_err().to_string();
+        assert!(err.contains("upserts on key= alone"), "{err}");
+        // A watermark is still accepted, as the dedup ordering column.
+        c.watermark = Some("updated_at".into());
+        c.validate_frame().unwrap();
+    }
+
+    #[test]
+    fn frame_relaxations_do_not_leak_to_the_other_sources() {
+        // The regression guard that matters: relaxing two rules for frames must
+        // not weaken them for the seven sources that had them before.
+        let mut db = cfg(SyncMode::Incremental, None);
+        db.key = vec![];
+        let err = db.validate().unwrap_err().to_string();
+        assert!(err.contains("watermark column is required"), "{err}");
+
+        let db = cfg(SyncMode::Append, Some("updated_at"));
+        let err = db.validate().unwrap_err().to_string();
+        assert!(err.contains("append mode"), "{err}");
+
+        let mut api = cfg(SyncMode::Incremental, None);
+        api.source_table = None;
+        let err = api.validate_api().unwrap_err().to_string();
+        assert!(err.contains("watermark column is required"), "{err}");
+    }
+
+    #[test]
+    fn frame_rejects_the_knobs_that_cannot_apply_to_it() {
+        // Each of these would otherwise be silently ignored — the failure mode
+        // this crate works hardest to avoid.
+        type Knob = (&'static str, Box<dyn Fn(&mut TransferConfig)>);
+        let cases: Vec<Knob> = vec![
+            (
+                "source_table",
+                Box::new(|c: &mut TransferConfig| c.source_table = Some("t".into())),
+            ),
+            (
+                "source_query",
+                Box::new(|c: &mut TransferConfig| c.source_query = Some("SELECT 1".into())),
+            ),
+            (
+                "watermark_source_expr",
+                Box::new(|c: &mut TransferConfig| c.watermark_source_expr = Some("x".into())),
+            ),
+            (
+                "partition_source_expr",
+                Box::new(|c: &mut TransferConfig| c.partition_source_expr = Some("x".into())),
+            ),
+            (
+                "partition_column",
+                Box::new(|c: &mut TransferConfig| c.partition_column = Some("id".into())),
+            ),
+            (
+                "read_max_rows_per_sec",
+                Box::new(|c: &mut TransferConfig| c.read_max_rows_per_sec = Some(100)),
+            ),
+            (
+                "read_idle_timeout_secs",
+                Box::new(|c: &mut TransferConfig| c.read_idle_timeout_secs = 30),
+            ),
+            (
+                "seed_watermark",
+                Box::new(|c: &mut TransferConfig| {
+                    c.seed_watermark = WatermarkSeed::Value("x".into())
+                }),
+            ),
+            (
+                "retry_max_attempts",
+                Box::new(|c: &mut TransferConfig| c.retry_max_attempts = 3),
+            ),
+            (
+                "chunk_rows",
+                Box::new(|c: &mut TransferConfig| c.chunk_rows = Some(1000)),
+            ),
+            (
+                "lookback_seconds",
+                Box::new(|c: &mut TransferConfig| c.lookback_seconds = 60),
+            ),
+            (
+                "column_transforms",
+                Box::new(|c: &mut TransferConfig| {
+                    c.column_transforms.insert("a".into(), "lower(a)".into());
+                }),
+            ),
+        ];
+        for (name, apply) in cases {
+            let mut c = frame_cfg(SyncMode::Incremental);
+            apply(&mut c);
+            let err = match c.validate_frame() {
+                Err(e) => e.to_string(),
+                Ok(()) => panic!("{name} should be rejected for a frame source, but passed"),
+            };
+            // The message has to name the knob, or the caller is left guessing
+            // which of their arguments was the problem.
+            assert!(
+                err.contains(name),
+                "{name}: message does not name it: {err}"
+            );
+        }
     }
 
     #[test]

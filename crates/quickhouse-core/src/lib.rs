@@ -31,11 +31,11 @@ pub mod transform;
 pub mod types;
 
 pub use config::{
-    ApiColumn, AppsFlyerConfig, BigQueryConfig, BigQueryDestConfig, BigQueryWriteMethod,
-    CleverTapConfig, ClickHouseConfig, ClickHouseSourceConfig, Compression, DestinationConfig,
-    HttpApiConfig, HttpFormat, MySqlConfig, ParquetCompression, PostgresConfig, S3ArchiveConfig,
-    SourceConfig, SyncMode, TransferConfig, TransferResult, TransferWarning, WarningKind,
-    WatermarkSeed,
+    ApiColumn, AppsFlyerConfig, ArrowFrameConfig, BigQueryConfig, BigQueryDestConfig,
+    BigQueryWriteMethod, CleverTapConfig, ClickHouseConfig, ClickHouseSourceConfig, Compression,
+    DestinationConfig, HttpApiConfig, HttpFormat, MySqlConfig, ParquetCompression, PostgresConfig,
+    S3ArchiveConfig, SourceConfig, SourceShape, SyncMode, TransferConfig, TransferResult,
+    TransferWarning, WarningKind, WatermarkSeed,
 };
 pub use error::{EtlError, Result};
 pub use reconcile::{reconcile_keys, ReconcileConfig, ReconcileResult};

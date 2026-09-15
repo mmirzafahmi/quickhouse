@@ -15,6 +15,14 @@ qh.BigQuery("my-gcp-project")                       # source_table="dataset.tabl
 qh.ClickHouse("http://ch-a:8123", database="raw")   # ClickHouse reads too
 ```
 
+A DataFrame you already hold is not a descriptor — it goes through
+[`from_pandas()`](dataframes.md) instead, which takes the frame and a target:
+
+```python
+qh.from_pandas(df, qh.ClickHouse("http://host:8123", database="analytics"),
+               dest_table="orders", mode="full", key=["id"])
+```
+
 For the exact constructor signatures see the [API reference](../../api.md).
 
 ```{raw} html
@@ -26,6 +34,10 @@ For the exact constructor signatures see the [API reference](../../api.md).
   <a class="qh-mode" href="http-apis.html">
     <div class="qh-mode__name">HTTP APIs</div>
     <div class="qh-mode__desc">CleverTap and AppsFlyer, with a schema you declare up front.</div>
+  </a>
+  <a class="qh-mode" href="dataframes.html">
+    <div class="qh-mode__name">DataFrames</div>
+    <div class="qh-mode__desc">pandas, polars or pyarrow, already in memory &mdash; via <code>from_pandas()</code>.</div>
   </a>
 </div>
 ```
@@ -124,4 +136,5 @@ qh.ClickHouse("https://host:8443", database="raw", user="reader", password="…"
 
 databases
 http-apis
+dataframes
 ```

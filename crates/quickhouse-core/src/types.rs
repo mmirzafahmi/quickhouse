@@ -741,6 +741,139 @@ pub mod clickhouse {
     }
 }
 
+/// Schema resolution for an in-memory Arrow frame (`quickhouse.from_pandas`).
+///
+/// Every other source resolves its schema by asking an engine — a catalog
+/// query, `DESCRIBE`, prepared-statement metadata, `tables.get`. A frame
+/// carries its schema *with* the data, so this module's whole job is to decide
+/// which Arrow types this crate is willing to move, and to say so by name when
+/// the answer is no.
+pub mod arrow_frame {
+    use arrow_schema::{DataType, Schema};
+
+    use crate::error::{EtlError, Result};
+    use crate::types::ColumnType;
+
+    /// Resolve a frame's Arrow schema into the destination column list.
+    ///
+    /// The frame *is* the catalog: each field's declared type and nullability
+    /// are taken at face value. Two deliberate choices:
+    ///
+    /// * `clickhouse_inner` comes from
+    ///   [`super::clickhouse::arrow_to_ch_cast_type`], reused rather than
+    ///   rewritten. Its doc frames it as a `CAST` target, but every string it
+    ///   can return is also a legal DDL type, and it returns `None` for exactly
+    ///   the types this crate has no home for — which is the rejection we want.
+    ///   **That reuse is only sound because the Python layer normalises every
+    ///   timestamp to microseconds first**: the function pins any
+    ///   `Timestamp(_, tz)` to `DateTime64(6, tz)` regardless of unit, so a
+    ///   nanosecond column would be handed a microsecond DDL type and land
+    ///   1000x off. The round-trip test in this crate's test module pins the
+    ///   two mappings together.
+    /// * `type_id` is `0`. It is documented on [`ColumnType`] as meaningful
+    ///   only to its own source's decoder, and a frame has no decoder — the
+    ///   bytes are already Arrow.
+    pub fn columns_from_arrow_schema(schema: &Schema) -> Result<Vec<ColumnType>> {
+        let mut seen = std::collections::HashSet::new();
+        let mut cols = Vec::with_capacity(schema.fields().len());
+        for field in schema.fields() {
+            let name = field.name();
+            if !seen.insert(name.as_str()) {
+                return Err(EtlError::config(format!(
+                    "duplicate column '{name}' in the frame: a destination table cannot hold two \
+                     columns of the same name, and matching them up positionally would silently \
+                     misalign the data. Rename one before syncing."
+                )));
+            }
+            let arrow = field.data_type();
+            let clickhouse_inner = ch_type_for(arrow).ok_or_else(|| unsupported(name, arrow))?;
+            cols.push(ColumnType {
+                name: name.clone(),
+                type_id: 0,
+                nullable: field.is_nullable(),
+                arrow: arrow.clone(),
+                clickhouse_inner,
+                arbitrary_precision_decimal: matches!(arrow, DataType::Decimal128(_, _)),
+            });
+        }
+        if cols.is_empty() {
+            return Err(EtlError::config(
+                "the frame has no columns; there is nothing to transfer",
+            ));
+        }
+        Ok(cols)
+    }
+
+    /// The destination type for one frame column.
+    ///
+    /// Delegates to [`super::clickhouse::arrow_to_ch_cast_type`] for everything
+    /// except a **timezone-naive** timestamp, where the two callers genuinely
+    /// want different things. That function defaults a missing timezone to
+    /// `'UTC'`, which is right for a ClickHouse *source* — a ClickHouse datetime
+    /// is an absolute instant whatever its type says. A frame is the opposite
+    /// case: pandas' `datetime64[ns]` with no tz is a wall-clock reading that
+    /// nobody has placed on the globe, so it maps to a naive `DateTime64(6)`,
+    /// the same way the Postgres source maps `timestamp` (vs. `timestamptz`).
+    ///
+    /// Getting this wrong is not cosmetic. `transform::datetime_override_tz`
+    /// reads the tz back *out* of this string to decide the destination Arrow
+    /// type, so claiming UTC here would plan a tz-aware column, leave the frame
+    /// supplying a naive one, and fail the batch with an unconvertible-types
+    /// decode error.
+    fn ch_type_for(arrow: &DataType) -> Option<String> {
+        match arrow {
+            // Rejected before anything else, and before delegating:
+            // `arrow_to_ch_cast_type` maps a timestamp of ANY unit to
+            // `DateTime64(6, ..)`, which is correct for a ClickHouse source
+            // (the SELECT casts the column server-side to match) but a silent
+            // 1000x error here, where the frame's own bytes are what arrive.
+            // The Python layer normalises every timestamp to microseconds, so
+            // this fires only for a caller who bypassed it.
+            DataType::Timestamp(unit, _) if *unit != arrow_schema::TimeUnit::Microsecond => None,
+            DataType::Timestamp(_, None) => Some("DateTime64(6)".to_string()),
+            other => super::clickhouse::arrow_to_ch_cast_type(other),
+        }
+    }
+
+    /// The rejection, with the fix. The Python layer normalises away everything
+    /// it can (nanosecond timestamps, dictionaries, large/view string types,
+    /// `float16`, `date64`, times), so reaching this generally means a genuinely
+    /// unmappable type — or a caller who bypassed that layer.
+    fn unsupported(column: &str, arrow: &DataType) -> EtlError {
+        let hint = match arrow {
+            DataType::Timestamp(unit, _) if *unit != arrow_schema::TimeUnit::Microsecond => {
+                " — quickhouse standardises on microsecond timestamps; cast the column first \
+                 (in pandas: `df[col] = df[col].dt.floor('us')`)"
+            }
+            DataType::Dictionary(_, _) => {
+                " — decode the dictionary first (in pandas, a categorical: `df[col].astype(str)`)"
+            }
+            DataType::List(_)
+            | DataType::LargeList(_)
+            | DataType::FixedSizeList(_, _)
+            | DataType::Struct(_)
+            | DataType::Map(_, _) => {
+                " — nested types have no destination column type; serialize it, e.g. \
+                 `df[col] = df[col].map(json.dumps)`"
+            }
+            DataType::Decimal256(_, _) => {
+                " — quickhouse has no Decimal256; use a Decimal128 (precision <= 38), a float, \
+                 or a string column"
+            }
+            DataType::Null => {
+                " — the column holds only nulls, so there is no type to infer; give it one, \
+                 e.g. `df[col] = df[col].astype('string')`"
+            }
+            _ => "",
+        };
+        EtlError::UnsupportedType {
+            engine: "DataFrame",
+            column: column.to_string(),
+            type_name: format!("{arrow}{hint}"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -937,6 +1070,150 @@ mod tests {
         // Not produced by any current decoder (all three sources map TIME to
         // Utf8 text, not Arrow Time64) — confirms there's no silent gap.
         assert_eq!(a2b(&DataType::Time64(TimeUnit::Microsecond)), None);
+    }
+
+    /// Build a one-column frame schema.
+    fn frame_field(arrow: DataType, nullable: bool) -> arrow_schema::Schema {
+        arrow_schema::Schema::new(vec![arrow_schema::Field::new("c", arrow, nullable)])
+    }
+
+    fn resolve_one(arrow: DataType) -> ColumnType {
+        crate::types::arrow_frame::columns_from_arrow_schema(&frame_field(arrow, true))
+            .unwrap()
+            .remove(0)
+    }
+
+    #[test]
+    fn frame_resolves_every_type_the_python_layer_can_produce() {
+        use arrow_schema::TimeUnit;
+        for (arrow, ch) in [
+            (DataType::Boolean, "Bool"),
+            (DataType::Int8, "Int8"),
+            (DataType::Int16, "Int16"),
+            (DataType::Int32, "Int32"),
+            (DataType::Int64, "Int64"),
+            (DataType::UInt8, "UInt8"),
+            (DataType::UInt16, "UInt16"),
+            (DataType::UInt32, "UInt32"),
+            (DataType::UInt64, "UInt64"),
+            (DataType::Float32, "Float32"),
+            (DataType::Float64, "Float64"),
+            (DataType::Utf8, "String"),
+            (DataType::Binary, "String"),
+            (DataType::Date32, "Date32"),
+            (DataType::Decimal128(18, 4), "Decimal(18, 4)"),
+            (
+                DataType::Timestamp(TimeUnit::Microsecond, Some("Asia/Jakarta".into())),
+                "DateTime64(6, 'Asia/Jakarta')",
+            ),
+        ] {
+            let c = resolve_one(arrow.clone());
+            assert_eq!(c.clickhouse_inner, ch, "{arrow}");
+            assert_eq!(c.arrow, arrow);
+            // Only a decimal is arbitrary-precision, which is what gates
+            // `numeric_as_decimal` and the exact-Decimal promotion.
+            assert_eq!(
+                c.arbitrary_precision_decimal,
+                matches!(arrow, DataType::Decimal128(_, _)),
+                "{arrow}"
+            );
+        }
+    }
+
+    #[test]
+    fn frame_keeps_a_naive_timestamp_naive() {
+        use arrow_schema::TimeUnit;
+        // Regression test, and the reason `arrow_frame` does not delegate this
+        // case: `arrow_to_ch_cast_type` defaults a missing timezone to 'UTC',
+        // which is right for a ClickHouse source (its datetimes are absolute
+        // instants) and wrong for a frame (pandas' datetime64[ns] with no tz is
+        // an unplaced wall clock). Claiming UTC here made
+        // `transform::datetime_override_tz` plan a tz-AWARE Arrow column while
+        // the frame supplied a naive one, and every batch failed to convert.
+        let c = resolve_one(DataType::Timestamp(TimeUnit::Microsecond, None));
+        assert_eq!(c.clickhouse_inner, "DateTime64(6)");
+        assert_eq!(c.arrow, DataType::Timestamp(TimeUnit::Microsecond, None));
+        // The tz-aware case must still carry its zone, or the same mismatch
+        // happens in the other direction.
+        let c = resolve_one(DataType::Timestamp(
+            TimeUnit::Microsecond,
+            Some("UTC".into()),
+        ));
+        assert_eq!(c.clickhouse_inner, "DateTime64(6, 'UTC')");
+    }
+
+    #[test]
+    fn frame_nullability_is_taken_from_the_frame() {
+        let cols = crate::types::arrow_frame::columns_from_arrow_schema(&frame_field(
+            DataType::Int64,
+            false,
+        ))
+        .unwrap();
+        assert!(!cols[0].nullable);
+        let cols = crate::types::arrow_frame::columns_from_arrow_schema(&frame_field(
+            DataType::Int64,
+            true,
+        ))
+        .unwrap();
+        assert!(cols[0].nullable);
+    }
+
+    #[test]
+    fn frame_rejects_unmappable_types_by_name_with_a_fix() {
+        use arrow_schema::{Field, TimeUnit};
+        use std::sync::Arc;
+        let cases: Vec<(DataType, &str)> = vec![
+            // The Python layer normalises these away; reaching Rust with one
+            // means a caller bypassed it, so the hint still has to be useful.
+            (
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                "floor('us')",
+            ),
+            (
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                "astype(str)",
+            ),
+            (
+                DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+                "json.dumps",
+            ),
+            (DataType::Decimal256(40, 2), "Decimal256"),
+            (DataType::Null, "astype('string')"),
+        ];
+        for (arrow, hint) in cases {
+            let err = crate::types::arrow_frame::columns_from_arrow_schema(&frame_field(
+                arrow.clone(),
+                true,
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains('c'), "{arrow}: {err}");
+            assert!(
+                err.contains(hint),
+                "{arrow}: expected hint {hint:?}, got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn frame_rejects_duplicate_column_names() {
+        let schema = arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", DataType::Int64, false),
+            arrow_schema::Field::new("id", DataType::Utf8, true),
+        ]);
+        let err = crate::types::arrow_frame::columns_from_arrow_schema(&schema)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("duplicate column 'id'"), "{err}");
+    }
+
+    #[test]
+    fn frame_rejects_a_schema_with_no_columns() {
+        let err =
+            crate::types::arrow_frame::columns_from_arrow_schema(&arrow_schema::Schema::empty())
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("no columns"), "{err}");
     }
 
     #[test]

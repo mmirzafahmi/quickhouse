@@ -1,5 +1,5 @@
-"""quickhouse — fast PostgreSQL/MySQL/BigQuery/ClickHouse ETL into ClickHouse or
-BigQuery, powered by a Rust engine.
+"""quickhouse — fast PostgreSQL/MySQL/BigQuery/ClickHouse and pandas ETL into
+ClickHouse or BigQuery, powered by a Rust engine.
 
 The heavy lifting (wire-protocol decoding, Arrow batching, parallel streaming,
 and destination ingestion) runs in native Rust. This module is a thin, typed
@@ -41,6 +41,14 @@ the ``source`` — a cross-cluster copy, or publishing a mart into BigQuery:
 >>> dst_ch = quickhouse.ClickHouse("http://ch-b:8123", database="analytics")
 >>> quickhouse.sync(src_ch, dst_ch, dest_table="orders", source_table="orders")
 
+A DataFrame you already hold goes in through :func:`quickhouse.from_pandas`
+(``pip install quickhouse[pandas]``) — a pandas, polars or pyarrow frame, with
+the same modes, DDL and warnings as any other source. ``mode="incremental"``
+upserts on ``key`` and needs no watermark, since the frame is the delta:
+
+>>> quickhouse.from_pandas(df, dst, dest_table="orders",
+...                        mode="incremental", key=["id"])
+
 For a tqdm progress bar instead of a print callback (``pip install quickhouse[progress]``):
 
 >>> with quickhouse.progress_bar() as on_progress:
@@ -65,6 +73,7 @@ from ._quickhouse import (
     sync,
     version,
 )
+from .pandas import QuickhouseWarning, from_pandas
 from .progress import progress_bar
 from .quality import Validation, ValidationFailed
 
@@ -83,7 +92,9 @@ __all__ = [
     "ReconcileResult",
     "Validation",
     "ValidationFailed",
+    "QuickhouseWarning",
     "sync",
+    "from_pandas",
     "reconcile_keys",
     "version",
     "__version__",

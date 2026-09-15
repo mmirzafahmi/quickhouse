@@ -48,6 +48,7 @@ source↔destination pairs — quickhouse deliberately supports a focused, fast 
 | ClickHouse | ✅ | ✅ |
 | CleverTap (HTTP API) | ✅ | ✅ |
 | AppsFlyer (HTTP API) | ✅ | ✅ |
+| pandas / polars / pyarrow DataFrame | ✅ | ✅ |
 
 BigQuery and ClickHouse are each both a source and a destination — so a
 cross-cluster ClickHouse copy, or publishing a ClickHouse mart into BigQuery,
@@ -150,6 +151,28 @@ Application Default Credentials. As a **destination** it also takes
 `write_method`: the default `"storage_write"` (the gRPC Storage Write API — free
 up to 2 TiB/month and higher-throughput) or the legacy `"insert_all"`
 (`tabledata.insertAll`, billed at roughly double and slower).
+
+### DataFrames — `from_pandas`
+
+A frame you already hold in memory goes in through `from_pandas` rather than
+`sync` (`pip install 'quickhouse[pandas]'`):
+
+```python
+qh.from_pandas(df, dst, dest_table="orders", mode="full", key=["id"])
+
+# Upsert on key — and unlike every other source, no watermark is needed.
+# A database source needs one to know where to resume reading; you already
+# hold every row, so the frame IS the delta.
+qh.from_pandas(df, dst, dest_table="orders", mode="incremental", key=["id"])
+```
+
+The conversion is Arrow, so pandas is the headline rather than the requirement:
+a `pyarrow.Table`, a `polars.DataFrame`, a DuckDB relation, or anything exposing
+`__arrow_c_stream__` all work. Every other `sync()` argument is forwarded
+unchanged. Categoricals, nullable `Int64`, `Decimal` objects and tz-aware
+timestamps are handled; nanosecond precision, nested columns and out-of-range
+dates are refused **by column name** rather than silently coerced. See the
+[DataFrames guide](docs/guide/sources/dataframes.md).
 
 ### HTTP API sources — CleverTap, AppsFlyer & generic HTTP
 
@@ -406,6 +429,10 @@ Arrays and composite (`RECORD`/`STRUCT`) types aren't supported yet.
   `client_key_file=...` (Postgres and MySQL). BigQuery accepts `credentials_file`,
   inline `credentials_json`, or ADC.
 - **Array / composite types** aren't mapped yet.
+- **`from_pandas` is not bounded-memory** — the frame is in RAM by definition.
+  Expect a transient peak of roughly 3–4x its Arrow footprint while it is
+  converted, serialized and decoded. Reading a table back *into* a DataFrame
+  (`to_pandas`) is not implemented yet.
 - **BigQuery as a source** reads through a single connection — `parallelism`
   becomes a server-side hint rather than true client-side fan-out (a limitation
   of the underlying crate's read API).

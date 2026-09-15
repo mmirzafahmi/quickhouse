@@ -103,60 +103,77 @@ impl ChArrowDecoder {
         })
     }
 
-    /// Re-label one decoded batch onto the planned schema, casting any column
-    /// whose type the server-side cast could not pin down.
     fn adapt(&self, batch: RecordBatch) -> Result<RecordBatch> {
-        if batch.num_columns() != self.schema.fields().len() {
-            return Err(EtlError::decode(format!(
-                "clickhouse returned {} column(s) for a read planned with {}",
-                batch.num_columns(),
-                self.schema.fields().len()
-            )));
-        }
-        let mut columns = Vec::with_capacity(batch.num_columns());
-        for (i, field) in self.schema.fields().iter().enumerate() {
-            let col = batch.column(i);
-            if col.data_type() == field.data_type() {
-                columns.push(col.clone());
-            } else {
-                columns.push(cast(col, field.data_type()).map_err(|e| {
-                    EtlError::decode(format!(
-                        "column '{}': clickhouse returned {:?} where {:?} was planned, and the \
-                         two don't convert ({e})",
-                        field.name(),
-                        col.data_type(),
-                        field.data_type()
-                    ))
-                })?);
-            }
-        }
-        RecordBatch::try_new(self.schema.clone(), columns).map_err(EtlError::from)
+        adapt_to_plan(batch, &self.schema, "clickhouse")
     }
 
-    /// Split a batch that exceeds `batch_bytes` into equal row slices. Slicing
-    /// is zero-copy (each slice shares the parent's buffers), so this bounds
-    /// what the *insert path* holds and hands back to the memory budget, not
-    /// the peak of this decode.
     fn split(&self, batch: RecordBatch) -> Vec<RecordBatch> {
-        let rows = batch.num_rows();
-        if self.batch_bytes == 0 || rows <= 1 {
-            return vec![batch];
-        }
-        let bytes = batch.get_array_memory_size();
-        if bytes <= self.batch_bytes {
-            return vec![batch];
-        }
-        let per_row = (bytes / rows).max(1);
-        let chunk = (self.batch_bytes / per_row).max(1);
-        let mut out = Vec::with_capacity(rows.div_ceil(chunk));
-        let mut offset = 0;
-        while offset < rows {
-            let len = chunk.min(rows - offset);
-            out.push(batch.slice(offset, len));
-            offset += len;
-        }
-        out
+        split_to_bytes(batch, self.batch_bytes)
     }
+}
+
+/// Re-label one decoded batch onto the planned schema, casting any column whose
+/// type the producer could not be made to pin down.
+///
+/// Shared by the ClickHouse source (where the producer is the server's
+/// `FORMAT ArrowStream`, and `source` reads "clickhouse") and the DataFrame
+/// source (where it is the caller's own frame, and `source` reads "the frame").
+/// `source` only shapes the error text.
+pub(crate) fn adapt_to_plan(
+    batch: RecordBatch,
+    schema: &SchemaRef,
+    source: &str,
+) -> Result<RecordBatch> {
+    if batch.num_columns() != schema.fields().len() {
+        return Err(EtlError::decode(format!(
+            "{source} returned {} column(s) for a read planned with {}",
+            batch.num_columns(),
+            schema.fields().len()
+        )));
+    }
+    let mut columns = Vec::with_capacity(batch.num_columns());
+    for (i, field) in schema.fields().iter().enumerate() {
+        let col = batch.column(i);
+        if col.data_type() == field.data_type() {
+            columns.push(col.clone());
+        } else {
+            columns.push(cast(col, field.data_type()).map_err(|e| {
+                EtlError::decode(format!(
+                    "column '{}': {source} returned {:?} where {:?} was planned, and the \
+                     two don't convert ({e})",
+                    field.name(),
+                    col.data_type(),
+                    field.data_type()
+                ))
+            })?);
+        }
+    }
+    RecordBatch::try_new(schema.clone(), columns).map_err(EtlError::from)
+}
+
+/// Split a batch that exceeds `batch_bytes` into equal row slices. Slicing is
+/// zero-copy (each slice shares the parent's buffers), so this bounds what the
+/// *insert path* holds and hands back to the memory budget, not the peak of the
+/// decode that produced it. `batch_bytes == 0` disables splitting.
+pub(crate) fn split_to_bytes(batch: RecordBatch, batch_bytes: usize) -> Vec<RecordBatch> {
+    let rows = batch.num_rows();
+    if batch_bytes == 0 || rows <= 1 {
+        return vec![batch];
+    }
+    let bytes = batch.get_array_memory_size();
+    if bytes <= batch_bytes {
+        return vec![batch];
+    }
+    let per_row = (bytes / rows).max(1);
+    let chunk = (batch_bytes / per_row).max(1);
+    let mut out = Vec::with_capacity(rows.div_ceil(chunk));
+    let mut offset = 0;
+    while offset < rows {
+        let len = chunk.min(rows - offset);
+        out.push(batch.slice(offset, len));
+        offset += len;
+    }
+    out
 }
 
 #[cfg(test)]
