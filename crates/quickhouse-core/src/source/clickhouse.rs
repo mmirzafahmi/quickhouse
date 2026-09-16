@@ -342,17 +342,20 @@ impl ClickHouseSource {
             .collect::<Vec<_>>()
             .join(", ");
 
-        let cursor_pred = keyset.as_ref().and_then(|k| {
-            k.cursor
-                .as_ref()
-                .map(|cur| format!("{} > {}", k.col_quoted, cur))
-        });
+        let cursor_pred = keyset.as_ref().and_then(crate::source::keyset_predicate);
         let extra_owned = extra_filter.map(str::to_string);
         let extra_and_cursor = combine_filters(&extra_owned, cursor_pred.as_deref());
         let filters = combine_filters(&partition.predicate, extra_and_cursor.as_deref());
         let order_limit = keyset
             .as_ref()
-            .map(|k| format!(" ORDER BY {} ASC LIMIT {}", k.col_quoted, k.limit))
+            .map(|k| match &k.bound {
+                crate::source::KeysetBound::OrderedLimit(n) => {
+                    format!(" ORDER BY {} ASC LIMIT {n}", k.col_quoted)
+                }
+                // A bounded window needs no sort; its upper bound is already
+                // folded into the WHERE by `keyset_predicate`.
+                crate::source::KeysetBound::UpperBound(_) => String::new(),
+            })
             .unwrap_or_default();
 
         let mut sql = format!(
@@ -559,6 +562,7 @@ fn tsv_field(raw: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::source::KeysetBound;
     use arrow_schema::{DataType, TimeUnit};
 
     fn col(name: &str, arrow: DataType, nullable: bool) -> ColumnType {
@@ -640,7 +644,7 @@ mod tests {
             Some(Keyset {
                 col_quoted: "`id`".into(),
                 cursor: Some("42".into()),
-                limit: 500,
+                bound: KeysetBound::OrderedLimit(500),
             }),
         );
         assert!(

@@ -1013,6 +1013,56 @@ pub struct TransferConfig {
     /// time; the value is chosen to separate those measured populations, not to
     /// mean anything absolute.
     pub probe_max_cost: f64,
+    /// Ceiling on the width, in key units, of a **windowed read** — the sweep
+    /// used when the read's own filter is a sequential scan. `None` uses
+    /// [`crate::source::DEFAULT_READ_WINDOW_ROWS`].
+    ///
+    /// This is a runaway guard, not the governor: the sweep starts well below
+    /// it and [`Self::window_target_secs`] decides the width in practice.
+    ///
+    /// **What this is for.** On a hot standby, any read longer than
+    /// `max_standby_streaming_delay` is cancelled with `SQLSTATE 40001`, and
+    /// retrying cannot converge: every attempt restarts the same scan against
+    /// the same window. Measured on a real replica with a 30s tolerance, reads
+    /// of this shape took 75-162s and several never completed in three
+    /// attempts.
+    ///
+    /// A window bounds the **key range examined** (`key > lo AND key <= hi`),
+    /// not the rows returned. With an index on the key, the work is
+    /// proportional to the range whatever the rest of the WHERE selects — so
+    /// each read's duration is predictable, which is what lets it finish inside
+    /// the tolerance. A window cancelled anyway is retried at half the width,
+    /// down to a floor, so the sweep reaches a size that fits instead of
+    /// re-running a doomed scan.
+    ///
+    /// Note this is *not* `chunk_rows`, which bounds by `ORDER BY key LIMIT n`
+    /// — that bounds matching rows *found*, and is unbounded work when the
+    /// other predicates are selective and unindexed.
+    ///
+    /// Windowing activates automatically from the planner-cost probe (see
+    /// [`Self::probe_max_cost`]); this only sizes it. The whole key space is
+    /// still swept, so the total work is unchanged — the gain is that the run
+    /// completes rather than being cancelled.
+    pub read_window_rows: Option<u64>,
+
+    /// What one **windowed read** should take, in seconds. `None` uses
+    /// [`crate::source::DEFAULT_WINDOW_TARGET_SECS`].
+    ///
+    /// The sweep re-sizes its window after every read to converge here, which
+    /// is what keeps each read inside a hot standby's
+    /// `max_standby_streaming_delay` without anyone guessing a row count — a
+    /// fixed width cannot know how wide the rows are.
+    ///
+    /// Keep this well under the standby's delay. Window duration is far more
+    /// variable than width (measured: p50 3.2s, p90 9.6s, max 82s on one
+    /// table), because it depends on how many rows in a key range actually
+    /// match. Raising the target buys little — the scan work is fixed, so a
+    /// wider window mostly moves the same work around — while shifting the
+    /// whole duration distribution, tail included, toward the cancellation
+    /// limit. What actually costs time is a cancelled window: its work is
+    /// thrown away and redone. Measured, 21 cancellations accounted for ~420s
+    /// of a 2603s sweep.
+    pub window_target_secs: Option<f64>,
     /// Per-column SQL value transforms applied in the source `SELECT`
     /// (source-column name -> expression, e.g. `"CAST(x AS TEXT)"`,
     /// `"col AT TIME ZONE 'UTC'"`, `"ROUND(amt, 9)"`). Applied over
@@ -1633,6 +1683,8 @@ pub(crate) fn default_test_config() -> TransferConfig {
         chunk_rows: None,
         retry_max_attempts: 1,
         probe_max_cost: crate::source::DEFAULT_PROBE_MAX_COST,
+        read_window_rows: None,
+        window_target_secs: None,
         column_transforms: HashMap::new(),
         column_transform_types: HashMap::new(),
         evolve_schema: false,
@@ -1746,6 +1798,8 @@ mod tests {
             chunk_rows: None,
             retry_max_attempts: 1,
             probe_max_cost: crate::source::DEFAULT_PROBE_MAX_COST,
+            read_window_rows: None,
+            window_target_secs: None,
             column_transforms: HashMap::new(),
             column_transform_types: HashMap::new(),
             evolve_schema: false,

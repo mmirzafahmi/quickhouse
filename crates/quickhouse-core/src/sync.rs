@@ -35,10 +35,10 @@ use crate::source::clevertap::CleverTapSource;
 use crate::source::clickhouse::quote_ch_table;
 use crate::source::mysql::{quote_my, quote_my_table};
 use crate::source::postgres::{quote_pg, quote_pg_table};
-use crate::source::ProbeCost;
 use crate::source::{
     BigQuerySource, ClickHouseSource, Keyset, MySqlSource, Partition, PgSource, Source,
 };
+use crate::source::{KeysetBound, ProbeCost};
 use crate::transform::{self, SelectPlan};
 use crate::types::bigquery::arrow_to_bigquery_type;
 use crate::types::ColumnType;
@@ -762,6 +762,9 @@ struct SourceSetup {
     /// no frozen upper bound and takes its cursor from the stream instead. See
     /// [`plan_watermark_probes`].
     stream_max_cursor: bool,
+    /// `Some` when the read's own filter plans as a sequential scan, so it must
+    /// be swept in bounded key windows to survive a standby's conflict window.
+    window: Option<WindowPlan>,
 }
 
 /// Run one table transfer end to end.
@@ -1025,18 +1028,6 @@ async fn run_transfer_impl(
     let base_query = cfg.source_query.clone();
     let watermark = cfg.watermark.clone();
 
-    // Read the persisted cursor up front: `setup_*` needs it to tell a first
-    // run (no cursor yet) from an ongoing one, which is what decides whether
-    // the nullable-watermark completeness scan is worth paying for. Re-read
-    // below for the filter itself — it is a single-row lookup in the
-    // destination's state table, not a source scan.
-    let committed_cursor = if cfg.mode == SyncMode::Incremental {
-        sink.read_last_watermark(&cfg).await?
-    } else {
-        None
-    };
-    let first_run = committed_cursor.is_none();
-
     // --- Resolve source schema, incremental snapshot max, and partitions,
     // all on one control connection. ---
     let setup = match source.as_ref() {
@@ -1047,7 +1038,6 @@ async fn run_transfer_impl(
                 base_table.as_deref(),
                 base_query.as_deref(),
                 watermark.as_deref(),
-                first_run,
                 &warnings,
             )
             .await?
@@ -1059,7 +1049,6 @@ async fn run_transfer_impl(
                 base_table.as_deref(),
                 base_query.as_deref(),
                 watermark.as_deref(),
-                first_run,
                 &warnings,
             )
             .await?
@@ -1084,6 +1073,7 @@ async fn run_transfer_impl(
         snapshot_max,
         partitions,
         stream_max_cursor,
+        window: window_plan,
     } = setup;
     tracing::info!(
         "resolved {} source column(s); computed {} partition(s) for parallel read",
@@ -1245,6 +1235,7 @@ async fn run_transfer_impl(
         let cfg = Arc::new(cfg);
         let extra_filter = Arc::new(extra_filter);
         let chunk_plan = Arc::new(chunk_plan);
+        let window_plan = Arc::new(window_plan);
         let target_table = Arc::new(target_table);
         let ctx = SendCtx {
             sink: sink.clone(),
@@ -1267,6 +1258,7 @@ async fn run_transfer_impl(
             let ctx = ctx.clone();
             let extra_filter = extra_filter.clone();
             let chunk_plan = chunk_plan.clone();
+            let window_plan = window_plan.clone();
             let base_table = base_table.clone();
             let base_query = base_query.clone();
             async move {
@@ -1282,6 +1274,7 @@ async fn run_transfer_impl(
                             extra_filter.as_deref(),
                             part,
                             chunk_plan.as_ref().as_ref(),
+                            window_plan.as_ref().as_ref(),
                         )
                         .await
                     }
@@ -1296,6 +1289,7 @@ async fn run_transfer_impl(
                             extra_filter.as_deref(),
                             part,
                             chunk_plan.as_ref().as_ref(),
+                            window_plan.as_ref().as_ref(),
                         )
                         .await
                     }
@@ -2547,7 +2541,6 @@ async fn setup_postgres(
     base_query: Option<&str>,
     watermark: Option<&str>,
     // No cursor persisted yet — this run reads the table from scratch anyway.
-    first_run: bool,
     warnings: &Warnings,
 ) -> Result<SourceSetup> {
     tracing::info!("connecting to postgres...");
@@ -2576,8 +2569,10 @@ async fn setup_postgres(
     };
     if base_table.is_some() && base_query.is_some() {
         tracing::warn!(
-            "both source_table and source_query are set; source_table is ignored — \
-             schema and data both come from source_query"
+            "both source_table and source_query are set; schema and data come from \
+             source_query. source_table is still used for the windowed read's key-bounds \
+             probe, which is why setting both is useful: the bounds come from the table's \
+             index instead of inheriting source_query's own filter"
         );
     }
     let source_cols = s
@@ -2589,6 +2584,7 @@ async fn setup_postgres(
     // mode="full" can't add a spurious query or fail on an aggregate edge
     // case (e.g. an empty table's MAX() being NULL) for a result nothing uses.
     let mut stream_max_cursor = false;
+    let mut window_activated = false;
     let snapshot_max = if cfg.mode == SyncMode::Incremental {
         if let Some(w) = watermark {
             ensure_watermark_column(w, &source_cols)?;
@@ -2611,7 +2607,6 @@ async fn setup_postgres(
                 count_cost.clone(),
                 max_cost.clone(),
                 cfg.probe_max_cost,
-                first_run,
                 cfg.lookback_seconds,
             );
             warn_on_costly_watermark(
@@ -2630,6 +2625,7 @@ async fn setup_postgres(
                 warn_on_null_watermark(w, null_count, warnings);
             }
             stream_max_cursor = probes.stream_max;
+            window_activated = probes.warn_costly;
             if probes.stream_max {
                 // No frozen upper bound: the filter is `wm > committed` alone,
                 // and the cursor comes from the rows actually read.
@@ -2645,12 +2641,71 @@ async fn setup_postgres(
         None
     };
 
-    let partitions = compute_partitions_pg(s, &control, cfg, &source_cols).await?;
+    // Does the read itself plan as a sequential scan? If so it will not
+    // reliably finish inside a standby's conflict window, and must be swept in
+    // bounded key ranges rather than attempted in one pass.
+    // The read's own filter is the watermark predicate, and the probes above
+    // already established whether that column can be served by an index. If it
+    // cannot, `WHERE wm > x` is a sequential scan that will not reliably finish
+    // inside a standby's conflict window — sweep it in bounded key ranges
+    // instead of attempting it in one pass. No extra EXPLAIN is needed: the
+    // signal is the one already computed.
+    let window = if window_activated {
+        match window_key(cfg, &source_cols) {
+            Some((col, nullable_key)) => {
+                let bounds = match s
+                    .key_bounds(&control, base_table, base_query, &col, None)
+                    .await
+                {
+                    Ok(b) => b,
+                    Err(e) => {
+                        // Never fail the run for a probe, but never fall back
+                        // silently either: without bounds there is no sweep, so
+                        // the read is attempted in one pass and gets cancelled
+                        // — the operator needs to know that is why.
+                        tracing::warn!(
+                            "the read plans as a sequential scan, but the key bounds of '{col}' \
+                             could not be probed ({e}), so it cannot be windowed and will be read \
+                             in one pass. If source_query embeds its own unindexed filter, the \
+                             probe inherits it; project the raw key and set partition_source_expr, \
+                             or index the filtered column."
+                        );
+                        None
+                    }
+                };
+                plan_read_window(cfg, bounds, quote_pg(&col), nullable_key)
+            }
+            None => {
+                tracing::info!(
+                    "the read plans as a sequential scan, but no usable integer key was found to \
+                     window it on; reading in one pass"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // A windowed read IS the sequencing: the sweep already walks the whole key
+    // space in bounded steps, so fanning out range partitions on top would make
+    // every partition sweep the entire space and multiply the work by
+    // `parallelism`. Same reasoning as chunked reads, which are likewise always
+    // single-stream.
+    let partitions = if window.is_some() {
+        vec![Partition {
+            label: "all".into(),
+            predicate: None,
+        }]
+    } else {
+        compute_partitions_pg(s, &control, cfg, &source_cols).await?
+    };
     Ok(SourceSetup {
         source_cols,
         snapshot_max,
         partitions,
         stream_max_cursor,
+        window,
     })
 }
 
@@ -2661,7 +2716,6 @@ async fn setup_mysql(
     base_query: Option<&str>,
     watermark: Option<&str>,
     // No cursor persisted yet — this run reads the table from scratch anyway.
-    first_run: bool,
     warnings: &Warnings,
 ) -> Result<SourceSetup> {
     tracing::info!("connecting to mysql...");
@@ -2690,6 +2744,7 @@ async fn setup_mysql(
     // mode="full" can't add a spurious query or fail on an aggregate edge
     // case (e.g. an empty table's MAX() being NULL) for a result nothing uses.
     let mut stream_max_cursor = false;
+    let mut window_activated = false;
     let snapshot_max = if cfg.mode == SyncMode::Incremental {
         if let Some(w) = watermark {
             ensure_watermark_column(w, &source_cols)?;
@@ -2709,7 +2764,6 @@ async fn setup_mysql(
                 count_cost.clone(),
                 max_cost.clone(),
                 cfg.probe_max_cost,
-                first_run,
                 cfg.lookback_seconds,
             );
             warn_on_costly_watermark(
@@ -2728,6 +2782,7 @@ async fn setup_mysql(
                 warn_on_null_watermark(w, null_count, warnings);
             }
             stream_max_cursor = probes.stream_max;
+            window_activated = probes.warn_costly;
             if probes.stream_max {
                 None
             } else {
@@ -2741,12 +2796,64 @@ async fn setup_mysql(
         None
     };
 
-    let partitions = compute_partitions_mysql(s, &mut control, cfg, &source_cols).await?;
+    // See the equivalent block in `setup_postgres`.
+    // The read's own filter is the watermark predicate, and the probes above
+    // already established whether that column can be served by an index. If it
+    // cannot, `WHERE wm > x` is a sequential scan that will not reliably finish
+    // inside a standby's conflict window — sweep it in bounded key ranges
+    // instead of attempting it in one pass. No extra EXPLAIN is needed: the
+    // signal is the one already computed.
+    let window = if window_activated {
+        match window_key(cfg, &source_cols) {
+            Some((col, nullable_key)) => {
+                let bounds = match s
+                    .key_bounds(&mut control, base_table, base_query, &col, None)
+                    .await
+                {
+                    Ok(b) => b,
+                    Err(e) => {
+                        // See the equivalent branch in `setup_postgres`.
+                        tracing::warn!(
+                            "the read plans as a sequential scan, but the key bounds of '{col}' \
+                             could not be probed ({e}), so it cannot be windowed and will be read \
+                             in one pass."
+                        );
+                        None
+                    }
+                };
+                plan_read_window(cfg, bounds, quote_my(&col), nullable_key)
+            }
+            None => {
+                tracing::info!(
+                    "the read plans as a sequential scan, but no usable integer key was found to \
+                     window it on; reading in one pass"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // A windowed read IS the sequencing: the sweep already walks the whole key
+    // space in bounded steps, so fanning out range partitions on top would make
+    // every partition sweep the entire space and multiply the work by
+    // `parallelism`. Same reasoning as chunked reads, which are likewise always
+    // single-stream.
+    let partitions = if window.is_some() {
+        vec![Partition {
+            label: "all".into(),
+            predicate: None,
+        }]
+    } else {
+        compute_partitions_mysql(s, &mut control, cfg, &source_cols).await?
+    };
     Ok(SourceSetup {
         source_cols,
         snapshot_max,
         partitions,
         stream_max_cursor,
+        window,
     })
 }
 
@@ -2906,7 +3013,7 @@ async fn transfer_keyset_postgres(
         let keyset = Keyset {
             col_quoted: col_quoted.clone(),
             cursor: cursor.clone(),
-            limit: chunk.limit,
+            bound: KeysetBound::OrderedLimit(chunk.limit),
         };
         let copy_sql = source.copy_sql(
             &plan.source_columns,
@@ -3027,7 +3134,350 @@ async fn transfer_keyset_postgres(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn transfer_partition_postgres(
+/// The column a windowed sweep can bound on, and whether it may hold NULLs.
+///
+/// The contract is deliberately weaker than the chunked-read path's, because
+/// windows need less:
+///
+/// * **Integer** — required, since a window is range arithmetic over the key.
+/// * **Untransformed** — required: a value-transform would mean the predicate
+///   bounds something other than the stored column, so no index could serve it.
+/// * **Unique** — *not* required. A repeated key value still falls in exactly
+///   one `(lo, hi]` window. Uniqueness matters for a resumable cursor, which
+///   this is not.
+/// * **NOT NULL** — *not* required. A NULL key matches no range predicate, so
+///   those rows get their own trailing `IS NULL` window, exactly as
+///   `range_partitions` already does for a nullable partition key.
+///
+/// That last point matters in practice: reading through a `source_query` gives
+/// PostgreSQL no base table to read NOT NULL constraints from, so every column
+/// resolves as nullable. Rejecting nullable keys would make windowing inert for
+/// precisely the transfers that need it — the same blind spot a catalog-based
+/// index check had.
+///
+/// Resolution order matches `keyset_column()`: `partition_column`, else the
+/// first `key` column — in practice the primary key, which an index covers.
+fn window_key(cfg: &TransferConfig, source_cols: &[ColumnType]) -> Option<(String, bool)> {
+    let col = cfg.keyset_column()?;
+    if cfg.column_transforms.contains_key(&col) {
+        return None;
+    }
+    let c = source_cols.iter().find(|c| c.name == col)?;
+    let integer = matches!(
+        c.arrow,
+        DataType::Int16 | DataType::Int32 | DataType::Int64 | DataType::UInt32
+    );
+    if !integer {
+        return None;
+    }
+    Some((col, c.nullable))
+}
+
+/// Decide whether the read must be swept in windows, and size the first one.
+///
+/// Activation is decided by the caller from the planner-cost probe 0.18.0
+/// already runs against the watermark column: if that column cannot be served
+/// by an index, the read's `WHERE wm > x` is a sequential scan. This function
+/// only sizes the sweep.
+///
+/// Returns `None` (read in one pass, exactly as before) when the relation is
+/// empty or windowing is disabled.
+fn plan_read_window(
+    cfg: &TransferConfig,
+    bounds: Option<(i64, i64)>,
+    col_quoted: String,
+    nullable_key: bool,
+) -> Option<WindowPlan> {
+    let (min, max) = bounds?;
+    // `read_window_rows` sets the ceiling; the sweep starts below it and grows
+    // into it only if measured durations allow.
+    let max_step = cfg
+        .read_window_rows
+        .unwrap_or(crate::source::DEFAULT_READ_WINDOW_ROWS);
+    if max_step == 0 {
+        return None;
+    }
+    let step = crate::source::INITIAL_READ_WINDOW_ROWS.min(max_step);
+    // The floor can never exceed the ceiling: an explicitly-configured window
+    // smaller than MIN_READ_WINDOW_ROWS is a deliberate choice (and the tests
+    // use tiny widths on purpose), so clamp rather than panic on an inverted
+    // range.
+    let floor = (step / 64)
+        .max(crate::source::MIN_READ_WINDOW_ROWS)
+        .min(step);
+    Some(WindowPlan {
+        col_quoted,
+        min,
+        max,
+        start: step,
+        max_step,
+        target_secs: cfg
+            .window_target_secs
+            .unwrap_or(crate::source::DEFAULT_WINDOW_TARGET_SECS),
+        floor,
+        nullable_key,
+    })
+}
+
+/// Read one partition, as one pass or as a sweep of bounded windows.
+///
+/// The sweep reuses the single-pass path verbatim: a window is just an extra
+/// `key > lo AND key <= hi` conjunct on the partition predicate, so every
+/// downstream behaviour — decode, backpressure, archival, the watermark
+/// tracker that folds through `push_batch` — is unchanged.
+macro_rules! sweeping_partition {
+    ($name:ident, $inner:ident, $src:ty) => {
+        #[allow(clippy::too_many_arguments)]
+        async fn $name(
+            source: &$src,
+            plan: &SelectPlan,
+            cfg: &TransferConfig,
+            ctx: &SendCtx,
+            base_table: Option<&str>,
+            base_query: Option<&str>,
+            extra_filter: Option<&str>,
+            partition: Partition,
+            chunk: Option<&ChunkPlan>,
+            window: Option<&WindowPlan>,
+        ) -> Result<()> {
+            let w = match window {
+                None => {
+                    return $inner(
+                        source,
+                        plan,
+                        cfg,
+                        ctx,
+                        base_table,
+                        base_query,
+                        extra_filter,
+                        partition,
+                        chunk,
+                    )
+                    .await
+                }
+                Some(w) => w,
+            };
+            // Half-open (lo, hi]: start just below `min` so the first window
+            // includes it, and every key is covered exactly once.
+            let mut lo = w.min.saturating_sub(1);
+            let mut step = w.start;
+            let mut shrinks = 0u32;
+            let mut windows = 0u32;
+            tracing::info!(
+                "windowed read on {} over [{}, {}], starting width {} (ceiling {}, target {:.1}s)",
+                w.col_quoted,
+                w.min,
+                w.max,
+                w.start,
+                w.max_step,
+                w.target_secs
+            );
+            while lo < w.max {
+                let hi = window_hi(lo, step, w.max);
+                let pred = format!(
+                    "{c} > {lo} AND {c} <= {hi}",
+                    c = w.col_quoted,
+                    lo = lo,
+                    hi = hi
+                );
+                let part = Partition {
+                    label: format!("{}:({lo},{hi}]", partition.label),
+                    predicate: Some(match &partition.predicate {
+                        Some(p) => format!("({p}) AND ({pred})"),
+                        None => pred,
+                    }),
+                };
+                let started = Instant::now();
+                let res = $inner(
+                    source,
+                    plan,
+                    cfg,
+                    ctx,
+                    base_table,
+                    base_query,
+                    extra_filter,
+                    part,
+                    None,
+                )
+                .await;
+                match res {
+                    Ok(()) => {
+                        windows += 1;
+                        let secs = started.elapsed().as_secs_f64();
+                        let (n_lo, n_step) =
+                            next_window(lo, hi, step, w, WindowOutcome::Done(secs));
+                        if n_step != step {
+                            tracing::debug!(
+                                "window took {secs:.1}s (target {:.1}s); width {step} -> {n_step}",
+                                w.target_secs
+                            );
+                        }
+                        lo = n_lo;
+                        step = n_step;
+                    }
+                    Err(e) if e.is_transient_source() && step > w.floor => {
+                        shrinks += 1;
+                        let (n_lo, n_step) = next_window(lo, hi, step, w, WindowOutcome::Cancelled);
+                        lo = n_lo;
+                        step = n_step;
+                        tracing::warn!(
+                            "window ({lo}, {hi}] was cancelled by the source ({e}); \
+                             retrying it at width {step}"
+                        );
+                    }
+                    // At the floor, or not a transient cancellation: this is a
+                    // real failure, not a sizing problem.
+                    Err(e) => return Err(e),
+                }
+            }
+            // A NULL key matches no range predicate, so those rows would be
+            // dropped by the sweep. Give them their own window — the same
+            // trailing `IS NULL` partition `range_partitions` already emits.
+            if w.nullable_key {
+                let pred = format!("{} IS NULL", w.col_quoted);
+                let part = Partition {
+                    label: format!("{}:null-key", partition.label),
+                    predicate: Some(match &partition.predicate {
+                        Some(p) => format!("({p}) AND ({pred})"),
+                        None => pred,
+                    }),
+                };
+                $inner(
+                    source,
+                    plan,
+                    cfg,
+                    ctx,
+                    base_table,
+                    base_query,
+                    extra_filter,
+                    part,
+                    None,
+                )
+                .await?;
+                windows += 1;
+            }
+            tracing::info!("windowed read complete: {windows} window(s), {shrinks} shrink(s)");
+            Ok(())
+        }
+    };
+}
+
+sweeping_partition!(
+    transfer_partition_postgres,
+    read_one_partition_postgres,
+    PgSource
+);
+sweeping_partition!(
+    transfer_partition_mysql,
+    read_one_partition_mysql,
+    MySqlSource
+);
+
+/// A sweep of bounded key-range windows, used when the read's own filter is a
+/// sequential scan.
+///
+/// **Why this exists.** On a hot standby, a read longer than
+/// `max_standby_streaming_delay` is cancelled with `SQLSTATE 40001`. Retrying
+/// the whole read cannot converge — every attempt restarts the same scan
+/// against the same window — so a 160s scan on a 30s tolerance fails every
+/// time. Measured on a real replica: two probes of this shape never completed
+/// in three attempts each.
+///
+/// A window bounds the **key range examined**, not the rows returned. With an
+/// index on the key, the work is proportional to the range whatever the rest of
+/// the WHERE selects, so each read's duration is predictable. A window that is
+/// cancelled anyway is retried at half the size, so the sweep provably reaches
+/// a size that fits inside the tolerance instead of re-sampling a doomed scan.
+#[derive(Debug, Clone)]
+struct WindowPlan {
+    /// Already-quoted key expression the windows bound.
+    col_quoted: String,
+    /// Inclusive key bounds of the relation.
+    min: i64,
+    max: i64,
+    /// Width of the first window, before anything has been measured.
+    ///
+    /// Deliberately cautious and separate from [`Self::max_step`]: the first
+    /// window is the only one sized by guesswork, and guessing high costs a
+    /// cancelled read plus a backoff, while guessing low costs one quick read.
+    start: u64,
+    /// Ceiling on window width. Only a runaway guard — [`Self::target_secs`] is
+    /// the real governor, and the sweep converges there on its own. Set it too
+    /// close to `start` and a fast table is stuck reading far more windows than
+    /// it needs: measured, 0.80s windows against a 5s target were being capped
+    /// at 6x more windows than the target implied.
+    max_step: u64,
+    /// What one window should take. The width is adjusted after every window to
+    /// converge on this, which is what keeps a read inside a standby's
+    /// conflict window without anyone having to guess a row count.
+    target_secs: f64,
+    /// Never shrink below this; a window still failing here is a real error,
+    /// not a sizing problem, and must surface rather than loop.
+    floor: u64,
+    /// The key may hold NULLs, which no range predicate matches — sweep a
+    /// final `IS NULL` window so those rows are not silently dropped.
+    nullable_key: bool,
+}
+
+/// Step the sweep: `(lo, hi]` windows over `[min, max]`, sized by how long the
+/// last one actually took.
+///
+/// **Why duration, not a row count.** A fixed window width cannot know how wide
+/// the rows are. Measured on a real 41 GB table, a 2,000,000-key window took
+/// 37-121 seconds — far outside the 30s `max_standby_streaming_delay` it had to
+/// fit inside — while the same width on a narrow table would be trivial. The
+/// only portable signal is the clock: aim each window at
+/// [`WindowPlan::target_secs`] and let the width find itself.
+///
+/// Returns the next `(lo, step)`. Kept separate from the I/O so the covering and
+/// resizing behaviour is unit-testable without a database.
+fn next_window(
+    lo: i64,
+    hi: i64,
+    step: u64,
+    plan: &WindowPlan,
+    outcome: WindowOutcome,
+) -> (i64, u64) {
+    let target = plan.target_secs.max(0.1);
+    match outcome {
+        // Cancelled: halve immediately and retry the SAME window. Nothing was
+        // learned about a workable size except that this one is too big.
+        WindowOutcome::Cancelled => (lo, (step / 2).max(plan.floor)),
+        WindowOutcome::Done(secs) => {
+            // Asymmetric on purpose (AIMD): shrink hard, grow gently.
+            //
+            // Window duration is far more variable than width — measured on a
+            // real table, p50 was 3.2s against a p90 of 9.6s and a max of 82s,
+            // because how long a key range takes depends on how many rows in it
+            // actually match, not on how wide it is. Growing as eagerly as we
+            // shrink means one empty range doubles the width straight into a
+            // dense one, and that overshoot is what lands past the standby's
+            // limit. Backing off fast and creeping back up keeps the tail in
+            // check at a small cost in window count.
+            let ratio = (target / secs.max(0.01)).clamp(0.25, 1.25);
+            let next = ((step as f64) * ratio).round() as u64;
+            (hi, next.clamp(plan.floor, plan.max_step))
+        }
+    }
+}
+
+/// What happened to one window, and how long it took.
+#[derive(Debug, Clone, Copy)]
+enum WindowOutcome {
+    Done(f64),
+    Cancelled,
+}
+
+/// The upper edge of the window starting just above `lo`, clamped to `max`.
+fn window_hi(lo: i64, step: u64, max: i64) -> i64 {
+    match lo.checked_add(step as i64) {
+        Some(h) => h.min(max),
+        None => max,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn read_one_partition_postgres(
     source: &PgSource,
     plan: &SelectPlan,
     cfg: &TransferConfig,
@@ -3190,7 +3640,7 @@ async fn transfer_keyset_mysql(
         let keyset = Keyset {
             col_quoted: col_quoted.clone(),
             cursor: cursor.clone(),
-            limit: chunk.limit,
+            bound: KeysetBound::OrderedLimit(chunk.limit),
         };
         let select_sql = source.select_sql(
             &plan.source_columns,
@@ -3300,7 +3750,7 @@ async fn transfer_keyset_mysql(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn transfer_partition_mysql(
+async fn read_one_partition_mysql(
     source: &MySqlSource,
     plan: &SelectPlan,
     cfg: &TransferConfig,
@@ -3479,6 +3929,7 @@ async fn setup_clickhouse(
         source_cols,
         snapshot_max,
         partitions,
+        window: None,
         // ClickHouse reads are not gated on probe cost: its sparse primary
         // index makes both probes cheap, and there is no seq-scan cliff to
         // detect.
@@ -3577,7 +4028,7 @@ async fn transfer_keyset_clickhouse(
         let keyset = Keyset {
             col_quoted: col_quoted.clone(),
             cursor: cursor.clone(),
-            limit: chunk.limit,
+            bound: KeysetBound::OrderedLimit(chunk.limit),
         };
         let select_sql = source.select_sql(
             &plan.source_columns,
@@ -3935,13 +4386,24 @@ fn plan_watermark_probes(
     count_cost: ProbeCost,
     max_cost: ProbeCost,
     threshold: f64,
-    first_run: bool,
     lookback_seconds: u64,
 ) -> WatermarkProbePlan {
     let count_too_dear = count_cost.should_skip(threshold);
     let max_too_dear = max_cost.should_skip(threshold);
     WatermarkProbePlan {
-        count_nulls: first_run || !count_too_dear,
+        // Cost gates the NULL check even on a first run.
+        //
+        // Forcing it when `first_run` made the completeness check
+        // unconditional, but on a large table with an unindexed watermark that
+        // scan cannot finish inside a hot standby's
+        // `max_standby_streaming_delay` — measured, it was cancelled with
+        // 40001 on three consecutive attempts and never completed once. A
+        // first run on such a table therefore died here, before the read was
+        // even attempted, and no first run could ever succeed to make the
+        // second one cheaper. Skipping it is reported loudly by
+        // `warn_on_costly_watermark`, which is explicit that the check did not
+        // run rather than implying it passed.
+        count_nulls: !count_too_dear,
         stream_max: max_too_dear && lookback_seconds > 0,
         warn_costly: count_too_dear || max_too_dear,
     }
@@ -3995,7 +4457,9 @@ fn warn_on_costly_watermark(
         ));
     }
     message.push_str(&format!(
-        ". The durable fix is an index: CREATE INDEX CONCURRENTLY ON <table> ({watermark})."
+        ". The read itself is swept in bounded key windows so it still completes; the durable \
+         fix that makes the whole sweep unnecessary is an index: CREATE INDEX CONCURRENTLY ON \
+         <table> ({watermark})."
     ));
     tracing::warn!("{message}");
     warnings.push(TransferWarning {
@@ -5188,7 +5652,7 @@ mod tests {
     fn cheap_probes_are_all_still_run() {
         // The backward-compatibility guard: where the planner says both probes
         // are index lookups, nothing changes and nothing is reported.
-        let p = plan_watermark_probes(CHEAP, CHEAP, T, false, 86_400);
+        let p = plan_watermark_probes(CHEAP, CHEAP, T, 86_400);
         assert!(p.count_nulls);
         assert!(!p.stream_max, "a cheap MAX must still be used as the bound");
         assert!(!p.warn_costly);
@@ -5196,7 +5660,7 @@ mod tests {
 
     #[test]
     fn costly_probes_are_skipped_on_an_ongoing_run() {
-        let p = plan_watermark_probes(DEAR, DEAR, T, false, 86_400);
+        let p = plan_watermark_probes(DEAR, DEAR, T, 86_400);
         assert!(
             !p.count_nulls,
             "a full-scan count is pure overhead per tick"
@@ -5209,20 +5673,43 @@ mod tests {
     }
 
     #[test]
-    fn a_first_run_still_pays_for_the_completeness_count() {
-        // It reads the whole table anyway, and this is the moment the
-        // NULL-watermark condition matters most: a pipeline that starts out
-        // excluding rows excludes them forever.
-        let p = plan_watermark_probes(DEAR, DEAR, T, true, 86_400);
+    fn even_a_first_run_skips_a_completeness_count_it_cannot_afford() {
+        // This reverses an earlier decision, deliberately.
+        //
+        // The reasoning for paying on a first run was sound in isolation: the
+        // read touches the whole table anyway, and a pipeline that starts out
+        // excluding NULL-watermark rows excludes them forever. But on a large
+        // table with an unindexed watermark, read from a hot standby, this
+        // scan does not merely cost — it never finishes. Measured, it was
+        // cancelled with 40001 on three consecutive attempts, which made the
+        // first run fail before reading anything, so no first run could ever
+        // complete to make a later one cheaper. A check that cannot run is not
+        // a check.
+        //
+        // What protects the user instead is that the skip is *reported*:
+        // `warn_on_costly_watermark` states the check did not run rather than
+        // implying it passed.
+        let p = plan_watermark_probes(DEAR, DEAR, T, 86_400);
+        assert!(
+            !p.count_nulls,
+            "an unaffordable check must not be attempted"
+        );
+        assert!(p.warn_costly, "and the user must be told it was skipped");
+    }
+
+    #[test]
+    fn a_first_run_still_runs_a_completeness_count_it_can_afford() {
+        // The check is only dropped when the planner says it is unaffordable.
+        // When it is cheap, a first run still verifies completeness.
+        let p = plan_watermark_probes(CHEAP, DEAR, T, 86_400);
         assert!(p.count_nulls);
-        assert!(p.warn_costly, "the cost is still worth reporting");
     }
 
     #[test]
     fn stream_max_requires_a_lookback_window() {
         // Without a trailing re-scan nothing re-covers a row written mid-read
         // that the scan had already passed, so the MAX scan is paid for.
-        let p = plan_watermark_probes(DEAR, DEAR, T, false, 0);
+        let p = plan_watermark_probes(DEAR, DEAR, T, 0);
         assert!(!p.stream_max);
         assert!(p.warn_costly);
     }
@@ -5231,7 +5718,7 @@ mod tests {
     fn an_unreachable_planner_skips_rather_than_scans() {
         // The inverse of the earlier bug, where a cancelled probe silently
         // upgraded the plan to "run the full scan and say nothing".
-        let p = plan_watermark_probes(ProbeCost::Unknown, ProbeCost::Unknown, T, false, 86_400);
+        let p = plan_watermark_probes(ProbeCost::Unknown, ProbeCost::Unknown, T, 86_400);
         assert!(!p.count_nulls);
         assert!(p.stream_max);
         assert!(p.warn_costly);
@@ -5239,7 +5726,7 @@ mod tests {
 
     #[test]
     fn zero_threshold_restores_unconditional_probing() {
-        let p = plan_watermark_probes(DEAR, DEAR, 0.0, false, 86_400);
+        let p = plan_watermark_probes(DEAR, DEAR, 0.0, 86_400);
         assert!(p.count_nulls);
         assert!(!p.stream_max);
         assert!(!p.warn_costly);
@@ -5248,7 +5735,7 @@ mod tests {
     #[test]
     fn the_warning_names_the_evidence_and_the_skipped_check() {
         let warnings = Warnings::default();
-        let p = plan_watermark_probes(DEAR, DEAR, T, false, 86_400);
+        let p = plan_watermark_probes(DEAR, DEAR, T, 86_400);
         warn_on_costly_watermark("write_date", p, DEAR, DEAR, true, 86_400, &warnings);
         let out = warnings.drain();
         assert_eq!(out.len(), 1);
@@ -5263,7 +5750,7 @@ mod tests {
     #[test]
     fn no_warning_when_both_probes_are_cheap() {
         let warnings = Warnings::default();
-        let p = plan_watermark_probes(CHEAP, CHEAP, T, false, 86_400);
+        let p = plan_watermark_probes(CHEAP, CHEAP, T, 86_400);
         warn_on_costly_watermark("write_date", p, CHEAP, CHEAP, true, 86_400, &warnings);
         assert!(warnings.drain().is_empty());
     }
@@ -5273,7 +5760,7 @@ mod tests {
         // Nothing was skipped, because the count never runs on a NOT NULL
         // column — the warning must not claim a lost check.
         let warnings = Warnings::default();
-        let p = plan_watermark_probes(ProbeCost::Known(0.0), DEAR, T, false, 86_400);
+        let p = plan_watermark_probes(ProbeCost::Known(0.0), DEAR, T, 86_400);
         warn_on_costly_watermark(
             "write_date",
             p,
@@ -5336,6 +5823,269 @@ mod tests {
             max: AtomicI64::new(19_723), // 2024-01-01
         };
         assert_eq!(t.render().as_deref(), Some("2024-01-01"));
+    }
+
+    fn wplan(min: i64, max: i64, step: u64, floor: u64) -> WindowPlan {
+        WindowPlan {
+            col_quoted: "\"id\"".into(),
+            min,
+            max,
+            start: step,
+            max_step: step,
+            target_secs: 5.0,
+            floor,
+            nullable_key: false,
+        }
+    }
+
+    /// Walk a sweep the way the dispatcher does, recording every window.
+    /// `fail_at` makes those windows report a transient cancellation once, so
+    /// the shrink path is exercised without a database.
+    fn sweep(plan: &WindowPlan, mut fails: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
+        let mut lo = plan.min.saturating_sub(1);
+        let mut step = plan.start;
+        let mut seen = Vec::new();
+        let mut guard = 0;
+        while lo < plan.max {
+            guard += 1;
+            assert!(guard < 10_000, "sweep failed to terminate");
+            let hi = window_hi(lo, step, plan.max);
+            if let Some(i) = fails.iter().position(|w| *w == (lo, hi)) {
+                fails.remove(i);
+                let (n_lo, n_step) = next_window(lo, hi, step, plan, WindowOutcome::Cancelled);
+                assert_eq!(n_lo, lo, "a failed window must be retried, not skipped");
+                assert!(n_step < step || n_step == plan.floor);
+                step = n_step;
+                continue;
+            }
+            seen.push((lo, hi));
+            let (n_lo, n_step) =
+                next_window(lo, hi, step, plan, WindowOutcome::Done(plan.target_secs));
+            lo = n_lo;
+            step = n_step;
+        }
+        seen
+    }
+
+    #[test]
+    fn sweep_covers_every_key_exactly_once() {
+        // (lo, hi] windows must tile [min, max] with no gap and no overlap —
+        // a gap silently drops rows, an overlap duplicates them.
+        let plan = wplan(1, 1000, 250, 10);
+        let w = sweep(&plan, vec![]);
+        assert_eq!(w.first().unwrap().0, 0, "first window must admit min");
+        assert_eq!(w.last().unwrap().1, 1000, "last window must reach max");
+        for pair in w.windows(2) {
+            assert_eq!(pair[0].1, pair[1].0, "gap or overlap between windows");
+        }
+    }
+
+    #[test]
+    fn sweep_handles_a_span_that_is_not_a_multiple_of_the_step() {
+        let plan = wplan(1, 1007, 250, 10);
+        let w = sweep(&plan, vec![]);
+        assert_eq!(w.last().unwrap().1, 1007);
+        for pair in w.windows(2) {
+            assert_eq!(pair[0].1, pair[1].0);
+        }
+    }
+
+    #[test]
+    fn sweep_still_covers_everything_when_a_window_shrinks() {
+        // The shrink path must not lose the keys the failed window covered.
+        let plan = wplan(1, 1000, 500, 10);
+        let w = sweep(&plan, vec![(0, 500)]);
+        assert_eq!(w.first().unwrap().0, 0);
+        assert_eq!(w.last().unwrap().1, 1000);
+        for pair in w.windows(2) {
+            assert_eq!(pair[0].1, pair[1].0);
+        }
+    }
+
+    #[test]
+    fn a_single_key_relation_is_one_window() {
+        let plan = wplan(42, 42, 1000, 10);
+        assert_eq!(sweep(&plan, vec![]), vec![(41, 42)]);
+    }
+
+    #[test]
+    fn a_cancelled_window_halves_and_stops_at_the_floor() {
+        let plan = wplan(1, 1_000_000, 1000, 250);
+        let (lo1, s1) = next_window(0, 1000, 1000, &plan, WindowOutcome::Cancelled);
+        assert_eq!((lo1, s1), (0, 500), "must retry the same window, narrower");
+        let (_, s2) = next_window(0, 500, s1, &plan, WindowOutcome::Cancelled);
+        assert_eq!(s2, 250);
+        // At the floor it stays there; the dispatcher then propagates the error
+        // rather than looping, because its guard is `step > floor`.
+        let (_, s3) = next_window(0, 250, s2, &plan, WindowOutcome::Cancelled);
+        assert_eq!(s3, 250);
+    }
+
+    #[test]
+    fn width_converges_on_the_target_duration() {
+        // The property a fixed row count cannot give: a window that overran
+        // shrinks proportionally, one that was quick grows, and neither moves
+        // more than 2x at a time.
+        let plan = wplan(1, 100_000_000, 100_000, 100);
+        // Took 4x the target -> quarter the width (the clamp floor of 0.25).
+        let (_, slow) = next_window(0, 100_000, 100_000, &plan, WindowOutcome::Done(20.0));
+        assert_eq!(slow, 25_000);
+        // Took a tenth of the target -> grows, but gently: 1.25x, not 10x and
+        // not even 2x. Overshooting into a dense key range is what lands a
+        // window past the standby's limit.
+        let (_, fast) = next_window(0, 25_000, 25_000, &plan, WindowOutcome::Done(0.5));
+        assert_eq!(fast, 31_250);
+        // On target -> unchanged.
+        let (_, steady) = next_window(0, 50_000, 50_000, &plan, WindowOutcome::Done(5.0));
+        assert_eq!(steady, 50_000);
+    }
+
+    #[test]
+    fn an_instant_empty_window_cannot_blow_the_next_one_up() {
+        // A key range that happened to contain no rows returns in ~0s. Scaling
+        // by target/0 would be unbounded; the 2x clamp is what prevents the
+        // next window being one that cannot possibly finish.
+        let plan = wplan(1, 100_000_000, 1_000_000, 100);
+        let (_, next) = next_window(0, 1000, 1000, &plan, WindowOutcome::Done(0.0));
+        assert_eq!(next, 1250);
+    }
+
+    #[test]
+    fn sizing_backs_off_faster_than_it_recovers() {
+        // The tail property. One overrun must not be undone by one quick
+        // window: measured durations spanned 25x at a fixed width, so
+        // symmetric response oscillates straight back over the limit.
+        let plan = wplan(1, 100_000_000, 1_000_000, 100);
+        let (_, after_slow) = next_window(0, 100_000, 100_000, &plan, WindowOutcome::Done(60.0));
+        let (_, recovered) = next_window(
+            0,
+            after_slow as i64,
+            after_slow,
+            &plan,
+            WindowOutcome::Done(0.1),
+        );
+        assert!(
+            recovered < 100_000,
+            "one fast window undid a backoff: {recovered}"
+        );
+    }
+
+    #[test]
+    fn width_never_exceeds_the_configured_ceiling() {
+        let plan = wplan(1, 100_000_000, 10_000, 100);
+        let (_, capped) = next_window(0, 10_000, 10_000, &plan, WindowOutcome::Done(0.001));
+        assert_eq!(capped, 10_000);
+    }
+
+    #[test]
+    fn window_hi_clamps_to_max_and_cannot_overflow() {
+        assert_eq!(window_hi(0, 100, 50), 50);
+        assert_eq!(window_hi(0, 100, 500), 100);
+        // i64::MAX + step must clamp rather than wrap — the same class of bug
+        // the range_partitions i128 regression test guards.
+        assert_eq!(window_hi(i64::MAX - 1, 1000, i64::MAX), i64::MAX);
+    }
+
+    #[test]
+    fn an_explicitly_small_window_does_not_invert_the_floor() {
+        // Regression: the floor is derived from the ceiling, so a configured
+        // width below MIN_READ_WINDOW_ROWS used to produce floor > step and
+        // panic inside `clamp` on the first resize.
+        let mut cfg = crate::config::default_test_config();
+        cfg.key = vec!["id".to_string()];
+        cfg.read_window_rows = Some(10);
+        let plan = plan_read_window(&cfg, Some((1, 1000)), "\"id\"".into(), false).unwrap();
+        assert!(
+            plan.floor <= plan.start,
+            "floor must never exceed the ceiling"
+        );
+        // And resizing from there must stay inside the range.
+        let (_, n) = next_window(0, 10, plan.start, &plan, WindowOutcome::Done(0.001));
+        assert!(n >= plan.floor && n <= plan.max_step);
+    }
+
+    #[test]
+    fn the_sweep_starts_below_its_ceiling_and_can_grow_into_it() {
+        // Start and ceiling are separate numbers. Tying them together caps a
+        // fast table at its starting guess: measured, 0.80s windows against a
+        // 5s target sat pinned at the ceiling for a whole sweep, reading ~6x
+        // more windows than the target implied.
+        let cfg = crate::config::default_test_config();
+        let plan = plan_read_window(&cfg, Some((1, 100_000_000)), "\"id\"".into(), false).unwrap();
+        assert!(
+            plan.start < plan.max_step,
+            "start {} should leave room to grow under ceiling {}",
+            plan.start,
+            plan.max_step
+        );
+        // A quick window grows past the starting width.
+        let (_, grown) = next_window(
+            0,
+            plan.start as i64,
+            plan.start,
+            &plan,
+            WindowOutcome::Done(0.1),
+        );
+        assert!(grown > plan.start);
+    }
+
+    #[test]
+    fn an_explicit_window_size_caps_the_start_too() {
+        // `read_window_rows` is the ceiling; the start must never exceed it.
+        let mut cfg = crate::config::default_test_config();
+        cfg.read_window_rows = Some(1_000);
+        let plan = plan_read_window(&cfg, Some((1, 100_000_000)), "\"id\"".into(), false).unwrap();
+        assert_eq!(plan.max_step, 1_000);
+        assert!(plan.start <= 1_000);
+    }
+
+    #[test]
+    fn an_empty_relation_produces_no_window_plan() {
+        let cfg = crate::config::default_test_config();
+        assert!(plan_read_window(&cfg, None, "\"id\"".into(), false).is_none());
+    }
+
+    #[test]
+    fn window_key_accepts_a_nullable_key_and_reports_it() {
+        let mut cfg = crate::config::default_test_config();
+        cfg.key = vec!["id".to_string()];
+        let int_col = |name: &str, nullable: bool| ColumnType {
+            name: name.to_string(),
+            type_id: 0,
+            nullable,
+            arrow: DataType::Int64,
+            clickhouse_inner: "Int64".into(),
+            arbitrary_precision_decimal: false,
+        };
+        assert_eq!(
+            window_key(&cfg, &[int_col("id", false)]),
+            Some(("id".to_string(), false))
+        );
+        // A nullable key is accepted and flagged, so the sweep can add a
+        // trailing `IS NULL` window. Rejecting it would make windowing inert
+        // for every source_query read, where PostgreSQL reports no NOT NULL
+        // constraints at all.
+        assert_eq!(
+            window_key(&cfg, &[int_col("id", true)]),
+            Some(("id".to_string(), true))
+        );
+        // A transformed key means the predicate bounds something other than
+        // the stored column, so no index can serve it.
+        cfg.column_transforms.insert("id".into(), "id + 1".into());
+        assert!(window_key(&cfg, &[int_col("id", false)]).is_none());
+    }
+
+    #[test]
+    fn window_predicate_is_half_open_and_unordered() {
+        // The SQL a window contributes: bounded range, and NO sort — a sort
+        // would reintroduce the unbounded work windows exist to avoid.
+        let k = crate::source::Keyset {
+            col_quoted: "\"id\"".into(),
+            cursor: Some("100".into()),
+            bound: crate::source::KeysetBound::UpperBound("200".into()),
+        };
+        let pred = crate::source::keyset_predicate(&k).unwrap();
+        assert_eq!(pred, "\"id\" > 100 AND \"id\" <= 200");
     }
 
     #[tokio::test]

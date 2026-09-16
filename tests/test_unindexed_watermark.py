@@ -99,24 +99,36 @@ def test_indexed_watermark_still_reports_null_rows(
         _drop_ch(ch_client, table)
 
 
-def test_unindexed_watermark_first_run_still_counts_nulls(
+def test_unindexed_watermark_first_run_skips_a_count_it_cannot_afford(
     pg_conn, ch_client, pg_source, ch_target, unique_name
 ):
-    """A first run reads the whole table anyway, so the extra scan is marginal.
+    """This reverses an earlier decision, deliberately.
 
-    It is also the moment the condition matters most: a pipeline that starts out
-    excluding rows excludes them forever. So even with no index, the first run
-    pays for the completeness check.
+    Paying for the completeness count on a first run was defensible in
+    isolation: the read touches the whole table anyway, and a pipeline that
+    starts out excluding NULL-watermark rows excludes them forever. But on a
+    large table with an unindexed watermark, read from a hot standby, that scan
+    does not merely cost -- it never finishes. Measured on a real replica it was
+    cancelled with 40001 on three consecutive attempts, so the first run failed
+    before reading anything and no first run could ever complete to make a later
+    one cheap. A check that cannot run is not a check.
+
+    What replaces it is honesty: the skip is reported, so nobody reads a missing
+    warning as a clean bill of health. The rows still transfer.
     """
     table = unique_name
     _seed_nullable_wm(pg_conn, table, rows=50, nulls=7, indexed=False)
     _drop_ch(ch_client, table)
     try:
         r = _sync(pg_source, ch_target, table, probe_max_cost=1.0)
-        assert "null_watermark" in _kinds(r), r.warnings
-        assert _warning(r, "null_watermark").count == 7
-        # The cost of the unindexed filter is still worth reporting.
+        # The count did not run, so no count is reported ...
+        assert "null_watermark" not in _kinds(r), r.warnings
+        # ... but the reason is, and it says the check was skipped.
         assert "unindexed_watermark" in _kinds(r), r.warnings
+        # A first run has no committed cursor to filter against, so every row
+        # transfers, NULL watermarks included. Skipping the count costs the
+        # report, not the data -- it is later runs, filtering on `wm > x`, where
+        # those rows go missing, which is what the warning is there to say.
         assert r.rows_written == 50
     finally:
         _drop_ch(ch_client, table)

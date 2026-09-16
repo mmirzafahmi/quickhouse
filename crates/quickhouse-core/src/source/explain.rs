@@ -194,6 +194,34 @@ pub(crate) fn mysql_explain_sql(sql: &str) -> String {
 /// above, so the exact value is not delicate.
 pub const DEFAULT_PROBE_MAX_COST: f64 = 50_000.0;
 
+/// Width of the very first window, before any duration has been measured.
+///
+/// Cautious on purpose: this is the one window sized by guesswork. Guessing
+/// high costs a cancelled read and a backoff; guessing low costs one quick
+/// read, after which the sweep sizes itself from the clock.
+pub const INITIAL_READ_WINDOW_ROWS: u64 = 50_000;
+
+/// Ceiling on a windowed read's width, in key units.
+///
+/// A runaway guard, not the governor — `DEFAULT_WINDOW_TARGET_SECS` decides the
+/// width in practice. Kept generous because a low ceiling silently caps a fast
+/// table: measured, 0.80s windows against a 5s target sat pinned at the ceiling,
+/// reading 6x more windows than the target implied.
+pub const DEFAULT_READ_WINDOW_ROWS: u64 = 5_000_000;
+
+/// What one window should take. The sweep scales its width after every window
+/// to converge here.
+///
+/// Chosen well under the 30s `max_standby_streaming_delay` this was built
+/// against, so an ordinary window finishes with room to spare and only an
+/// unusually slow one gets close to the limit.
+pub const DEFAULT_WINDOW_TARGET_SECS: f64 = 5.0;
+
+/// Never shrink a window below this. A window this narrow that still cannot
+/// complete is a real failure, not a sizing problem, and must surface rather
+/// than loop forever.
+pub const MIN_READ_WINDOW_ROWS: u64 = 1_000;
+
 /// Neither engine's cost units are wall-clock seconds, and they are not
 /// comparable across engines — PostgreSQL counts notional page fetches, MySQL
 /// its own composite. The default is chosen to separate the two *measured*

@@ -377,6 +377,8 @@ errors are surfaced verbatim rather than wrapped in something generic.
 | `merge_prune_partition_by` | BigQuery incremental: prune the MERGE's destination scan to the staging range on this column. Only safe for an *immutable* partition column (e.g. `created_at`) — never a mutable `updated_at` (would insert dup keys) |
 | `chunk_rows` | Read in keyset-ordered chunks of N rows, committing the cursor per chunk so a mid-read failure resumes. Incremental + ClickHouse dest only; keyset column must be a unique NOT-NULL integer. `None` = one read (default) |
 | `probe_max_cost` | Skip a setup-phase watermark probe when the planner estimates it above this cost. Without an index, `MAX(watermark)` and the nullable-watermark `count(*)` are full scans on every run (measured 57s each on a 14.9 GB table). Asked via `EXPLAIN`, never `ANALYZE`. `0` = always probe (default `50000`) |
+| `read_window_rows` | Sweep an unindexed read in bounded key ranges so each piece finishes inside a hot standby's conflict window, instead of being cancelled with `40001`. Activates automatically; this only sizes it (default `None`) |
+| `window_target_secs` | What one windowed read should take; the sweep re-sizes itself to converge on it (default `5.0`) |
 | `retry_max_attempts` | Re-run the whole transfer on a transient *source* error (PG recovery-conflict/cancel; MySQL gone-away/lock-wait/deadlock). `1` = no retry (default) |
 | `column_transforms` | Per-column SQL value transforms over `source_table=` (e.g. `{"ts":"ts AT TIME ZONE 'UTC'"}`), preserving range partitioning. Postgres/MySQL/ClickHouse only |
 | `evolve_schema` | Auto-`ADD COLUMN` (Nullable) when the source has a column the destination lacks, instead of erroring. ADD-only. Default `False` |

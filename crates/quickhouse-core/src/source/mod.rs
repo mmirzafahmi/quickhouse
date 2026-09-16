@@ -9,21 +9,74 @@ pub mod postgres;
 
 pub use bigquery::BigQuerySource;
 pub use clickhouse::ClickHouseSource;
-pub use explain::{ProbeCost, DEFAULT_PROBE_MAX_COST};
+pub use explain::{
+    ProbeCost, DEFAULT_PROBE_MAX_COST, DEFAULT_READ_WINDOW_ROWS, DEFAULT_WINDOW_TARGET_SECS,
+    INITIAL_READ_WINDOW_ROWS, MIN_READ_WINDOW_ROWS,
+};
 pub use mysql::MySqlSource;
 pub use postgres::{Partition, PgSource};
 
-/// One chunk's keyset bound for resumable reads (see `TransferConfig::chunk_rows`).
-/// Shared by both SQL sources: the reader appends `{col_quoted} > {cursor}`
-/// (when resuming) plus `ORDER BY {col_quoted} ASC LIMIT {limit}` to the
-/// SELECT, so each chunk reads the next `limit` rows past the cursor in key
-/// order. `cursor` is a bare integer literal (the keyset column is gated to an
-/// integer type), re-validated as `^-?[0-9]+$` before injection.
+/// How a keyset read is bounded above.
+///
+/// The two forms exist because they bound *different things*, and confusing
+/// them is what makes an unindexed read fail:
+///
+/// * [`Self::OrderedLimit`] bounds the number of **matching rows returned**.
+///   The server must keep scanning until it has found that many, so when the
+///   other predicates are selective and unindexed the work is unbounded — a
+///   `LIMIT 1000` over a 130M-row table can walk the whole table to find its
+///   thousand rows.
+/// * [`Self::UpperBound`] bounds the **key range examined**. With an index on
+///   the key the work is proportional to the range, whatever the rest of the
+///   WHERE clause selects, which makes each read's duration predictable — the
+///   property that lets a read finish inside a hot standby's
+///   `max_standby_streaming_delay` instead of being cancelled.
+#[derive(Debug, Clone)]
+pub enum KeysetBound {
+    /// `ORDER BY {col} ASC LIMIT {n}` — chunked resumable reads
+    /// (`TransferConfig::chunk_rows`).
+    OrderedLimit(usize),
+    /// `{col} <= {hi}` — one window of a bounded sweep. No sort is emitted:
+    /// windows are disjoint and stepped in order by the driver, so the server
+    /// has nothing to order.
+    UpperBound(String),
+}
+
+/// One keyset-bounded read. Shared by both SQL sources: the reader appends
+/// `{col_quoted} > {cursor}` (when resuming or mid-sweep) plus whatever
+/// [`KeysetBound`] specifies. `cursor` and any bound are bare integer literals
+/// (the keyset column is gated to an integer type), re-validated as
+/// `^-?[0-9]+$` before injection.
 #[derive(Debug, Clone)]
 pub struct Keyset {
     pub col_quoted: String,
     pub cursor: Option<String>,
-    pub limit: usize,
+    pub bound: KeysetBound,
+}
+
+/// The WHERE fragment a [`Keyset`] contributes: the exclusive lower bound from
+/// `cursor` (when set) AND, for a window, the inclusive upper bound. Returns
+/// `None` when the keyset constrains nothing — the first chunk of an
+/// ordered-limit read, whose bound lives in the `LIMIT` instead.
+///
+/// Shared by both SQL builders so the two engines cannot drift on the
+/// half-open `(lo, hi]` convention, which is what guarantees a sweep covers
+/// every key exactly once with no gap and no overlap.
+pub(crate) fn keyset_predicate(k: &Keyset) -> Option<String> {
+    let lower = k
+        .cursor
+        .as_ref()
+        .map(|cur| format!("{} > {}", k.col_quoted, cur));
+    let upper = match &k.bound {
+        KeysetBound::UpperBound(hi) => Some(format!("{} <= {}", k.col_quoted, hi)),
+        KeysetBound::OrderedLimit(_) => None,
+    };
+    match (lower, upper) {
+        (Some(l), Some(u)) => Some(format!("{l} AND {u}")),
+        (Some(l), None) => Some(l),
+        (None, Some(u)) => Some(u),
+        (None, None) => None,
+    }
 }
 
 /// Which database engine a transfer reads from. `sync.rs` matches on this to

@@ -16,7 +16,7 @@ use mysql_async::prelude::*;
 use mysql_async::{ClientIdentity, Conn, Opts, OptsBuilder, SslOpts, Value};
 
 use crate::error::{EtlError, Result};
-use crate::source::{Keyset, ProbeCost};
+use crate::source::{Keyset, KeysetBound, ProbeCost};
 use crate::types::{mysql::map_mysql_type, ColumnType};
 
 use super::Partition;
@@ -195,6 +195,51 @@ impl MySqlSource {
         }
     }
 
+    /// `(min, max)` of the windowing key — see
+    /// [`crate::source::PgSource::key_bounds`]. Decoded via the raw wire
+    /// `Value` for the same reason `range_partitions` does: a `BIGINT UNSIGNED`
+    /// can exceed `i64::MAX` and arrives as `Value::UInt`.
+    pub async fn key_bounds(
+        &self,
+        conn: &mut Conn,
+        from_table: Option<&str>,
+        base_query: Option<&str>,
+        column: &str,
+        source_expr: Option<&str>,
+    ) -> Result<Option<(i64, i64)>> {
+        let key = source_expr
+            .map(str::to_string)
+            .unwrap_or_else(|| quote_my(column));
+        // MIN()/MAX(), not `ORDER BY key LIMIT 1` — see
+        // [`crate::source::PgSource::key_bounds`] for the measurement.
+        // Prefer the base table when both are given — see
+        // [`crate::source::PgSource::key_bounds`] for why.
+        let sql = match (from_table, base_query) {
+            (Some(t), _) => format!(
+                "SELECT MIN({key}), MAX({key}) FROM {t}",
+                t = quote_my_table(t),
+            ),
+            (None, Some(q)) => format!("SELECT MIN({key}), MAX({key}) FROM ({q}) AS _src"),
+            (None, None) => return Err(EtlError::internal("key_bounds: no table or query")),
+        };
+        let row: Option<(Option<Value>, Option<Value>)> = conn
+            .query_first(sql)
+            .await
+            .map_err(|e| EtlError::from(e).context("probing mysql key bounds"))?;
+        let as_i64 = |v: Value| match v {
+            Value::Int(i) => Some(i),
+            Value::UInt(u) if u <= i64::MAX as u64 => Some(u as i64),
+            _ => None,
+        };
+        Ok(match row {
+            Some((Some(lo), Some(hi))) => match (as_i64(lo), as_i64(hi)) {
+                (Some(lo), Some(hi)) if hi >= lo => Some((lo, hi)),
+                _ => None,
+            },
+            _ => None,
+        })
+    }
+
     /// Compute range partitions over `column`, either for a base table
     /// (`from_table`) or for a wrapped `source_query` (`base_query`). Falls back
     /// to a single partition when the column isn't an integer type or has no
@@ -310,18 +355,20 @@ impl MySqlSource {
             .collect::<Vec<_>>()
             .join(", ");
 
-        let cursor_pred = keyset.as_ref().and_then(|k| {
-            k.cursor
-                .as_ref()
-                .map(|cur| format!("{} > {}", k.col_quoted, cur))
-        });
+        let keyset_pred = keyset.as_ref().and_then(super::keyset_predicate);
         let extra_owned = extra_filter.map(str::to_string);
-        let extra_and_cursor = combine_filters(&extra_owned, cursor_pred.as_deref());
+        let extra_and_cursor = combine_filters(&extra_owned, keyset_pred.as_deref());
         let filters = combine_filters(&partition.predicate, extra_and_cursor.as_deref());
-        let order_limit = keyset
-            .as_ref()
-            .map(|k| format!(" ORDER BY {} ASC LIMIT {}", k.col_quoted, k.limit))
-            .unwrap_or_default();
+        // Only the ordered-limit form needs a sort; a bounded window does not.
+        let order_limit = match keyset.as_ref() {
+            Some(k) => match &k.bound {
+                KeysetBound::OrderedLimit(n) => {
+                    format!(" ORDER BY {} ASC LIMIT {n}", k.col_quoted)
+                }
+                KeysetBound::UpperBound(_) => String::new(),
+            },
+            None => String::new(),
+        };
 
         let mut sql = if let Some(q) = base_query {
             format!("SELECT {col_list} FROM ({q}) AS _src")
@@ -565,7 +612,7 @@ mod tests {
             Some(Keyset {
                 col_quoted: "`id`".into(),
                 cursor: Some("42".into()),
-                limit: 500,
+                bound: KeysetBound::OrderedLimit(500),
             }),
         );
         assert!(sql.contains("ROUND(`amt`, 9) AS `amt`"), "{sql}");

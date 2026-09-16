@@ -637,6 +637,8 @@ def sync(
     chunk_rows: Optional[int] = None,
     retry_max_attempts: int = 1,
     probe_max_cost: float = 50_000.0,
+    read_window_rows: Optional[int] = None,
+    window_target_secs: Optional[float] = None,
     column_transforms: Optional[Mapping[str, str]] = None,
     column_transform_types: Optional[Mapping[str, str]] = None,
     evolve_schema: bool = False,
@@ -812,6 +814,29 @@ def sync(
       ``lookback_seconds > 0``. Cost units are each engine's own and mean
       nothing absolute; the default separates the two measured populations.
       Skipping is reported as ``"unindexed_watermark"``.
+    - ``read_window_rows`` (default ``None``) caps the width of a **windowed
+      read** (a runaway guard, not the governor \u2014 see ``window_target_secs``): when
+      the watermark column has no usable index, the read is swept in bounded
+      key ranges (``key > lo AND key <= hi``) instead of attempted in one pass.
+      On a hot standby a read longer than ``max_standby_streaming_delay`` is
+      cancelled with ``SQLSTATE 40001``, and retrying cannot converge because
+      every attempt restarts the same scan against the same window \u2014 measured
+      on a real replica, reads of this shape took 75-162s and several never
+      completed in three attempts. A window bounds the *key range examined*,
+      not the rows returned, so with an index on the key its duration is
+      predictable whatever the rest of the WHERE selects; a window cancelled
+      anyway is retried at half the width. This activates automatically from
+      the same planner-cost probe as ``probe_max_cost``; the setting only sizes
+      it. Note the whole key space is still swept, so the total work is
+      unchanged \u2014 the gain is that the run *completes*.
+    - ``window_target_secs`` (default ``5.0``) is what one window should take;
+      the sweep re-sizes itself after every window to converge on it. Keep it
+      well under the standby's ``max_standby_streaming_delay``. Raising it buys
+      little \u2014 the scan work is fixed \u2014 while shifting the whole duration
+      distribution, tail included, toward the cancellation limit. What costs
+      time is a cancelled window, whose work is thrown away and redone:
+      measured, 21 cancellations accounted for ~420s of a 2603s sweep. Measured on one table: p50 3.2s, p90 9.6s,
+      max 82s, all at the same target.
     - ``retry_max_attempts`` (default ``1`` = no retry) re-runs the whole
       transfer on a *transient source* error — PostgreSQL hot-standby recovery
       conflict / statement cancel, MySQL server-gone-away / lock-wait / deadlock.

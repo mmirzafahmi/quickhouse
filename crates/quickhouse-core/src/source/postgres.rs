@@ -18,7 +18,7 @@ use tokio_postgres::Client;
 use tokio_postgres_rustls::MakeRustlsConnect;
 
 use crate::error::{EtlError, Result};
-use crate::source::{Keyset, ProbeCost};
+use crate::source::{Keyset, KeysetBound, ProbeCost};
 use crate::types::{map_oid, oid, ColumnType};
 
 fn load_extra_ca_certs(roots: &mut RootCertStore, path: &str) -> Result<()> {
@@ -283,6 +283,59 @@ impl PgSource {
         }
     }
 
+    /// `(min, max)` of the windowing key, or `None` when the relation is empty.
+    ///
+    /// On an indexed key this is two index scans and costs ~1 — the same probe
+    /// `range_partitions` uses. It is what bounds a windowed sweep, so it must
+    /// stay cheap; a key without an index would make this a full scan, which is
+    /// why windowing is gated on the key being indexed.
+    pub async fn key_bounds(
+        &self,
+        client: &Client,
+        from_table: Option<&str>,
+        base_query: Option<&str>,
+        column: &str,
+        source_expr: Option<&str>,
+    ) -> Result<Option<(i64, i64)>> {
+        let key = source_expr
+            .map(str::to_string)
+            .unwrap_or_else(|| quote_pg(column));
+        // `min()`/`max()`, despite the aggregate scanning a filtered relation.
+        //
+        // The obvious alternative — `ORDER BY key LIMIT 1` — is worse here, and
+        // measurably so. It walks the key index from one end testing each row
+        // against the relation's own filter, and when that filter selects
+        // recent rows (a `write_date` window) it steps over millions of old
+        // keys before its first match. Measured on a 130M-row table: aggregate
+        // 5.6s, ordered LIMIT 1 cancelled after 111s.
+        // The base table wins over the query when both are given, and that
+        // preference is the whole point.
+        //
+        // A sweep needs the KEY SPACE, not the filtered set — any superset is
+        // correct, because a window matching nothing just returns no rows. Read
+        // through a `source_query` that embeds an unindexed predicate, this
+        // aggregate inherits it and costs what the read costs: the probe that
+        // decides whether we can avoid a doomed scan becomes a doomed scan.
+        // Against the table it is an index-only scan on the primary key.
+        let sql = match (from_table, base_query) {
+            (Some(t), _) => format!(
+                "SELECT min({key})::bigint, max({key})::bigint FROM {t}",
+                t = quote_pg_table(t),
+            ),
+            (None, Some(q)) => {
+                format!("SELECT min({key})::bigint, max({key})::bigint FROM ({q}) AS _src")
+            }
+            (None, None) => return Err(EtlError::internal("key_bounds: no table or query")),
+        };
+        let row = client.query_one(&sql, &[]).await?;
+        let lo: Option<i64> = row.get(0);
+        let hi: Option<i64> = row.get(1);
+        Ok(match (lo, hi) {
+            (Some(lo), Some(hi)) if hi >= lo => Some((lo, hi)),
+            _ => None,
+        })
+    }
+
     /// Compute range partitions over `column`, either for a base table
     /// (`from_table`) or for a wrapped `source_query` (`base_query`). Falls back
     /// to a single partition when the column is not an integer or has no rows.
@@ -393,18 +446,20 @@ impl PgSource {
         // Merge the incremental/extra filter with the keyset cursor predicate,
         // then with the partition predicate (all AND-ed). Cursor is a bare
         // validated integer literal — no quoting.
-        let cursor_pred = keyset.as_ref().and_then(|k| {
-            k.cursor
-                .as_ref()
-                .map(|cur| format!("{} > {}", k.col_quoted, cur))
-        });
+        let keyset_pred = keyset.as_ref().and_then(super::keyset_predicate);
         let extra_owned = extra_filter.map(str::to_string);
-        let extra_and_cursor = combine_filters(&extra_owned, cursor_pred.as_deref());
+        let extra_and_cursor = combine_filters(&extra_owned, keyset_pred.as_deref());
         let filters = combine_filters(&partition.predicate, extra_and_cursor.as_deref());
-        let order_limit = keyset
-            .as_ref()
-            .map(|k| format!(" ORDER BY {} ASC LIMIT {}", k.col_quoted, k.limit))
-            .unwrap_or_default();
+        // Only the ordered-limit form needs a sort; a bounded window does not.
+        let order_limit = match keyset.as_ref() {
+            Some(k) => match &k.bound {
+                KeysetBound::OrderedLimit(n) => {
+                    format!(" ORDER BY {} ASC LIMIT {n}", k.col_quoted)
+                }
+                KeysetBound::UpperBound(_) => String::new(),
+            },
+            None => String::new(),
+        };
 
         let mut inner = if let Some(q) = base_query {
             // Wrap the user query so we can apply partition/incremental filters.
@@ -751,7 +806,7 @@ OCm3XK2CW4/x+Z55ntrAffyyonL3V3vHIz7fokiz5H+l
         let keyset = Keyset {
             col_quoted: "\"id\"".into(),
             cursor: Some("500".into()),
-            limit: 1000,
+            bound: KeysetBound::OrderedLimit(1000),
         };
         let sql = src.copy_sql(
             &["id".to_string()],
@@ -786,7 +841,7 @@ OCm3XK2CW4/x+Z55ntrAffyyonL3V3vHIz7fokiz5H+l
             Some(Keyset {
                 col_quoted: "\"id\"".into(),
                 cursor: None,
-                limit: 1000,
+                bound: KeysetBound::OrderedLimit(1000),
             }),
         );
         assert!(first.contains("ORDER BY \"id\" ASC LIMIT 1000"), "{first}");

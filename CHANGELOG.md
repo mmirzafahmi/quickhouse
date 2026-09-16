@@ -9,6 +9,93 @@ any breaking change is called out explicitly.
 
 ## [Unreleased]
 
+## [0.18.1] — 2026-09-16
+
+### Fixed — a first run on a large unindexed table could never complete
+
+0.18.0 made the watermark probes conditional on planner cost, but kept one
+exception: the nullable-watermark completeness count ran on a **first** run
+regardless of cost. The reasoning was that such a run reads the whole table
+anyway, and it is the moment the condition matters most.
+
+The exception does not survive contact with a hot standby. That count is a full
+sequential scan, and on a large table it does not merely cost — it never
+finishes:
+
+| Table | Probe | Result |
+| --- | --- | --- |
+| `account_move_line` 41 GB | `count(*) IS NULL` | **never completed — 3× `SQLSTATE 40001`** |
+| `account_move_line` | `MAX(write_date)` | 162.42s |
+| `sale_order` | `count(*) IS NULL` | 75.67s (1× `40001`) |
+| `account_move` | `MAX(write_date)` | **never completed — 3× `40001`** |
+
+So every first run died at the probe, before reading a row — and because it
+died, no watermark was ever committed, so the next run was a first run too. The
+table could never be loaded at all.
+
+The count is now gated on cost like every other probe. The skip is reported by
+`WarningKind::UnindexedWatermark`, which states the check did not run rather
+than implying it passed. A check that cannot run is not a check.
+
+### Added — windowed reads (`read_window_rows`, `window_target_secs`)
+
+Even with the probes fixed, the read's own `WHERE watermark > x` is still a
+sequential scan, and a scan longer than `max_standby_streaming_delay` is
+cancelled with `40001`. Retrying cannot converge: every attempt restarts the
+same scan against the same limit.
+
+When the planner says the watermark cannot be served by an index, quickhouse now
+sweeps the read in **bounded key ranges** — `key > lo AND key <= hi` over the
+primary key — instead of attempting it in one pass. A window bounds the *key
+range examined*, not the rows returned, so with an index on the key its duration
+is predictable whatever the rest of the `WHERE` selects. This is not
+`chunk_rows`, which bounds by `ORDER BY key LIMIT n` — that bounds matching rows
+*found*, and is unbounded work when matches are rare.
+
+Each window is timed and the next is resized toward `window_target_secs`
+(default `5.0`), backing off to a quarter on a cancellation and creeping back at
+1.25x. The asymmetry is deliberate: window duration is far more variable than
+width — measured p50 3.2s against a max of 82s at a fixed width — because it
+tracks how many rows in a range actually match, so symmetric growth oscillates
+straight back over the limit. `read_window_rows` (default `5_000_000`) is only a
+runaway ceiling; the sweep starts at 50,000 and grows into it.
+
+Measured against the same PostgreSQL 16 hot standby, where a one-pass read of
+each table is cancelled:
+
+| Table | Result |
+| --- | --- |
+| `account_move` 47.9M keys | 396.5s, 57,322 rows — 93 windows, 0 shrinks |
+| `sale_order` 84.6M keys | 237.6s, 419,135 rows — 61 windows, 0 shrinks |
+| `account_move_line` 144.7M keys, 41 GB | 695.9s, 477,656 rows — 148 windows, 0 shrinks |
+
+The whole key space is still swept, so the total work is unchanged. The gain is
+that the run *completes*.
+
+**Windowing needs bounds it can afford.** The sweep needs the key range, and any
+superset is correct since an empty window returns no rows. Read through a
+`source_query` that embeds its own unindexed filter, a `min()`/`max()` probe
+inherits that filter and costs what the read costs — the probe that decides
+whether to avoid a doomed scan becomes one. Pass **`source_table` alongside
+`source_query`** and the bounds are read from the table's index instead. Without
+it, windowing declines and says so.
+
+`ORDER BY key LIMIT 1` was tried as an index-friendly alternative and is worse:
+it walks the key index testing each row against the relation's own filter, so a
+recent-rows filter steps over millions of old keys first. Measured on the 41 GB
+table — aggregate 5.6s, ordered `LIMIT 1` cancelled after 111s.
+
+### Changed
+
+- Windowing replaces range fan-out for that read. Composing them made every
+  partition sweep the whole key space, multiplying the work by `parallelism`.
+- `source_table` set alongside `source_query` is no longer simply "ignored":
+  schema and data still come from the query, but the table now supplies the
+  key-bounds probe, and the warning says so.
+- The redundant `read_last_watermark` call that existed only to derive a
+  `first_run` flag is gone, along with the flag — which also settles its
+  recomputation on every retry attempt.
+
 ## [0.18.0] — 2026-09-15
 
 ### Performance — incremental runs whose watermark has no index
