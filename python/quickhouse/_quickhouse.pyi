@@ -508,6 +508,15 @@ class TransferWarning:
       count, since it reads the whole table anyway. The durable fix is an index
       on the watermark column.
     """
+    - ``"incomplete_export"`` — an API export finished in a state that means the
+      destination holds fewer records than the source has, and the run still
+      succeeded. Raised for a CleverTap paging chain that ended on a repeated
+      cursor, one that ended after a single page while returning records, or a
+      page carrying a ``"partial"`` status the vendor is not documented to send.
+      None of these can be told apart from a genuinely quiet day by the run
+      itself, which is why it is reported rather than logged: a defect of this
+      family was once measured reading 4,991 of 146,852 records (3.40%) and
+      reporting the run clean. ``count`` is the number of records actually read.
 
     column: Optional[str]
     """The source column responsible, or ``None`` for a table-level condition."""

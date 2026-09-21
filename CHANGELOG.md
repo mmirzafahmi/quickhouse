@@ -9,6 +9,58 @@ any breaking change is called out explicitly.
 
 ## [Unreleased]
 
+## [0.18.2] — 2026-09-21
+
+### Fixed — a CleverTap export that read only part of the data reported success
+
+`WarningKind` exists because these conditions "used to be `tracing::warn!`
+lines only, which meant an orchestrator could not act on them: a Dagster asset
+reported success while a column quietly rotted." The CleverTap reader had
+exactly that gap and raised none of the eight kinds.
+
+It detected two anomalies and wrote both only to the log — the code itself says
+"treat the result as incomplete", in a line nothing is required to read:
+
+- the paging chain stopped on a cursor that was not advancing
+- the chain ended after a single page, the signature of every paging defect this
+  module has had (one measured reading 4,991 of 146,852 records — 3.40% — and
+  reporting the run clean)
+
+**Added — `WarningKind::IncompleteExport`** (`"incomplete_export"`). Raised when
+an export finishes in a state that means the destination holds fewer records
+than the source has, with the records actually read as `count`. The run still
+succeeds; the rows it read are real. What changes is that a caller inspecting
+`result.warnings` can now see it, instead of a clean success.
+
+A single page is only flagged when records came back: a genuinely empty day
+remains a legitimate zero rather than a false alarm.
+
+### Fixed — a paging cycle longer than one page looped forever
+
+The non-advancing-cursor guard compared each cursor against only its immediate
+predecessor, so `a -> a` was caught but `a -> b -> a` was not. With no page cap
+and no time budget, such a cycle re-appended the same records indefinitely,
+growing the destination until the process was killed.
+
+Every fetched cursor is now remembered and any revisit stops the chain — as a
+hash per cursor, since an observed cursor runs to ~1,900 characters.
+
+### Fixed — a `partial` page status could not be seen
+
+`PageStatus::Partial` was parsed and then reached only a `tracing::debug!` line,
+off at default levels. The module documents `"partial"` as undocumented for this
+API and "a contract change worth seeing"; seeing it was not actually
+implemented. It now raises `IncompleteExport`.
+
+### Known, not changed
+
+`create_export`'s POST is retried by the shared transient-retry path along with
+the GET page reads. A lost response could therefore ask the vendor to
+materialise the same export more than once. Leaving it retried trades a possible
+duplicate export for a spurious hard failure, and the vendor's POST semantics
+are not documented well enough to choose from here; it is recorded rather than
+guessed at.
+
 ## [0.18.1] — 2026-09-16
 
 ### Fixed — a first run on a large unindexed table could never complete

@@ -425,6 +425,77 @@ impl CleverTapSource {
 mod tests {
     use super::*;
 
+    /// The walk the driver performs, reduced to its cursor logic so the cycle
+    /// rule can be tested without a vendor. Returns the cursors fetched.
+    fn walk(chain: &[(&str, Option<&str>)], start: &str) -> Vec<String> {
+        use std::collections::HashSet;
+        use std::hash::{Hash, Hasher};
+        let hash = |c: &str| {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            c.hash(&mut h);
+            h.finish()
+        };
+        let mut seen: HashSet<u64> = HashSet::new();
+        let mut cursor = start.to_string();
+        seen.insert(hash(&cursor));
+        let mut fetched = vec![cursor.clone()];
+        let mut guard = 0;
+        loop {
+            guard += 1;
+            assert!(
+                guard < 100,
+                "walk did not terminate — the cycle rule failed"
+            );
+            let next = chain
+                .iter()
+                .find(|(c, _)| *c == cursor)
+                .and_then(|(_, n)| *n);
+            let Some(next) = next else { break };
+            if !seen.insert(hash(next)) {
+                break;
+            }
+            cursor = next.to_string();
+            fetched.push(cursor.clone());
+        }
+        fetched
+    }
+
+    #[test]
+    fn a_chain_that_ends_by_omitting_the_cursor_reads_every_page() {
+        let chain = [
+            ("a", Some("b")),
+            ("b", Some("c")),
+            ("c", None), // the terminal page still says "success"
+        ];
+        assert_eq!(walk(&chain, "a"), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn an_immediately_repeating_cursor_stops() {
+        let chain = [("a", Some("a"))];
+        assert_eq!(walk(&chain, "a"), ["a"]);
+    }
+
+    #[test]
+    fn a_longer_cycle_also_stops() {
+        // The case the previous `next == cursor` rule could not see: it compares
+        // only consecutive pages, so a -> b -> a never tripped it and the loop
+        // ran until the process was killed.
+        let chain = [("a", Some("b")), ("b", Some("a"))];
+        assert_eq!(walk(&chain, "a"), ["a", "b"]);
+    }
+
+    #[test]
+    fn a_cycle_that_rejoins_further_back_also_stops() {
+        let chain = [
+            ("a", Some("b")),
+            ("b", Some("c")),
+            ("c", Some("d")),
+            ("d", Some("b")), // rejoins three pages back
+        ];
+        assert_eq!(walk(&chain, "a"), ["a", "b", "c", "d"]);
+    }
+
     #[test]
     fn host_validates_region() {
         assert_eq!(

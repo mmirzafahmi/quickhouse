@@ -2069,6 +2069,27 @@ async fn run_transfer_api(
                 let mut pages: u64 = 0;
                 let mut records_total: u64 = 0;
                 let stop: &str;
+                // Every cursor already fetched. The chain is a walk that must
+                // never revisit a node: comparing only against the *previous*
+                // cursor catches A -> A but not A -> B -> A, and with no page
+                // cap a cycle of length two spins forever, re-appending the
+                // same records until the process is killed. Cursors run to
+                // ~1,900 characters, so the set holds hashes rather than the
+                // tokens themselves.
+                let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+                let cursor_hash = |c: &str| {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    c.hash(&mut h);
+                    h.finish()
+                };
+                seen.insert(cursor_hash(&cursor));
+                // Set when the export ends in a state that means the
+                // destination holds fewer records than the source has. The run
+                // still succeeds — the rows read are real — but the caller is
+                // told, because nothing else can tell this apart from a quiet
+                // day.
+                let mut incomplete: Option<String> = None;
                 loop {
                     let page = src.next_page(&cursor).await?;
                     pages += 1;
@@ -2080,6 +2101,23 @@ async fn run_transfer_api(
                         page.records.len(),
                         if page.next_cursor.is_some() { "yes" } else { "no" },
                     );
+                    // The vendor is not documented to send "partial", and the
+                    // module treats "success" as non-terminal precisely because
+                    // "partial" never arrives. If it ever does, that is a
+                    // contract change, and the value reaching only a debug!
+                    // line would let it pass unnoticed — which is the whole
+                    // failure mode this warning exists to close.
+                    if page.status == crate::source::clevertap::PageStatus::Partial
+                        && incomplete.is_none()
+                    {
+                        incomplete = Some(format!(
+                            "CleverTap export for '{}' returned a page with status \"partial\" \
+                             on page {pages}, a status this API is not documented to send. Treat \
+                             the export as a contract change and verify the record count against \
+                             the vendor.",
+                            c.event_name,
+                        ));
+                    }
                     for rec in &page.records {
                         if let Some(b) = batcher.append_record(rec)? {
                             ctx.push_batch(&mut sends, &mut insert_buf, schema.clone(), b).await;
@@ -2092,19 +2130,21 @@ async fn run_transfer_api(
                         stop = "no next_cursor (end of export)";
                         break;
                     };
-                    // A cursor that does not advance would spin forever, and an
-                    // export that genuinely ends says so by omitting the key
-                    // rather than by repeating it. Treat a repeat as the end and
-                    // say so loudly — it is the one stop reason that indicates a
-                    // vendor-side anomaly rather than a normal finish.
-                    if next == cursor {
-                        tracing::warn!(
-                            "clevertap '{}': page {pages} returned the SAME cursor it was fetched \
-                             with, so the chain is not advancing; stopping after \
-                             {records_total} record(s). This is a vendor-side anomaly — treat the \
-                             result as incomplete.",
+                    // A cursor that repeats one already fetched cannot
+                    // advance the chain, and an export that genuinely ends says
+                    // so by omitting the key rather than by repeating it. Any
+                    // revisit — immediate or further back — is a vendor-side
+                    // anomaly, and stopping is the only way out of the cycle.
+                    if !seen.insert(cursor_hash(&next)) {
+                        let msg = format!(
+                            "CleverTap export for '{}' stopped after {pages} page(s) and \
+                             {records_total} record(s): the vendor returned a cursor already \
+                             fetched, so the chain was not advancing. The destination holds \
+                             fewer records than the source has.",
                             c.event_name,
                         );
+                        tracing::warn!("{msg}");
+                        incomplete = Some(msg);
                         stop = "cursor stopped advancing";
                         break;
                     }
@@ -2115,14 +2155,30 @@ async fn run_transfer_api(
                      [{from}, {to}]; stopped on {stop}",
                     c.event_name,
                 );
-                if pages == 1 {
-                    tracing::warn!(
-                        "clevertap '{}': the export ended after a SINGLE page ({records_total} \
-                         record(s)). For a busy event that is the signature of a paging failure, \
-                         not an empty day — verify against the vendor's own count before trusting \
-                         this run.",
+                // A single page is the signature of every paging defect this
+                // module has had — each produced exactly one page and a
+                // reported success. It is also what a genuinely quiet day looks
+                // like, and the run cannot tell them apart, so it says so
+                // rather than silently picking one. Only raised when records
+                // came back: a truly empty day is a legitimate zero.
+                if pages == 1 && records_total > 0 && incomplete.is_none() {
+                    incomplete = Some(format!(
+                        "CleverTap export for '{}' ended after a single page ({records_total} \
+                         record(s)). For a busy event that is the signature of a paging failure \
+                         rather than a quiet day; verify against the vendor's own count before \
+                         trusting this run.",
                         c.event_name,
-                    );
+                    ));
+                }
+                if let Some(message) = incomplete {
+                    tracing::warn!("{message}");
+                    warnings.push(TransferWarning {
+                        kind: WarningKind::IncompleteExport,
+                        column: None,
+                        count: records_total,
+                        sample: None,
+                        message,
+                    });
                 }
                 tracing::info!(
                     "clevertap '{}': read {records_total} record(s) across {pages} page(s) for \
@@ -4248,6 +4304,7 @@ fn coercion_message(kind: WarningKind, column: &str, n: u64) -> String {
         WarningKind::NullWatermark
         | WarningKind::FullRefreshShrink
         | WarningKind::UnclusteredMergeTarget
+        | WarningKind::IncompleteExport
         | WarningKind::UnindexedWatermark => {
             format!("column '{column}': {n} affected row(s)")
         }

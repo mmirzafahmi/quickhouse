@@ -1551,6 +1551,18 @@ pub enum WarningKind {
     /// the merge key, so the key-range prune had nothing to prune with and the
     /// statement scanned the whole table. Not a data problem — a cost one.
     UnclusteredMergeTarget,
+    /// An API export finished in a state that means the destination holds
+    /// *fewer* records than the source has, and the run still succeeded.
+    ///
+    /// Raised for the paging anomalies a CleverTap export can end on: a cursor
+    /// that stopped advancing, a chain that ended after a single page for an
+    /// event that should be busy, or a page carrying a `partial` status the
+    /// vendor is not documented to send. None of these can be distinguished
+    /// from a genuinely small day by the run itself — which is exactly why the
+    /// caller has to be told rather than left to read a log line. A paging
+    /// defect of this family was once measured reading 4,991 of 146,852
+    /// records (3.40%) and reporting the run clean.
+    IncompleteExport,
 }
 
 impl WarningKind {
@@ -1566,6 +1578,7 @@ impl WarningKind {
             WarningKind::NullWatermark => "null_watermark",
             WarningKind::FullRefreshShrink => "full_refresh_shrink",
             WarningKind::UnclusteredMergeTarget => "unclustered_merge_target",
+            WarningKind::IncompleteExport => "incomplete_export",
             WarningKind::UnindexedWatermark => "unindexed_watermark",
         }
     }
