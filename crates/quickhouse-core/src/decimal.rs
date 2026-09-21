@@ -213,6 +213,7 @@ impl CoercionTally {
             | WarningKind::FullRefreshShrink
             | WarningKind::UnclusteredMergeTarget
             | WarningKind::IncompleteExport
+            | WarningKind::IgnoredSourceArchive
             | WarningKind::UnindexedWatermark => None,
         }
     }

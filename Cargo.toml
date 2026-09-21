@@ -6,7 +6,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.18.2"
+version = "0.19.0"
 edition = "2021"
 license = "MIT"
 authors = ["quickhouse contributors"]
@@ -60,9 +60,9 @@ base64 = "0.22"
 # verify the wire format. Pinned to the versions the bigquery crate resolves.
 prost = "0.13"
 prost-types = "0.13"
-# For the opt-in S3 data-lake archival path (ClickHouse destination only):
-# pinned to the exact arrow 53.x release line so `RecordBatch`es already
-# flowing through this crate's decoders pass straight into the Parquet
+# For the opt-in Parquet data-lake archival path (S3 or GCS, either
+# destination): pinned to the exact arrow 53.x release line so `RecordBatch`es
+# already flowing through this crate's decoders pass straight into the Parquet
 # writer with zero conversion — a newer `parquet` would pull in a second,
 # incompatible `arrow-array` version (verified via `cargo tree`).
 parquet = { version = "53", default-features = false, features = ["arrow", "async", "object_store", "zstd", "snap"] }
@@ -74,7 +74,9 @@ parquet = { version = "53", default-features = false, features = ["arrow", "asyn
 # workspace's pure-rustls stack; it also pulls in `aws-lc-rs` as a rustls
 # crypto backend, but the process-wide `ring` install in sync.rs already
 # handles exactly this "another dependency's rustls backend" scenario.
-object_store = { version = "=0.11.2", default-features = false, features = ["aws"] }
+# `gcp` adds only `cloud` + `rustls-pemfile` on top of what `aws` already
+# enables — no second crypto backend, so it raises no new rustls question.
+object_store = { version = "=0.11.2", default-features = false, features = ["aws", "gcp"] }
 # RFC-4180 CSV parsing for the AppsFlyer Pull API report (quoted fields with
 # embedded commas/newlines, "" escapes) — the only new dep for the API sources.
 csv = "1"

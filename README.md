@@ -55,8 +55,7 @@ cross-cluster ClickHouse copy, or publishing a ClickHouse mart into BigQuery,
 is an ordinary `sync()`. Some knobs are engine-specific: `column_transforms` /
 `read_max_rows_per_sec` apply to the PostgreSQL, MySQL and ClickHouse sources;
 `merge_prune_partition_by` /
-`delete_stale_in_window` apply to BigQuery-destination incremental syncs; S3
-archival applies to ClickHouse destinations.
+`delete_stale_in_window` apply to BigQuery-destination incremental syncs.
 
 ## Why quickhouse
 
@@ -263,25 +262,44 @@ Three knobs tune the incremental behavior for these sources:
   that immutable column's staging range, so it never touches history outside the
   batch (a hard error otherwise).
 
-A ClickHouse destination can also archive every synced batch to S3 as a data
-lake — a secondary, best-effort-free backup independent of ClickHouse's own
-retention:
+### Backup to cloud storage during the transfer
+
+Either destination can also archive every synced batch to Google Cloud Storage
+or S3 as a data lake — a secondary, best-effort-free backup independent of the
+destination's own retention:
 
 ```python
-qh.ClickHouse(
+dst = qh.ClickHouse(
     "http://host:8123", database="analytics",
-    archive=qh.S3Archive(bucket="my-data-lake", prefix="quickhouse"),
+    archive=qh.backup(destination="gcs", format="parquet",
+                      bucket="my-data-lake", prefix="quickhouse"),
 )
+qh.sync(src, dst, dest_table="orders", source_table="orders", mode="full", key=["id"])
 ```
 
+`backup()` is a thin factory over the two descriptors, which you can also name
+directly — `qh.GcsArchive(bucket=...)` and `qh.S3Archive(bucket=...)`. Parquet
+is the only supported `format`; any other value is rejected at the call.
+
 This streams Parquet — one file per parallel partition, never fully buffered
-in memory — to `s3://{bucket}/{prefix}/{dest_table}/dt=<date>/run=<id>/
-part-<partition>.parquet`, a Hive-style layout directly queryable by Athena,
-Spark, or DuckDB. Credentials fall back to the standard AWS chain (env vars,
-IAM role) unless overridden; pass `endpoint=` for an S3-compatible service
-like MinIO. A persistent upload failure fails the whole `sync()` call, same as
-a ClickHouse insert failure. Storage/request costs are billed by AWS as usual
-(free on a self-hosted MinIO).
+in memory — to `gs://` or `s3://{bucket}/{prefix}/{dest_table}/dt=<date>/
+run=<id>/part-<partition>.parquet`, a Hive-style layout directly queryable by
+BigQuery external tables, Athena, Spark, or DuckDB. It works for **every**
+source and **both** destinations, so a CleverTap pull or a `from_pandas()`
+frame is archived the same way a Postgres table is.
+
+GCS credentials fall back to Application Default Credentials and the standard
+`SERVICE_ACCOUNT`/`GOOGLE_SERVICE_ACCOUNT` environment, exactly like the
+`BigQuery` descriptor; pass `credentials_file=` or `credentials_json=` to
+override. S3 falls back to the standard AWS chain (env vars, IAM role); pass
+`endpoint=` for an S3-compatible service like MinIO.
+
+A persistent upload failure fails the whole `sync()` call, same as a
+destination insert failure — the archive never silently falls behind. Set
+`archive=` on the **destination** descriptor: one set on the source does
+nothing, and says so with an `ignored_source_archive` warning. Storage and
+request costs are billed by Google/AWS as usual (free on a self-hosted
+MinIO).
 
 The DDL knobs (`engine`, `partition_by`, `order_by`, `primary_key`, `key`) are
 interpreted per destination — for ClickHouse they shape the `MergeTree`

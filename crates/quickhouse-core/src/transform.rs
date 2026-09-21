@@ -443,6 +443,7 @@ mod tests {
 
     fn cfg() -> TransferConfig {
         TransferConfig {
+            source_archive_ignored: false,
             source_table: Some("t".into()),
             source_query: None,
             dest_table: "t".into(),

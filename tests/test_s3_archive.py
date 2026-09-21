@@ -1,5 +1,13 @@
-"""Integration tests: the optional S3 data-lake archive for a ClickHouse
-destination, against a local MinIO service (no AWS account needed).
+"""Integration tests: the optional Parquet data-lake archive, against a local
+MinIO service (no AWS account needed).
+
+Doubles as the regression suite for the *backend-blind* archive plumbing —
+which source shapes and which destinations reach the writer at all. That code
+holds an `Arc<dyn ObjectStore>` and never learns which cloud it is, so proving
+it here proves it for GCS too. It has to live here rather than in
+`test_gcs_archive.py` because MinIO is the only archive backend with a working
+local emulator: `object_store` writes GCS objects through the XML API, which
+fake-gcs-server does not implement.
 
 Run against the services in ``docker-compose.yml`` after building the module:
 
@@ -171,3 +179,28 @@ def test_archive_rejects_empty_bucket(pg_source):
         quickhouse.sync(
             pg_source, dst, dest_table="x", source_table="y", mode="full"
         )
+
+
+def test_archive_fires_for_a_dataframe_source(ch_client, s3_client, minio_bucket, unique_name):
+    """Regression: `run_transfer_frame` hardcoded `archive: None`, so a backup
+    configured on a DataFrame sync produced no files and no error — the one
+    way a backup fails that nobody notices."""
+    pytest.importorskip("pyarrow")
+    import pyarrow as pa
+
+    table = unique_name
+    _drop_ch(ch_client, table)
+    frame = pa.table({"id": list(range(1, 51)), "name": [f"row-{i}" for i in range(1, 51)]})
+    try:
+        result = quickhouse.from_pandas(
+            frame, _archive_target(minio_bucket), dest_table=table,
+            mode="full", key=["id"], create_if_missing=True,
+        )
+        assert result.rows_written == 50
+        keys, archived = _read_parquet_objects(s3_client, minio_bucket, f"lake/{table}/")
+        assert keys, "a DataFrame source must archive too, not silently skip"
+        assert archived.num_rows == 50
+        assert sorted(archived.column("id").to_pylist()) == list(range(1, 51))
+    finally:
+        _drop_ch(ch_client, table)
+

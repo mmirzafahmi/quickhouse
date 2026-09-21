@@ -236,18 +236,21 @@ struct BigQuery {
     credentials_json: Option<String>,
     dataset_id: Option<String>,
     write_method: String,
+    archive: Option<AnyArchive>,
 }
 
 #[pymethods]
 impl BigQuery {
     #[new]
-    #[pyo3(signature = (project_id=None, *, credentials_file=None, credentials_json=None, dataset_id=None, write_method="storage_write".to_string()))]
+    #[pyo3(signature = (project_id=None, *, credentials_file=None, credentials_json=None, dataset_id=None, write_method="storage_write".to_string(), archive=None))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         project_id: Option<String>,
         credentials_file: Option<String>,
         credentials_json: Option<String>,
         dataset_id: Option<String>,
         write_method: String,
+        archive: Option<AnyArchive>,
     ) -> Self {
         BigQuery {
             project_id,
@@ -255,6 +258,7 @@ impl BigQuery {
             credentials_json,
             dataset_id,
             write_method,
+            archive,
         }
     }
 
@@ -585,6 +589,21 @@ enum AnySource {
     Frame(FrameBytes),
 }
 
+impl AnySource {
+    /// True when this descriptor carries an `archive` that will be dropped.
+    /// `ClickHouse` and `BigQuery` double as destinations, so both accept an
+    /// `archive=` that only means something in that role; core turns this
+    /// into a `WarningKind::IgnoredSourceArchive` so the mistake is visible
+    /// instead of producing no backup and no complaint.
+    fn archive_ignored(&self) -> bool {
+        match self {
+            AnySource::ClickHouse(c) => c.archive.is_some(),
+            AnySource::BigQuery(b) => b.archive.is_some(),
+            _ => false,
+        }
+    }
+}
+
 impl From<AnySource> for core::SourceConfig {
     fn from(source: AnySource) -> Self {
         match source {
@@ -666,12 +685,12 @@ impl From<AnySource> for core::SourceConfig {
 }
 
 /// Optional S3 (or S3-compatible, e.g. MinIO) data-lake archive attached to a
-/// `ClickHouse` destination via its `archive=` parameter — every batch synced
-/// into ClickHouse is also written as Parquet, one file per parallel
+/// `ClickHouse` or `BigQuery` destination via its `archive=` parameter —
+/// every batch synced is also written as Parquet, one file per parallel
 /// partition, to `s3://{bucket}/{prefix}/{dest_table}/dt=<date>/run=<id>/
 /// part-<partition>.parquet`. A secondary, best-effort-free backup/historical
 /// side channel; omitting `archive` entirely disables it and has zero effect
-/// on the ClickHouse write path.
+/// on the destination write path. See `GcsArchive` for the GCS equivalent.
 ///
 /// `region`/`access_key_id`/`secret_access_key` default to the standard AWS
 /// credential chain (env vars, IAM role) when omitted — set them explicitly
@@ -723,6 +742,117 @@ impl S3Archive {
     }
 }
 
+/// Optional Google Cloud Storage data-lake archive — the GCS counterpart of
+/// `S3Archive`, attached to a `ClickHouse` or `BigQuery` destination via its
+/// `archive=` parameter and writing the identical Hive-style layout to
+/// `gs://{bucket}/{prefix}/{dest_table}/dt=<date>/run=<id>/
+/// part-<partition>.parquet`.
+///
+/// With neither `credentials_file` nor `credentials_json` set, credentials
+/// resolve from the environment (`SERVICE_ACCOUNT`, `GOOGLE_SERVICE_ACCOUNT*`)
+/// and Application Default Credentials, exactly as for the `BigQuery`
+/// descriptor. `credentials_json` takes precedence over `credentials_file`.
+///
+/// `endpoint` sets an alternate GCS base URL (a proxy or private endpoint)
+/// and makes the request unauthenticated; leave it unset for ordinary GCS.
+/// Unlike S3 there is no region to set.
+#[pyclass]
+#[derive(Clone)]
+struct GcsArchive {
+    bucket: String,
+    prefix: String,
+    credentials_file: Option<String>,
+    credentials_json: Option<String>,
+    endpoint: Option<String>,
+    compression: String,
+}
+
+#[pymethods]
+impl GcsArchive {
+    #[new]
+    #[pyo3(signature = (bucket, *, prefix="".to_string(), credentials_file=None, credentials_json=None, endpoint=None, compression="zstd".to_string()))]
+    fn new(
+        bucket: String,
+        prefix: String,
+        credentials_file: Option<String>,
+        credentials_json: Option<String>,
+        endpoint: Option<String>,
+        compression: String,
+    ) -> Self {
+        GcsArchive {
+            bucket,
+            prefix,
+            credentials_file,
+            credentials_json,
+            endpoint,
+            compression,
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "GcsArchive(bucket={:?}, prefix={:?}, endpoint={:?})",
+            self.bucket, self.prefix, self.endpoint
+        )
+    }
+}
+
+/// Accepts either archive backend as a destination's `archive=` argument.
+/// Unlike `AnyDestination` this needs no `#[allow(clippy::large_enum_variant)]`
+/// — both variants are a handful of `Option<String>`s and differ by ~24 bytes.
+#[derive(FromPyObject, Clone)]
+enum AnyArchive {
+    S3(S3Archive),
+    Gcs(GcsArchive),
+}
+
+/// Convert a destination's `archive=` into core config. Shared by both
+/// destination arms of `AnyDestination::into_config`, so ClickHouse and
+/// BigQuery cannot drift in how they validate an archive.
+///
+/// The non-empty-bucket check lives here rather than in core: `object_store`'s
+/// builders accept an empty bucket name and it would only surface later as a
+/// rejected request, and this mirrors how `BigQueryDestConfig::dataset_id`
+/// requiredness is checked at this same boundary.
+fn archive_config(archive: Option<AnyArchive>) -> PyResult<Option<core::ArchiveConfig>> {
+    let Some(a) = archive else {
+        return Ok(None);
+    };
+    Ok(Some(match a {
+        AnyArchive::S3(a) => {
+            if a.bucket.is_empty() {
+                return Err(PyRuntimeError::new_err(
+                    "S3Archive(...) requires a non-empty bucket",
+                ));
+            }
+            core::ArchiveConfig::S3(core::S3ArchiveConfig {
+                bucket: a.bucket,
+                prefix: a.prefix,
+                region: a.region,
+                access_key_id: a.access_key_id,
+                secret_access_key: a.secret_access_key,
+                endpoint: a.endpoint,
+                compression: parse_parquet_compression(&a.compression)?,
+            })
+        }
+        AnyArchive::Gcs(a) => {
+            if a.bucket.is_empty() {
+                return Err(PyRuntimeError::new_err(
+                    "GcsArchive(...) requires a non-empty bucket",
+                ));
+            }
+            core::ArchiveConfig::Gcs(core::GcsArchiveConfig {
+                bucket: a.bucket,
+                prefix: a.prefix,
+                credentials_file: a.credentials_file,
+                credentials_json: a.credentials_json,
+                endpoint: a.endpoint,
+                compression: parse_parquet_compression(&a.compression)?,
+            })
+        }
+    }))
+}
+
 /// ClickHouse connection descriptor — usable as either a `source` or a
 /// `target` for `sync()`, like `BigQuery`.
 ///
@@ -744,7 +874,7 @@ struct ClickHouse {
     user: String,
     password: String,
     compression: String,
-    archive: Option<S3Archive>,
+    archive: Option<AnyArchive>,
     settings: BTreeMap<String, String>,
     insert_dedup_token: bool,
     statement_timeout_secs: u64,
@@ -761,7 +891,7 @@ impl ClickHouse {
         user: String,
         password: String,
         compression: String,
-        archive: Option<S3Archive>,
+        archive: Option<AnyArchive>,
         settings: Option<BTreeMap<String, String>>,
         insert_dedup_token: bool,
         statement_timeout_secs: u64,
@@ -790,11 +920,11 @@ impl ClickHouse {
 /// Accepts `ClickHouse` or `BigQuery` as `sync()`'s `target` argument.
 ///
 /// `#[allow(clippy::large_enum_variant)]`: the `ClickHouse` descriptor is a few
-/// hundred bytes wider than the `BigQuery` one (mostly its optional
-/// `S3Archive`), and the obvious fix — boxing the variant — doesn't apply here,
-/// since `FromPyObject` is derived and pyo3 has no `Box<T>` extraction to
-/// derive through. One short-lived value per `sync()` call; not worth a
-/// hand-written extractor.
+/// hundred bytes wider than the `BigQuery` one — its `url`/`database`/`user`/
+/// `password` strings and `settings` map, since both now carry an `archive` —
+/// and the obvious fix, boxing the variant, doesn't apply here: `FromPyObject`
+/// is derived and pyo3 has no `Box<T>` extraction to derive through. One
+/// short-lived value per `sync()` call; not worth a hand-written extractor.
 #[allow(clippy::large_enum_variant)]
 #[derive(FromPyObject)]
 enum AnyDestination {
@@ -809,25 +939,7 @@ impl AnyDestination {
     fn into_config(self) -> PyResult<core::DestinationConfig> {
         match self {
             AnyDestination::ClickHouse(c) => {
-                let s3_archive = match c.archive {
-                    Some(a) => {
-                        if a.bucket.is_empty() {
-                            return Err(PyRuntimeError::new_err(
-                                "S3Archive(...) requires a non-empty bucket",
-                            ));
-                        }
-                        Some(core::S3ArchiveConfig {
-                            bucket: a.bucket,
-                            prefix: a.prefix,
-                            region: a.region,
-                            access_key_id: a.access_key_id,
-                            secret_access_key: a.secret_access_key,
-                            endpoint: a.endpoint,
-                            compression: parse_parquet_compression(&a.compression)?,
-                        })
-                    }
-                    None => None,
-                };
+                let archive = archive_config(c.archive)?;
                 Ok(core::DestinationConfig::ClickHouse(
                     core::ClickHouseConfig {
                         url: c.url,
@@ -837,7 +949,7 @@ impl AnyDestination {
                         compression: parse_compression(&c.compression)?,
                         insert_dedup_token: c.insert_dedup_token,
                         settings: c.settings,
-                        s3_archive,
+                        archive,
                     },
                 ))
             }
@@ -855,6 +967,7 @@ impl AnyDestination {
                         credentials_json: b.credentials_json,
                         dataset_id,
                         write_method: parse_bq_write_method(&b.write_method)?,
+                        archive: archive_config(b.archive)?,
                     },
                 ))
             }
@@ -1252,6 +1365,7 @@ fn sync(
     validate: Option<PyObject>,
 ) -> PyResult<TransferResult> {
     init_logging();
+    let source_archive_ignored = source.archive_ignored();
     let source_cfg: core::SourceConfig = source.into();
     let dest_cfg = target.into_config()?;
     // `seed_watermark` (an explicit floor) and `skip_to_max` (seed to the
@@ -1267,6 +1381,7 @@ fn sync(
         (None, false) => core::WatermarkSeed::None,
     };
     let cfg = core::TransferConfig {
+        source_archive_ignored,
         source_table,
         source_query,
         dest_table,
@@ -1463,6 +1578,7 @@ fn _quickhouse(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<HttpApi>()?;
     m.add_class::<ClickHouse>()?;
     m.add_class::<S3Archive>()?;
+    m.add_class::<GcsArchive>()?;
     m.add_class::<Progress>()?;
     m.add_class::<StagedInfo>()?;
     m.add_class::<TransferResult>()?;

@@ -18,7 +18,7 @@ For the exact constructor signatures see the [API reference](../../api.md).
 <div class="qh-modes">
   <a class="qh-mode qh-mode--current" href="clickhouse.html">
     <div class="qh-mode__name">ClickHouse</div>
-    <div class="qh-mode__desc">MergeTree-family DDL, atomic swap. Optional S3 archive of every synced batch.</div>
+    <div class="qh-mode__desc">MergeTree-family DDL, atomic swap. Optional Parquet backup of every synced batch to GCS or S3.</div>
   </a>
   <a class="qh-mode" href="bigquery.html">
     <div class="qh-mode__name">BigQuery</div>

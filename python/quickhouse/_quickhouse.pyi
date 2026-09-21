@@ -146,6 +146,7 @@ class BigQuery:
         credentials_json: Optional[str] = None,
         dataset_id: Optional[str] = None,
         write_method: str = "storage_write",
+        archive: Optional[Union[S3Archive, GcsArchive]] = None,
     ) -> None:
         """``credentials_json`` holds inline service-account JSON key contents
         (e.g. loaded from a secrets manager) as an alternative to
@@ -198,6 +199,66 @@ class S3Archive:
         region: Optional[str] = None,
         access_key_id: Optional[str] = None,
         secret_access_key: Optional[str] = None,
+        endpoint: Optional[str] = None,
+        compression: str = "zstd",
+    ) -> None: ...
+
+class GcsArchive:
+    """Optional Google Cloud Storage data-lake archive attached to a
+    :class:`ClickHouse` or :class:`BigQuery` destination via its ``archive=``
+    parameter — the GCS counterpart of :class:`S3Archive`.
+
+    Every batch synced is also written as Parquet — one streamed file per
+    parallel partition, never fully buffered in memory — to
+    ``gs://{bucket}/{prefix}/{dest_table}/dt=<date>/run=<id>/
+    part-<partition>.parquet``, the same Hive-style layout the S3 archive
+    writes, directly queryable by BigQuery external tables, Spark or DuckDB.
+    A persistent GCS failure fails the whole ``sync()`` call, matching how
+    the destination write path itself behaves, so the archive never silently
+    falls behind.
+
+    Parameters
+    ----------
+    bucket:
+        Target GCS bucket (required).
+    prefix:
+        Object-name prefix within the bucket; empty (default) writes at the
+        bucket root.
+    credentials_file:
+        Path to a service-account JSON key file.
+    credentials_json:
+        Inline service-account JSON key contents, e.g. loaded from a secrets
+        manager. Takes precedence over ``credentials_file``.
+    endpoint:
+        Alternate GCS base URL — a proxy or a private endpoint. Setting it
+        bypasses credentials entirely (the request is made unauthenticated),
+        so leave it unset for ordinary GCS. Note it does **not** make
+        fake-gcs-server usable: quickhouse writes GCS objects through the XML
+        API, which that emulator does not implement. Unlike S3 there is no
+        ``region``.
+    compression:
+        Parquet's own internal compression: ``"zstd"`` (default),
+        ``"snappy"``, or ``"uncompressed"``.
+
+    Note
+    ----
+    With neither ``credentials_file`` nor ``credentials_json`` set,
+    credentials resolve from the environment (``SERVICE_ACCOUNT``,
+    ``GOOGLE_SERVICE_ACCOUNT``) and Application Default Credentials, the same
+    chain :class:`BigQuery` uses. GCS storage and request costs are billed by
+    Google as usual.
+
+    .. versionadded:: 0.19.0
+
+    """
+
+    def __init__(
+        self,
+        bucket: str,
+        *,
+        prefix: str = "",
+        credentials_file: Optional[str] = None,
+        credentials_json: Optional[str] = None,
         endpoint: Optional[str] = None,
         compression: str = "zstd",
     ) -> None: ...
@@ -386,9 +447,15 @@ class ClickHouse:
         use ``"none"`` on a fast local network where CPU, not bandwidth, is
         the bottleneck.
     archive:
-        Optional :class:`S3Archive` — also write every synced batch as
-        Parquet to S3 for backup/historical analysis. ``None`` (default)
-        disables this entirely.
+        Optional :class:`S3Archive` or :class:`GcsArchive` (or the result of
+        :func:`~quickhouse.backup`) — also write every synced batch as
+        Parquet to cloud object storage for backup/historical analysis.
+        ``None`` (default) disables this entirely. Write-path only: set on
+        the descriptor passed as ``target``, since one passed as ``source``
+        archives nothing and raises an ``"ignored_source_archive"`` warning.
+
+        .. versionchanged:: 0.19.0
+           Accepts :class:`GcsArchive` as well as :class:`S3Archive`.
     settings:
         Arbitrary ClickHouse settings, sent as URL query parameters on **every**
         request this descriptor makes (as a target: DDL, inserts, reads, swaps;
@@ -430,7 +497,7 @@ class ClickHouse:
         user: str = "default",
         password: str = "",
         compression: str = "zstd",
-        archive: Optional[S3Archive] = None,
+        archive: Optional[Union[S3Archive, GcsArchive]] = None,
         settings: Optional[Mapping[str, str]] = None,
         insert_dedup_token: bool = False,
         statement_timeout_secs: int = 0,
@@ -499,6 +566,10 @@ class TransferWarning:
       destination not clustered by the merge key, so the key bound pruned
       nothing and the statement scanned the whole table. A cost problem, not a
       data one.
+    - ``"ignored_source_archive"`` — an ``archive=`` was set on the descriptor
+      passed as the ``source``, where it does nothing: archiving is read from
+      the destination only, so no backup was written for that run. New in
+      0.19.0.
     - ``"unindexed_watermark"`` — the planner estimated a setup-phase
       watermark probe as too costly to run (see ``probe_max_cost``), meaning
       ``WHERE watermark > x`` has no index to use and scans the whole table
@@ -507,7 +578,6 @@ class TransferWarning:
       ``"null_watermark"`` would go undetected. A first run still pays for that
       count, since it reads the whole table anyway. The durable fix is an index
       on the watermark column.
-    """
     - ``"incomplete_export"`` — an API export finished in a state that means the
       destination holds fewer records than the source has, and the run still
       succeeded. Raised for a CleverTap paging chain that ended on a repeated
@@ -517,6 +587,7 @@ class TransferWarning:
       itself, which is why it is reported rather than logged: a defect of this
       family was once measured reading 4,991 of 146,852 records (3.40%) and
       reporting the run clean. ``count`` is the number of records actually read.
+    """
 
     column: Optional[str]
     """The source column responsible, or ``None`` for a table-level condition."""

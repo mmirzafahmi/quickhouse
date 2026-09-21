@@ -9,6 +9,71 @@ any breaking change is called out explicitly.
 
 ## [Unreleased]
 
+## [0.19.0] — 2026-09-21
+
+### Added — back a transfer up to Google Cloud Storage, not just S3
+
+The Parquet data-lake archive now writes to GCS as well as S3, and a `backup()`
+factory names the cloud in one call:
+
+```python
+dst = qh.ClickHouse(
+    "http://host:8123", database="analytics",
+    archive=qh.backup(destination="gcs", format="parquet", bucket="my-lake"),
+)
+```
+
+`qh.GcsArchive(...)` is the explicit spelling, mirroring `S3Archive`. Layout is
+unchanged — `gs://{bucket}/{prefix}/{dest_table}/dt=<date>/run=<id>/
+part-<partition>.parquet`, one streamed file per parallel partition, never
+fully buffered. Credentials resolve through Application Default Credentials and
+the `SERVICE_ACCOUNT`/`GOOGLE_SERVICE_ACCOUNT` environment, with
+`credentials_file=` / `credentials_json=` overrides, matching the `BigQuery`
+descriptor. `format=` accepts only `"parquet"` and rejects anything else at the
+call rather than mid-transfer.
+
+This costs no new dependencies: `object_store` was already pinned at `=0.11.2`
+for the S3 path and merely gains its `gcp` feature, which adds `cloud` (already
+enabled by `aws`) and `rustls-pemfile` (already in the tree). `Cargo.lock` is
+unchanged.
+
+### Fixed — three ways a configured backup wrote nothing, silently
+
+Archiving was wired for a ClickHouse destination reading from a database
+source. Every other combination accepted `archive=` and quietly produced no
+files — which is the one way a backup fails that nobody notices until they
+need it. All three now archive:
+
+- **A BigQuery destination.** `sync.rs` read the archive off a ClickHouse
+  destination and hardcoded `None` for BigQuery.
+- **HTTP API sources** (CleverTap, AppsFlyer, `HttpApi`) and **DataFrame
+  sources** (`from_pandas`, and any Arrow frame). Both built their write
+  context with `archive: None`. Like the BigQuery-source path they have no
+  discrete partitions, so each run writes a single `part-all.parquet`.
+
+An archive set on the descriptor passed as the **source** still does nothing —
+archiving is a write-path option — but it is no longer silent: it raises the
+new `"ignored_source_archive"` warning kind on `TransferResult.warnings`.
+
+### Fixed — a stray `"""` in the type stub
+
+`_quickhouse.pyi` closed the `TransferWarning.kind` docstring one bullet early,
+leaving `"incomplete_export"` and everything after it as bare code and making
+the stub invalid Python. Unrelated to the rest of this release; found because
+this change adds a bullet to that same list.
+
+### Known, not changed
+
+There is no local emulator for the GCS archive path. `object_store` writes GCS
+objects through Google's XML API, and fake-gcs-server implements only the JSON
+upload API, answering with `400 invalid uploadType`. The GCS client and its
+credential precedence are covered by Rust unit tests, the Parquet writer by an
+in-memory round trip, and the archive plumbing by the MinIO suite (that code is
+backend-blind — it holds an `Arc<dyn ObjectStore>` and never learns which cloud
+it is). A real end-to-end GCS run is covered by tests that activate when
+`QUICKHOUSE_GCS_BUCKET` is set, and skip otherwise.
+
+
 ## [0.18.2] — 2026-09-21
 
 ### Fixed — a CleverTap export that read only part of the data reported success

@@ -17,9 +17,9 @@ use mysql_async::prelude::*;
 use object_store::ObjectStore;
 use tokio::task::JoinSet;
 
-use crate::archive::{archive_object_key, build_s3_store, S3ArchiveWriter};
+use crate::archive::{archive_object_key, build_store, ArchiveWriter};
 use crate::config::{
-    ApiColumn, DestinationConfig, ParquetCompression, S3ArchiveConfig, SourceConfig, SourceShape,
+    ApiColumn, ArchiveConfig, DestinationConfig, ParquetCompression, SourceConfig, SourceShape,
     SyncMode, TransferConfig, TransferResult, TransferWarning, WarningKind, WatermarkSeed,
 };
 use crate::decode::CopyDecoder;
@@ -539,8 +539,8 @@ struct SendCtx {
     counters: Arc<Counters>,
     progress: Option<ProgressCb>,
     started: Instant,
-    /// `Some` only for a ClickHouse destination with `s3_archive` configured;
-    /// `None` otherwise (including always for BigQuery). See
+    /// `Some` whenever the destination — ClickHouse or BigQuery — has an
+    /// `archive` configured, for every source shape. See
     /// `ArchiveRunInfo::writer_for`.
     archive: Option<Arc<ArchiveRunInfo>>,
     /// `Some` when `read_max_rows_per_sec` is set: a single limiter shared by
@@ -681,8 +681,8 @@ impl SendCtx {
     }
 }
 
-/// Static per-run info every partition needs to open its own S3 archive
-/// writer — the S3 client and naming info are shared (built once per
+/// Static per-run info every partition needs to open its own archive writer —
+/// the object-store client and naming info are shared (built once per
 /// transfer, mirroring `build_sink`); only the partition label varies.
 struct ArchiveRunInfo {
     store: Arc<dyn ObjectStore>,
@@ -691,10 +691,13 @@ struct ArchiveRunInfo {
     run_date: String,
     run_id: String,
     compression: ParquetCompression,
+    /// Backend label ("s3"/"gcs") for error messages only — the store itself
+    /// is a `dyn ObjectStore` and no longer says which cloud it talks to.
+    kind: &'static str,
 }
 
 impl ArchiveRunInfo {
-    fn writer_for(&self, partition_label: &str, schema: SchemaRef) -> Result<S3ArchiveWriter> {
+    fn writer_for(&self, partition_label: &str, schema: SchemaRef) -> Result<ArchiveWriter> {
         let key = archive_object_key(
             &self.prefix,
             &self.dest_table,
@@ -702,30 +705,32 @@ impl ArchiveRunInfo {
             &self.run_id,
             partition_label,
         );
-        S3ArchiveWriter::new(self.store.clone(), key, schema, self.compression)
+        ArchiveWriter::new(self.store.clone(), key, schema, self.compression, self.kind)
     }
 }
 
-/// Build the shared archive info for one transfer run, or `None` if S3
-/// archival isn't configured. Building the S3 client here — before any
+/// Build the shared archive info for one transfer run, or `None` if archival
+/// isn't configured. Building the object-store client here — before any
 /// source connection is opened — means a bad archive config (e.g. a missing
-/// bucket) fails fast rather than being discovered mid-transfer.
+/// bucket, or unparseable service-account JSON) fails fast rather than being
+/// discovered mid-transfer.
 fn build_archive_run_info(
-    s3_archive: Option<S3ArchiveConfig>,
+    archive: Option<ArchiveConfig>,
     dest_table: &str,
 ) -> Result<Option<Arc<ArchiveRunInfo>>> {
-    let Some(cfg) = s3_archive else {
+    let Some(cfg) = archive else {
         return Ok(None);
     };
-    let store = build_s3_store(&cfg)?;
+    let store = build_store(&cfg)?;
     let now = Utc::now();
     Ok(Some(Arc::new(ArchiveRunInfo {
         store,
-        prefix: cfg.prefix,
+        prefix: cfg.prefix().to_string(),
         dest_table: dest_table.to_string(),
         run_date: now.format("%Y-%m-%d").to_string(),
         run_id: now.timestamp().to_string(),
-        compression: cfg.compression,
+        compression: cfg.compression(),
+        kind: cfg.kind(),
     })))
 }
 
@@ -879,6 +884,27 @@ async fn run_transfer_impl(
     // reports only the successful attempt's warnings.
     let warnings = Warnings::default();
 
+    // A backup configured on the source descriptor is a backup that never
+    // happens: `archive` is read off the destination only. Warn rather than
+    // error, because one descriptor legitimately serves as both source and
+    // destination in a self-copy — but never let it pass in silence.
+    if cfg.source_archive_ignored {
+        let message = format!(
+            "archive= was set on the {} source descriptor, where it does nothing — archiving \
+             is a write-path option, read from the destination only. NO BACKUP WILL BE WRITTEN \
+             for this run unless archive= is also set on the destination descriptor.",
+            source_cfg.kind(),
+        );
+        tracing::warn!("{message}");
+        warnings.push(TransferWarning {
+            kind: WarningKind::IgnoredSourceArchive,
+            column: None,
+            count: 0,
+            sample: None,
+            message,
+        });
+    }
+
     let source_label = cfg
         .source_table
         .clone()
@@ -892,15 +918,12 @@ async fn run_transfer_impl(
         cfg.mode
     );
 
-    // --- Optional S3 data-lake archival (ClickHouse destinations only). ---
+    // --- Optional Parquet data-lake archival (either destination). ---
     // Extracted (and cloned) before `build_sink(dest)` consumes `dest` below —
     // in either branch — and built once here so a bad archive config (e.g. a
     // missing bucket) fails fast rather than being discovered mid-transfer.
-    let s3_archive_cfg = match &dest {
-        DestinationConfig::ClickHouse(ch) => ch.s3_archive.clone(),
-        DestinationConfig::BigQuery(_) => None,
-    };
-    let archive_info = build_archive_run_info(s3_archive_cfg, &cfg.dest_table)?;
+    let archive_cfg = dest.archive().cloned();
+    let archive_info = build_archive_run_info(archive_cfg, &cfg.dest_table)?;
 
     // Per-run-unique staging table name (see `staging_name`), computed once
     // and reused at every create/swap/merge/drop site this run.
@@ -936,25 +959,41 @@ async fn run_transfer_impl(
 
     // HTTP API sources (CleverTap/AppsFlyer/HttpApi): a declared schema +
     // paginated fetch into either sink (BigQuery or ClickHouse, since
-    // `bc1ab45`) — a separate flow from the DB partition machinery. archive is
-    // always None: S3 archiving is wired for DB sources only.
+    // `bc1ab45`) — a separate flow from the DB partition machinery. Like the
+    // BigQuery-source flow it has no discrete partitions, so it archives a
+    // single "all" file per run.
     if source_cfg.is_api() {
         let sink = build_sink(dest).await?;
         return run_transfer_api(
-            source_cfg, sink, cfg, progress, on_staged, started, staging, warnings,
+            source_cfg,
+            sink,
+            cfg,
+            progress,
+            on_staged,
+            started,
+            archive_info,
+            staging,
+            warnings,
         )
         .await;
     }
 
     // An in-memory Arrow frame: the schema arrives with the data and there is
     // nothing to connect to, so — like the API flow above — this returns before
-    // any of the partition machinery is built. archive is None for the same
-    // reason it is there (S3 archiving is wired for DB sources only).
+    // any of the partition machinery is built, and archives one "all" file.
     if let SourceConfig::Arrow(frame) = &source_cfg {
         let frame = frame.clone();
         let sink = build_sink(dest).await?;
         return run_transfer_frame(
-            frame, sink, cfg, progress, on_staged, started, staging, warnings,
+            frame,
+            sink,
+            cfg,
+            progress,
+            on_staged,
+            started,
+            archive_info,
+            staging,
+            warnings,
         )
         .await;
     }
@@ -1946,6 +1985,7 @@ async fn run_transfer_api(
     progress: Option<ProgressCb>,
     on_staged: Option<StagedValidationCb>,
     started: Instant,
+    archive_info: Option<Arc<ArchiveRunInfo>>,
     staging: String,
     warnings: Warnings,
 ) -> Result<TransferResult> {
@@ -2043,7 +2083,7 @@ async fn run_transfer_api(
             counters: counters.clone(),
             progress: progress.clone(),
             started,
-            archive: None,
+            archive: archive_info.clone(),
             throttle: None,
             warnings: warnings.clone(),
             watermark_max: None,
@@ -2053,6 +2093,13 @@ async fn run_transfer_api(
         let schema = batcher.schema();
         let mut sends: JoinSet<Result<()>> = JoinSet::new();
         let mut insert_buf = InsertBuffer::new(cfg.insert_bytes);
+        // No discrete partitions on this path (the fetch is sequential, like
+        // the BigQuery-source flow) — "all" is the only file this run will
+        // ever archive for this table.
+        let mut archive_writer = match &ctx.archive {
+            Some(info) => Some(info.writer_for("all", schema.clone())?),
+            None => None,
+        };
 
         match &source_cfg {
             SourceConfig::CleverTap(c) => {
@@ -2120,6 +2167,9 @@ async fn run_transfer_api(
                     }
                     for rec in &page.records {
                         if let Some(b) = batcher.append_record(rec)? {
+                            if let Some(w) = archive_writer.as_mut() {
+                                w.write(&b).await?;
+                            }
                             ctx.push_batch(&mut sends, &mut insert_buf, schema.clone(), b).await;
                             reap(&mut sends, false).await?;
                         }
@@ -2200,6 +2250,9 @@ async fn run_transfer_api(
                 let records = src.fetch_records(&from, &to, &lookups).await?;
                 for rec in &records {
                     if let Some(b) = batcher.append_record(rec)? {
+                        if let Some(w) = archive_writer.as_mut() {
+                            w.write(&b).await?;
+                        }
                         ctx.push_batch(&mut sends, &mut insert_buf, schema.clone(), b).await;
                         reap(&mut sends, false).await?;
                     }
@@ -2210,6 +2263,9 @@ async fn run_transfer_api(
                 let records = src.fetch_records(&from, &to, &lookups).await?;
                 for rec in &records {
                     if let Some(b) = batcher.append_record(rec)? {
+                        if let Some(w) = archive_writer.as_mut() {
+                            w.write(&b).await?;
+                        }
                         ctx.push_batch(&mut sends, &mut insert_buf, schema.clone(), b).await;
                         reap(&mut sends, false).await?;
                     }
@@ -2218,7 +2274,13 @@ async fn run_transfer_api(
             _ => unreachable!("run_transfer_api only handles API sources"),
         }
         if let Some(b) = batcher.finish()? {
+            if let Some(w) = archive_writer.as_mut() {
+                w.write(&b).await?;
+            }
             ctx.push_batch(&mut sends, &mut insert_buf, schema.clone(), b).await;
+        }
+        if let Some(w) = archive_writer.take() {
+            w.close().await?;
         }
         ctx.flush(&mut sends, &mut insert_buf, schema.clone()).await;
         reap(&mut sends, true).await?;
@@ -2362,6 +2424,7 @@ async fn run_transfer_frame(
     progress: Option<ProgressCb>,
     on_staged: Option<StagedValidationCb>,
     started: Instant,
+    archive_info: Option<Arc<ArchiveRunInfo>>,
     staging: String,
     warnings: Warnings,
 ) -> Result<TransferResult> {
@@ -2464,7 +2527,7 @@ async fn run_transfer_frame(
             counters: counters.clone(),
             progress: progress.clone(),
             started,
-            archive: None,
+            archive: archive_info.clone(),
             throttle: None,
             warnings: warnings.clone(),
             watermark_max: None,
@@ -2479,6 +2542,12 @@ async fn run_transfer_frame(
         let mut sends: JoinSet<Result<()>> = JoinSet::new();
         let mut insert_buf = InsertBuffer::new(cfg.insert_bytes);
         let mut rows_read = 0u64;
+        // A frame is one unit with no partitions, so "all" is the only file
+        // this run will ever archive for this table.
+        let mut archive_writer = match &ctx.archive {
+            Some(info) => Some(info.writer_for("all", schema.clone())?),
+            None => None,
+        };
 
         let mut reader = StreamReader::try_new(Cursor::new(&frame.ipc[..]), projection)
             .map_err(EtlError::from)?;
@@ -2490,6 +2559,9 @@ async fn run_transfer_frame(
             )?;
             rows_read += batch.num_rows() as u64;
             for slice in crate::decode_clickhouse::split_to_bytes(batch, cfg.batch_bytes) {
+                if let Some(w) = archive_writer.as_mut() {
+                    w.write(&slice).await?;
+                }
                 ctx.push_batch(&mut sends, &mut insert_buf, schema.clone(), slice)
                     .await;
                 reap(&mut sends, false).await?;
@@ -2503,6 +2575,9 @@ async fn run_transfer_frame(
                 "the Arrow IPC stream ended without an end-of-stream marker — the frame was \
                  serialized incompletely, so an unknown number of rows are missing",
             ));
+        }
+        if let Some(w) = archive_writer.take() {
+            w.close().await?;
         }
         ctx.flush(&mut sends, &mut insert_buf, schema.clone()).await;
         reap(&mut sends, true).await?;
@@ -4305,6 +4380,7 @@ fn coercion_message(kind: WarningKind, column: &str, n: u64) -> String {
         | WarningKind::FullRefreshShrink
         | WarningKind::UnclusteredMergeTarget
         | WarningKind::IncompleteExport
+        | WarningKind::IgnoredSourceArchive
         | WarningKind::UnindexedWatermark => {
             format!("column '{column}': {n} affected row(s)")
         }
@@ -6167,7 +6243,7 @@ mod tests {
             compression: crate::config::Compression::None,
             insert_dedup_token: false,
             settings: Default::default(),
-            s3_archive: None,
+            archive: None,
         });
         let cb: StagedValidationCb = Arc::new(|_info: &StagedInfo| Ok(()));
         let err = run_transfer_impl(src, dst, cfg, None, Some(cb))

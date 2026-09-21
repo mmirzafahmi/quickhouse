@@ -64,6 +64,8 @@ Connection descriptors accepted as ``sync()``'s ``target`` argument. ``BigQuery`
 
 ```{eval-rst}
 .. autoclass:: S3Archive
+
+.. autoclass:: GcsArchive
 ```
 
 ## Result & progress types
@@ -96,6 +98,8 @@ Optional Great Expectations gate passed to ``sync()``'s ``validate=`` — see th
 ## Helpers
 
 ```{eval-rst}
+.. autofunction:: backup
+
 .. autofunction:: progress_bar
 
 .. autofunction:: version

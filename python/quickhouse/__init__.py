@@ -60,6 +60,7 @@ from ._quickhouse import (
     BigQuery,
     CleverTap,
     ClickHouse,
+    GcsArchive,
     HttpApi,
     MySQL,
     Postgres,
@@ -73,6 +74,7 @@ from ._quickhouse import (
     sync,
     version,
 )
+from .backup import backup
 from .pandas import QuickhouseWarning, from_pandas
 from .progress import progress_bar
 from .quality import Validation, ValidationFailed
@@ -86,6 +88,7 @@ __all__ = [
     "HttpApi",
     "ClickHouse",
     "S3Archive",
+    "GcsArchive",
     "Progress",
     "TransferResult",
     "TransferWarning",
@@ -94,6 +97,7 @@ __all__ = [
     "ValidationFailed",
     "QuickhouseWarning",
     "sync",
+    "backup",
     "from_pandas",
     "reconcile_keys",
     "version",

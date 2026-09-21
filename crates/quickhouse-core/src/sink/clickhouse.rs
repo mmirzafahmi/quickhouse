@@ -1131,7 +1131,7 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
-            s3_archive: None,
+            archive: None,
         })
         .unwrap()
     }
@@ -1187,7 +1187,7 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
-            s3_archive: None,
+            archive: None,
         })
         .unwrap()
     }

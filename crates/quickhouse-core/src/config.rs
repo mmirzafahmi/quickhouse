@@ -417,12 +417,12 @@ pub struct ClickHouseConfig {
     /// unknown setting itself, with a better message than a client-side
     /// allowlist could give. Avoid `database`, which the sink already sends.
     pub settings: std::collections::BTreeMap<String, String>,
-    /// Optional: also archive every synced batch as Parquet into S3 (or an
-    /// S3-compatible store like MinIO) — a secondary, best-effort-free data
-    /// lake for backup/historical analysis, independent of ClickHouse's own
-    /// retention. `None` (default) disables this entirely; the ClickHouse
-    /// write path is unaffected either way.
-    pub s3_archive: Option<S3ArchiveConfig>,
+    /// Optional: also archive every synced batch as Parquet into cloud object
+    /// storage — a secondary, best-effort-free data lake for backup/historical
+    /// analysis, independent of ClickHouse's own retention. `None` (default)
+    /// disables this entirely; the ClickHouse write path is unaffected either
+    /// way.
+    pub archive: Option<ArchiveConfig>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -443,9 +443,9 @@ pub enum ParquetCompression {
     Uncompressed,
 }
 
-/// Optional S3 (or S3-compatible) data-lake archive for a ClickHouse
-/// destination. Every batch synced into ClickHouse is also written as
-/// Parquet to `s3://{bucket}/{prefix}/{dest_table}/dt=<date>/run=<id>/
+/// Optional S3 (or S3-compatible) data-lake archive. Every batch synced to
+/// the destination is also written as Parquet to
+/// `s3://{bucket}/{prefix}/{dest_table}/dt=<date>/run=<id>/
 /// part-<partition>.parquet` — one streamed file per parallel partition,
 /// never fully buffered in memory (see `crate::archive`).
 #[derive(Debug, Clone)]
@@ -462,6 +462,83 @@ pub struct S3ArchiveConfig {
     /// plain HTTP is allowed automatically (real AWS S3 always uses HTTPS).
     pub endpoint: Option<String>,
     pub compression: ParquetCompression,
+}
+
+/// Optional Google Cloud Storage data-lake archive — the GCS counterpart of
+/// [`S3ArchiveConfig`], writing the identical Hive-style layout to
+/// `gs://{bucket}/{prefix}/{dest_table}/dt=<date>/run=<id>/
+/// part-<partition>.parquet`.
+#[derive(Debug, Clone)]
+pub struct GcsArchiveConfig {
+    pub bucket: String,
+    /// Object-name prefix within the bucket; empty string writes at the
+    /// bucket root.
+    pub prefix: String,
+    /// Path to a service-account JSON key file. With both this and
+    /// `credentials_json` `None`, credentials resolve from the environment
+    /// (`SERVICE_ACCOUNT`, `GOOGLE_SERVICE_ACCOUNT*`) and Application Default
+    /// Credentials via `GoogleCloudStorageBuilder::from_env()`.
+    pub credentials_file: Option<String>,
+    /// Inline service-account JSON key contents — e.g. straight from a
+    /// secrets manager. Takes precedence over `credentials_file` when both
+    /// are set, matching [`BigQueryDestConfig`].
+    pub credentials_json: Option<String>,
+    /// Alternate GCS base URL — a proxy or private endpoint. Unlike S3,
+    /// `object_store`'s GCS builder exposes no endpoint setter: the only hook
+    /// is a `gcs_base_url` key inside the service-account JSON, so
+    /// `crate::archive` synthesizes an unauthenticated key from this, which
+    /// also means the request carries no credentials. Leave unset for
+    /// ordinary GCS. Note this does not make `fake-gcs-server` usable — see
+    /// `crate::archive::unauthenticated_service_account_key`.
+    pub endpoint: Option<String>,
+    pub compression: ParquetCompression,
+}
+
+/// Which object store an archive writes to. The rest of the pipeline is
+/// backend-blind — `crate::archive::build_store` turns this into an
+/// `Arc<dyn ObjectStore>` once per run and nothing downstream looks at the
+/// variant again.
+#[derive(Debug, Clone)]
+pub enum ArchiveConfig {
+    S3(S3ArchiveConfig),
+    Gcs(GcsArchiveConfig),
+}
+
+impl ArchiveConfig {
+    /// Object-name prefix within the bucket, whichever backend this is.
+    pub fn prefix(&self) -> &str {
+        match self {
+            ArchiveConfig::S3(c) => &c.prefix,
+            ArchiveConfig::Gcs(c) => &c.prefix,
+        }
+    }
+
+    /// Parquet's internal compression for the files this archive writes.
+    pub fn compression(&self) -> ParquetCompression {
+        match self {
+            ArchiveConfig::S3(c) => c.compression,
+            ArchiveConfig::Gcs(c) => c.compression,
+        }
+    }
+
+    /// The target bucket, used for the non-empty check at the Python
+    /// boundary and for error messages.
+    pub fn bucket(&self) -> &str {
+        match self {
+            ArchiveConfig::S3(c) => &c.bucket,
+            ArchiveConfig::Gcs(c) => &c.bucket,
+        }
+    }
+
+    /// Short backend label that prefixes every archive error message. Which
+    /// store a write or finalize failed against is the first thing an
+    /// operator needs, and it is not otherwise recoverable from the message.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            ArchiveConfig::S3(_) => "s3",
+            ArchiveConfig::Gcs(_) => "gcs",
+        }
+    }
 }
 
 /// How to write rows into BigQuery.
@@ -499,6 +576,11 @@ pub struct BigQueryDestConfig {
     /// How rows are written into BigQuery (default `InsertAll`). Only meaningful
     /// when BigQuery is the destination; ignored when it's the source.
     pub write_method: BigQueryWriteMethod,
+    /// Optional: also archive every synced batch as Parquet into cloud object
+    /// storage, exactly as for a ClickHouse destination. Independent of
+    /// BigQuery's own snapshots and time travel; `None` (default) disables it
+    /// and leaves the BigQuery write path untouched.
+    pub archive: Option<ArchiveConfig>,
 }
 
 /// Which destination engine to write to. Mirrors [`SourceConfig`]. `sync.rs`
@@ -524,6 +606,16 @@ impl DestinationConfig {
         match self {
             DestinationConfig::ClickHouse(_) => DestKind::ClickHouse,
             DestinationConfig::BigQuery(_) => DestKind::BigQuery,
+        }
+    }
+
+    /// The optional Parquet data-lake archive, whichever destination this is.
+    /// Both destinations archive identically, so `sync.rs` reads it through
+    /// here rather than matching on the variant.
+    pub fn archive(&self) -> Option<&ArchiveConfig> {
+        match self {
+            DestinationConfig::ClickHouse(c) => c.archive.as_ref(),
+            DestinationConfig::BigQuery(c) => c.archive.as_ref(),
         }
     }
 }
@@ -1149,6 +1241,13 @@ pub struct TransferConfig {
     /// DDL/nullability instead of regenerating it (see `Sink::clone_table_structure`),
     /// so this has nothing to add there.
     pub not_null: Vec<String>,
+    /// Set by the Python boundary when the *source* descriptor carried an
+    /// `archive`, which is write-path only and therefore dropped. Unlike
+    /// every other field here this mirrors no `sync()` kwarg — it exists so
+    /// core can raise `WarningKind::IgnoredSourceArchive` through the same
+    /// channel as every other warning, rather than the mistake passing in
+    /// silence.
+    pub source_archive_ignored: bool,
     /// Default destination type for **every** arbitrary-precision decimal
     /// column (PostgreSQL `numeric`, MySQL `DECIMAL`/`NEWDECIMAL`, BigQuery
     /// `NUMERIC`) that has no `type_overrides` entry of its own — e.g.
@@ -1551,6 +1650,12 @@ pub enum WarningKind {
     /// the merge key, so the key-range prune had nothing to prune with and the
     /// statement scanned the whole table. Not a data problem — a cost one.
     UnclusteredMergeTarget,
+    /// An `archive` was configured on the descriptor passed as the *source*,
+    /// where it does nothing. Archiving is a write-path concern, so it is
+    /// read off the destination only — a backup asked for this way is
+    /// silently never written, which is the one way a backup fails that the
+    /// user cannot see. Move `archive=` to the destination descriptor.
+    IgnoredSourceArchive,
     /// An API export finished in a state that means the destination holds
     /// *fewer* records than the source has, and the run still succeeded.
     ///
@@ -1578,6 +1683,7 @@ impl WarningKind {
             WarningKind::NullWatermark => "null_watermark",
             WarningKind::FullRefreshShrink => "full_refresh_shrink",
             WarningKind::UnclusteredMergeTarget => "unclustered_merge_target",
+            WarningKind::IgnoredSourceArchive => "ignored_source_archive",
             WarningKind::IncompleteExport => "incomplete_export",
             WarningKind::UnindexedWatermark => "unindexed_watermark",
         }
@@ -1662,6 +1768,7 @@ pub struct TransferResult {
 #[cfg(test)]
 pub(crate) fn default_test_config() -> TransferConfig {
     TransferConfig {
+        source_archive_ignored: false,
         source_table: Some("t".into()),
         source_query: None,
         dest_table: "t".into(),
@@ -1777,6 +1884,7 @@ mod tests {
 
     fn cfg(mode: SyncMode, watermark: Option<&str>) -> TransferConfig {
         TransferConfig {
+            source_archive_ignored: false,
             source_table: Some("t".into()),
             source_query: None,
             dest_table: "t".into(),

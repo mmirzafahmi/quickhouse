@@ -23,3 +23,24 @@ qh.sync(
 
 The DDL knobs a BigQuery destination accepts are on the
 [Destinations index](index.md#destination-ddl).
+
+## Cloud backup (Parquet archive)
+
+A BigQuery destination takes the same `archive=` a
+[ClickHouse destination](clickhouse.md#cloud-backup-parquet-archive) does —
+every synced batch is also streamed to Google Cloud Storage or S3 as Parquet,
+a secondary backup independent of BigQuery's own snapshots and time travel:
+
+```python
+qh.BigQuery(
+    "my-project", dataset_id="analytics",
+    archive=qh.backup(destination="gcs", format="parquet",
+                      bucket="my-data-lake", prefix="quickhouse"),
+)
+```
+
+```{versionadded} 0.19.0
+Before this, a BigQuery destination accepted no archive at all. See the
+[ClickHouse page](clickhouse.md#cloud-backup-parquet-archive) for the object
+layout, credential resolution and failure behaviour, which are identical here.
+```

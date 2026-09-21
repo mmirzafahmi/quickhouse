@@ -29,6 +29,11 @@ CH_PASSWORD = os.environ.get("QUICKHOUSE_CH_PASSWORD", "")
 MINIO_ENDPOINT = os.environ.get("QUICKHOUSE_MINIO_ENDPOINT", "http://localhost:9010")
 MINIO_ACCESS_KEY = os.environ.get("QUICKHOUSE_MINIO_ACCESS_KEY", "minioadmin")
 MINIO_SECRET_KEY = os.environ.get("QUICKHOUSE_MINIO_SECRET_KEY", "minioadmin")
+# A real GCS bucket for the live archive tests. Unset (the default, and in
+# CI) those tests skip: object_store writes GCS objects through the XML
+# API, which fake-gcs-server does not implement, so there is no emulator
+# to stand in for a real bucket. See tests/test_gcs_archive.py.
+GCS_BUCKET = os.environ.get("QUICKHOUSE_GCS_BUCKET")
 
 
 @pytest.fixture(scope="session")
