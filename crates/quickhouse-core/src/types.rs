@@ -129,16 +129,28 @@ impl ColumnType {
         if !self.nullable {
             return self.clickhouse_inner.clone();
         }
-        if let Some(inner) = strip_low_cardinality(&self.clickhouse_inner) {
-            // Already spelled with the Nullable inside — leave it alone rather
-            // than double-wrapping.
-            if inner.starts_with("Nullable(") {
-                return self.clickhouse_inner.clone();
-            }
-            return format!("LowCardinality(Nullable({inner}))");
-        }
-        format!("Nullable({})", self.clickhouse_inner)
+        wrap_clickhouse_nullable(&self.clickhouse_inner)
     }
+}
+
+/// Wrap a ClickHouse inner type (as stored in [`ColumnType::clickhouse_inner`])
+/// in `Nullable`, honoring the same LowCardinality-must-be-outermost rule as
+/// [`ColumnType::clickhouse_type`] — see that method's docs for why plain
+/// `Nullable(LowCardinality(T))` is rejected outright. Exposed (rather than
+/// folded only into `clickhouse_type`) for `ddl::add_column`, which needs this
+/// wrapping *unconditionally*, regardless of the column's own resolved
+/// `nullable`: an evolved column's existing rows all predate it and must read
+/// back as NULL either way.
+pub fn wrap_clickhouse_nullable(inner: &str) -> String {
+    if let Some(stripped) = strip_low_cardinality(inner) {
+        // Already spelled with the Nullable inside — leave it alone rather
+        // than double-wrapping.
+        if stripped.starts_with("Nullable(") {
+            return inner.to_string();
+        }
+        return format!("LowCardinality(Nullable({stripped}))");
+    }
+    format!("Nullable({inner})")
 }
 
 /// `LowCardinality(T)` -> `Some("T")`, anything else -> `None`. Matches only
@@ -412,6 +424,19 @@ pub mod mysql {
             MyType::MYSQL_TYPE_DOUBLE
             | MyType::MYSQL_TYPE_DECIMAL
             | MyType::MYSQL_TYPE_NEWDECIMAL => (DataType::Float64, "Float64".to_string()),
+            // BINARY(n)/VARBINARY(n) share the CHAR/VARCHAR wire codes and, like
+            // BLOB below, differ only by the binary charset. Their bytes are
+            // arbitrary (UUID_TO_BIN keys, hashes), so they must stay Binary:
+            // decoding them as text replaces invalid bytes with U+FFFD, which
+            // corrupts the value and can make distinct keys identical. JSON is
+            // left out on purpose: MySQL reports it with the binary charset too.
+            MyType::MYSQL_TYPE_VARCHAR
+            | MyType::MYSQL_TYPE_VAR_STRING
+            | MyType::MYSQL_TYPE_STRING
+                if is_binary =>
+            {
+                (DataType::Binary, "String".to_string())
+            }
             MyType::MYSQL_TYPE_VARCHAR
             | MyType::MYSQL_TYPE_VAR_STRING
             | MyType::MYSQL_TYPE_STRING
@@ -987,6 +1012,37 @@ mod tests {
                 "{ty:?} BLOB"
             );
         }
+    }
+
+    /// BINARY/VARBINARY use the CHAR/VARCHAR wire codes; the binary charset
+    /// must keep them as bytes, while JSON (also reported with the binary
+    /// charset) stays text.
+    #[test]
+    fn mysql_binary_and_varbinary_stay_bytes() {
+        use super::mysql::map_mysql_type;
+        use mysql_async::consts::ColumnType as MyType;
+        for ty in [
+            MyType::MYSQL_TYPE_VARCHAR,
+            MyType::MYSQL_TYPE_VAR_STRING,
+            MyType::MYSQL_TYPE_STRING,
+        ] {
+            assert_eq!(
+                map_mysql_type(ty, false, false, true).unwrap().0,
+                DataType::Binary,
+                "{ty:?} binary"
+            );
+            assert_eq!(
+                map_mysql_type(ty, false, false, false).unwrap().0,
+                DataType::Utf8,
+                "{ty:?} text"
+            );
+        }
+        assert_eq!(
+            map_mysql_type(MyType::MYSQL_TYPE_JSON, false, false, true)
+                .unwrap()
+                .0,
+            DataType::Utf8
+        );
     }
 
     #[test]

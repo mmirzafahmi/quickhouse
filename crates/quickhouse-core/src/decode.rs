@@ -134,6 +134,11 @@ impl ColBuilder {
                     // maps to a ClickHouse String (no time-of-day type); render
                     // it as canonical "HH:MM:SS[.ffffff]" text.
                     b.append_value(format_pg_time(read_i64(buf)?));
+                } else if pg_oid == oid::UUID && buf.len() == 16 {
+                    // uuid_send writes the 16 raw bytes, not text. (A uuid
+                    // column rewritten by column_transforms still carries the
+                    // uuid OID but arrives as text, hence the length check.)
+                    b.append_value(format_uuid(buf));
                 } else {
                     // jsonb wire format prefixes a 1-byte version header.
                     let bytes = if pg_oid == oid::JSONB && !buf.is_empty() {
@@ -216,6 +221,20 @@ impl ColBuilder {
             ColBuilder::Decimal128(b, _, _) => Arc::new(b.finish()),
         }
     }
+}
+
+/// Render 16 raw uuid bytes as the canonical lowercase
+/// `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` text, the form PostgreSQL prints and
+/// a ClickHouse `UUID` column parses.
+fn format_uuid(b: &[u8]) -> String {
+    let mut out = String::with_capacity(36);
+    for (i, byte) in b.iter().enumerate() {
+        if matches!(i, 4 | 6 | 8 | 10) {
+            out.push('-');
+        }
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
 }
 
 /// Format a PostgreSQL `time` value (microseconds since midnight, always in
@@ -363,21 +382,48 @@ fn parse_numeric_wire(buf: &[u8]) -> Result<NumericWire> {
         )));
     }
     let mut magnitude: i128 = 0;
+    let mut native_scale = (ndigits as i32 - 1 - weight) * 4;
     for i in 0..ndigits {
         let off = 8 + i * 2;
         let digit = i16::from_be_bytes([buf[off], buf[off + 1]]) as i128;
-        magnitude = match magnitude
+        match magnitude
             .checked_mul(10_000)
             .and_then(|m| m.checked_add(digit))
         {
-            Some(m) => m,
-            None => return Ok(NumericWire::MagnitudeOverflow),
-        };
+            Some(m) => magnitude = m,
+            None => {
+                // Groups 0..=weight are the integer part: if those overflow,
+                // the value is genuinely too large. A fractional group that
+                // overflows is truncated instead, keeping as many of its
+                // decimal digits as fit — the same as `parse_decimal_text`,
+                // and `rescale_mantissa` still rounds correctly from what is
+                // kept. Without this an unconstrained numeric such as
+                // 1.6666666666666667^3 was NULLed rather than rounded.
+                if i as i32 <= weight {
+                    return Ok(NumericWire::MagnitudeOverflow);
+                }
+                let mut kept = 0;
+                for place in [1000, 100, 10, 1] {
+                    match magnitude
+                        .checked_mul(10)
+                        .and_then(|m| m.checked_add((digit / place) % 10))
+                    {
+                        Some(m) => {
+                            magnitude = m;
+                            kept += 1;
+                        }
+                        None => break,
+                    }
+                }
+                native_scale = (i as i32 - 1 - weight) * 4 + kept;
+                break;
+            }
+        }
     }
     Ok(NumericWire::Value {
         negative: sign == 0x4000,
         magnitude,
-        native_scale: (ndigits as i32 - 1 - weight) * 4,
+        native_scale,
     })
 }
 
@@ -747,6 +793,48 @@ mod tests {
         assert!(names.is_null(1));
     }
 
+    #[test]
+    fn uuid_decodes_from_its_16_byte_binary_form() {
+        // Binary COPY sends a uuid as 16 raw bytes (uuid_send). One row with a
+        // real value, one with a text value (a column_transforms rewrite keeps
+        // the uuid OID but arrives as text), one NULL.
+        let raw = [
+            0xa0, 0xee, 0xbc, 0x99, 0x9c, 0x0b, 0x4e, 0xf8, 0xbb, 0x6d, 0x6b, 0xb9, 0xbd, 0x38,
+            0x0a, 0x11,
+        ];
+        let text = b"00000000-0000-0000-0000-000000000001";
+        let mut v = Vec::new();
+        v.extend_from_slice(SIGNATURE);
+        v.extend_from_slice(&0i32.to_be_bytes());
+        v.extend_from_slice(&0i32.to_be_bytes());
+        for field in [Some(&raw[..]), Some(&text[..]), None] {
+            v.extend_from_slice(&1i16.to_be_bytes());
+            match field {
+                Some(f) => {
+                    v.extend_from_slice(&(f.len() as i32).to_be_bytes());
+                    v.extend_from_slice(f);
+                }
+                None => v.extend_from_slice(&(-1i32).to_be_bytes()),
+            }
+        }
+        v.extend_from_slice(&(-1i16).to_be_bytes());
+
+        let cols = vec![col("id", oid::UUID, DataType::Utf8, true)];
+        let mut dec = CopyDecoder::new(&cols, 1024).unwrap();
+        let mut batches = dec.feed(&v).unwrap();
+        if let Some(b) = dec.finish().unwrap() {
+            batches.push(b);
+        }
+        let ids = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(ids.value(0), "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11");
+        assert_eq!(ids.value(1), "00000000-0000-0000-0000-000000000001");
+        assert!(ids.is_null(2));
+    }
+
     /// A COPY stream of `n` rows, each `(id: int4, text of `payload_len` bytes)`.
     fn wide_rows_stream(n: usize, payload_len: usize) -> Vec<u8> {
         let mut v = Vec::new();
@@ -903,6 +991,23 @@ mod tests {
             .downcast_ref::<arrow_array::Decimal128Array>()
             .unwrap();
         assert!(arr.is_null(0));
+    }
+
+    #[test]
+    fn decimal_rounds_a_value_with_more_fraction_digits_than_an_i128_holds() {
+        // 1.6666...(40 sixes) as an unconstrained numeric: 1 integer group and
+        // 10 fractional groups of 6666. It used to overflow and land as NULL;
+        // it fits Decimal(38, 9) once the excess fraction digits are dropped.
+        let mut digits = vec![1i16];
+        digits.extend(std::iter::repeat(6666).take(10));
+        let mut b = ColBuilder::new(&DataType::Decimal128(38, 9)).unwrap();
+        let (coercion, arr) = decimal_value(&mut b, &numeric_wire(0, 0x0000, &digits));
+        assert_eq!(coercion, Coercion::None);
+        let arr = arr
+            .as_any()
+            .downcast_ref::<arrow_array::Decimal128Array>()
+            .unwrap();
+        assert_eq!(arr.value(0), 1_666_666_667);
     }
 
     #[test]

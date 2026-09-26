@@ -89,7 +89,15 @@ pub(crate) fn rescale_mantissa(magnitude: i128, from_scale: i32, to_scale: i32) 
         magnitude.checked_mul(factor)
     } else {
         let shift = diff.checked_neg()?;
-        let divisor = 10i128.checked_pow(u32::try_from(shift).ok()?)?;
+        // Narrowing by more digits than an i128 holds: the divisor would
+        // overflow, but every i128 magnitude is below half of it, so the value
+        // rounds to zero rather than being unrepresentable.
+        let Some(divisor) = u32::try_from(shift)
+            .ok()
+            .and_then(|p| 10i128.checked_pow(p))
+        else {
+            return Some(0);
+        };
         let quotient = magnitude / divisor;
         let remainder = magnitude % divisor;
         // `remainder >= divisor / 2` rather than `remainder * 2 >= divisor` —
@@ -104,11 +112,10 @@ pub(crate) fn rescale_mantissa(magnitude: i128, from_scale: i32, to_scale: i32) 
 }
 
 /// Result of parsing plain decimal text into its sign/magnitude/scale parts.
-/// `MagnitudeOverflow` (more digits than fit in an i128, before any
-/// rescaling is even attempted) is deliberately not an `Err` — it's the same
-/// "value too large for any Decimal128" category as a post-rescale precision
-/// overflow, and both coerce to NULL upstream rather than aborting the
-/// transfer.
+/// `MagnitudeOverflow` (the *integer* digits alone do not fit in an i128) is
+/// deliberately not an `Err` — it's the same "value too large for any
+/// Decimal128" category as a post-rescale precision overflow, and both coerce
+/// to NULL upstream rather than aborting the transfer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DecimalText {
     Ok {
@@ -146,20 +153,41 @@ pub(crate) fn parse_decimal_text(s: &str) -> Result<DecimalText> {
         return Err(EtlError::decode(format!("invalid decimal text '{s}'")));
     }
 
-    let scale = frac_part.len() as i32;
     let mut magnitude: i128 = 0;
-    for b in int_part.bytes().chain(frac_part.bytes()) {
-        let digit = (b - b'0') as i128;
-        magnitude = match magnitude.checked_mul(10).and_then(|m| m.checked_add(digit)) {
-            Some(m) => m,
+    for b in int_part.bytes() {
+        match push_digit(magnitude, b) {
+            Some(m) => magnitude = m,
             None => return Ok(DecimalText::MagnitudeOverflow),
-        };
+        }
+    }
+    // Fractional digits past what an i128 holds are dropped (truncated, not
+    // rounded). Text often carries far more of them than any Decimal128 keeps
+    // (BigQuery renders BIGNUMERIC with all 38, MySQL pads to the full
+    // declared scale), and the caller's `rescale_mantissa` still rounds
+    // correctly from the kept digits: a truncated tail is less than one unit
+    // of the last kept digit, so it can never move a half-way decision.
+    let mut scale = 0;
+    for b in frac_part.bytes() {
+        match push_digit(magnitude, b) {
+            Some(m) => {
+                magnitude = m;
+                scale += 1;
+            }
+            None => break,
+        }
     }
     Ok(DecimalText::Ok {
         negative,
         magnitude,
         scale,
     })
+}
+
+/// Append one ASCII decimal digit to `magnitude`, or `None` on i128 overflow.
+fn push_digit(magnitude: i128, digit: u8) -> Option<i128> {
+    magnitude
+        .checked_mul(10)
+        .and_then(|m| m.checked_add((digit - b'0') as i128))
 }
 
 /// Which kind of lossy coercion a decoder applied to an otherwise-valid value
@@ -395,6 +423,49 @@ mod tests {
             parse_decimal_text(&forty_nines).unwrap(),
             DecimalText::MagnitudeOverflow
         );
+    }
+
+    #[test]
+    fn parse_decimal_text_drops_fractional_digits_an_i128_cannot_hold() {
+        // BigQuery renders BIGNUMERIC with all 38 fractional digits: 41 digits
+        // for 100.25, which used to overflow and land as NULL.
+        let bignumeric = format!("100.25{}", "0".repeat(36));
+        let DecimalText::Ok {
+            negative,
+            magnitude,
+            scale,
+        } = parse_decimal_text(&bignumeric).unwrap()
+        else {
+            panic!("100.25 must parse");
+        };
+        assert!(!negative);
+        assert_eq!(rescale_mantissa(magnitude, scale, 2), Some(10025));
+        assert_eq!(rescale_mantissa(magnitude, scale, 9), Some(100_250_000_000));
+
+        // Rounding still sees the dropped digits' effect: ...45 followed by a
+        // long tail of 9s rounds up at scale 2 whatever gets truncated.
+        let tail = format!("1.12{}", "9".repeat(60));
+        let DecimalText::Ok {
+            magnitude, scale, ..
+        } = parse_decimal_text(&tail).unwrap()
+        else {
+            panic!("must parse");
+        };
+        assert_eq!(rescale_mantissa(magnitude, scale, 2), Some(113));
+        let just_below_half = format!("1.124{}", "9".repeat(60));
+        let DecimalText::Ok {
+            magnitude, scale, ..
+        } = parse_decimal_text(&just_below_half).unwrap()
+        else {
+            panic!("must parse");
+        };
+        assert_eq!(rescale_mantissa(magnitude, scale, 2), Some(112));
+    }
+
+    #[test]
+    fn rescale_rounds_to_zero_when_narrowing_past_i128() {
+        assert_eq!(rescale_mantissa(123, 45, 0), Some(0));
+        assert_eq!(rescale_mantissa(i128::MAX, 80, 2), Some(0));
     }
 
     #[test]

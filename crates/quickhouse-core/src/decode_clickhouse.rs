@@ -31,10 +31,14 @@ use std::sync::Arc;
 use arrow::buffer::Buffer;
 use arrow::compute::cast;
 use arrow::ipc::reader::StreamDecoder;
-use arrow_array::RecordBatch;
-use arrow_schema::{Field, Schema, SchemaRef};
+use arrow_array::builder::Decimal128Builder;
+use arrow_array::types::{Decimal128Type, DecimalType};
+use arrow_array::{Array, ArrayRef, Decimal128Array, RecordBatch};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use bytes::Bytes;
 
+use crate::config::WarningKind;
+use crate::decimal::{rescale_mantissa, CoercionTally};
 use crate::error::{EtlError, Result};
 use crate::types::ColumnType;
 
@@ -104,7 +108,7 @@ impl ChArrowDecoder {
     }
 
     fn adapt(&self, batch: RecordBatch) -> Result<RecordBatch> {
-        adapt_to_plan(batch, &self.schema, "clickhouse")
+        adapt_to_plan(batch, &self.schema, "clickhouse", None)
     }
 
     fn split(&self, batch: RecordBatch) -> Vec<RecordBatch> {
@@ -119,10 +123,19 @@ impl ChArrowDecoder {
 /// `FORMAT ArrowStream`, and `source` reads "clickhouse") and the DataFrame
 /// source (where it is the caller's own frame, and `source` reads "the frame").
 /// `source` only shapes the error text.
+///
+/// A decimal-to-decimal conversion does not go through arrow's `cast`: in
+/// arrow 53 a same-scale narrowing (e.g. `Decimal128(38, 2)` to
+/// `Decimal128(18, 2)`) adds one unit to every value, and a value that no
+/// longer fits turns into NULL silently. [`rescale_decimal128`] rounds half
+/// away from zero like every other decoder here, and counts each value that
+/// overflows the target precision in `tally` (when given) so it surfaces as a
+/// `CoercedDecimal` warning.
 pub(crate) fn adapt_to_plan(
     batch: RecordBatch,
     schema: &SchemaRef,
     source: &str,
+    mut tally: Option<&mut CoercionTally>,
 ) -> Result<RecordBatch> {
     if batch.num_columns() != schema.fields().len() {
         return Err(EtlError::decode(format!(
@@ -136,6 +149,17 @@ pub(crate) fn adapt_to_plan(
         let col = batch.column(i);
         if col.data_type() == field.data_type() {
             columns.push(col.clone());
+        } else if let (DataType::Decimal128(_, from_s), DataType::Decimal128(to_p, to_s)) =
+            (col.data_type(), field.data_type())
+        {
+            columns.push(rescale_decimal128(
+                col,
+                *from_s,
+                *to_p,
+                *to_s,
+                i,
+                tally.as_deref_mut(),
+            )?);
         } else {
             columns.push(cast(col, field.data_type()).map_err(|e| {
                 EtlError::decode(format!(
@@ -149,6 +173,47 @@ pub(crate) fn adapt_to_plan(
         }
     }
     RecordBatch::try_new(schema.clone(), columns).map_err(EtlError::from)
+}
+
+/// Convert a `Decimal128` column to another precision/scale, rounding half
+/// away from zero. A value that does not fit the target precision becomes
+/// NULL and is recorded in `tally` as column `col_idx`.
+fn rescale_decimal128(
+    col: &ArrayRef,
+    from_s: i8,
+    to_p: u8,
+    to_s: i8,
+    col_idx: usize,
+    mut tally: Option<&mut CoercionTally>,
+) -> Result<ArrayRef> {
+    let arr = col
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .ok_or_else(|| EtlError::internal("Decimal128 column is not a Decimal128Array"))?;
+    let mut b = Decimal128Builder::with_capacity(arr.len())
+        .with_precision_and_scale(to_p, to_s)
+        .map_err(EtlError::from)?;
+    for v in arr.iter() {
+        let Some(v) = v else {
+            b.append_null();
+            continue;
+        };
+        let rescaled = v
+            .checked_abs()
+            .and_then(|m| rescale_mantissa(m, from_s as i32, to_s as i32))
+            .map(|m| if v < 0 { -m } else { m })
+            .filter(|m| Decimal128Type::is_valid_decimal_precision(*m, to_p));
+        match rescaled {
+            Some(m) => b.append_value(m),
+            None => {
+                b.append_null();
+                if let Some(t) = tally.as_deref_mut() {
+                    t.record(col_idx, WarningKind::CoercedDecimal);
+                }
+            }
+        }
+    }
+    Ok(std::sync::Arc::new(b.finish()))
 }
 
 /// Split a batch that exceeds `batch_bytes` into equal row slices. Slicing is
@@ -259,6 +324,60 @@ mod tests {
         }
         d.finish().unwrap();
         assert_eq!(rows, 3);
+    }
+
+    #[test]
+    fn decimal_narrowing_keeps_values_exact_and_counts_overflow() {
+        // arrow 53's cast added one unit to every value on a same-scale
+        // narrowing (12.34 -> 12.35) and NULLed overflows silently.
+        let src: ArrayRef = Arc::new(
+            Decimal128Array::from(vec![Some(0), Some(1234), Some(-550), Some(9999), None])
+                .with_precision_and_scale(38, 2)
+                .unwrap(),
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "amount",
+                src.data_type().clone(),
+                true,
+            )])),
+            vec![src],
+        )
+        .unwrap();
+        let plan = |p: u8, s: i8| {
+            Arc::new(Schema::new(vec![Field::new(
+                "amount",
+                DataType::Decimal128(p, s),
+                true,
+            )]))
+        };
+        let values = |b: &RecordBatch| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>()
+        };
+
+        let out = adapt_to_plan(batch.clone(), &plan(18, 2), "the frame", None).unwrap();
+        assert_eq!(
+            values(&out),
+            vec![Some(0), Some(1234), Some(-550), Some(9999), None]
+        );
+
+        // Scale down by one: half away from zero, as the other decoders round.
+        let out = adapt_to_plan(batch.clone(), &plan(18, 1), "the frame", None).unwrap();
+        assert_eq!(
+            values(&out),
+            vec![Some(0), Some(123), Some(-55), Some(1000), None]
+        );
+
+        // 99.99 does not fit Decimal(3, 2): NULL, and counted.
+        let mut tally = CoercionTally::new(["amount"]);
+        let out = adapt_to_plan(batch, &plan(3, 2), "the frame", Some(&mut tally)).unwrap();
+        assert_eq!(values(&out), vec![Some(0), None, Some(-550), None, None]);
+        assert_eq!(tally.total(WarningKind::CoercedDecimal), 2);
     }
 
     #[test]

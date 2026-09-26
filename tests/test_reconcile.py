@@ -266,3 +266,58 @@ def test_null_watermark_rows_surface_as_a_structured_warning(
     # The run still succeeded — which is exactly why the caller needs this as
     # data rather than as a log line.
     assert r.rows_written == 1
+
+
+def test_reconcile_keeps_padded_char_keys(pg_conn, ch_client, pg_source, ch_target, unique_name):
+    """A char(n) key reaches the destination padded ('XYZ       '), but the
+    source keyset rendered it with ::text, which strips the padding. Every short
+    key then looked like an orphan and delete=True removed live rows."""
+    src = f"{unique_name}_src"
+    pg_conn.execute(f"DROP TABLE IF EXISTS {src}")
+    pg_conn.execute(f"CREATE TABLE {src} (code char(10) PRIMARY KEY, qty integer)")
+    pg_conn.execute(f"INSERT INTO {src} VALUES ('ABCDEFGHIJ', 1), ('XYZ', 2)")
+    qh.sync(pg_source, ch_target, source_table=src, dest_table=unique_name, mode="full", key=["code"])
+
+    result = qh.reconcile_keys(
+        pg_source,
+        ch_target,
+        unique_name,
+        key="code",
+        source_table=src,
+        window="code <> ''",
+        delete=True,
+    )
+    assert result.orphan_keys == 0
+    assert result.rows_deleted == 0
+    assert int(ch_client.command(f"SELECT count() FROM {CH_DB}.{unique_name}")) == 2
+
+
+def test_reconcile_keeps_keys_that_differ_only_in_case(
+    mysql_conn, ch_client, mysql_source, ch_target, unique_name
+):
+    """MySQL's DISTINCT ran under the connection's case-insensitive collation,
+    so 'aB3x' and 'Ab3X' (distinct under the column's utf8mb4_bin) came back as
+    one key and reconcile deleted the other from the destination."""
+    src = f"{unique_name}_src"
+    with mysql_conn.cursor() as cur:
+        cur.execute(f"DROP TABLE IF EXISTS `{src}`")
+        cur.execute(
+            f"CREATE TABLE `{src}` (code VARCHAR(12) COLLATE utf8mb4_bin PRIMARY KEY, qty INT)"
+        )
+        cur.execute(f"INSERT INTO `{src}` VALUES ('aB3x', 1), ('Ab3X', 2)")
+    mysql_conn.commit()
+    qh.sync(mysql_source, ch_target, source_table=src, dest_table=unique_name, mode="full", key=["code"])
+
+    result = qh.reconcile_keys(
+        mysql_source,
+        ch_target,
+        unique_name,
+        key="code",
+        source_table=src,
+        window="code <> ''",
+        delete=True,
+    )
+    assert result.source_keys == 2
+    assert result.orphan_keys == 0
+    assert result.rows_deleted == 0
+    assert int(ch_client.command(f"SELECT count() FROM {CH_DB}.{unique_name}")) == 2

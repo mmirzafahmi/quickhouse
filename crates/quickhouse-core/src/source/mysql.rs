@@ -77,6 +77,25 @@ pub struct MySqlSource {
     client_key_file: Option<String>,
 }
 
+/// Decode a MySQL wire `Value` as an `i128`, whichever protocol produced it.
+/// The binary protocol (prepared statements) returns `Value::Int`/`Value::UInt`
+/// directly; the *text* protocol — `query`/`query_first`, what every MIN/MAX
+/// probe in this module uses — returns every non-NULL value, integer columns
+/// included, as `Value::Bytes`: its plain ASCII text rendering. So parsing
+/// `Bytes` as text is not a fallback for some other kind of value, it is the
+/// only representation these probes ever actually see. Matching only
+/// `Int`/`UInt` (as this used to) made every text-protocol MIN/MAX probe
+/// return `None` unconditionally, silently disabling range partitioning and
+/// the windowed sweep for every MySQL source.
+fn mysql_value_to_i128(v: Value) -> Option<i128> {
+    match v {
+        Value::Int(i) => Some(i as i128),
+        Value::UInt(u) => Some(u as i128),
+        Value::Bytes(b) => std::str::from_utf8(&b).ok()?.trim().parse().ok(),
+        _ => None,
+    }
+}
+
 impl MySqlSource {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -226,11 +245,7 @@ impl MySqlSource {
             .query_first(sql)
             .await
             .map_err(|e| EtlError::from(e).context("probing mysql key bounds"))?;
-        let as_i64 = |v: Value| match v {
-            Value::Int(i) => Some(i),
-            Value::UInt(u) if u <= i64::MAX as u64 => Some(u as i64),
-            _ => None,
-        };
+        let as_i64 = |v: Value| mysql_value_to_i128(v).and_then(|i| i64::try_from(i).ok());
         Ok(match row {
             Some((Some(lo), Some(hi))) => match (as_i64(lo), as_i64(hi)) {
                 (Some(lo), Some(hi)) if hi >= lo => Some((lo, hi)),
@@ -305,11 +320,7 @@ impl MySqlSource {
                 )),
                 None => EtlError::from(e).context("computing mysql partition bounds"),
             })?;
-        let as_i128 = |v: Value| match v {
-            Value::Int(i) => Some(i as i128),
-            Value::UInt(u) => Some(u as i128),
-            _ => None,
-        };
+        let as_i128 = mysql_value_to_i128;
         let (lo, hi) = match row {
             Some((Some(lo), Some(hi))) => match (as_i128(lo), as_i128(hi)) {
                 (Some(lo), Some(hi)) if hi >= lo => (lo, hi),
@@ -482,11 +493,18 @@ impl MySqlSource {
             Some(w) => format!("WHERE ({w}) AND {k} IS NOT NULL"),
             None => format!("WHERE {k} IS NOT NULL"),
         };
+        // DISTINCT over `CAST(k AS CHAR)` compares under the connection's
+        // collation (case- and accent-insensitive, PAD SPACE), so keys the
+        // column itself keeps apart ('aB3x' vs 'Ab3X' under utf8mb4_bin)
+        // collapsed into one, and reconcile deleted the rest as orphans.
+        // Converting to utf8mb4 and then to BINARY keeps the text rendering but
+        // makes DISTINCT byte-exact.
+        let rendered = format!("CAST(CONVERT({k} USING utf8mb4) AS BINARY)");
         let sql = if let Some(q) = base_query {
-            format!("SELECT DISTINCT CAST({k} AS CHAR) FROM ({q}) AS _src {where_sql}")
+            format!("SELECT DISTINCT {rendered} FROM ({q}) AS _src {where_sql}")
         } else {
             format!(
-                "SELECT DISTINCT CAST({k} AS CHAR) FROM {t} {where_sql}",
+                "SELECT DISTINCT {rendered} FROM {t} {where_sql}",
                 t = quote_my_table(from_table.expect("table required"))
             )
         };
@@ -542,6 +560,31 @@ pub(crate) fn quote_my_table(table: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mysql_value_decodes_the_text_protocols_bytes_encoding() {
+        // The text protocol (query/query_first — what every MIN/MAX probe
+        // uses) renders every non-NULL value, integers included, as
+        // Value::Bytes: its ASCII text form. This is the path MIN/MAX probes
+        // actually take, not a fallback for some other case.
+        assert_eq!(mysql_value_to_i128(Value::Bytes(b"42".to_vec())), Some(42));
+        assert_eq!(mysql_value_to_i128(Value::Bytes(b"-7".to_vec())), Some(-7));
+        // BIGINT UNSIGNED above i64::MAX: representable in i128, not i64.
+        assert_eq!(
+            mysql_value_to_i128(Value::Bytes(b"18446744073709551615".to_vec())),
+            Some(18_446_744_073_709_551_615)
+        );
+        // The binary protocol's own variants still decode directly.
+        assert_eq!(mysql_value_to_i128(Value::Int(-7)), Some(-7));
+        assert_eq!(mysql_value_to_i128(Value::UInt(42)), Some(42));
+        // Non-integer text and other wire types are not silently misread as 0.
+        assert_eq!(
+            mysql_value_to_i128(Value::Bytes(b"not_a_number".to_vec())),
+            None
+        );
+        assert_eq!(mysql_value_to_i128(Value::NULL), None);
+        assert_eq!(mysql_value_to_i128(Value::Float(1.5)), None);
+    }
 
     #[test]
     fn build_opts_requires_client_cert_and_key_together() {

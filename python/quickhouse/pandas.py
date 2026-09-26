@@ -354,14 +354,23 @@ def _guard_ch_range(name, column, pa, pc, *, is_date: bool):
 # --------------------------------------------------------------------------
 
 
-def _dedupe_on_key(table, key: Sequence[str], pa, pc):
-    """Keep only the last row per key, the way an upsert is meant to behave.
+def _dedupe_on_key(table, key: Sequence[str], pa, pc, watermark: str | None = None):
+    """Keep only one row per key, the way an upsert is meant to behave.
 
     Incremental from a frame merges on ``key``, and neither destination can
     order duplicates *within* one batch without a version column — ClickHouse
     would pick whichever part merged last, BigQuery whichever row `ROW_NUMBER`
-    happened to see first. Resolving it here makes "last one wins" true rather
-    than nearly true.
+    happened to see first. Resolving it here makes the winner well-defined
+    rather than arbitrary.
+
+    With no ``watermark``, "last one wins": the winner is whichever row came
+    last in the frame. With ``watermark``, the winner is the row with the
+    *highest* value in that column — matching the config error's own promise
+    ("watermark= ... used as the version column for dedup ordering") and what
+    every other incremental source in this project does — with position as the
+    tiebreaker among rows that tie on the watermark itself, so a duplicate key
+    with no watermark spread at all still resolves the same "last one wins" way
+    it always has.
 
     Done on the Arrow table rather than in pandas so a polars or DuckDB frame
     behaves identically.
@@ -372,22 +381,44 @@ def _dedupe_on_key(table, key: Sequence[str], pa, pc):
             f"key column(s) {missing!r} are not in the frame; incremental mode upserts on "
             f"key, so they have to be there. Frame columns: {table.column_names!r}"
         )
+    if watermark is not None and watermark not in table.column_names:
+        raise ValueError(
+            f"watermark={watermark!r} is not in the frame; it names the column that decides "
+            f"which duplicate wins. Frame columns: {table.column_names!r}"
+        )
     ordinal = "__quickhouse_ordinal"
     with_ord = table.append_column(
         ordinal, pa.array(range(table.num_rows), type=pa.int64())
     )
+    if watermark is not None:
+        # Sort ascending by (watermark, ordinal): within each key, the row that
+        # then sorts *last* is the one with the highest watermark, with
+        # original position breaking a tie. `group_by(...).aggregate("max")`
+        # below is then over this sorted table's own row order (via a freshly
+        # assigned ordinal), so "max ordinal per key" picks that last-sorted
+        # row — the intended winner — rather than the original max-position
+        # row a plain aggregate over the unsorted `ordinal` column would.
+        with_ord = with_ord.sort_by([(watermark, "ascending"), (ordinal, "ascending")])
+        with_ord = with_ord.drop([ordinal]).append_column(
+            ordinal, pa.array(range(with_ord.num_rows), type=pa.int64())
+        )
     keep = with_ord.group_by(list(key)).aggregate([(ordinal, "max")])
     wanted = keep.column(f"{ordinal}_max")
     dropped = table.num_rows - keep.num_rows
     if dropped == 0:
         return table
     mask = pc.is_in(with_ord.column(ordinal), value_set=wanted.combine_chunks())
+    by = f"highest {watermark!r}" if watermark is not None else "last"
     warnings.warn(
-        f"the frame has {dropped} row(s) sharing a key with a later row; keeping the last "
+        f"the frame has {dropped} row(s) sharing a key with another row; keeping the {by} "
         f"of each (key={list(key)!r}). Neither destination can order duplicates within one "
         "batch without a version column, so quickhouse resolves it here rather than "
-        "letting the winner be arbitrary. Pass a watermark= column to order by that "
-        "instead, or dedupe the frame yourself to silence this.",
+        + (
+            "letting the winner be arbitrary. Pass a watermark= column to order by that "
+            "instead, or dedupe the frame yourself to silence this."
+            if watermark is None
+            else "letting the winner be arbitrary."
+        ),
         QuickhouseWarning,
         stacklevel=3,
     )
@@ -440,7 +471,8 @@ def from_pandas(
     ``mode="append"`` inserts straight in, with no staging and no dedup.
     ``mode="incremental"`` upserts on ``key`` — and needs **no watermark**,
     unlike a database source: the frame you passed *is* the delta. Rows sharing
-    a key within the frame are deduped last-wins first, with a warning.
+    a key within the frame are deduped, with a warning: last-wins by default,
+    or by the highest value in ``watermark=`` when that is also passed.
 
     Returns
     -------
@@ -467,7 +499,7 @@ def from_pandas(
 
     key = sync_kwargs.get("key") or []
     if sync_kwargs.get("mode") == "incremental" and key:
-        table = _dedupe_on_key(table, key, pa, pc)
+        table = _dedupe_on_key(table, key, pa, pc, watermark=sync_kwargs.get("watermark"))
 
     sink = pa.BufferOutputStream()
     with pa.ipc.new_stream(sink, table.schema) as writer:

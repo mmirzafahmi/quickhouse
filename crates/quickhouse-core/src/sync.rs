@@ -728,7 +728,15 @@ fn build_archive_run_info(
         prefix: cfg.prefix().to_string(),
         dest_table: dest_table.to_string(),
         run_date: now.format("%Y-%m-%d").to_string(),
-        run_id: now.timestamp().to_string(),
+        // Whole-second resolution (`now.timestamp()`) let two runs into the
+        // same `dest_table` starting in the same second — a quick backfill
+        // loop, or two concurrent transfers — write the identical object key
+        // (`.../run={run_id}/part-{label}.parquet`, and every run's part
+        // labels are deterministic). `object_store`'s `put` overwrites with
+        // no error, so the loser's whole backup silently vanished. `new_run_id`
+        // (nanosecond wall clock) is what the staging table name already uses
+        // for exactly this reason.
+        run_id: new_run_id(),
         compression: cfg.compression(),
         kind: cfg.kind(),
     })))
@@ -770,6 +778,9 @@ struct SourceSetup {
     /// `Some` when the read's own filter plans as a sequential scan, so it must
     /// be swept in bounded key windows to survive a standby's conflict window.
     window: Option<WindowPlan>,
+    /// ClickHouse only: the watermark's ClickHouse type, which types the
+    /// filter's cursor literals (see `build_watermark_filter_clickhouse`).
+    watermark_type: Option<String>,
 }
 
 /// Run one table transfer end to end.
@@ -1113,6 +1124,7 @@ async fn run_transfer_impl(
         partitions,
         stream_max_cursor,
         window: window_plan,
+        watermark_type,
     } = setup;
     tracing::info!(
         "resolved {} source column(s); computed {} partition(s) for parallel read",
@@ -1124,14 +1136,47 @@ async fn run_transfer_impl(
     // NULL (see `transform::plan_with`), so it is the only one whose NOT NULL
     // date/decimal columns stay NOT NULL at the destination.
     let source_may_coerce = !matches!(source.as_ref(), Source::ClickHouse(_));
-    let plan: SelectPlan =
+    let mut plan: SelectPlan =
         transform::plan_with(&source_cols, &cfg, sink.dest_kind(), source_may_coerce)?;
+    if matches!(source.as_ref(), Source::Postgres(_)) {
+        crate::source::postgres::pin_transformed_wire_types(&mut plan);
+    }
     let plan = Arc::new(plan);
 
     // When the `MAX(watermark)` probe was skipped as too costly, the cursor has
     // to come from the rows this run actually reads. Built here because it
     // needs the resolved plan (for the watermark's column position and type),
     // and consumed after the streaming phase.
+    //
+    // The tracker folds the *decoded, projected* values — whatever the SELECT
+    // actually emits as `watermark`, which is the `column_transforms` expression
+    // when one is registered for this column. The incremental filter, on the
+    // other hand, always binds to the *raw* column (or `watermark_source_expr`,
+    // itself another raw expression) — never to `column_transforms`, because a
+    // transform can be arbitrary SQL a WHERE cannot generally invert. So a
+    // stream-derived cursor for a transformed watermark would be persisted in
+    // one value domain and compared against the other on the next run,
+    // silently skipping whatever the transform's range doesn't overlap between
+    // runs. `build_chunk_plan` already refuses this same combination for the
+    // keyset column; the stream watermark needs the identical guard.
+    if stream_max_cursor
+        && cfg
+            .watermark
+            .as_deref()
+            .is_some_and(|w| cfg.column_transforms.contains_key(w))
+    {
+        return Err(EtlError::config(format!(
+            "watermark column '{}' cannot be in column_transforms together with a stream-derived \
+             cursor: the MAX(watermark) probe was skipped as too costly (see the \
+             unindexed_watermark warning above), so the cursor is taken from the transformed \
+             values this run reads, but the incremental filter always compares against the raw \
+             column (or watermark_source_expr, itself a raw expression) — never against \
+             column_transforms, which can be arbitrary SQL a WHERE cannot generally invert. Add \
+             an index on the raw watermark column so the MAX probe runs and this path isn't \
+             needed, or set probe_max_cost=0 to force it unconditionally.",
+            cfg.watermark.as_deref().unwrap_or("?"),
+        )));
+    }
     let watermark_tracker = match (stream_max_cursor, cfg.watermark.as_deref()) {
         (true, Some(w)) => WatermarkTracker::new(w, &plan).map(Arc::new),
         _ => None,
@@ -1162,15 +1207,34 @@ async fn run_transfer_impl(
         } else {
             None
         };
-        let (pinned_upper, start_cursor) = match &resume {
-            Some((c, u)) => (Some(u.clone()), Some(c.clone())),
-            None => (None, None),
-        };
+        let (pinned_upper, start_cursor) = resume_bounds(resume.as_ref());
         // Resume freezes the upper bound to the interrupted run's snapshot so it
         // reads the same window; a fresh run uses the live source MAX. (For a
         // non-chunked run `pinned_upper` is always None, so this == snapshot_max
         // and behavior is unchanged.)
         let effective_upper = pinned_upper.or_else(|| snapshot_max.clone());
+        // `skip_to_max` (WatermarkSeed::CurrentMax) exists precisely for a
+        // table where a full first pull "would be a doomed waste" (its own
+        // doc comment) — almost always because it is too big to probe
+        // cheaply, which is exactly the condition that makes `stream_max_cursor`
+        // true and leaves `effective_upper` unresolved here. Silently falling
+        // through to `seed_value(_, None) == None` would run that doomed full
+        // read instead of skipping it, with nothing to say so. Refuse instead:
+        // the fix is `probe_max_cost=0` (pay for one MAX probe) or an index on
+        // the watermark column, either of which resolves `effective_upper` and
+        // clears this. Does not apply to a chunk-resume (`pinned_upper` is
+        // already `Some`) or a genuinely empty source (`stream_max_cursor` is
+        // only set when `lookback_seconds > 0`, so an empty table's `None` max
+        // never sets it — see `plan_watermark_probes`).
+        if cfg.seed_watermark == WatermarkSeed::CurrentMax
+            && committed.is_none()
+            && effective_upper.is_none()
+            && stream_max_cursor
+        {
+            return Err(EtlError::config(format!(
+                "seed_watermark=skip_to_max on '{watermark}' needs the source's current MAX, but                  the MAX(watermark) probe was skipped as too costly (see the unindexed_watermark                  warning above). Reading with no seed would run the full-table first pull                  skip_to_max exists to avoid, so this run is refused instead. Add an index on                  '{watermark}', or set probe_max_cost=0 to pay for one MAX probe regardless of                  estimated cost."
+            )));
+        }
         // First run only: seed the lower bound.
         let last = committed
             .clone()
@@ -1200,6 +1264,7 @@ async fn run_transfer_impl(
                 last.as_deref(),
                 effective_upper.as_deref(),
                 cfg.lookback_seconds,
+                watermark_pg_is_tz_aware(watermark, &source_cols),
             ),
             Source::MySql(_) => build_watermark_filter_mysql(
                 watermark,
@@ -1214,6 +1279,7 @@ async fn run_transfer_impl(
                 last.as_deref(),
                 effective_upper.as_deref(),
                 cfg.lookback_seconds,
+                watermark_type.as_deref(),
             ),
             Source::BigQuery(_) => {
                 unreachable!("BigQuery is handled via the early return in run_transfer")
@@ -1431,6 +1497,22 @@ async fn run_transfer_impl(
                     tracing::info!(
                         "advance_watermark=false: computed watermark {w} NOT persisted (cursor left unchanged)"
                     );
+                }
+            }
+            // A chunked run that persists no new watermark (nothing to advance
+            // to, or advance_watermark=false) must still clear the resume
+            // marker it, or the interrupted run it resumed, left behind.
+            // Otherwise every later run resumes past that key cursor and never
+            // re-reads lower keys, whatever changes in them. Re-writing the
+            // committed watermark clears the marker without moving the cursor.
+            if let Some(chunk) = chunk_plan.as_ref() {
+                if new_watermark.is_none() || !cfg.advance_watermark {
+                    sink.persist_watermark(
+                        &cfg,
+                        chunk.committed.as_deref().unwrap_or(""),
+                        counters.rows_written.load(Ordering::Relaxed),
+                    )
+                    .await?;
                 }
             }
         }
@@ -2551,11 +2633,14 @@ async fn run_transfer_frame(
 
         let mut reader = StreamReader::try_new(Cursor::new(&frame.ipc[..]), projection)
             .map_err(EtlError::from)?;
+        let mut coercions =
+            crate::decimal::CoercionTally::new(schema.fields().iter().map(|f| f.name().as_str()));
         for batch in reader.by_ref() {
             let batch = crate::decode_clickhouse::adapt_to_plan(
                 batch.map_err(EtlError::from)?,
                 &schema,
                 "the frame",
+                Some(&mut coercions),
             )?;
             rows_read += batch.num_rows() as u64;
             for slice in crate::decode_clickhouse::split_to_bytes(batch, cfg.batch_bytes) {
@@ -2576,6 +2661,7 @@ async fn run_transfer_frame(
                  serialized incompletely, so an unknown number of rows are missing",
             ));
         }
+        report_coercions("the frame", coercions.entries(), &warnings);
         if let Some(w) = archive_writer.take() {
             w.close().await?;
         }
@@ -2837,6 +2923,7 @@ async fn setup_postgres(
         partitions,
         stream_max_cursor,
         window,
+        watermark_type: None,
     })
 }
 
@@ -2985,11 +3072,26 @@ async fn setup_mysql(
         partitions,
         stream_max_cursor,
         window,
+        watermark_type: None,
     })
 }
 
 /// Resolved plan for a keyset-chunked resumable read (see
 /// `TransferConfig::chunk_rows`). Built once per run in `run_transfer_impl`.
+/// Split a chunk-resume marker `(cursor, upper)` into the frozen upper bound
+/// and the cursor to resume past. A marker written while the run had no
+/// frozen upper bound (the MAX probe was skipped, or MAX was NULL) stores an
+/// empty `upper`; that means "no pin", never a literal `<= ''` bound.
+fn resume_bounds(resume: Option<&(String, String)>) -> (Option<String>, Option<String>) {
+    match resume {
+        Some((cursor, upper)) => (
+            (!upper.is_empty()).then(|| upper.clone()),
+            Some(cursor.clone()),
+        ),
+        None => (None, None),
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ChunkPlan {
     /// Rows per chunk (`LIMIT`).
@@ -4026,7 +4128,7 @@ async fn setup_clickhouse(
 
     // Only needed for incremental mode — see `setup_mysql` for why full
     // refresh deliberately skips the probe entirely.
-    let snapshot_max = if cfg.mode == SyncMode::Incremental {
+    let (snapshot_max, watermark_type) = if cfg.mode == SyncMode::Incremental {
         if let Some(w) = watermark {
             ensure_watermark_column(w, &source_cols)?;
             ensure_lookback_compatible(w, cfg.lookback_seconds, &source_cols)?;
@@ -4049,10 +4151,10 @@ async fn setup_clickhouse(
             )
             .await?
         } else {
-            None
+            (None, None)
         }
     } else {
-        None
+        (None, None)
     };
 
     let partitions = compute_partitions_clickhouse(s, cfg, &source_cols).await?;
@@ -4060,6 +4162,7 @@ async fn setup_clickhouse(
         source_cols,
         snapshot_max,
         partitions,
+        watermark_type,
         window: None,
         // ClickHouse reads are not gated on probe cost: its sparse primary
         // index makes both probes cheap, and there is no seq-scan cliff to
@@ -5160,13 +5263,26 @@ fn build_watermark_filter_pg(
     last: Option<&str>,
     snapshot_max: Option<&str>,
     lookback_seconds: u64,
+    tz_aware: bool,
 ) -> Option<String> {
     let col = source_expr
         .map(str::to_string)
         .unwrap_or_else(|| format!("\"{}\"", watermark.replace('"', "\"\"")));
-    let lower = last.map(|l| lookback_lower_bound_pg(l, lookback_seconds));
+    let lower = last.map(|l| lookback_lower_bound_pg(l, lookback_seconds, tz_aware));
     let upper = snapshot_max.map(quote_sql_literal);
     build_watermark_filter(&col, lower, upper)
+}
+
+/// Whether the watermark column resolved as a tz-aware `timestamptz`
+/// (`Timestamp(_, Some(_))`) rather than a naive `timestamp` — see
+/// [`lookback_lower_bound_pg`] for why the distinction matters. `false` for
+/// any non-temporal or unresolved column, which keeps today's (correct only
+/// for a UTC session) `::timestamp` cast as the fallback.
+fn watermark_pg_is_tz_aware(watermark: &str, source_cols: &[ColumnType]) -> bool {
+    source_cols
+        .iter()
+        .find(|c| c.name == watermark)
+        .is_some_and(|c| matches!(c.arrow, DataType::Timestamp(_, Some(_))))
 }
 
 fn build_watermark_filter_mysql(
@@ -5185,22 +5301,37 @@ fn build_watermark_filter_mysql(
 }
 
 /// ClickHouse uses backtick identifier quoting and MySQL-style backslash
-/// escaping in string literals, so both halves of the filter are built the same
-/// way as MySQL's — only the lookback arithmetic differs (see
-/// [`lookback_lower_bound_clickhouse`]). Kept as its own function rather than
-/// aliased onto the MySQL one so that divergence stays a one-line change here.
+/// escaping in string literals, so the literals are quoted the same way as
+/// MySQL's. What differs is how the cursor is read back.
+///
+/// The cursor is `toString(max(col))`, which ClickHouse renders in the column's
+/// own timezone: the declared one (`DateTime('Asia/Jakarta')`), or the
+/// server's for a bare `DateTime`. A bare `'...'` literal is not a safe way to
+/// read that back, because `select_sql` projects the column as
+/// `CAST(col AS DateTime64(6, 'UTC')) AS col` and a WHERE on `col` binds to
+/// that alias, which parses the literal as UTC. So a temporal cursor is
+/// written as `CAST('...' AS <watermark_type>)`: it parses in the same zone
+/// `toString` rendered it in, and the comparison is then between instants,
+/// whichever of the column or the alias it binds to. Cursors already persisted
+/// keep working, since their format does not change.
+///
+/// `watermark_type` is the watermark's `toTypeName` from
+/// `ClickHouseSource::max_watermark`. Non-temporal watermarks (integers,
+/// strings) keep plain literals.
 fn build_watermark_filter_clickhouse(
     watermark: &str,
     source_expr: Option<&str>,
     last: Option<&str>,
     snapshot_max: Option<&str>,
     lookback_seconds: u64,
+    watermark_type: Option<&str>,
 ) -> Option<String> {
     let col = source_expr
         .map(str::to_string)
         .unwrap_or_else(|| crate::ddl::quote_ident(watermark));
-    let lower = last.map(|l| lookback_lower_bound_clickhouse(l, lookback_seconds));
-    let upper = snapshot_max.map(quote_clickhouse_literal);
+    let temporal_type = watermark_type.filter(|t| is_clickhouse_temporal_type(t));
+    let lower = last.map(|l| lookback_lower_bound_clickhouse(l, lookback_seconds, temporal_type));
+    let upper = snapshot_max.map(|u| clickhouse_cursor_literal(u, temporal_type));
     build_watermark_filter(&col, lower, upper)
 }
 
@@ -5212,22 +5343,62 @@ fn quote_clickhouse_literal(m: &str) -> String {
     format!("'{}'", m.replace('\\', "\\\\").replace('\'', "''"))
 }
 
-/// Widen `last`'s lower bound by `lookback_seconds` using ClickHouse's own
-/// parse-and-subtract, a same-engine round trip: the tracked watermark string
-/// was produced by this source's `toString(max(col))`, so the engine that wrote
-/// it is the one that reads it back. `lookback_seconds == 0` returns the plain
-/// quoted literal, byte-identical to the non-lookback filter.
-///
-/// The `'UTC'` is not a reinterpretation of the value: `ensure_lookback_compatible`
-/// has already restricted this path to a date/timestamp watermark, and every
-/// ClickHouse datetime this source resolves is tz-aware UTC (see
-/// `types::clickhouse::map_ch_type`).
-fn lookback_lower_bound_clickhouse(last: &str, lookback_seconds: u64) -> String {
-    let l = last.replace('\\', "\\\\").replace('\'', "''");
-    if lookback_seconds == 0 {
-        return format!("'{l}'");
+/// A `Date`/`Date32`/`DateTime`/`DateTime64` type, possibly wrapped in
+/// `Nullable(...)` or `LowCardinality(...)`. The type text comes from the
+/// server and is spliced into SQL unquoted, so anything with characters a
+/// type name never needs is refused (and the cursor falls back to a plain
+/// literal).
+fn is_clickhouse_temporal_type(t: &str) -> bool {
+    let safe = !t.contains("--")
+        && t.chars()
+            .all(|c| c.is_ascii_alphanumeric() || " (),'/_+-.".contains(c));
+    let mut inner = t.trim();
+    loop {
+        let unwrapped = ["Nullable(", "LowCardinality("]
+            .iter()
+            .find_map(|w| inner.strip_prefix(w).and_then(|r| r.strip_suffix(')')));
+        match unwrapped {
+            Some(rest) => inner = rest.trim(),
+            None => break,
+        }
     }
-    format!("(toDateTime64('{l}', 6, 'UTC') - INTERVAL {lookback_seconds} SECOND)")
+    safe && inner.starts_with("Date")
+}
+
+/// The cursor as a ClickHouse literal: `CAST('...' AS <type>)` for a temporal
+/// watermark (see `build_watermark_filter_clickhouse`), plain `'...'` otherwise.
+fn clickhouse_cursor_literal(value: &str, temporal_type: Option<&str>) -> String {
+    let quoted = quote_clickhouse_literal(value);
+    match temporal_type {
+        Some(t) => format!("CAST({quoted} AS {t})"),
+        None => quoted,
+    }
+}
+
+/// Widen `last`'s lower bound by `lookback_seconds` using ClickHouse's own
+/// parse-and-subtract. `lookback_seconds == 0` returns the same literal as the
+/// upper bound would use. `ensure_lookback_compatible` has already restricted
+/// lookback to a date/timestamp watermark, so `temporal_type` is always known
+/// here in practice; the `toDateTime64(..., 'UTC')` branch is only a fallback
+/// for a type the server did not report.
+fn lookback_lower_bound_clickhouse(
+    last: &str,
+    lookback_seconds: u64,
+    temporal_type: Option<&str>,
+) -> String {
+    if lookback_seconds == 0 {
+        return clickhouse_cursor_literal(last, temporal_type);
+    }
+    match temporal_type {
+        Some(_) => format!(
+            "({} - INTERVAL {lookback_seconds} SECOND)",
+            clickhouse_cursor_literal(last, temporal_type)
+        ),
+        None => format!(
+            "(toDateTime64({}, 6, 'UTC') - INTERVAL {lookback_seconds} SECOND)",
+            quote_clickhouse_literal(last)
+        ),
+    }
 }
 
 /// Postgres, under the default `standard_conforming_strings = on`, treats
@@ -5339,12 +5510,21 @@ fn bq_cast_type_name(t: &TableFieldType) -> &'static str {
 /// string is parsed by the same engine that produced it via `CAST(MAX(col)
 /// AS ...)`, not guessed at in Rust). `lookback_seconds == 0` returns the
 /// plain quoted literal, byte-identical to the pre-lookback filter.
-fn lookback_lower_bound_pg(last: &str, lookback_seconds: u64) -> String {
+fn lookback_lower_bound_pg(last: &str, lookback_seconds: u64, tz_aware: bool) -> String {
     let l = last.replace('\'', "''");
     if lookback_seconds == 0 {
         return format!("'{l}'");
     }
-    format!("('{l}'::timestamp - interval '{lookback_seconds} seconds')")
+    // The cursor for a tz-aware column is rendered with its UTC offset
+    // (`...+00`, see `WatermarkTracker::render`), and a bare `::timestamp`
+    // cast silently drops that offset, reinterpreting the wall-clock digits in
+    // the session's own TimeZone (which quickhouse never sets, so it is
+    // whatever the server defaults to) instead of UTC. `::timestamptz` keeps
+    // the offset the string carries, so the round trip is exact whatever the
+    // session zone is. A naive `timestamp` column has no offset to lose, so it
+    // keeps the cast it always used.
+    let cast = if tz_aware { "timestamptz" } else { "timestamp" };
+    format!("('{l}'::{cast} - interval '{lookback_seconds} seconds')")
 }
 
 fn lookback_lower_bound_mysql(last: &str, lookback_seconds: u64) -> String {
@@ -6377,7 +6557,8 @@ mod tests {
                 None,
                 Some("2024-01-01"),
                 Some("2024-06-01"),
-                0
+                0,
+                false
             ),
             Some("\"write_date\" > '2024-01-01' AND \"write_date\" <= '2024-06-01'".to_string())
         );
@@ -6431,7 +6612,8 @@ mod tests {
                 Some("\"write_date_raw\""),
                 Some("2024-01-01"),
                 Some("2024-06-01"),
-                0
+                0,
+                false
             ),
             Some(
                 "\"write_date_raw\" > '2024-01-01' AND \"write_date_raw\" <= '2024-06-01'"
@@ -6513,6 +6695,7 @@ mod tests {
             Some("2024-06-10"),
             Some("2024-06-15"),
             3600,
+            false,
         )
         .unwrap();
         assert!(
@@ -6523,6 +6706,59 @@ mod tests {
             f.contains("<= '2024-06-15'"),
             "upper bound stays exact: {f}"
         );
+    }
+
+    #[test]
+    fn watermark_filter_pg_casts_a_tz_aware_lookback_bound_to_timestamptz() {
+        // A naive `timestamp` column keeps the pre-existing cast.
+        let f = build_watermark_filter_pg(
+            "write_date",
+            None,
+            Some("2024-06-10 12:00:00"),
+            Some("2024-06-15 00:00:00"),
+            3600,
+            false,
+        )
+        .unwrap();
+        assert!(
+            f.contains("'2024-06-10 12:00:00'::timestamp - interval '3600 seconds'"),
+            "got: {f}"
+        );
+
+        // A tz-aware `timestamptz` column's cursor carries its UTC offset
+        // (`WatermarkTracker::render`); `::timestamp` would silently drop it
+        // and reinterpret the wall-clock digits in the session's own
+        // TimeZone, shifting the lower bound by that offset.
+        let f = build_watermark_filter_pg(
+            "write_date",
+            None,
+            Some("2024-06-10 12:00:00+00"),
+            Some("2024-06-15 00:00:00+00"),
+            3600,
+            true,
+        )
+        .unwrap();
+        assert!(
+            f.contains("'2024-06-10 12:00:00+00'::timestamptz - interval '3600 seconds'"),
+            "got: {f}"
+        );
+    }
+
+    #[test]
+    fn watermark_pg_is_tz_aware_matches_the_resolved_arrow_type() {
+        let cols = vec![
+            col_typed("naive_ts", DataType::Timestamp(TimeUnit::Microsecond, None)),
+            col_typed(
+                "tz_ts",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            ),
+            col_typed("id", DataType::Int64),
+        ];
+        assert!(!watermark_pg_is_tz_aware("naive_ts", &cols));
+        assert!(watermark_pg_is_tz_aware("tz_ts", &cols));
+        assert!(!watermark_pg_is_tz_aware("id", &cols));
+        // Unresolved/unknown column name: false, same as the pre-fix default.
+        assert!(!watermark_pg_is_tz_aware("missing", &cols));
     }
 
     #[test]
@@ -6539,6 +6775,93 @@ mod tests {
             f.contains("CAST('2024-06-10 00:00:00' AS DATETIME) - INTERVAL 3600 SECOND"),
             "got: {f}"
         );
+    }
+
+    #[test]
+    fn watermark_filter_clickhouse_types_both_bounds_in_the_columns_zone() {
+        // `toString` renders a DateTime('Asia/Jakarta') cursor as Jakarta
+        // wall-clock text; both bounds must parse it back in that zone rather
+        // than as UTC, or the window shifts by the offset and rows are skipped.
+        let t = "DateTime('Asia/Jakarta')";
+        let f = build_watermark_filter_clickhouse(
+            "updated_at",
+            None,
+            Some("2024-03-01 19:00:00"),
+            Some("2024-03-01 20:00:00"),
+            3600,
+            Some(t),
+        )
+        .unwrap();
+        assert_eq!(
+            f,
+            "`updated_at` > (CAST('2024-03-01 19:00:00' AS DateTime('Asia/Jakarta')) - INTERVAL \
+             3600 SECOND) AND `updated_at` <= CAST('2024-03-01 20:00:00' AS \
+             DateTime('Asia/Jakarta'))"
+        );
+        assert!(!f.contains("'UTC'"), "got: {f}");
+
+        // No lookback: the same typed literal on both sides. A bare DateTime
+        // (server timezone) is typed as bare DateTime, so it parses in the
+        // server's zone — the one toString rendered it in.
+        let f = build_watermark_filter_clickhouse(
+            "ts",
+            None,
+            Some("2024-01-01 22:00:00"),
+            Some("2024-01-02 04:00:00"),
+            0,
+            Some("Nullable(DateTime64(9))"),
+        )
+        .unwrap();
+        assert_eq!(
+            f,
+            "`ts` > CAST('2024-01-01 22:00:00' AS Nullable(DateTime64(9))) AND `ts` <= \
+             CAST('2024-01-02 04:00:00' AS Nullable(DateTime64(9)))"
+        );
+    }
+
+    #[test]
+    fn watermark_filter_clickhouse_keeps_plain_literals_for_non_temporal_types() {
+        let f = build_watermark_filter_clickhouse(
+            "id",
+            None,
+            Some("41"),
+            Some("99"),
+            0,
+            Some("UInt64"),
+        )
+        .unwrap();
+        assert_eq!(f, "`id` > '41' AND `id` <= '99'");
+        // A type the server did not report falls back to the old literals.
+        let f = build_watermark_filter_clickhouse("ts", None, Some("2024-01-01"), None, 60, None)
+            .unwrap();
+        assert_eq!(
+            f,
+            "`ts` > (toDateTime64('2024-01-01', 6, 'UTC') - INTERVAL 60 SECOND)"
+        );
+    }
+
+    #[test]
+    fn clickhouse_temporal_type_detection() {
+        for t in [
+            "Date",
+            "Date32",
+            "DateTime",
+            "DateTime('Asia/Jakarta')",
+            "DateTime64(3, 'America/New_York')",
+            "Nullable(DateTime)",
+            "LowCardinality(Nullable(Date))",
+        ] {
+            assert!(is_clickhouse_temporal_type(t), "{t}");
+        }
+        for t in [
+            "UInt64",
+            "String",
+            "Nullable(String)",
+            "DateTime; DROP TABLE x",
+            "DateTime('a')--",
+        ] {
+            assert!(!is_clickhouse_temporal_type(t), "{t}");
+        }
     }
 
     #[test]
@@ -6649,6 +6972,52 @@ mod tests {
             dest_columns: src.clone(),
         };
         (cfg, plan, src)
+    }
+
+    #[test]
+    fn resume_marker_with_empty_upper_pins_nothing() {
+        let with_upper = ("41".to_string(), "2024-06-10 00:00:00".to_string());
+        assert_eq!(
+            resume_bounds(Some(&with_upper)),
+            (
+                Some("2024-06-10 00:00:00".to_string()),
+                Some("41".to_string())
+            )
+        );
+        let no_upper = ("41".to_string(), String::new());
+        assert_eq!(
+            resume_bounds(Some(&no_upper)),
+            (None, Some("41".to_string()))
+        );
+        assert_eq!(resume_bounds(None), (None, None));
+    }
+
+    #[test]
+    fn archive_run_ids_are_unique_across_back_to_back_calls() {
+        // Regression guard: whole-second resolution (`now.timestamp()`) let
+        // two runs into the same dest_table starting in the same second write
+        // the identical archive object key, silently overwriting each other's
+        // backup. Calling this in a tight loop is exactly the "quick backfill
+        // loop" scenario, and every run_id it produces must be distinct.
+        let cfg = ArchiveConfig::Gcs(crate::config::GcsArchiveConfig {
+            bucket: "test-bucket".to_string(),
+            prefix: "lake".to_string(),
+            credentials_file: None,
+            credentials_json: None,
+            endpoint: None,
+            compression: ParquetCompression::Zstd,
+        });
+        let mut ids = std::collections::HashSet::new();
+        for _ in 0..20 {
+            let info = build_archive_run_info(Some(cfg.clone()), "orders")
+                .unwrap()
+                .unwrap();
+            assert!(
+                ids.insert(info.run_id.clone()),
+                "duplicate run_id: {}",
+                info.run_id
+            );
+        }
     }
 
     #[test]

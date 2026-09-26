@@ -194,6 +194,20 @@ pub async fn reconcile_keys(
         ));
     }
 
+    // Destination first, then source. A row that lands in the destination
+    // between the two reads (a concurrent incremental sync) must not look like
+    // an orphan: read in this order it is at worst "missing", which is only
+    // reported, whereas the reverse order deleted it — permanently, since the
+    // watermark had already moved past it.
+    let dest_keys = sink
+        .distinct_keys(&cfg.dest_table, &cfg.key, cfg.effective_dest_window())
+        .await?;
+    tracing::info!(
+        "reconcile: destination '{}' holds {} distinct '{}' value(s) in the window",
+        cfg.dest_table,
+        dest_keys.len(),
+        cfg.key,
+    );
     let source_keys = read_source_keys(&source_cfg, &cfg).await?;
     tracing::info!(
         "reconcile: source '{}' holds {} distinct '{}' value(s) in the window",
@@ -202,15 +216,6 @@ pub async fn reconcile_keys(
             .or(cfg.source_query.as_deref())
             .unwrap_or("?"),
         source_keys.len(),
-        cfg.key,
-    );
-    let dest_keys = sink
-        .distinct_keys(&cfg.dest_table, &cfg.key, cfg.effective_dest_window())
-        .await?;
-    tracing::info!(
-        "reconcile: destination '{}' holds {} distinct '{}' value(s) in the window",
-        cfg.dest_table,
-        dest_keys.len(),
         cfg.key,
     );
 

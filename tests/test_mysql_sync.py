@@ -88,6 +88,35 @@ def test_full_refresh_reconciles(mysql_conn, ch_client, mysql_source, ch_target,
         _drop_ch(ch_client, table)
 
 
+def test_wide_decimal_is_rounded_into_a_narrower_override(
+    mysql_conn, ch_client, mysql_source, ch_target, unique_name
+):
+    """MySQL sends DECIMAL(65,30) padded to all 30 fraction digits, so
+    1000000000.5 arrives as 40 digits. It fits Decimal(38, 9) but used to
+    overflow while being parsed and land as NULL."""
+    table = unique_name
+    with mysql_conn.cursor() as cur:
+        cur.execute(f"DROP TABLE IF EXISTS `{table}`")
+        cur.execute(f"CREATE TABLE `{table}` (id BIGINT PRIMARY KEY, v DECIMAL(65, 30))")
+        cur.execute(f"INSERT INTO `{table}` VALUES (1, 1000000000.5), (2, 0.1234567894)")
+    mysql_conn.commit()
+    _drop_ch(ch_client, table)
+    try:
+        quickhouse.sync(
+            mysql_source,
+            ch_target,
+            dest_table=table,
+            source_table=table,
+            mode="full",
+            key=["id"],
+            type_overrides={"v": "Decimal(38, 9)"},
+        )
+        rows = ch_client.query(f"SELECT id, toString(v) FROM `{table}` ORDER BY id").result_rows
+        assert rows == [(1, "1000000000.5"), (2, "0.123456789")]
+    finally:
+        _drop_ch(ch_client, table)
+
+
 def test_full_refresh_coerces_zero_dates_to_null(
     mysql_conn, ch_client, mysql_source, ch_target, unique_name
 ):

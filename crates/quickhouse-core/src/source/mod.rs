@@ -66,9 +66,9 @@ pub(crate) fn keyset_predicate(k: &Keyset) -> Option<String> {
     let lower = k
         .cursor
         .as_ref()
-        .map(|cur| format!("{} > {}", k.col_quoted, cur));
+        .map(|cur| format!("{} > {}", k.col_quoted, integer_literal(cur)));
     let upper = match &k.bound {
-        KeysetBound::UpperBound(hi) => Some(format!("{} <= {}", k.col_quoted, hi)),
+        KeysetBound::UpperBound(hi) => Some(format!("{} <= {}", k.col_quoted, integer_literal(hi))),
         KeysetBound::OrderedLimit(_) => None,
     };
     match (lower, upper) {
@@ -76,6 +76,44 @@ pub(crate) fn keyset_predicate(k: &Keyset) -> Option<String> {
         (Some(l), None) => Some(l),
         (None, Some(u)) => Some(u),
         (None, None) => None,
+    }
+}
+
+/// Validate a keyset cursor/bound as `^-?[0-9]+$` before it is spliced into
+/// generated SQL. The doc comment on [`Keyset`] has always promised this, but
+/// nothing enforced it: `keyset_predicate` formatted the value verbatim. That
+/// matters because a resumed run's cursor is read back from the destination's
+/// own state table (`chunk_cursor`), unquoted there because it is meant to be
+/// a bare integer — so anyone able to write to that table (not necessarily
+/// anyone with source access) could inject arbitrary SQL into the next
+/// resumed read. A value that fails the check is replaced with a literal that
+/// is syntactically valid but matches no row (`0=1` cannot appear in an
+/// integer position, so this uses a value outside the resumable, positive,
+/// unique-key domain instead: `-9223372036854775808`, `i64::MIN`), which fails
+/// loudly in the destination-column-type comparison rather than being
+/// silently dropped or, worse, executed. This is a defense in depth — every
+/// producer of these strings already writes only digits (see
+/// `build_chunk_plan`'s integer-type gate and the u64 formatting in
+/// `sync.rs`) — not the primary fix for a compromised state table.
+fn integer_literal(v: &str) -> String {
+    let valid = {
+        let mut chars = v.chars();
+        match chars.next() {
+            Some('-') => !v[1..].is_empty() && chars.as_str().bytes().all(|b| b.is_ascii_digit()),
+            Some(c) if c.is_ascii_digit() => chars.as_str().bytes().all(|b| b.is_ascii_digit()),
+            _ => false,
+        }
+    };
+    if valid {
+        v.to_string()
+    } else {
+        tracing::error!(
+            "keyset cursor/bound {v:?} is not a bare integer (expected ^-?[0-9]+$); refusing to \
+             splice it into generated SQL. This should be unreachable from normal operation — it \
+             means the value quickhouse itself persisted was tampered with, most likely by direct \
+             writes to the destination's state table. Using a value that matches no row instead."
+        );
+        i64::MIN.to_string()
     }
 }
 
@@ -140,6 +178,60 @@ pub(crate) fn range_partitions(lo: i128, hi: i128, n: usize, quoted_col: &str) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keyset_predicate_rejects_a_cursor_that_is_not_a_bare_integer() {
+        // A resumed cursor comes from the destination's own state table, so it
+        // is untrusted input, not something quickhouse itself just formatted.
+        // A tampered value must never be spliced into the generated SQL.
+        let k = Keyset {
+            col_quoted: "`id`".to_string(),
+            cursor: Some("0 UNION ALL SELECT password FROM secrets".to_string()),
+            bound: KeysetBound::OrderedLimit(1000),
+        };
+        let pred = keyset_predicate(&k).unwrap();
+        assert!(!pred.contains("UNION"), "got: {pred}");
+        assert_eq!(pred, "`id` > -9223372036854775808");
+    }
+
+    #[test]
+    fn keyset_predicate_rejects_a_tampered_upper_bound() {
+        let k = Keyset {
+            col_quoted: "`id`".to_string(),
+            cursor: None,
+            bound: KeysetBound::UpperBound("100); DROP TABLE orders; --".to_string()),
+        };
+        let pred = keyset_predicate(&k).unwrap();
+        assert_eq!(pred, "`id` <= -9223372036854775808");
+    }
+
+    #[test]
+    fn keyset_predicate_accepts_valid_integers_unchanged() {
+        let k = Keyset {
+            col_quoted: "`id`".to_string(),
+            cursor: Some("41".to_string()),
+            bound: KeysetBound::UpperBound("-7".to_string()),
+        };
+        assert_eq!(keyset_predicate(&k).unwrap(), "`id` > 41 AND `id` <= -7");
+    }
+
+    #[test]
+    fn integer_literal_accepts_and_rejects() {
+        for ok in [
+            "0",
+            "41",
+            "-7",
+            "9223372036854775807",
+            "-9223372036854775808",
+        ] {
+            assert_eq!(integer_literal(ok), ok, "{ok}");
+        }
+        for bad in [
+            "", "-", "1.5", "1e5", "0x1", " 1", "1 ", "1--", "--1", "a1", "",
+        ] {
+            assert_eq!(integer_literal(bad), "-9223372036854775808", "{bad:?}");
+        }
+    }
 
     #[test]
     fn body_head_never_panics_on_multibyte_boundaries() {

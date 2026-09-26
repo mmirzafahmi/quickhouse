@@ -9,6 +9,59 @@ any breaking change is called out explicitly.
 
 ## [Unreleased]
 
+## [0.20.0] — 2026-09-26
+
+### Fixed — silent data loss and corruption
+
+- **ClickHouse source, timezones.** An incremental read of a `DateTime` watermark
+  compared the cursor in the wrong timezone whenever the column declares its own
+  zone (`DateTime('Asia/Jakarta')`) and lookback was on, or the server's timezone
+  is not UTC. The read window came out empty or shifted, rows were skipped, and the
+  cursor still advanced. The cursor is now read back as
+  `CAST('...' AS <watermark type>)`, in the same zone it was written in. Saved
+  cursors keep working unchanged.
+- **Chunked reads, resume.** A run interrupted after its first chunk, with no
+  frozen upper bound (the MAX probe skipped as too costly, or MAX was NULL), left a
+  resume marker whose empty upper bound came back as `watermark <= ''`. Every later
+  run then failed (PostgreSQL) or read nothing and reported success (MySQL). An
+  empty upper bound now means "no bound", and a chunked run that finishes without a
+  new watermark clears the marker.
+- **PostgreSQL `uuid` columns** failed with "invalid utf8": binary COPY sends 16
+  raw bytes, which are now rendered as the canonical text form.
+- **MySQL `BINARY`/`VARBINARY` columns** were decoded as text, replacing invalid
+  bytes with U+FFFD. That corrupted the values and could make distinct keys
+  identical. They now map to Binary, like `BLOB` already did. **Behavior change:**
+  on a BigQuery destination these columns are now `BYTES`, not `STRING`.
+- **PostgreSQL `column_transforms`** were decoded using the source column's type:
+  `payload->>'user_id'` on a jsonb column lost its first character, and
+  `ROUND(ratio::numeric, 2)` on a float8 column came out as a denormal. Each
+  transformed expression is now cast to the type it is decoded as. A transform
+  whose result cannot be cast that way now fails in PostgreSQL instead of being
+  decoded as garbage.
+- **Decimals with many digits** (BigQuery `BIGNUMERIC`, MySQL `DECIMAL(65,30)`,
+  long unconstrained PostgreSQL `numeric`) were NULLed even when they fit the
+  target `Decimal(P,S)`, because every digit was accumulated before rounding.
+  Fraction digits past what fits are now dropped before rounding, which gives the
+  same correctly rounded result.
+- **DataFrame decimals narrowed by `type_overrides` / `numeric_as_decimal`**
+  went through arrow's cast. On a same-scale narrowing it added one unit to every
+  value (12.34 became 12.35), and values that no longer fit became NULL with no
+  warning. The conversion now rounds half away from zero and reports overflows as
+  `coerced_decimal` warnings.
+- **`reconcile_keys(delete=True)` deleted live rows** in three cases:
+  - A BigQuery window containing `OR` (or a trailing `--` comment) escaped the
+    key filter. The window is now parenthesized.
+  - MySQL keys that differ only in case or accents collapsed into one. The source
+    key list is now compared byte-exactly.
+  - PostgreSQL `char(n)` keys lost their padding at the source but kept it in
+    the destination. The padding is now kept on both sides.
+
+  Also, the destination keys are now read before the source keys, so a row that
+  lands during the reconcile is at worst reported as missing, never deleted.
+- **BigQuery `source_query`** waited for its job by re-running the query as a new,
+  separately billed job every 10 seconds. A query that took longer and could not
+  be served from cache never finished. It now waits on the job it submitted.
+
 ## [0.19.0] — 2026-09-21
 
 ### Added — back a transfer up to Google Cloud Storage, not just S3

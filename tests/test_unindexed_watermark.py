@@ -344,3 +344,74 @@ def test_stream_cursor_needs_a_lookback(
         assert r.new_watermark is not None
     finally:
         _drop_ch(ch_client, table)
+
+
+def test_stream_derived_watermark_refuses_a_transformed_column(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """When the MAX probe is skipped as too costly, the cursor is taken from
+    the read stream's own (decoded, transformed) values. The incremental
+    filter, though, always compares against the raw column — never against
+    column_transforms, which can be arbitrary SQL a WHERE cannot generally
+    invert. That domain mismatch used to persist a cursor no later run's
+    filter could correctly compare against, silently skipping rows."""
+    table = unique_name
+    _seed_nullable_wm(pg_conn, table, rows=50, nulls=0, indexed=False)
+    _drop_ch(ch_client, table)
+    try:
+        try:
+            _sync(
+                pg_source,
+                ch_target,
+                table,
+                lookback_seconds=3600,
+                probe_max_cost=1.0,
+                column_transforms={"write_date": "write_date + interval '1 hour'"},
+            )
+            assert False, "expected a RuntimeError"
+        except RuntimeError as e:
+            msg = str(e)
+            assert "column_transforms" in msg, msg
+            assert "write_date" in msg, msg
+        # int(), because clickhouse_connect returns EXISTS as an int on some
+        # driver versions and a str on others; the assertion is about the
+        # table not existing, not about which of those we got.
+        assert int(ch_client.command(f"EXISTS TABLE `{table}`")) == 0
+    finally:
+        _drop_ch(ch_client, table)
+
+
+def test_skip_to_max_refuses_rather_than_full_scanning_when_the_probe_is_skipped(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """skip_to_max exists so the first run reads "(almost) nothing" instead of
+    a doomed full pull. When the MAX probe itself is too costly to run, there
+    is no snapshot to seed from — it used to fall through to a plain, unseeded
+    first run (the exact full scan skip_to_max exists to avoid) and say
+    nothing. It must refuse instead."""
+    table = unique_name
+    _seed_nullable_wm(pg_conn, table, rows=50, nulls=0, indexed=False)
+    _drop_ch(ch_client, table)
+    try:
+        try:
+            _sync(
+                pg_source,
+                ch_target,
+                table,
+                skip_to_max=True,
+                lookback_seconds=3600,
+                probe_max_cost=1.0,
+            )
+            assert False, "expected a RuntimeError"
+        except RuntimeError as e:
+            msg = str(e)
+            assert "skip_to_max" in msg, msg
+            assert "probe_max_cost" in msg, msg
+        # The refusal happens before the destination table is even created.
+        # int(), because clickhouse_connect returns EXISTS as an int on some
+        # driver versions and a str on others; the assertion is about the
+        # table not existing, not about which of those we got.
+        assert int(ch_client.command(f"EXISTS TABLE `{table}`")) == 0
+
+    finally:
+        _drop_ch(ch_client, table)

@@ -592,11 +592,16 @@ impl PgSource {
             Some(w) => format!("WHERE ({w}) AND {k} IS NOT NULL"),
             None => format!("WHERE {k} IS NOT NULL"),
         };
+        // `format('%s', k)` renders through the type's own output function,
+        // like `::text` does for every type except char(n): `::text` strips
+        // its trailing padding, while binary COPY — and so the destination —
+        // keeps it. The stripped 'XYZ' never matched the destination's
+        // 'XYZ       ', so reconcile deleted every short char(n) key.
         let sql = if let Some(q) = base_query {
-            format!("SELECT DISTINCT ({k})::text FROM ({q}) AS _src {where_sql}")
+            format!("SELECT DISTINCT format('%s', {k}) FROM ({q}) AS _src {where_sql}")
         } else {
             format!(
-                "SELECT DISTINCT ({k})::text FROM {t} {where_sql}",
+                "SELECT DISTINCT format('%s', {k}) FROM {t} {where_sql}",
                 t = quote_pg_table(from_table.expect("table required"))
             )
         };
@@ -659,9 +664,93 @@ pub(crate) fn quote_pg_table(table: &str) -> String {
     }
 }
 
+/// Make a `column_transforms` column arrive in the wire type its decoder
+/// expects.
+///
+/// Binary COPY sends each value in its expression's own type, while the
+/// decoder picks its path from the column's Arrow type and PostgreSQL OID. A
+/// transformed column used to keep the *source* column's OID, so the
+/// OID-specific paths misread it without error: `payload->>'user_id'` on a
+/// jsonb column lost its first character (the jsonb version-byte strip),
+/// `ROUND(ratio::numeric, 2)` declared Float64 was read as IEEE bits, and a
+/// time column cast to text was read as microseconds.
+///
+/// So each transformed expression is cast to the PostgreSQL type that matches
+/// its Arrow decode type, and its OID is set to that type. A transform whose
+/// result cannot be cast that way now fails in PostgreSQL instead of being
+/// decoded as garbage. Arrow types with no entry here are left as they were.
+pub fn pin_transformed_wire_types(plan: &mut crate::transform::SelectPlan) {
+    use arrow_schema::DataType;
+    for (expr, col) in plan
+        .source_select_exprs
+        .iter_mut()
+        .zip(plan.dest_columns.iter_mut())
+    {
+        let Some(e) = expr.as_mut() else { continue };
+        let (pg_type, pg_oid) = match &col.arrow {
+            DataType::Boolean => ("bool", oid::BOOL),
+            DataType::Int16 => ("int2", oid::INT2),
+            DataType::Int32 => ("int4", oid::INT4),
+            DataType::Int64 => ("int8", oid::INT8),
+            DataType::UInt32 => ("oid", oid::OID),
+            DataType::Float32 => ("float4", oid::FLOAT4),
+            DataType::Float64 => ("float8", oid::FLOAT8),
+            DataType::Decimal128(_, _) => ("numeric", oid::NUMERIC),
+            DataType::Utf8 => ("text", oid::TEXT),
+            DataType::Binary => ("bytea", oid::BYTEA),
+            DataType::Date32 => ("date", oid::DATE),
+            DataType::Timestamp(_, None) => ("timestamp", oid::TIMESTAMP),
+            DataType::Timestamp(_, Some(_)) => ("timestamptz", oid::TIMESTAMPTZ),
+            _ => continue,
+        };
+        *e = format!("({e})::{pg_type}");
+        col.type_id = pg_oid;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transformed_columns_are_cast_to_their_decode_type() {
+        use arrow_schema::DataType;
+        let col = |name: &str, type_id: u32, arrow: DataType| ColumnType {
+            name: name.into(),
+            type_id,
+            nullable: true,
+            arrow,
+            clickhouse_inner: "String".into(),
+            arbitrary_precision_decimal: false,
+        };
+        let mut plan = crate::transform::SelectPlan {
+            source_columns: vec!["payload".into(), "ratio".into(), "name".into()],
+            source_select_exprs: vec![
+                Some("payload->>'user_id'".into()),
+                Some("ROUND(ratio::numeric, 2)".into()),
+                None,
+            ],
+            dest_columns: vec![
+                col("payload", oid::JSONB, DataType::Utf8),
+                col("ratio", oid::FLOAT8, DataType::Float64),
+                col("name", oid::TEXT, DataType::Utf8),
+            ],
+        };
+        pin_transformed_wire_types(&mut plan);
+        assert_eq!(
+            plan.source_select_exprs,
+            vec![
+                Some("(payload->>'user_id')::text".to_string()),
+                Some("(ROUND(ratio::numeric, 2))::float8".to_string()),
+                None,
+            ]
+        );
+        // The jsonb OID would strip a "version byte" from plain text.
+        assert_eq!(plan.dest_columns[0].type_id, oid::TEXT);
+        assert_eq!(plan.dest_columns[1].type_id, oid::FLOAT8);
+        // An untransformed column keeps its source OID.
+        assert_eq!(plan.dest_columns[2].type_id, oid::TEXT);
+    }
 
     // Throwaway self-signed cert (openssl req -x509 -newkey rsa:2048 -nodes
     // -days 3650 -subj '/CN=test-ca.example.com'), used only to exercise the

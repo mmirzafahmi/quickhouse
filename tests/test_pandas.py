@@ -30,6 +30,7 @@ import quickhouse
 
 pd = pytest.importorskip("pandas")
 pa = pytest.importorskip("pyarrow")
+pc = pytest.importorskip("pyarrow.compute")
 
 
 def _drop(ch_client, *tables: str):
@@ -148,6 +149,64 @@ def test_duplicate_keys_are_deduped_last_wins(ch_client, ch_target, unique_name)
         assert float(ch_client.command(f"SELECT amount FROM `{table}` WHERE id = 1")) == 7.0
     finally:
         _drop(ch_client, table)
+
+
+def test_duplicate_keys_with_watermark_keep_the_highest_watermark_row(
+    ch_client, ch_target, unique_name
+):
+    """Passing watermark= must decide the dedup winner, not row position.
+
+    The rows are deliberately ordered so the *older* row comes last in the
+    frame: with the old position-based dedup this kept the stale 'old' value,
+    even though watermark= was passed specifically to prevent that (the
+    engine's own config error for the no-watermark, no-key case says exactly
+    this: "Pass watermark= as well if you want it used as the version column
+    for dedup ordering.")."""
+    table = unique_name
+    _drop(ch_client, table)
+    df = pd.DataFrame(
+        {
+            "id": [1, 1, 2],
+            "updated_at": pd.to_datetime(["2024-02-01", "2024-01-01", "2024-01-01"]),
+            "status": ["new", "old", "only"],
+        }
+    )
+    try:
+        with pytest.warns(quickhouse.QuickhouseWarning, match="sharing a key"):
+            quickhouse.from_pandas(
+                df,
+                ch_target,
+                dest_table=table,
+                mode="incremental",
+                key=["id"],
+                watermark="updated_at",
+            )
+        ch_client.command(f"OPTIMIZE TABLE `{table}` FINAL")
+        assert int(ch_client.command(f"SELECT count() FROM `{table}`")) == 2
+        assert (
+            str(ch_client.command(f"SELECT status FROM `{table}` WHERE id = 1")) == "new"
+        )
+    finally:
+        _drop(ch_client, table)
+
+
+def test_dedupe_on_key_breaks_watermark_ties_by_position():
+    """A pure unit test (no database) of the tie-break: when two duplicates of
+    a key share the same watermark value, position still decides — the same
+    "last one wins" rule as with no watermark at all — rather than the
+    ordering going arbitrary."""
+    from quickhouse.pandas import _dedupe_on_key
+
+    table = pa.table(
+        {
+            "id": pa.array([1, 1, 2], type=pa.int64()),
+            "updated_at": pa.array([1000, 1000, 1000], type=pa.int64()),
+            "status": pa.array(["earlier", "later", "only"]),
+        }
+    )
+    out = _dedupe_on_key(table, ["id"], pa, pc, watermark="updated_at")
+    got = dict(zip(out.column("id").to_pylist(), out.column("status").to_pylist()))
+    assert got == {1: "later", 2: "only"}
 
 
 def test_dtype_coverage(ch_client, ch_target, unique_name):
@@ -405,3 +464,30 @@ def test_include_and_exclude_project_the_frame(ch_client, ch_target, unique_name
 def test_not_a_frame_is_refused_with_a_useful_message():
     with pytest.raises(TypeError, match="pandas.DataFrame"):
         quickhouse.from_pandas({"id": [1]}, None, dest_table="t", mode="full")
+
+
+def test_narrowing_a_decimal_column_keeps_values_exact(ch_client, ch_target, unique_name):
+    """A frame decimal narrowed by type_overrides went through arrow's cast,
+    which (arrow 53) added one unit to every value on a same-scale narrowing
+    and turned values that no longer fit into NULL without a warning."""
+    table = unique_name
+    amounts = [decimal.Decimal(v) for v in ("0.00", "12.34", "-5.50", "99.99", "1234567890.12")]
+    frame = pa.table(
+        {"id": pa.array(range(1, 6), pa.int64()), "amount": pa.array(amounts, pa.decimal128(38, 2))}
+    )
+    _drop(ch_client, table)
+    try:
+        result = quickhouse.from_pandas(
+            frame,
+            ch_target,
+            dest_table=table,
+            mode="full",
+            key=["id"],
+            type_overrides={"amount": "Decimal(10, 2)"},
+        )
+        rows = ch_client.query(f"SELECT id, toString(amount) FROM `{table}` ORDER BY id").result_rows
+        assert rows == [(1, "0"), (2, "12.34"), (3, "-5.5"), (4, "99.99"), (5, None)]
+        coerced = [w for w in result.warnings if w.kind == "coerced_decimal"]
+        assert [(w.column, w.count) for w in coerced] == [("amount", 1)]
+    finally:
+        _drop(ch_client, table)

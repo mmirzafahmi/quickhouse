@@ -398,25 +398,37 @@ impl ClickHouseSource {
     /// zero matching rows returns the column type's default value (the epoch,
     /// or `0`) rather than NULL, so without it an empty source would persist a
     /// 1970 watermark as though it had genuinely read up to there.
+    ///
+    /// Also returns the watermark's ClickHouse type (`toTypeName`), even when
+    /// the source is empty. `toString` renders a `DateTime` in the column's
+    /// own timezone — the declared one, or the server's for a bare `DateTime`
+    /// — so the cursor is local wall-clock text, not UTC. The filter reads it
+    /// back as `CAST(... AS <this type>)`, which parses it in that same zone
+    /// (see `build_watermark_filter_clickhouse`).
     pub async fn max_watermark(
         &self,
         from_table: Option<&str>,
         base_query: Option<&str>,
         watermark: &str,
         source_expr: Option<&str>,
-    ) -> Result<Option<String>> {
+    ) -> Result<(Option<String>, Option<String>)> {
         let w = source_expr
             .map(str::to_string)
             .unwrap_or_else(|| quote_ident(watermark));
         let sql = format!(
-            "SELECT if(count({w}) = 0, NULL, toString(max({w}))) FROM {src} FORMAT TabSeparated",
+            "SELECT if(count({w}) = 0, NULL, toString(max({w}))), toTypeName(max({w})) \
+             FROM {src} FORMAT TabSeparated",
             src = from_source(from_table, base_query),
         );
         let rows = self
             .query_rows(&sql)
             .await
             .map_err(|e| e.context("reading clickhouse max watermark"))?;
-        Ok(rows.first().and_then(|r| r.first().cloned()).flatten())
+        let row = rows.into_iter().next().unwrap_or_default();
+        let mut cells = row.into_iter();
+        let max = cells.next().flatten();
+        let type_name = cells.next().flatten();
+        Ok((max, type_name))
     }
 
     /// Count rows whose watermark value is NULL — see

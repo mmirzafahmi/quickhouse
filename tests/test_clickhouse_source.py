@@ -326,13 +326,64 @@ def test_chunked_keyset_read_transfers_every_row_once(
         _drop(ch_client, src_table, dest_table)
 
 
+def test_resume_marker_without_an_upper_bound_resumes_and_is_cleared(
+    ch_client, ch_source, ch_target, unique_name
+):
+    """A chunk-resume marker saved with no frozen upper bound must not pin one.
+
+    A chunked run that had no upper bound (the MAX probe was skipped, or MAX was
+    NULL) saves `chunk_upper = ''`. That used to come back as a real bound, so
+    every later run filtered on `updated_at <= ''` and failed or read nothing,
+    and nothing ever cleared the marker. The marker is injected here exactly as
+    such an interrupted run leaves it.
+    """
+    src_table, dest_table = unique_name, f"{unique_name}_dst"
+    n = 250
+    _seed_source(ch_client, src_table, n, base_ts="2024-03-01 12:00:00")
+    _drop(ch_client, dest_table)
+    kwargs = dict(
+        dest_table=dest_table,
+        source_table=src_table,
+        mode="incremental",
+        watermark="updated_at",
+        key=["id"],
+        create_if_missing=True,
+        chunk_rows=40,
+    )
+    try:
+        assert quickhouse.sync(ch_source, ch_target, **kwargs).rows_written == n
+        ch_client.command(
+            "INSERT INTO _quickhouse_state "
+            "(source_table, dest_table, last_watermark, rows, chunk_cursor, chunk_upper) "
+            f"VALUES ('{src_table}', '{dest_table}', '2024-03-01 12:00:00', 0, '100', '')"
+        )
+
+        # Resumes past id 100 up to the live MAX: nothing new, and no error.
+        assert quickhouse.sync(ch_source, ch_target, **kwargs).rows_written == 0
+        marker = ch_client.command(
+            f"SELECT chunk_cursor FROM _quickhouse_state FINAL "
+            f"WHERE source_table = '{src_table}' AND dest_table = '{dest_table}' "
+            f"ORDER BY run_ts DESC LIMIT 1"
+        )
+        assert marker == "", "a finished run must clear the resume marker"
+
+        # With the marker gone, a change to a key below the old cursor is read.
+        ch_client.command(
+            f"ALTER TABLE `{src_table}` UPDATE updated_at = toDateTime('2024-03-02 00:00:00'), "
+            f"amount = 999.0 WHERE id = 5 SETTINGS mutations_sync = 2"
+        )
+        assert quickhouse.sync(ch_source, ch_target, **kwargs).rows_written == 1
+    finally:
+        _drop(ch_client, src_table, dest_table)
+
+
 def test_lookback_seconds_re_reads_across_the_watermark_boundary(
     ch_client, ch_source, ch_target, unique_name
 ):
     """`lookback_seconds` widens the lower bound with ClickHouse's own arithmetic.
 
     The interesting part is that the bound is built as
-    `toDateTime64('<cursor>', 6, 'UTC') - INTERVAL n SECOND` — a same-engine
+    `CAST('<cursor>' AS <watermark type>) - INTERVAL n SECOND` — a same-engine
     round trip of the watermark string this source itself produced. A row
     restated at exactly the committed watermark is invisible without it.
     """
@@ -367,6 +418,52 @@ def test_lookback_seconds_re_reads_across_the_watermark_boundary(
         assert (
             float(ch_client.command(f"SELECT amount FROM `{dest_table}` WHERE id = 1")) == 999.0
         )
+    finally:
+        _drop(ch_client, src_table, dest_table)
+
+
+def test_lookback_on_a_zoned_datetime_reads_the_cursor_in_that_zone(
+    ch_client, ch_source, ch_target, unique_name
+):
+    """A `DateTime('Asia/Jakarta')` watermark with a lookback must not skip rows.
+
+    `toString(max(col))` renders the cursor as Jakarta wall-clock text. Reading
+    it back as UTC put the lower bound 7 hours after the real cursor, so with a
+    lookback shorter than the offset the window was empty: every run after the
+    first read nothing while the cursor still advanced.
+    """
+    src_table, dest_table = unique_name, f"{unique_name}_dst"
+    ch_client.command(f"DROP TABLE IF EXISTS `{src_table}`")
+    ch_client.command(
+        f"CREATE TABLE `{src_table}` (id Int64, updated_at DateTime('Asia/Jakarta')) "
+        f"ENGINE = MergeTree ORDER BY id"
+    )
+    ch_client.command(
+        f"INSERT INTO `{src_table}` SELECT number + 1, "
+        f"toDateTime('2024-03-01 12:00:00', 'UTC') + number * 60 FROM numbers(10)"
+    )
+    _drop(ch_client, dest_table)
+    try:
+        kwargs = dict(
+            dest_table=dest_table,
+            source_table=src_table,
+            mode="incremental",
+            watermark="updated_at",
+            key=["id"],
+            create_if_missing=True,
+            lookback_seconds=3600,
+        )
+        assert quickhouse.sync(ch_source, ch_target, **kwargs).rows_written == 10
+
+        # Five new rows two hours after the cursor (12:09 UTC). The one-hour
+        # lookback also re-reads the first ten, which all sit within it.
+        ch_client.command(
+            f"INSERT INTO `{src_table}` SELECT number + 11, "
+            f"toDateTime('2024-03-01 14:00:00', 'UTC') + number * 60 FROM numbers(5)"
+        )
+        assert quickhouse.sync(ch_source, ch_target, **kwargs).rows_written == 15
+        ch_client.command(f"OPTIMIZE TABLE `{dest_table}` FINAL")
+        assert int(ch_client.command(f"SELECT count() FROM `{dest_table}`")) == 15
     finally:
         _drop(ch_client, src_table, dest_table)
 

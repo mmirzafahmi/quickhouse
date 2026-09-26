@@ -923,7 +923,7 @@ impl BigQuerySink {
              WHERE {} AND `{key_column}` IS NOT NULL",
             self.project_id,
             self.dataset_id,
-            window.unwrap_or("TRUE"),
+            window_predicate(window),
         );
         self.query_strings(&query, "distinct keys").await
     }
@@ -947,7 +947,7 @@ impl BigQuerySink {
             let lits = bq_key_literals(&data_type, key_column, chunk)?.join(", ");
             let predicate = format!(
                 "{} AND `{key_column}` IN ({lits})",
-                window.unwrap_or("TRUE")
+                window_predicate(window)
             );
             let count_sql = format!(
                 "SELECT CAST(COUNT(*) AS STRING) FROM `{}`.`{}`.`{table}` WHERE {predicate}",
@@ -1317,6 +1317,19 @@ impl Sink for BigQuerySink {
         window: Option<&str>,
     ) -> Result<u64> {
         BigQuerySink::delete_keys(self, table, key_column, keys, window).await
+    }
+}
+
+/// A caller's `window` as a self-contained predicate. The window is raw SQL
+/// that gets ANDed with a key filter, so it must be parenthesized: unwrapped,
+/// `a OR b AND key IN (...)` binds as `a OR (b AND key IN (...))` and a
+/// reconcile DELETE removes every row matching `a`. The newline before the
+/// closing parenthesis keeps a trailing `--` comment from swallowing the rest
+/// of the statement.
+fn window_predicate(window: Option<&str>) -> String {
+    match window {
+        Some(w) => format!("(\n{w}\n)"),
+        None => "TRUE".to_string(),
     }
 }
 
@@ -2093,6 +2106,19 @@ pub(crate) fn timestamp_micros_to_iso(micros: i64, has_tz: bool) -> Result<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn window_predicate_is_parenthesized_and_comment_safe() {
+        assert_eq!(window_predicate(None), "TRUE");
+        let p = format!(
+            "{} AND `id` IN (1, 2)",
+            window_predicate(Some("a >= '2026-07-01' OR b >= '2026-07-01' -- July"))
+        );
+        assert_eq!(
+            p,
+            "(\na >= '2026-07-01' OR b >= '2026-07-01' -- July\n) AND `id` IN (1, 2)"
+        );
+    }
     use arrow_array::{ArrayRef, Float64Array, Int64Array};
     use arrow_schema::{Field, Schema};
     use std::collections::HashMap;

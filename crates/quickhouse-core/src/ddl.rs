@@ -199,15 +199,23 @@ pub fn migrate_state_table(db: &str, state_table: &str) -> String {
 }
 
 /// `ALTER TABLE ... ADD COLUMN IF NOT EXISTS <col> Nullable(<inner>)` for
-/// opt-in schema evolution. Always `Nullable` regardless of the column's
-/// resolved nullability: an existing table has rows that predate the column,
-/// which must read back as NULL. `IF NOT EXISTS` makes it idempotent.
+/// opt-in schema evolution. Always nullable-wrapped regardless of the
+/// column's resolved nullability: an existing table has rows that predate the
+/// column, which must read back as NULL. `IF NOT EXISTS` makes it idempotent.
+///
+/// The wrapping goes through [`crate::types::wrap_clickhouse_nullable`], not a
+/// bare `format!("Nullable({inner})")`: for a `LowCardinality` inner type,
+/// plain `Nullable(LowCardinality(T))` is rejected by ClickHouse outright
+/// (`Code: 43`) — it has to be `LowCardinality(Nullable(T))` instead. An
+/// evolved `LowCardinality` column (from a ClickHouse source, or a
+/// `type_overrides` entry) used to fail every subsequent sync with that error
+/// until the column was added by hand.
 pub fn add_column(db: &str, table: &str, column: &ColumnType) -> String {
     format!(
-        "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} Nullable({})",
+        "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} {}",
         qualified(db, table),
         quote_ident(&column.name),
-        column.clickhouse_inner,
+        crate::types::wrap_clickhouse_nullable(&column.clickhouse_inner),
     )
 }
 
@@ -227,6 +235,48 @@ mod tests {
             clickhouse_inner: ch.into(),
             arbitrary_precision_decimal: false,
         }
+    }
+
+    #[test]
+    fn add_column_wraps_low_cardinality_on_the_outside() {
+        // ClickHouse rejects Nullable(LowCardinality(T)) outright (Code 43);
+        // it must be spelled LowCardinality(Nullable(T)).
+        let c = col("tag", "LowCardinality(String)", true);
+        assert_eq!(
+            add_column("db", "t", &c),
+            "ALTER TABLE `db`.`t` ADD COLUMN IF NOT EXISTS `tag` \
+             LowCardinality(Nullable(String))"
+        );
+    }
+
+    #[test]
+    fn add_column_is_always_nullable_even_for_a_not_null_source_column() {
+        // An evolved column's existing rows all predate it and must read back
+        // as NULL, whatever the source column's own nullability resolved to.
+        let c = col("amount", "Float64", false);
+        assert_eq!(
+            add_column("db", "t", &c),
+            "ALTER TABLE `db`.`t` ADD COLUMN IF NOT EXISTS `amount` Nullable(Float64)"
+        );
+        let c = col("tag", "LowCardinality(String)", false);
+        assert_eq!(
+            add_column("db", "t", &c),
+            "ALTER TABLE `db`.`t` ADD COLUMN IF NOT EXISTS `tag` \
+             LowCardinality(Nullable(String))"
+        );
+    }
+
+    #[test]
+    fn add_column_leaves_an_already_nullable_low_cardinality_inner_alone() {
+        // clickhouse_inner can itself already read "LowCardinality(Nullable(T))"
+        // (a ClickHouse source's own nullable LowCardinality column) — must not
+        // double-wrap into LowCardinality(Nullable(Nullable(T))).
+        let c = col("tag", "LowCardinality(Nullable(String))", true);
+        assert_eq!(
+            add_column("db", "t", &c),
+            "ALTER TABLE `db`.`t` ADD COLUMN IF NOT EXISTS `tag` \
+             LowCardinality(Nullable(String))"
+        );
     }
 
     fn base_cfg(mode: SyncMode) -> TransferConfig {

@@ -163,6 +163,96 @@ def test_time_column_stored_as_text(pg_conn, ch_client, pg_source, ch_target, un
         _drop_ch(ch_client, table)
 
 
+def test_uuid_column_round_trips(pg_conn, ch_client, pg_source, ch_target, unique_name):
+    """Binary COPY sends a uuid as 16 raw bytes. It used to be decoded as UTF-8
+    text, so any table with a uuid column failed with "invalid utf8"."""
+    table = unique_name
+    ids = ["a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", "ffffffff-ffff-ffff-ffff-ffffffffffff"]
+    with pg_conn.cursor() as cur:
+        cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+        cur.execute(f'CREATE TABLE "{table}" (id uuid PRIMARY KEY, other uuid)')
+        cur.execute(f'INSERT INTO "{table}" VALUES (%s, %s), (%s, NULL)', (ids[0], ids[0], ids[1]))
+    _drop_ch(ch_client, table)
+    try:
+        result = quickhouse.sync(
+            pg_source, ch_target, dest_table=table, source_table=table, mode="full", key=["id"]
+        )
+        assert result.rows_written == 2
+        rows = ch_client.query(
+            f"SELECT toString(id), toString(other) FROM `{table}` ORDER BY id"
+        ).result_rows
+        assert rows == [(ids[0], ids[0]), (ids[1], None)]
+    finally:
+        _drop_ch(ch_client, table)
+
+
+def test_column_transforms_are_decoded_in_their_own_type(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """A transformed column used to keep its source column's type for decoding.
+    A jsonb extraction lost its first character, a numeric rounding of a float8
+    column came out as a denormal, and a time cast to text was read as
+    microseconds — all silently."""
+    table = unique_name
+    with pg_conn.cursor() as cur:
+        cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+        cur.execute(
+            f'CREATE TABLE "{table}" (id bigint PRIMARY KEY, payload jsonb, ratio float8, t time)'
+        )
+        cur.execute(
+            f"""INSERT INTO "{table}" VALUES (1, '{{"user_id": "12345"}}', 0.1234, '14:30:00')"""
+        )
+    _drop_ch(ch_client, table)
+    try:
+        quickhouse.sync(
+            pg_source,
+            ch_target,
+            dest_table=table,
+            source_table=table,
+            mode="full",
+            key=["id"],
+            column_transforms={
+                "payload": "payload->>'user_id'",
+                "ratio": "ROUND(ratio::numeric, 2)",
+                "t": "CAST(t AS TEXT)",
+            },
+        )
+        row = ch_client.query(f"SELECT payload, ratio, t FROM `{table}`").result_rows[0]
+        assert row == ("12345", 0.12, "14:30:00")
+    finally:
+        _drop_ch(ch_client, table)
+
+
+def test_decimal_with_more_digits_than_fit_is_rounded_not_nulled(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """An unconstrained numeric with 46 significant digits fits Decimal(38, 9)
+    once rounded, but decoding used to add up every digit first, overflow, and
+    land the value as NULL."""
+    table = unique_name
+    with pg_conn.cursor() as cur:
+        cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+        cur.execute(f'CREATE TABLE "{table}" (id bigint PRIMARY KEY, v numeric)')
+        cur.execute(
+            f'INSERT INTO "{table}" VALUES (1, (\'1.\' || repeat(\'6\', 45))::numeric), (2, 2.5)'
+        )
+    _drop_ch(ch_client, table)
+    try:
+        quickhouse.sync(
+            pg_source,
+            ch_target,
+            dest_table=table,
+            source_table=table,
+            mode="full",
+            key=["id"],
+            type_overrides={"v": "Decimal(38, 9)"},
+        )
+        rows = ch_client.query(f"SELECT id, toString(v) FROM `{table}` ORDER BY id").result_rows
+        assert rows == [(1, "1.666666667"), (2, "2.5")]
+    finally:
+        _drop_ch(ch_client, table)
+
+
 def test_full_refresh_zstd_with_tight_memory_budget(
     pg_conn, ch_client, pg_source, ch_target_zstd, unique_name
 ):

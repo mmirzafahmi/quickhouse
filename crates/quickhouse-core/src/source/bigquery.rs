@@ -20,6 +20,7 @@
 use google_cloud_bigquery::client::google_cloud_auth::credentials::CredentialsFile;
 use google_cloud_bigquery::client::{Client, ClientConfig, ReadTableOption};
 use google_cloud_bigquery::http::job::get::GetJobRequest;
+use google_cloud_bigquery::http::job::get_query_results::GetQueryResultsRequest;
 use google_cloud_bigquery::http::job::query::QueryRequest;
 use google_cloud_bigquery::http::job::JobType;
 use google_cloud_bigquery::http::table::{TableFieldMode, TableReference, TableSchema};
@@ -144,31 +145,42 @@ impl BigQuerySource {
             query: query.to_string(),
             ..Default::default()
         };
-        let mut result = client
+        let result = client
             .job()
             .query(project_id, &request)
             .await
             .map_err(|e| EtlError::other(format!("bigquery query error: {e}")))?;
 
+        // Wait on *this* job with jobs.getQueryResults. Calling jobs.query
+        // again here started a new, separately billed job on every iteration,
+        // each waiting only 10 s — so a query that takes longer and cannot be
+        // served from cache (anything using CURRENT_DATE(), say) never
+        // completed, and a cacheable one was paid for many times over.
         let job_ref = result.job_reference.clone();
-        while !result.job_complete {
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            result = client
+        let mut complete = result.job_complete;
+        let mut schema = result.schema;
+        let wait = GetQueryResultsRequest {
+            max_results: Some(0),
+            timeout_ms: Some(60_000),
+            location: job_ref.location.clone(),
+            ..Default::default()
+        };
+        while !complete {
+            let r = client
                 .job()
-                .query(
-                    project_id,
-                    &QueryRequest {
-                        query: query.to_string(),
-                        ..Default::default()
-                    },
-                )
+                .get_query_results(&job_ref.project_id, &job_ref.job_id, &wait)
                 .await
-                .map_err(|e| EtlError::other(format!("bigquery query error: {e}")))?;
+                .map_err(|e| EtlError::other(format!("bigquery getQueryResults error: {e}")))?;
+            complete = r.job_complete;
+            if r.schema.is_some() {
+                schema = r.schema;
+            }
+            if !complete {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
         }
 
-        let schema = result
-            .schema
-            .ok_or_else(|| EtlError::other("BigQuery query returned no schema"))?;
+        let schema = schema.ok_or_else(|| EtlError::other("BigQuery query returned no schema"))?;
         let columns = columns_from_schema(&schema)?;
 
         let job = client
