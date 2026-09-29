@@ -902,6 +902,10 @@ struct SourceSetup {
     /// ClickHouse only: the watermark's ClickHouse type, which types the
     /// filter's cursor literals (see `build_watermark_filter_clickhouse`).
     watermark_type: Option<String>,
+    /// PostgreSQL only: the `chunk_rows` keyset column resolved as nullable
+    /// (every `source_query` column does) but the query proves it NOT NULL
+    /// (see `PgSource::result_column_not_null`).
+    keyset_not_null: bool,
 }
 
 /// Run one table transfer end to end.
@@ -1242,6 +1246,7 @@ async fn run_transfer_impl(
         stream_max_cursor,
         window: window_plan,
         watermark_type,
+        keyset_not_null,
     } = setup;
     tracing::info!(
         "resolved {} source column(s); computed {} partition(s) for parallel read",
@@ -1458,6 +1463,7 @@ async fn run_transfer_impl(
                 committed,
                 effective_upper.clone(),
                 start_cursor,
+                keyset_not_null,
             )?),
             None => None,
         };
@@ -3009,6 +3015,31 @@ async fn setup_postgres(
     let source_cols = s
         .resolve_columns(&control, &schema_probe, not_null_from)
         .await?;
+    // `chunk_rows` needs a NOT NULL keyset, and every `source_query` column
+    // resolves as nullable, so ask the query itself. A failed check only means
+    // "not proven": `build_chunk_plan` then refuses, and says how to assert it.
+    let keyset_not_null = match (cfg.chunk_rows, base_query, cfg.keyset_column()) {
+        (Some(_), Some(q), Some(k))
+            if !cfg.keyset_not_null && source_cols.iter().any(|c| c.name == k && c.nullable) =>
+        {
+            match s.result_column_not_null(&control, q, &k).await {
+                Ok(proven) => {
+                    if proven {
+                        tracing::info!(
+                            "keyset column '{k}' is a NOT NULL table column in source_query, \
+                             whose plan has no outer join or grouping sets: accepted for chunk_rows"
+                        );
+                    }
+                    proven
+                }
+                Err(e) => {
+                    tracing::warn!("could not check keyset column '{k}' for NOT NULL: {e}");
+                    false
+                }
+            }
+        }
+        _ => false,
+    };
 
     // Only needed for incremental mode (the value is discarded otherwise) —
     // skip it in full-refresh so a watermark column left set alongside
@@ -3138,6 +3169,7 @@ async fn setup_postgres(
         stream_max_cursor,
         window,
         watermark_type: None,
+        keyset_not_null,
     })
 }
 
@@ -3287,6 +3319,7 @@ async fn setup_mysql(
         stream_max_cursor,
         window,
         watermark_type: None,
+        keyset_not_null: false,
     })
 }
 
@@ -3328,7 +3361,10 @@ struct ChunkPlan {
 /// correctness contract: the keyset column must be selected, an integer type,
 /// NOT NULL (a NULL key is silently skipped by `> cursor`), and not
 /// value-transformed (the cursor is compared against the raw column in SQL, so
-/// the decoded value must be the raw column value).
+/// the decoded value must be the raw column value). `proven_not_null` is the
+/// source's own proof for a column that resolved as nullable (see
+/// `SourceSetup::keyset_not_null`); `cfg.keyset_not_null` is the caller's.
+#[allow(clippy::too_many_arguments)]
 fn build_chunk_plan(
     cfg: &TransferConfig,
     plan: &SelectPlan,
@@ -3337,6 +3373,7 @@ fn build_chunk_plan(
     committed: Option<String>,
     effective_upper: Option<String>,
     start_cursor: Option<String>,
+    proven_not_null: bool,
 ) -> Result<ChunkPlan> {
     let keyset_col = cfg
         .keyset_column()
@@ -3372,11 +3409,13 @@ fn build_chunk_plan(
             col.arrow
         )));
     }
-    if col.nullable {
+    if col.nullable && !proven_not_null && !cfg.keyset_not_null {
         return Err(EtlError::config(format!(
             "keyset column '{keyset_col}' must be NOT NULL for chunk_rows (a NULL key is silently \
-             skipped by the cursor). With source_query, nullability can't be verified — use \
-             source_table with a NOT NULL, unique integer key"
+             skipped by the cursor). A source_query's keyset is accepted when it is a plain \
+             reference to a NOT NULL table column and the query has no outer join or grouping \
+             sets; where it isn't (a view, a join), pass keyset_not_null=True to assert that the \
+             column never holds NULL"
         )));
     }
     Ok(ChunkPlan {
@@ -4401,6 +4440,7 @@ async fn setup_clickhouse(
         // index makes both probes cheap, and there is no seq-scan cliff to
         // detect.
         stream_max_cursor: false,
+        keyset_not_null: false,
     })
 }
 
@@ -8119,7 +8159,17 @@ mod tests {
     #[test]
     fn build_chunk_plan_accepts_unique_integer_notnull_key() {
         let (cfg, plan, src) = chunk_inputs("id", DataType::Int64, false);
-        let cp = build_chunk_plan(&cfg, &plan, &src, 1000, None, Some("100".into()), None).unwrap();
+        let cp = build_chunk_plan(
+            &cfg,
+            &plan,
+            &src,
+            1000,
+            None,
+            Some("100".into()),
+            None,
+            false,
+        )
+        .unwrap();
         assert_eq!(cp.keyset_col, "id");
         assert_eq!(cp.keyset_idx, 0);
         assert_eq!(cp.limit, 1000);
@@ -8295,27 +8345,48 @@ mod tests {
         assert_eq!(wm, Some("2026-07-10".to_string()));
     }
 
+    /// Issue #7: a keyset that resolved as nullable (every PostgreSQL
+    /// `source_query` column does) is accepted once the source proves it NOT
+    /// NULL, or the caller asserts it, and the refusal names the assertion.
+    #[test]
+    fn a_nullable_keyset_is_accepted_when_proven_or_asserted() {
+        let (mut cfg, plan, src) = chunk_inputs("id", DataType::Int64, true);
+        let msg = build_chunk_plan(&cfg, &plan, &src, 1000, None, None, None, false)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("keyset_not_null=True"), "{msg}");
+        assert!(build_chunk_plan(&cfg, &plan, &src, 1000, None, None, None, true).is_ok());
+        cfg.keyset_not_null = true;
+        assert!(build_chunk_plan(&cfg, &plan, &src, 1000, None, None, None, false).is_ok());
+    }
+
     #[test]
     fn build_chunk_plan_rejects_nullable_non_integer_and_transformed_keys() {
         // Nullable key (NULLs silently skipped) -> reject.
         let (cfg, plan, src) = chunk_inputs("id", DataType::Int64, true);
-        assert!(build_chunk_plan(&cfg, &plan, &src, 1000, None, None, None)
-            .unwrap_err()
-            .to_string()
-            .contains("NOT NULL"));
+        assert!(
+            build_chunk_plan(&cfg, &plan, &src, 1000, None, None, None, false)
+                .unwrap_err()
+                .to_string()
+                .contains("NOT NULL")
+        );
         // Non-integer key -> reject.
         let (cfg, plan, src) = chunk_inputs("id", DataType::Utf8, false);
-        assert!(build_chunk_plan(&cfg, &plan, &src, 1000, None, None, None)
-            .unwrap_err()
-            .to_string()
-            .contains("integer"));
+        assert!(
+            build_chunk_plan(&cfg, &plan, &src, 1000, None, None, None, false)
+                .unwrap_err()
+                .to_string()
+                .contains("integer")
+        );
         // Transformed key (decoded value != raw column) -> reject.
         let (mut cfg, plan, src) = chunk_inputs("id", DataType::Int64, false);
         cfg.column_transforms =
             std::collections::HashMap::from([("id".to_string(), "id + 1".to_string())]);
-        assert!(build_chunk_plan(&cfg, &plan, &src, 1000, None, None, None)
-            .unwrap_err()
-            .to_string()
-            .contains("column_transforms"));
+        assert!(
+            build_chunk_plan(&cfg, &plan, &src, 1000, None, None, None, false)
+                .unwrap_err()
+                .to_string()
+                .contains("column_transforms")
+        );
     }
 }

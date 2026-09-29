@@ -9,6 +9,22 @@ any breaking change is called out explicitly.
 
 ## [Unreleased]
 
+### Added
+- **`chunk_rows` works with `source_query`.** Every column of a PostgreSQL
+  `source_query` resolves as nullable, so a keyset column there was always
+  refused, even a bare pass-through of a `NOT NULL` primary key. It is now
+  accepted when the column is a plain reference to a `NOT NULL` table column
+  and the query's plan (`EXPLAIN`, nothing runs) has no outer join and no
+  grouping sets. Both checks are needed: PostgreSQL attributes a column to its
+  table straight through the nullable side of a `LEFT JOIN` and through
+  `GROUPING SETS`, and either can return `NULL` there. A MySQL `source_query`
+  was already judged by its result metadata, which gets both cases right.
+  (#7)
+- **`keyset_not_null=True`** asserts the keyset is never `NULL` where quickhouse
+  can't prove it (a view, a join). A `NULL` key is silently skipped by the
+  cursor, so the assertion is yours to make. Only with `chunk_rows` and
+  `source_query`. (#7)
+
 ## [0.20.2] — 2026-09-29
 
 ### Changed — please read before upgrading

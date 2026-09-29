@@ -332,6 +332,7 @@ mod tests {
             not_null: vec![],
             tinyint1_as_bool: true,
             numeric_as_decimal: None,
+            keyset_not_null: false,
         }
     }
 

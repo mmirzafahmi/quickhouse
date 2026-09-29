@@ -141,7 +141,14 @@ incremental-mode only):
       <div class="qh-params__name">chunk_rows</div>
       <div class="qh-params__type">Optional[int] = None &mdash; experimental</div>
     </div>
-    <p class="qh-params__desc">Reads the source in keyset-ordered chunks of <code>N</code> rows, committing the cursor per chunk so a mid-read failure resumes instead of restarting. <strong>Incremental only</strong>, and the keyset column (<code>partition_column</code>, else the first <code>key</code>) must be a <strong>unique, NOT NULL integer</strong>. Single-stream (<code>parallelism</code> is ignored). <code>None</code> (default) = one read. On BigQuery each chunk is staged and <code>MERGE</code>d on its own, so a destination clustered by <code>key</code> keeps each merge to its own key range, while an unclustered one is scanned in full once per chunk.</p>
+    <p class="qh-params__desc">Reads the source in keyset-ordered chunks of <code>N</code> rows, committing the cursor per chunk so a mid-read failure resumes instead of restarting. <strong>Incremental only</strong>, and the keyset column (<code>partition_column</code>, else the first <code>key</code>) must be a <strong>unique, NOT NULL integer</strong>. Single-stream (<code>parallelism</code> is ignored). <code>None</code> (default) = one read. On BigQuery each chunk is staged and <code>MERGE</code>d on its own, so a destination clustered by <code>key</code> keeps each merge to its own key range, while an unclustered one is scanned in full once per chunk. With <code>source_query</code>, the keyset is accepted when quickhouse can prove it NOT NULL: on PostgreSQL, a plain NOT NULL table column in a query with no outer join or grouping sets; on MySQL, the query's own result metadata.</p>
+  </div>
+  <div>
+    <div>
+      <div class="qh-params__name">keyset_not_null</div>
+      <div class="qh-params__type">bool = False</div>
+    </div>
+    <p class="qh-params__desc">With <code>chunk_rows</code> and <code>source_query</code>: assert that the keyset column never holds <code>NULL</code> where quickhouse can't prove it (a view, a keyset from the nullable side of a join). A <code>NULL</code> key is silently skipped by the cursor, so a wrong assertion loses those rows.</p>
   </div>
 </div>
 ```

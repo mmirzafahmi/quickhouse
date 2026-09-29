@@ -109,6 +109,28 @@ pub(crate) fn parse_pg_cost(json: &str) -> ProbeCost {
     }
 }
 
+/// Whether an `EXPLAIN (FORMAT JSON)` plan holds an operation that can put
+/// NULL in a column whose table declares it NOT NULL: an outer join (`Left`,
+/// `Right` or `Full`; an inner, semi or anti join never null-extends a row) or
+/// grouping sets (`ROLLUP`, `CUBE` and `GROUPING SETS` put NULL in the grouped
+/// columns of their subtotal rows). Walks every node, including the subplans
+/// of CTEs and subqueries.
+pub(crate) fn pg_plan_can_null_columns(plan: &serde_json::Value) -> bool {
+    match plan {
+        serde_json::Value::Object(node) => {
+            let outer_join = matches!(
+                node.get("Join Type").and_then(|j| j.as_str()),
+                Some("Left" | "Right" | "Full")
+            );
+            outer_join
+                || node.contains_key("Grouping Sets")
+                || node.values().any(pg_plan_can_null_columns)
+        }
+        serde_json::Value::Array(nodes) => nodes.iter().any(pg_plan_can_null_columns),
+        _ => false,
+    }
+}
+
 /// Query cost from `EXPLAIN FORMAT=JSON` output.
 ///
 /// `query_block.cost_info.query_cost` when present. When it is not — the
@@ -351,6 +373,36 @@ mod tests {
         assert!(!ProbeCost::Known(11_046_344.72).should_skip(0.0));
         assert!(!ProbeCost::Unknown.should_skip(0.0));
         assert!(!ProbeCost::AccessPath { full_scan: true }.should_skip(0.0));
+    }
+
+    /// Plan shapes taken from PostgreSQL 16's own `EXPLAIN (FORMAT JSON)`.
+    #[test]
+    fn only_outer_joins_and_grouping_sets_can_null_a_not_null_column() {
+        let plan = |node: serde_json::Value| serde_json::json!([{ "Plan": node }]);
+        let scan = serde_json::json!({ "Node Type": "Seq Scan", "Relation Name": "t" });
+        let join = |kind: &str| {
+            plan(serde_json::json!({
+                "Node Type": "Hash Join", "Join Type": kind, "Plans": [scan.clone(), scan.clone()]
+            }))
+        };
+        assert!(!pg_plan_can_null_columns(&plan(scan.clone())));
+        for safe in ["Inner", "Semi", "Anti"] {
+            assert!(!pg_plan_can_null_columns(&join(safe)), "{safe}");
+        }
+        for nulling in ["Left", "Right", "Full"] {
+            assert!(pg_plan_can_null_columns(&join(nulling)), "{nulling}");
+        }
+        let rollup = plan(serde_json::json!({
+            "Node Type": "Aggregate", "Strategy": "Sorted",
+            "Grouping Sets": [{ "Group Keys": [["id"], []] }], "Plans": [scan.clone()]
+        }));
+        assert!(pg_plan_can_null_columns(&rollup));
+        // Found however deep it sits, e.g. inside a materialized CTE's subplan.
+        let nested = plan(serde_json::json!({
+            "Node Type": "CTE Scan",
+            "Plans": [{ "Node Type": "Hash Join", "Join Type": "Left", "Plans": [] }]
+        }));
+        assert!(pg_plan_can_null_columns(&nested));
     }
 
     #[test]

@@ -289,6 +289,50 @@ impl PgSource {
         }
     }
 
+    /// Whether `column` of `query`'s result is provably never NULL, for a
+    /// `chunk_rows` keyset read through a `source_query`, whose columns all
+    /// resolve as nullable (see [`Self::resolve_columns`]).
+    ///
+    /// Proven when the column is a plain reference to a table column declared
+    /// NOT NULL, and the query's plan has no outer join and no grouping sets.
+    /// The plan check is what makes the origin trustworthy: PostgreSQL reports
+    /// a column's table straight through the nullable side of a LEFT JOIN and
+    /// through GROUPING SETS, and either can hand back NULL in a column still
+    /// attributed to a NOT NULL one. A view's column reports the view, which
+    /// declares no constraint, so it is never proven. Plans only; runs nothing.
+    pub async fn result_column_not_null(
+        &self,
+        client: &Client,
+        query: &str,
+        column: &str,
+    ) -> Result<bool> {
+        let stmt = client.prepare(query).await?;
+        let origin = stmt
+            .columns()
+            .iter()
+            .find(|c| c.name() == column)
+            .and_then(|c| Some((c.table_oid()?, c.column_id()?)))
+            .filter(|&(table, attnum)| table != 0 && attnum > 0);
+        let Some((table, attnum)) = origin else {
+            return Ok(false);
+        };
+        let declared = client
+            .query_opt(
+                "SELECT attnotnull FROM pg_attribute WHERE attrelid = $1 AND attnum = $2",
+                &[&table, &attnum],
+            )
+            .await?
+            .is_some_and(|r| r.get::<_, bool>(0));
+        if !declared {
+            return Ok(false);
+        }
+        let plan = client
+            .query_one(&super::explain::pg_explain_sql(query), &[])
+            .await?
+            .try_get::<_, serde_json::Value>(0)?;
+        Ok(!super::explain::pg_plan_can_null_columns(&plan))
+    }
+
     /// `(min, max)` of the windowing key, or `None` when the relation is empty.
     ///
     /// On an indexed key this is two index scans and costs ~1 — the same probe

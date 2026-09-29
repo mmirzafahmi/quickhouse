@@ -742,6 +742,7 @@ def sync(
     read_max_rows_per_sec: Optional[int] = None,
     read_idle_timeout_secs: int = 0,
     chunk_rows: Optional[int] = None,
+    keyset_not_null: bool = False,
     retry_max_attempts: int = 1,
     probe_max_cost: float = 50_000.0,
     read_window_rows: Optional[int] = None,
@@ -903,6 +904,17 @@ def sync(
       is single-stream (``parallelism`` is ignored). ``None`` (default) = one
       read, as before. Not combinable with ``validate=`` or
       ``delete_stale_in_window``.
+
+      With ``source_query``, the keyset column's NOT NULL can't be read from a
+      table constraint. On PostgreSQL it is accepted when the column is a
+      plain reference to a NOT NULL table column and the query's plan has no
+      outer join or grouping sets; on MySQL the query's result metadata says
+      so directly. Anything else (a view, a keyset from the nullable side of a
+      join) is refused unless you pass ``keyset_not_null=True``.
+    - ``keyset_not_null=True`` asserts that ``chunk_rows``' keyset column
+      never holds NULL, for a ``source_query`` quickhouse can't prove it for.
+      A NULL key is silently skipped by the cursor, so a wrong assertion loses
+      those rows. Only with ``chunk_rows`` and ``source_query``. New in 0.20.3.
 
       On a BigQuery destination each chunk is staged in its own table and
       merged into the destination before its cursor is committed, so a

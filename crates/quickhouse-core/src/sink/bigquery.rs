@@ -2461,6 +2461,7 @@ mod tests {
             read_max_rows_per_sec: None,
             read_idle_timeout_secs: 0,
             chunk_rows: None,
+            keyset_not_null: false,
             retry_max_attempts: 1,
             probe_max_cost: crate::source::DEFAULT_PROBE_MAX_COST,
             read_window_rows: None,

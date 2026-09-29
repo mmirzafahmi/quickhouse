@@ -967,3 +967,38 @@ def test_a_cursor_ahead_of_the_source_is_reported(
         assert _cursor_warnings(quickhouse.sync(mysql_source, ch_target, **kw)) == []
     finally:
         _drop_ch(ch_client, table)
+
+
+def test_chunk_rows_takes_a_source_querys_keyset_nullability_from_mysql(
+    mysql_conn, ch_client, mysql_source, ch_target, unique_name
+):
+    """Issue #7, MySQL half: the result metadata of a source_query carries
+    NOT_NULL_FLAG per column, cleared on the nullable side of a LEFT JOIN, so
+    a NOT NULL primary key is accepted for chunk_rows and a keyset the query
+    can null is refused."""
+    table, other = unique_name, f"{unique_name}_b"
+    _seed_table(mysql_conn, table, 100)
+    with mysql_conn.cursor() as cur:
+        cur.execute(f"DROP TABLE IF EXISTS `{other}`")
+        cur.execute(f"CREATE TABLE `{other}` (id BIGINT PRIMARY KEY, k BIGINT)")
+        cur.execute(f"INSERT INTO `{other}` SELECT id, id FROM `{table}`")
+    kw = dict(
+        dest_table=table, mode="incremental", watermark="write_date", key=["id"],
+        create_if_missing=True, engine="ReplacingMergeTree", order_by=["id"], chunk_rows=30,
+    )
+    _drop_ch(ch_client, table)
+    try:
+        projected = f"SELECT id, CAST(name AS CHAR) AS name, write_date FROM `{table}`"
+        r = quickhouse.sync(mysql_source, ch_target, source_query=projected, **kw)
+        assert r.rows_written == 100
+
+        _drop_ch(ch_client, table)
+        nullable_side = (
+            f"SELECT t.id, t.write_date FROM `{other}` o LEFT JOIN `{table}` t ON t.id = o.k"
+        )
+        with pytest.raises(Exception, match="keyset_not_null=True"):
+            quickhouse.sync(mysql_source, ch_target, source_query=nullable_side, **kw)
+    finally:
+        _drop_ch(ch_client, table)
+        with mysql_conn.cursor() as cur:
+            cur.execute(f"DROP TABLE IF EXISTS `{other}`")

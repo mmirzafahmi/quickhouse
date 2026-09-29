@@ -1079,6 +1079,14 @@ pub struct TransferConfig {
     /// that is a **unique, NOT NULL integer** — ties or NULLs would silently
     /// skip rows. Chunked mode runs single-stream (range partitioning is off).
     pub chunk_rows: Option<usize>,
+    /// `chunk_rows` through a `source_query`: assert that the keyset column is
+    /// never NULL where quickhouse can't prove it. A PostgreSQL `source_query`
+    /// is proven when the keyset is a plain NOT NULL table column and the plan
+    /// has no outer join or grouping sets; a MySQL one carries the flag in its
+    /// result metadata. Anything else (a view, a join) needs this. A NULL key
+    /// is silently skipped by the cursor, so a wrong assertion loses those
+    /// rows. Only with `chunk_rows` and `source_query`.
+    pub keyset_not_null: bool,
     /// Max total attempts for the whole transfer when it fails with a
     /// *transient source* error (PostgreSQL hot-standby recovery conflict /
     /// statement cancel; MySQL server-gone-away / lock-wait / deadlock).
@@ -1362,6 +1370,7 @@ impl TransferConfig {
             // Chunked resumable reads are incremental-only (validate rejects
             // this combo; clearing keeps the effective config honest).
             self.chunk_rows = None;
+            self.keyset_not_null = false;
         }
     }
 
@@ -1534,6 +1543,12 @@ impl TransferConfig {
         if self.chunk_rows.is_some() && self.mode != SyncMode::Incremental {
             return Err(EtlError::config(
                 "chunk_rows (keyset resumable reads) only applies to incremental mode",
+            ));
+        }
+        if self.keyset_not_null && (self.chunk_rows.is_none() || self.source_query.is_none()) {
+            return Err(EtlError::config(
+                "keyset_not_null only applies to chunk_rows with a source_query (with \
+                 source_table, quickhouse reads the keyset column's NOT NULL constraint itself)",
             ));
         }
         if self.chunk_rows.is_some() && self.keyset_column().is_none() {
@@ -1845,6 +1860,7 @@ pub(crate) fn default_test_config() -> TransferConfig {
         read_max_rows_per_sec: None,
         read_idle_timeout_secs: 0,
         chunk_rows: None,
+        keyset_not_null: false,
         retry_max_attempts: 1,
         probe_max_cost: crate::source::DEFAULT_PROBE_MAX_COST,
         read_window_rows: None,
@@ -1961,6 +1977,7 @@ mod tests {
             read_max_rows_per_sec: None,
             read_idle_timeout_secs: 0,
             chunk_rows: None,
+            keyset_not_null: false,
             retry_max_attempts: 1,
             probe_max_cost: crate::source::DEFAULT_PROBE_MAX_COST,
             read_window_rows: None,
@@ -2283,6 +2300,18 @@ mod tests {
         let mut c = cfg(SyncMode::Incremental, Some("write_date"));
         c.chunk_rows = Some(1000);
         assert!(c.validate().is_ok());
+        // keyset_not_null asserts something only a source_query needs asserted.
+        c.delete_stale_in_window = false;
+        c.keyset_not_null = true;
+        let msg = c.validate().unwrap_err().to_string();
+        assert!(msg.contains("keyset_not_null"), "{msg}");
+        c.source_query = Some("SELECT * FROM t".into());
+        assert!(c.validate().is_ok());
+        c.chunk_rows = None;
+        assert!(c.validate().is_err());
+        c.chunk_rows = Some(1000);
+        c.keyset_not_null = false;
+        c.source_query = None;
         // A window-scoped delete can't be split across chunks.
         c.delete_stale_in_window = true;
         c.merge_prune_partition_by = Some("order_date".into());

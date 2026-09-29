@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
+import pytest
+
 import quickhouse
 
 
@@ -816,3 +818,97 @@ def test_quiet_incremental_runs_raise_no_cursor_warnings(
             )
         finally:
             _drop_ch(ch_client, dest)
+
+
+def _chunked_query_sync(pg_source, ch_target, dest, query, **kw):
+    return quickhouse.sync(
+        pg_source,
+        ch_target,
+        dest_table=dest,
+        source_query=query,
+        mode="incremental",
+        watermark="write_date",
+        key=["id"],
+        create_if_missing=True,
+        engine="ReplacingMergeTree",
+        order_by=["id"],
+        chunk_rows=40,
+        **kw,
+    )
+
+
+def test_chunk_rows_accepts_a_source_query_whose_keyset_is_a_not_null_column(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """Issue #7: every column of a PostgreSQL source_query resolves as
+    nullable, which refused chunk_rows outright. A keyset that is a plain
+    reference to a NOT NULL column, in a query with no outer join, is now
+    proven from the query itself, and chunks like source_table does."""
+    table = unique_name
+    with pg_conn.cursor() as cur:
+        cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+        cur.execute(
+            f'CREATE TABLE "{table}" (id bigint PRIMARY KEY, qty numeric(12, 3), '
+            "write_date timestamptz NOT NULL)"
+        )
+        cur.execute(
+            f"INSERT INTO \"{table}\" SELECT g, g / 7.0, '2024-01-01 00:00:00+00' "
+            "FROM generate_series(1, 250) g"
+        )
+    query = (
+        f'SELECT "id", CAST(ROUND("qty", 9) AS TEXT) AS "qty", '
+        f'("write_date" AT TIME ZONE \'UTC\') AS "write_date" FROM "{table}"'
+    )
+    _drop_ch(ch_client, table)
+    try:
+        r = _chunked_query_sync(pg_source, ch_target, table, query)
+        assert r.rows_written == 250
+        assert int(ch_client.command(f"SELECT count() FROM `{table}` FINAL")) == 250
+        # Committed a marker per chunk on the way, and cleared it at the end.
+        assert ch_client.command(
+            f"SELECT chunk_cursor FROM _quickhouse_state FINAL WHERE dest_table = '{table}' "
+            "ORDER BY run_ts DESC LIMIT 1"
+        ) == ""
+    finally:
+        _drop_ch(ch_client, table)
+        with pg_conn.cursor() as cur:
+            cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+
+
+def test_chunk_rows_refuses_a_keyset_a_query_can_null_unless_asserted(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """PostgreSQL reports a column's table straight through the nullable side
+    of a LEFT JOIN and through GROUPING SETS, so the NOT NULL constraint alone
+    proves nothing there: both stay refused, and the error names the explicit
+    assertion, which is then accepted."""
+    table, other = unique_name, f"{unique_name}_b"
+    with pg_conn.cursor() as cur:
+        cur.execute(f'DROP TABLE IF EXISTS "{table}", "{other}"')
+        cur.execute(
+            f'CREATE TABLE "{table}" (id bigint PRIMARY KEY, write_date timestamp NOT NULL)'
+        )
+        cur.execute(f'CREATE TABLE "{other}" (id bigint PRIMARY KEY, k bigint)')
+        cur.execute(
+            f"INSERT INTO \"{table}\" SELECT g, '2024-01-01' FROM generate_series(1, 50) g"
+        )
+        cur.execute(f'INSERT INTO "{other}" SELECT g, g FROM generate_series(1, 50) g')
+    nullable_side = (
+        f'SELECT t.id, t.write_date FROM "{other}" o LEFT JOIN "{table}" t ON t.id = o.k'
+    )
+    grouping_sets = (
+        f'SELECT id, max(write_date) AS write_date FROM "{table}" '
+        "GROUP BY GROUPING SETS ((id), ())"
+    )
+    _drop_ch(ch_client, table)
+    try:
+        for query in (nullable_side, grouping_sets):
+            with pytest.raises(Exception, match="keyset_not_null=True"):
+                _chunked_query_sync(pg_source, ch_target, table, query)
+        # Every o.k matches, so asserting it is true here.
+        r = _chunked_query_sync(pg_source, ch_target, table, nullable_side, keyset_not_null=True)
+        assert r.rows_written == 50
+    finally:
+        _drop_ch(ch_client, table)
+        with pg_conn.cursor() as cur:
+            cur.execute(f'DROP TABLE IF EXISTS "{table}", "{other}"')
