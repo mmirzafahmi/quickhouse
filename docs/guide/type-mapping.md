@@ -9,14 +9,33 @@ A few deliberate choices are worth knowing.
 
 ## Arbitrary-precision decimals
 
-`numeric` / `DECIMAL` / `NUMERIC` default to **`Float64`**, since precision can't
-be recovered from the type alone. Pin an exact type with `type_overrides` and the
-value is decoded exactly (no `Float64` round-trip), not just declared with the
-right destination type:
+A decimal column that **declares** its precision — PostgreSQL `numeric(P, S)`,
+MySQL `DECIMAL(P, S)` — lands as the exact **`Decimal(P, S)`** (BigQuery
+`NUMERIC`) and is decoded exactly, with no `Float64` round-trip. That covers
+`P <= 38`; wider types stay `Float64`, as does an unconstrained PostgreSQL
+`numeric`, whose type carries no precision to use. BigQuery sources are
+unchanged: their `NUMERIC` stays `Float64` unless you ask for more.
+
+Two limits keep the default from breaking a table that already exists:
+
+- **An existing column keeps its type.** The exact type applies to a table or
+  column created fresh, and to a column that is already a decimal. A column
+  created as `Float64` by an earlier version keeps receiving floats. To move it
+  to a decimal, change the column (or recreate the table) yourself.
+- **BigQuery `NUMERIC` holds at most 9 fractional and 29 integer digits.** A
+  declared type past either stays `FLOAT64`; pin a type with `type_overrides` if
+  you need it exact.
+
+Pin an exact type yourself with `type_overrides`, for one column, or with
+`numeric_as_decimal`, for every decimal column including unconstrained ones:
 
 ```python
 qh.sync(..., type_overrides={"qty": "Decimal(18, 3)"})
+qh.sync(..., numeric_as_decimal="Decimal(38, 9)")
 ```
+
+`numeric_as_decimal="Float64"` restores the old mapping: every decimal column
+lands as `Float64`.
 
 - A value that doesn't fit the declared precision, or is `NaN`/`Infinity`
   (PostgreSQL `numeric` only), coerces to `NULL` with a warning.

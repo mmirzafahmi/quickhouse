@@ -110,6 +110,28 @@ impl ClickHouseSink {
         Ok(self.query_scalar(&sql).await?.as_deref() == Some("1"))
     }
 
+    /// `table`'s columns and their types (`Nullable(Decimal(15, 2))`, ...),
+    /// from `system.columns`. Empty when the table doesn't exist.
+    pub async fn column_types(
+        &self,
+        table: &str,
+    ) -> Result<std::collections::HashMap<String, String>> {
+        let sql = format!(
+            "SELECT name, type FROM system.columns WHERE database = '{}' AND table = '{}'",
+            escape_sql_string(&self.cfg.database),
+            escape_sql_string(table),
+        );
+        Ok(self
+            .query_column(&sql)
+            .await?
+            .into_iter()
+            .filter_map(|line| {
+                let (name, ty) = line.split_once('\t')?;
+                Some((name.to_string(), ty.to_string()))
+            })
+            .collect())
+    }
+
     /// Current row count of `table`, or `None` if it doesn't exist. Diagnostic.
     pub async fn current_row_count(&self, table: &str) -> Result<Option<u64>> {
         if !self.table_exists(table).await? {
@@ -759,6 +781,12 @@ impl ClickHouseSink {
 impl Sink for ClickHouseSink {
     async fn table_exists(&self, table: &str) -> Result<bool> {
         ClickHouseSink::table_exists(self, table).await
+    }
+    async fn column_types(
+        &self,
+        table: &str,
+    ) -> Result<Option<std::collections::HashMap<String, String>>> {
+        ClickHouseSink::column_types(self, table).await.map(Some)
     }
     async fn create_table(
         &self,

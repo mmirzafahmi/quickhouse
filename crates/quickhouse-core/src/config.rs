@@ -1251,8 +1251,10 @@ pub struct TransferConfig {
     /// Default destination type for **every** arbitrary-precision decimal
     /// column (PostgreSQL `numeric`, MySQL `DECIMAL`/`NEWDECIMAL`, BigQuery
     /// `NUMERIC`) that has no `type_overrides` entry of its own — e.g.
-    /// `"Decimal(38, 9)"`. `None` (default) keeps the historical `Float64`
-    /// mapping.
+    /// `"Decimal(38, 9)"`, or `"Float64"` for the historical mapping. `None`
+    /// (default) maps a column that declares its precision to that exact
+    /// `Decimal(P, S)`, within the limits `transform::declared_decimal_default`
+    /// documents, and anything else to `Float64`.
     ///
     /// **Why this exists (bug report B7b).** Those source types are exact
     /// decimals with no `f64` equivalent, so the default mapping round-trips
@@ -1266,10 +1268,12 @@ pub struct TransferConfig {
     /// be remembered for every affected column in every table, and forgetting it
     /// is silent. Setting this once covers them all.
     ///
-    /// Not the default, because it changes the *destination column type*:
-    /// against a table that already exists with a `Float64`/`FLOAT64` column,
-    /// switching the decode type to `Decimal128` would mean writing a decimal
-    /// into a float column. Choose the precision and scale deliberately —
+    /// A blanket decimal isn't the default because it changes the
+    /// *destination column type* of every decimal column at once: against a
+    /// table that already exists with a `Float64`/`FLOAT64` column, switching
+    /// the decode type to `Decimal128` would mean writing a decimal into a
+    /// float column. (The declared-precision default checks the destination
+    /// first; this setting doesn't.) Choose the precision and scale deliberately —
     /// a value that doesn't fit is coerced to NULL (counted and warned about,
     /// see `warn_coerced_decimals`), so pick a scale that covers the column's
     /// real range. P > 38 needs `Decimal256`, which isn't supported yet.

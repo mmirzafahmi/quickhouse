@@ -156,6 +156,35 @@ impl BigQuerySink {
         }
     }
 
+    /// `table`'s top-level columns and their types (`NUMERIC`, `FLOAT`, ...),
+    /// from free table metadata; `None` if the table doesn't exist.
+    pub async fn column_types(&self, table: &str) -> Result<Option<HashMap<String, String>>> {
+        let t = match self
+            .client
+            .table()
+            .get(&self.project_id, &self.dataset_id, table)
+            .await
+        {
+            Ok(t) => t,
+            Err(e) if is_not_found(&e) => return Ok(None),
+            Err(e) => return Err(EtlError::other(format!("bigquery table get error: {e}"))),
+        };
+        let fields = t.schema.map(|s| s.fields).unwrap_or_default();
+        Ok(Some(
+            fields
+                .into_iter()
+                .map(|f| {
+                    // The API's own spelling ("NUMERIC", "FLOAT"), not Rust's.
+                    let ty = match serde_json::to_value(&f.data_type) {
+                        Ok(Value::String(s)) => s,
+                        _ => format!("{:?}", f.data_type),
+                    };
+                    (f.name, ty)
+                })
+                .collect(),
+        ))
+    }
+
     /// Committed row count from free table metadata (`numRows`); `None` if the
     /// table doesn't exist. May lag the streaming buffer — diagnostic only.
     pub async fn current_row_count(&self, table: &str) -> Result<Option<u64>> {
@@ -1201,6 +1230,9 @@ impl Sink for BigQuerySink {
     async fn table_exists(&self, table: &str) -> Result<bool> {
         BigQuerySink::table_exists(self, table).await
     }
+    async fn column_types(&self, table: &str) -> Result<Option<HashMap<String, String>>> {
+        BigQuerySink::column_types(self, table).await
+    }
     async fn create_table(
         &self,
         table: &str,
@@ -2132,6 +2164,7 @@ mod tests {
             arrow,
             clickhouse_inner: "irrelevant".into(),
             arbitrary_precision_decimal: false,
+            declared_decimal: None,
         }
     }
 

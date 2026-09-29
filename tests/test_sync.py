@@ -668,6 +668,93 @@ def test_rows_of_every_size_survive_copy_chunking(
             _drop_ch(ch_client, dest)
 
 
+def _ch_types(ch_client, table: str) -> dict:
+    return dict(
+        ch_client.query(
+            "SELECT name, type FROM system.columns "
+            f"WHERE database = currentDatabase() AND table = '{table}'"
+        ).result_rows
+    )
+
+
+def _seed_numeric_table(pg_conn, table: str):
+    with pg_conn.cursor() as cur:
+        cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+        cur.execute(
+            f'CREATE TABLE "{table}" (id bigint PRIMARY KEY, price numeric(15, 2), ratio numeric)'
+        )
+        cur.execute(
+            f'INSERT INTO "{table}" VALUES (1, 32.90, 0.1), (2, 1234567890123.45, 2.5), '
+            "(3, NULL, NULL)"
+        )
+
+
+def test_declared_numeric_lands_as_exact_decimal(
+    pg_conn, ch_client, pg_source, ch_target_zstd, unique_name
+):
+    """A numeric(P, S) column lands as the exact Decimal(P, S): ClickHouse holds
+    32.9, not the 32.89999999999999 a Float64 round-trip produces. An
+    unconstrained numeric carries no precision, so it stays Float64."""
+    table = unique_name
+    _seed_numeric_table(pg_conn, table)
+    _drop_ch(ch_client, table)
+    try:
+        quickhouse.sync(
+            pg_source, ch_target_zstd, dest_table=table, source_table=table,
+            mode="full", key=["id"], create_if_missing=True,
+        )
+        types = _ch_types(ch_client, table)
+        assert types["price"] == "Nullable(Decimal(15, 2))"
+        assert types["ratio"] == "Nullable(Float64)"
+        rows = ch_client.query(f"SELECT id, toString(price) FROM `{table}` ORDER BY id").result_rows
+        assert rows == [(1, "32.9"), (2, "1234567890123.45"), (3, None)]
+    finally:
+        _drop_ch(ch_client, table)
+
+
+def test_existing_float_column_keeps_its_type(
+    pg_conn, ch_client, pg_source, ch_target_zstd, unique_name
+):
+    """A table an earlier version created holds numeric(P, S) as Float64. Later
+    runs keep writing floats into it instead of changing its type underneath
+    whatever reads it; on BigQuery a decimal payload aimed at a FLOAT64 column
+    would be rejected outright."""
+    table = unique_name
+    _seed_numeric_table(pg_conn, table)
+    _drop_ch(ch_client, table)
+    ch_client.command(
+        f"CREATE TABLE `{table}` (id Int64, price Nullable(Float64), ratio Nullable(Float64)) "
+        "ENGINE = ReplacingMergeTree ORDER BY id"
+    )
+    try:
+        for mode in ("full", "incremental"):
+            quickhouse.sync(
+                pg_source, ch_target_zstd, dest_table=table, source_table=table,
+                mode=mode, key=["id"], watermark="id" if mode == "incremental" else None,
+            )
+            assert _ch_types(ch_client, table)["price"] == "Nullable(Float64)", mode
+        total = ch_client.command(f"SELECT round(sum(price), 2) FROM `{table}` FINAL")
+        assert float(total) == 1234567890156.35
+    finally:
+        _drop_ch(ch_client, table)
+
+
+def test_numeric_as_decimal_float64_restores_the_old_mapping(
+    pg_conn, ch_client, pg_source, ch_target_zstd, unique_name
+):
+    table = unique_name
+    _seed_numeric_table(pg_conn, table)
+    _drop_ch(ch_client, table)
+    try:
+        quickhouse.sync(
+            pg_source, ch_target_zstd, dest_table=table, source_table=table,
+            mode="full", key=["id"], create_if_missing=True, numeric_as_decimal="Float64",
+        )
+        assert _ch_types(ch_client, table)["price"] == "Nullable(Float64)"
+    finally:
+        _drop_ch(ch_client, table)
+
+
 def _pg_scalar(pg_conn, sql: str):
     with pg_conn.cursor() as cur:
         cur.execute(sql)

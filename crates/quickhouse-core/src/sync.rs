@@ -1136,8 +1136,21 @@ async fn run_transfer_impl(
     // NULL (see `transform::plan_with`), so it is the only one whose NOT NULL
     // date/decimal columns stay NOT NULL at the destination.
     let source_may_coerce = !matches!(source.as_ref(), Source::ClickHouse(_));
-    let mut plan: SelectPlan =
-        transform::plan_with(&source_cols, &cfg, sink.dest_kind(), source_may_coerce)?;
+    // A column that declares its precision defaults to that exact decimal, but
+    // never against a destination column that already holds something else —
+    // so the destination is only consulted when such a column exists.
+    let existing = if source_cols.iter().any(|c| c.declared_decimal.is_some()) {
+        existing_columns(sink.as_ref(), &cfg.dest_table).await?
+    } else {
+        transform::ExistingColumns::NoTable
+    };
+    let mut plan: SelectPlan = transform::plan_for_destination(
+        &source_cols,
+        &cfg,
+        sink.dest_kind(),
+        source_may_coerce,
+        &existing,
+    )?;
     if matches!(source.as_ref(), Source::Postgres(_)) {
         crate::source::postgres::pin_transformed_wire_types(&mut plan);
     }
@@ -5288,6 +5301,18 @@ fn feed_off_reactor(
     })
 }
 
+/// What the destination table already holds, for
+/// `transform::plan_for_destination`.
+async fn existing_columns(sink: &dyn Sink, table: &str) -> Result<transform::ExistingColumns> {
+    if !sink.table_exists(table).await? {
+        return Ok(transform::ExistingColumns::NoTable);
+    }
+    Ok(match sink.column_types(table).await? {
+        Some(cols) => transform::ExistingColumns::Known(cols),
+        None => transform::ExistingColumns::Unknown,
+    })
+}
+
 /// A panic (or cancellation) inside the off-reactor decode task. Not reachable
 /// through normal decode failures — those come back as the inner `Result`.
 fn decode_task_failed(e: tokio::task::JoinError) -> EtlError {
@@ -5694,6 +5719,7 @@ mod tests {
             arrow: DataType::Int64,
             clickhouse_inner: "Int64".into(),
             arbitrary_precision_decimal: false,
+            declared_decimal: None,
         }
     }
 
@@ -6564,6 +6590,7 @@ mod tests {
             arrow: DataType::Int64,
             clickhouse_inner: "Int64".into(),
             arbitrary_precision_decimal: false,
+            declared_decimal: None,
         };
         assert_eq!(
             window_key(&cfg, &[int_col("id", false)]),
@@ -6688,6 +6715,7 @@ mod tests {
             arrow,
             clickhouse_inner: "Int64".into(),
             arbitrary_precision_decimal: false,
+            declared_decimal: None,
         }
     }
 
@@ -7155,6 +7183,7 @@ mod tests {
                 arrow: arrow.clone(),
                 clickhouse_inner: "x".into(),
                 arbitrary_precision_decimal: false,
+                declared_decimal: None,
             },
             col_typed(
                 "wm",

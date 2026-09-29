@@ -207,6 +207,7 @@ impl ClickHouseSource {
                 arrow: mapped.arrow,
                 clickhouse_inner: mapped.clickhouse_inner,
                 arbitrary_precision_decimal: mapped.arbitrary_precision_decimal,
+                declared_decimal: None,
             });
         }
         if cols.is_empty() {
@@ -585,6 +586,7 @@ mod tests {
             arrow,
             clickhouse_inner: "String".to_string(),
             arbitrary_precision_decimal: false,
+            declared_decimal: None,
         }
     }
 

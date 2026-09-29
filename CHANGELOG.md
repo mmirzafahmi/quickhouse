@@ -9,6 +9,26 @@ any breaking change is called out explicitly.
 
 ## [Unreleased]
 
+### Changed — please read before upgrading
+- **Declared-precision decimals land as exact `Decimal(P, S)`.** A PostgreSQL
+  `numeric(P, S)` or MySQL `DECIMAL(P, S)` column (`P <= 38`) used to land as
+  `Float64`, so a stored `32.9` could arrive as `32.89999999999999`. It now
+  lands as `Decimal(P, S)` (BigQuery `NUMERIC`) and is decoded exactly.
+  - **Existing tables are unaffected.** This applies to a table or column
+    created fresh, and to a column that is already a decimal. A column an
+    earlier version created as `Float64` / `FLOAT64` keeps its type and keeps
+    receiving floats. quickhouse now reads the destination's column types to
+    tell; if it can't read them, it keeps the old mapping.
+  - **BigQuery `NUMERIC` limits apply.** A declared type with more than 9
+    fractional or 29 integer digits stays `FLOAT64`.
+  - **Unchanged:** an unconstrained PostgreSQL `numeric` (it declares no
+    precision), MySQL `DECIMAL` wider than 38 digits, and BigQuery `NUMERIC`
+    sources all stay `Float64`.
+  - **The new columns are created `Nullable`,** as `numeric_as_decimal` columns
+    always were: a value that overflows its declared type coerces to NULL with
+    a `coerced_decimal` warning.
+  - **To keep the old mapping everywhere,** pass `numeric_as_decimal="Float64"`.
+
 ### Performance
 - **PostgreSQL reads decode many rows per hand-off instead of one.** PostgreSQL
   sends a binary `COPY` as one message per row, and since 0.14.0 each message

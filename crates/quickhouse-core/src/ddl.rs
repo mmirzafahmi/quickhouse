@@ -234,6 +234,7 @@ mod tests {
             arrow: DataType::Int32,
             clickhouse_inner: ch.into(),
             arbitrary_precision_decimal: false,
+            declared_decimal: None,
         }
     }
 

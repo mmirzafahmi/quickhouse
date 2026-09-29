@@ -297,6 +297,7 @@ fn columns_from_schema(schema: &TableSchema) -> Result<Vec<ColumnType>> {
             arrow,
             clickhouse_inner: ch_inner,
             arbitrary_precision_decimal: matches!(type_id, id::NUMERIC | id::BIGNUMERIC),
+            declared_decimal: None,
         });
     }
     Ok(cols)

@@ -178,6 +178,11 @@ impl MySqlSource {
                 type_name: format!("{col_type:?}"),
             })?;
             let nullable = !c.flags().contains(ColumnFlags::NOT_NULL_FLAG);
+            let declared_decimal = if col_type == MyType::MYSQL_TYPE_NEWDECIMAL {
+                declared_decimal(c.column_length(), c.decimals(), is_unsigned)
+            } else {
+                None
+            };
             cols.push(ColumnType {
                 name: c.name_str().to_string(),
                 type_id: col_type as u8 as u32,
@@ -188,6 +193,7 @@ impl MySqlSource {
                     col_type,
                     MyType::MYSQL_TYPE_DECIMAL | MyType::MYSQL_TYPE_NEWDECIMAL
                 ),
+                declared_decimal,
             });
         }
         Ok(cols)
@@ -525,6 +531,24 @@ fn combine_filters(a: &Option<String>, b: Option<&str>) -> Option<String> {
     }
 }
 
+/// Precision and scale of a `DECIMAL(P, S)` result column, from its metadata.
+///
+/// MySQL reports a decimal's *display* length rather than its precision:
+/// `P`, plus one for the decimal point when `S > 0`, plus one for the sign
+/// unless the column is `UNSIGNED` (`my_decimal_precision_to_length` in the
+/// server). `decimals` is `S`. `None` when the result isn't something
+/// `Decimal128` can hold (`1 <= P <= 38`, `S <= P`).
+fn declared_decimal(column_length: u32, decimals: u8, unsigned: bool) -> Option<(u8, i8)> {
+    let point = u32::from(decimals > 0);
+    let sign = u32::from(!unsigned);
+    let precision = column_length.checked_sub(point + sign)?;
+    let scale = u32::from(decimals);
+    if !(1..=38).contains(&precision) || scale > precision {
+        return None;
+    }
+    Some((precision as u8, scale as i8))
+}
+
 /// Backtick-quote a MySQL identifier.
 /// Whether a MySQL column type can be split into numeric ranges for parallel
 /// partitioning. The single definition of that gate — used both by
@@ -560,6 +584,23 @@ pub(crate) fn quote_my_table(table: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn declared_decimal_recovers_precision_from_display_length() {
+        // DECIMAL(15,2): 15 digits + point + sign.
+        assert_eq!(declared_decimal(17, 2, false), Some((15, 2)));
+        // DECIMAL(15,2) UNSIGNED: no sign position.
+        assert_eq!(declared_decimal(16, 2, true), Some((15, 2)));
+        // DECIMAL(10,0), MySQL's default DECIMAL: no point.
+        assert_eq!(declared_decimal(11, 0, false), Some((10, 0)));
+        // DECIMAL(38,10) is the widest Decimal128 holds...
+        assert_eq!(declared_decimal(40, 10, false), Some((38, 10)));
+        // ...and DECIMAL(65,30), MySQL's widest, is past it.
+        assert_eq!(declared_decimal(67, 30, false), None);
+        // Nonsense metadata doesn't underflow or invent a type.
+        assert_eq!(declared_decimal(0, 0, false), None);
+        assert_eq!(declared_decimal(2, 5, false), None);
+    }
 
     #[test]
     fn mysql_value_decodes_the_text_protocols_bytes_encoding() {
