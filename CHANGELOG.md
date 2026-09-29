@@ -9,6 +9,14 @@ any breaking change is called out explicitly.
 
 ## [Unreleased]
 
+### Added
+- **`benchmarks/bench_pg_table.py`** times a real PostgreSQL table into
+  ClickHouse. Unlike `bench_transfer.py` it seeds nothing, so it can point at a
+  read replica: it reads the last `--rows` rows by `id`, fully refreshes a
+  scratch `bench_<table>` `--runs` times, prints wall clock and the read, stage
+  and promote split per run plus the median, and drops the table at the end.
+  Run it once per build to compare `main` against a branch.
+
 ## [0.20.4] — 2026-09-29
 
 ### Fixed
