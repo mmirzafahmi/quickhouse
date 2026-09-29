@@ -256,6 +256,7 @@ mod tests {
             arrow,
             clickhouse_inner: "String".to_string(),
             arbitrary_precision_decimal: false,
+            declared_decimal: None,
         }
     }
 

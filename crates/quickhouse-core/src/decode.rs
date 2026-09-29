@@ -675,6 +675,7 @@ mod tests {
             arrow: dt,
             clickhouse_inner: "x".into(),
             arbitrary_precision_decimal: false,
+            declared_decimal: None,
         }
     }
 

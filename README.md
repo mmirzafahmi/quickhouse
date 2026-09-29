@@ -63,8 +63,8 @@ is an ordinary `sync()`. Some knobs are engine-specific: `column_transforms` /
   no per-row Python, no intermediate DataFrame. Tables are split into ranges
   and read in parallel, and decoding overlaps uploading. On a laptop-class box
   a 1M-row, 20-column full refresh runs at **hundreds of thousands of rows per
-  second** while peak memory stays flat (under ~180 MB) no matter how much you
-  parallelize. Reproduce it with `python benchmarks/bench_transfer.py`.
+  second**, and memory is bounded by `max_memory_bytes` rather than by table
+  size. Reproduce it with `python benchmarks/bench_transfer.py`.
 
 - **It's one function call.** `sync()` replaces the cursor loop, manual
   batching, retry logic, and `CREATE TABLE` you'd otherwise write by hand.

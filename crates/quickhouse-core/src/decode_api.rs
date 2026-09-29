@@ -100,6 +100,7 @@ pub fn resolve_api_columns(cols: &[ApiColumn]) -> Result<Vec<ColumnType>> {
             arrow,
             clickhouse_inner: ch_inner,
             arbitrary_precision_decimal: apd,
+            declared_decimal: None,
         });
     }
     Ok(out)

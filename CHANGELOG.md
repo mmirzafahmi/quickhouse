@@ -9,6 +9,59 @@ any breaking change is called out explicitly.
 
 ## [Unreleased]
 
+### Changed — please read before upgrading
+- **Declared-precision decimals land as exact `Decimal(P, S)`.** A PostgreSQL
+  `numeric(P, S)` or MySQL `DECIMAL(P, S)` column (`P <= 38`) used to land as
+  `Float64`, so a stored `32.9` could arrive as `32.89999999999999`. It now
+  lands as `Decimal(P, S)` (BigQuery `NUMERIC`) and is decoded exactly.
+  - **Existing tables are unaffected.** This applies to a table or column
+    created fresh, and to a column that is already a decimal. A column an
+    earlier version created as `Float64` / `FLOAT64` keeps its type and keeps
+    receiving floats. quickhouse now reads the destination's column types to
+    tell; if it can't read them, it keeps the old mapping.
+  - **BigQuery `NUMERIC` limits apply.** A declared type with more than 9
+    fractional or 29 integer digits stays `FLOAT64`.
+  - **Unchanged:** an unconstrained PostgreSQL `numeric` (it declares no
+    precision), MySQL `DECIMAL` wider than 38 digits, and BigQuery `NUMERIC`
+    sources all stay `Float64`.
+  - **The new columns are created `Nullable`,** as `numeric_as_decimal` columns
+    always were: a value that overflows its declared type coerces to NULL with
+    a `coerced_decimal` warning.
+  - **To keep the old mapping everywhere,** pass `numeric_as_decimal="Float64"`.
+
+### Added
+- **`compression="lz4"` for ClickHouse inserts.** It sends the body in the LZ4
+  frame format (`Content-Encoding: lz4`), at ~610 MB/s per core against zstd's
+  ~280, with a 2.35× ratio against 4.2×. It suits a fast network, where
+  compression CPU rather than bandwidth is the limit. A transfer that uses
+  `compression="gzip"` now logs a warning: gzip compresses at ~22 MB/s per core,
+  which caps every insert near that rate.
+
+### Performance
+- **PostgreSQL reads decode many rows per hand-off instead of one.** PostgreSQL
+  sends a binary `COPY` as one message per row, and since 0.14.0 each message
+  went to the blocking pool as its own decode task: a thread wake-up in each
+  direction per row, several times the cost of parsing the row. On a large
+  table that hand-off, not the source or the destination, was most of the
+  transfer. Messages that have already arrived are now decoded together, in
+  chunks of up to 256 KiB; no row is held back to fill a chunk, so a slow source
+  still streams. Measured PostgreSQL → ClickHouse, one stream: a 44-column Odoo
+  `sale_order_line` read from a PostgreSQL 16 replica went from 4.86s to 1.98s
+  for 300k rows and from 15.3s to 6.2s for 1M rows; TPC-H `lineitem` (6M rows)
+  from 72–78s to 23s. MySQL, ClickHouse and BigQuery sources are unchanged.
+- **MySQL rows are decoded without copying every value.** The decoder cloned
+  each cell out of the row before converting it, so every string and `DECIMAL`
+  cell was allocated and copied twice. Measured MySQL → ClickHouse, TPC-H
+  `lineitem` (6M rows): 23.0s to 22.0s.
+
+### Documentation
+- **The memory claim is corrected.** The README and performance guide said peak
+  memory stays flat, under ~180 MB, however far you parallelize. Since insert
+  batching (0.14.0) it doesn't: each stream buffers up to `insert_bytes` before
+  an insert, and has working memory outside `max_memory_bytes`. The performance
+  guide now says what memory scales with and gives measured numbers: ~300–390 MB
+  at `parallelism=1` rising to ~850–930 MB at 16, on TPC-H `lineitem`.
+
 ## [0.20.0] — 2026-09-26
 
 ### Fixed — silent data loss and corruption

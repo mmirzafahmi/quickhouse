@@ -402,8 +402,12 @@ impl MySqlBatcher {
             )));
         }
         let mut row_bytes = 0usize;
-        for (i, builder) in self.builders.iter_mut().enumerate() {
-            let value = row.as_ref(i).cloned().unwrap_or(Value::NULL);
+        // Take the row's values over rather than cloning them: every string and
+        // DECIMAL cell is a heap `Vec<u8>`, and reading them through
+        // `as_ref(i).cloned()` allocated and copied each one a second time, per
+        // row. Nothing has been `take`n from the row, so `unwrap` can't panic.
+        let values = row.unwrap();
+        for (i, (builder, value)) in self.builders.iter_mut().zip(values).enumerate() {
             row_bytes += value_size(&value);
             let coercion = builder
                 .append_value(value)

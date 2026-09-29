@@ -14,7 +14,7 @@
 //! arbitrary-precision decimal column at once, for when the point is to stop
 //! losing precision generally rather than on one known column.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_array::types::{validate_decimal_precision_and_scale, Decimal128Type};
@@ -140,6 +140,85 @@ pub struct SelectPlan {
     pub dest_columns: Vec<ColumnType>,
 }
 
+/// What the destination already holds, for the choices a plan must not make
+/// against an existing table — today, whether a declared-precision decimal
+/// defaults to an exact `Decimal(P, S)` (see [`declared_decimal_default`]).
+#[derive(Debug, Clone)]
+pub enum ExistingColumns {
+    /// The destination table doesn't exist yet: every column is created fresh.
+    NoTable,
+    /// The destination's current columns: name -> type, as the destination
+    /// spells it (`Nullable(Decimal(15, 2))`, `FLOAT`, `NUMERIC`, ...).
+    Known(HashMap<String, String>),
+    /// The table exists, but its column types couldn't be read.
+    Unknown,
+}
+
+impl ExistingColumns {
+    /// The destination type of `name`, if the table has that column. Exact
+    /// first, then case-insensitively: BigQuery column names are.
+    fn type_of(&self, name: &str) -> Option<&str> {
+        let ExistingColumns::Known(cols) = self else {
+            return None;
+        };
+        cols.get(name)
+            .or_else(|| {
+                cols.iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                    .map(|(_, v)| v)
+            })
+            .map(String::as_str)
+    }
+}
+
+/// A destination type that already holds exact decimals: ClickHouse
+/// `Decimal(P, S)` (bare or `Nullable`), BigQuery `NUMERIC` / `BIGNUMERIC`.
+fn is_decimal_type(dest_type: &str) -> bool {
+    let upper = dest_type.to_ascii_uppercase();
+    upper.contains("DECIMAL") || upper.starts_with("NUMERIC") || upper.starts_with("BIGNUMERIC")
+}
+
+/// The exact `Decimal(P, S)` a declared-precision decimal column defaults to
+/// when neither `type_overrides` nor `numeric_as_decimal` names a type for it.
+///
+/// A source column that declares `numeric(P, S)` / `DECIMAL(P, S)` says exactly
+/// what it holds, so the historical `Float64` default — right only for an
+/// unconstrained PostgreSQL `numeric`, whose type carries no precision — threw
+/// that away for nothing and let values like 32.9 arrive as 32.89999999999999.
+/// Two limits keep the default from breaking an existing table or creating one
+/// the destination can't hold:
+/// - **An existing destination column keeps its type.** The default only fires
+///   for a column created fresh, or one that is already a decimal. A table that
+///   already holds floats in that column keeps receiving floats — a BigQuery
+///   `FLOAT64` column would reject decimal-encoded rows outright — and a table
+///   whose column types couldn't be read gets no default at all.
+/// - **BigQuery's `NUMERIC` holds at most 9 fractional and 29 integer digits.**
+///   A declared type past either stays `Float64` rather than landing in a
+///   column that can't hold it.
+fn declared_decimal_default(
+    c: &ColumnType,
+    dest_name: &str,
+    dest_kind: DestKind,
+    existing: &ExistingColumns,
+) -> Option<String> {
+    let (p, s) = c.declared_decimal?;
+    match existing {
+        ExistingColumns::NoTable => {}
+        ExistingColumns::Unknown => return None,
+        ExistingColumns::Known(_) => {
+            if let Some(dest_type) = existing.type_of(dest_name) {
+                if !is_decimal_type(dest_type) {
+                    return None;
+                }
+            }
+        }
+    }
+    if dest_kind == DestKind::BigQuery && (s > 9 || i16::from(p) - i16::from(s) > 29) {
+        return None;
+    }
+    Some(format!("Decimal({p}, {s})"))
+}
+
 pub fn plan(
     source: &[ColumnType],
     cfg: &TransferConfig,
@@ -166,6 +245,26 @@ pub fn plan_with(
     cfg: &TransferConfig,
     dest_kind: DestKind,
     source_may_coerce_to_null: bool,
+) -> Result<SelectPlan> {
+    plan_for_destination(
+        source,
+        cfg,
+        dest_kind,
+        source_may_coerce_to_null,
+        &ExistingColumns::NoTable,
+    )
+}
+
+/// [`plan_with`], told what the destination table already holds, so a default
+/// that would change an existing column's type is held back (see
+/// [`declared_decimal_default`]). The transfer paths call this; `plan` and
+/// `plan_with` assume a table created fresh.
+pub fn plan_for_destination(
+    source: &[ColumnType],
+    cfg: &TransferConfig,
+    dest_kind: DestKind,
+    source_may_coerce_to_null: bool,
+    existing: &ExistingColumns,
 ) -> Result<SelectPlan> {
     // 1. Apply include (allowlist) then exclude (denylist) on source names.
     let included: Vec<&ColumnType> = source
@@ -280,6 +379,10 @@ pub fn plan_with(
                     .clone()
                     .filter(|_| c.arbitrary_precision_decimal)
             })
+            // Neither names a type: a column that declares its precision gets
+            // that exact decimal, within the limits `declared_decimal_default`
+            // documents.
+            .or_else(|| declared_decimal_default(c, &dest_name, dest_kind, existing))
             .unwrap_or_else(|| c.clickhouse_inner.clone());
         let is_key = key_columns.contains(dest_name.as_str());
         // ClickHouse's ReplacingMergeTree also rejects a Nullable version
@@ -388,6 +491,7 @@ pub fn plan_with(
             arrow,
             clickhouse_inner: ch_inner,
             arbitrary_precision_decimal: c.arbitrary_precision_decimal,
+            declared_decimal: c.declared_decimal,
         });
     }
 
@@ -412,6 +516,7 @@ mod tests {
             arrow: DataType::Int32,
             clickhouse_inner: "Int32".into(),
             arbitrary_precision_decimal: false,
+            declared_decimal: None,
         }
     }
 
@@ -423,6 +528,7 @@ mod tests {
             arrow,
             clickhouse_inner: "irrelevant".into(),
             arbitrary_precision_decimal: false,
+            declared_decimal: None,
         }
     }
 
@@ -438,6 +544,7 @@ mod tests {
             arrow: DataType::Float64,
             clickhouse_inner: "Float64".into(),
             arbitrary_precision_decimal: true,
+            declared_decimal: None,
         }
     }
 
@@ -695,14 +802,99 @@ mod tests {
         assert!(p.dest_columns[0].nullable);
     }
 
-    /// Without an override, an arbitrary-precision decimal column keeps its
-    /// default Float64 mapping unchanged (today's existing, lossy behavior —
-    /// unaffected by this fix, which only activates when the user opts in).
+    /// Without an override, a decimal that declares no precision (an
+    /// unconstrained PostgreSQL `numeric`) keeps its default Float64 mapping:
+    /// there is no exact type to choose for it.
     #[test]
     fn decimal_column_stays_float64_without_override() {
         let src = vec![decimal_col("amount")];
         let p = plan(&src, &cfg(), DestKind::ClickHouse).unwrap();
         assert_eq!(p.dest_columns[0].arrow, DataType::Float64);
+    }
+
+    fn declared_col(name: &str, p: u8, s: i8) -> ColumnType {
+        ColumnType {
+            declared_decimal: Some((p, s)),
+            ..decimal_col(name)
+        }
+    }
+
+    /// A column that declares `numeric(P, S)` / `DECIMAL(P, S)` defaults to
+    /// that exact decimal on a table created fresh.
+    #[test]
+    fn declared_decimal_defaults_to_its_exact_type() {
+        let src = vec![declared_col("amount", 15, 2), decimal_col("unconstrained")];
+        let p = plan(&src, &cfg(), DestKind::ClickHouse).unwrap();
+        assert_eq!(p.dest_columns[0].arrow, DataType::Decimal128(15, 2));
+        assert_eq!(p.dest_columns[0].clickhouse_inner, "Decimal(15, 2)");
+        assert_eq!(p.dest_columns[1].arrow, DataType::Float64);
+    }
+
+    /// The default never changes the type of a column the destination already
+    /// has, so a table created under the Float64 default keeps working.
+    #[test]
+    fn declared_decimal_leaves_an_existing_float_column_alone() {
+        let src = vec![
+            declared_col("amount", 15, 2),
+            declared_col("tax", 15, 2),
+            declared_col("fee", 15, 2),
+        ];
+        let existing = ExistingColumns::Known(HashMap::from([
+            ("amount".to_string(), "Nullable(Float64)".to_string()),
+            ("tax".to_string(), "Nullable(Decimal(15, 2))".to_string()),
+        ]));
+        let p = plan_for_destination(&src, &cfg(), DestKind::ClickHouse, true, &existing).unwrap();
+        // Already floats: stays a float.
+        assert_eq!(p.dest_columns[0].arrow, DataType::Float64);
+        // Already a decimal: decodes exactly.
+        assert_eq!(p.dest_columns[1].arrow, DataType::Decimal128(15, 2));
+        // Not in the table yet (schema evolution adds it): created as a decimal.
+        assert_eq!(p.dest_columns[2].arrow, DataType::Decimal128(15, 2));
+    }
+
+    #[test]
+    fn declared_decimal_is_held_back_when_existing_types_are_unknown() {
+        let src = vec![declared_col("amount", 15, 2)];
+        let p = plan_for_destination(
+            &src,
+            &cfg(),
+            DestKind::ClickHouse,
+            true,
+            &ExistingColumns::Unknown,
+        )
+        .unwrap();
+        assert_eq!(p.dest_columns[0].arrow, DataType::Float64);
+    }
+
+    /// BigQuery `NUMERIC` holds at most 9 fractional and 29 integer digits.
+    #[test]
+    fn declared_decimal_on_bigquery_only_where_numeric_holds_it() {
+        let src = vec![
+            declared_col("price", 15, 2),
+            declared_col("rate", 20, 10),
+            declared_col("huge", 38, 2),
+        ];
+        let p = plan(&src, &cfg(), DestKind::BigQuery).unwrap();
+        assert_eq!(p.dest_columns[0].arrow, DataType::Decimal128(15, 2));
+        assert_eq!(p.dest_columns[1].arrow, DataType::Float64);
+        assert_eq!(p.dest_columns[2].arrow, DataType::Float64);
+        // Existing BigQuery columns match case-insensitively, as BigQuery does.
+        let existing =
+            ExistingColumns::Known(HashMap::from([("PRICE".to_string(), "FLOAT".to_string())]));
+        let p =
+            plan_for_destination(&src[..1], &cfg(), DestKind::BigQuery, true, &existing).unwrap();
+        assert_eq!(p.dest_columns[0].arrow, DataType::Float64);
+    }
+
+    /// `numeric_as_decimal="Float64"` restores the historical mapping.
+    #[test]
+    fn numeric_as_decimal_float64_opts_out_of_the_declared_default() {
+        let src = vec![declared_col("amount", 15, 2)];
+        let mut cfg = cfg();
+        cfg.numeric_as_decimal = Some("Float64".to_string());
+        let p = plan(&src, &cfg, DestKind::ClickHouse).unwrap();
+        assert_eq!(p.dest_columns[0].arrow, DataType::Float64);
+        assert_eq!(p.dest_columns[0].clickhouse_inner, "Float64");
     }
 
     /// `numeric_as_decimal` is the blanket form of the per-column

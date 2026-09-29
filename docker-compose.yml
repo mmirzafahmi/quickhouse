@@ -56,21 +56,28 @@ services:
   # needed. API on 9010 (mapped away from ClickHouse's native-protocol 9000),
   # web console on 9011.
   minio:
-    # quay.io, not Docker Hub: `minio/minio` on Hub stopped serving
-    # anonymous pulls ("pull access denied ... requested access to the
-    # resource is denied"), which broke CI's compose step and with it
-    # the whole pytest suite. quay.io is MinIO's own registry and needs
-    # no login.
-    image: quay.io/minio/minio:latest
+    # Chainguard's build, not MinIO's own: MinIO stopped publishing images,
+    # and both `minio/minio` on Docker Hub and `quay.io/minio/minio` now
+    # refuse anonymous pulls ("unauthorized"), which broke CI's compose step
+    # and with it the whole pytest suite. Chainguard builds MinIO from source
+    # and serves `latest` without a login.
+    image: cgr.dev/chainguard/minio:latest
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
+      # The image has no curl; the healthcheck asks `mc` instead, and this
+      # names the server for it.
+      MC_HOST_local: http://minioadmin:minioadmin@localhost:9000
     command: server /data --console-address ":9001"
+    # A volume, as MinIO's own image declared: on the container's overlay
+    # filesystem MinIO fails its temp-dir renames ("Rename across devices").
+    volumes:
+      - /data
     ports:
       - "9010:9000"
       - "9011:9001"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      test: ["CMD", "mc", "ready", "local"]
       interval: 3s
       timeout: 3s
       retries: 20

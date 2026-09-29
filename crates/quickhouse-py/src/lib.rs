@@ -1218,9 +1218,10 @@ fn parse_compression(c: &str) -> PyResult<core::Compression> {
     match c.to_ascii_lowercase().as_str() {
         "none" | "off" | "" => Ok(core::Compression::None),
         "gzip" | "gz" => Ok(core::Compression::Gzip),
+        "lz4" => Ok(core::Compression::Lz4),
         "zstd" | "zst" => Ok(core::Compression::Zstd),
         other => Err(PyRuntimeError::new_err(format!(
-            "invalid compression {other:?}; expected 'none', 'gzip', or 'zstd'"
+            "invalid compression {other:?}; expected 'none', 'lz4', 'zstd', or 'gzip'"
         ))),
     }
 }

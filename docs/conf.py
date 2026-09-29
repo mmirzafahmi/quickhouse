@@ -44,8 +44,17 @@ def _build_shim() -> pathlib.Path:
 
     # The pure-Python modules import cleanly as-is (progress.py imports tqdm
     # lazily inside the function; quality.py imports great-expectations lazily
-    # inside Validation.__call__), so copy them verbatim.
-    for name in ("__init__.py", "progress.py", "quality.py", "py.typed"):
+    # inside Validation.__call__; pandas.py imports pandas only when called;
+    # backup.py needs nothing beyond the stub), so copy them verbatim. Every
+    # module __init__.py imports must be listed, or the whole API page fails.
+    for name in (
+        "__init__.py",
+        "backup.py",
+        "pandas.py",
+        "progress.py",
+        "quality.py",
+        "py.typed",
+    ):
         shutil.copy(PKG_SRC / name, pkg / name)
 
     # Turn the type stub into a real, importable module. The stub only
@@ -119,6 +128,9 @@ autoclass_content = "both"
 napoleon_numpy_docstring = True
 napoleon_google_docstring = False
 napoleon_use_rtype = False
+# from_pandas documents its modes under their own heading; unregistered, napoleon
+# folds the section into Parameters and renders every line as a parameter.
+napoleon_custom_sections = ["Modes"]
 
 # Nitpicky would flood warnings for stdlib typing generics we don't own; keep
 # it off but still surface genuine broken cross-references during the build.

@@ -113,6 +113,13 @@ pub struct ColumnType {
     /// `transform::plan` (decoders don't need it directly — see
     /// `decimal.rs`'s module docs).
     pub arbitrary_precision_decimal: bool,
+    /// The precision and scale a decimal column *declares* in the source —
+    /// PostgreSQL `numeric(P, S)` (from the column's type modifier), MySQL
+    /// `DECIMAL(P, S)` — when it fits `Decimal128` (`1 <= P <= 38`,
+    /// `0 <= S <= P`). `None` for an unconstrained PostgreSQL `numeric`, for
+    /// any source that doesn't report it, and for every non-decimal column.
+    /// Drives the default exact mapping in `transform::plan`.
+    pub declared_decimal: Option<(u8, i8)>,
 }
 
 impl ColumnType {
@@ -163,9 +170,10 @@ fn strip_low_cardinality(t: &str) -> Option<&str> {
 /// Resolve a PostgreSQL OID to (Arrow type, ClickHouse inner type).
 ///
 /// Timestamps use microsecond precision to match PostgreSQL's native binary
-/// representation. `numeric` is mapped to `Float64` by default because arbitrary
-/// precision/scale is unknown from the OID alone; callers can override to a
-/// `Decimal(P, S)` via `type_overrides`.
+/// representation. `numeric` maps to `Float64` here because the OID alone
+/// carries no precision; a column that declares one gets its exact
+/// `Decimal(P, S)` later, from `ColumnType::declared_decimal` in
+/// `transform::plan`, and `type_overrides` can name one for any column.
 pub fn map_oid(oid: u32) -> Option<(DataType, String)> {
     use self::oid as o;
     let mapped = match oid {
@@ -819,6 +827,7 @@ pub mod arrow_frame {
                 arrow: arrow.clone(),
                 clickhouse_inner,
                 arbitrary_precision_decimal: matches!(arrow, DataType::Decimal128(_, _)),
+                declared_decimal: None,
             });
         }
         if cols.is_empty() {
@@ -1054,6 +1063,7 @@ mod tests {
             arrow: DataType::Int32,
             clickhouse_inner: "Int32".into(),
             arbitrary_precision_decimal: false,
+            declared_decimal: None,
         };
         assert_eq!(c.clickhouse_type(), "Nullable(Int32)");
     }
@@ -1283,6 +1293,7 @@ mod tests {
             arrow: DataType::Utf8,
             clickhouse_inner: "LowCardinality(String)".into(),
             arbitrary_precision_decimal: false,
+            declared_decimal: None,
         };
         assert_eq!(c.clickhouse_type(), "LowCardinality(Nullable(String))");
         // Not nullable: untouched.

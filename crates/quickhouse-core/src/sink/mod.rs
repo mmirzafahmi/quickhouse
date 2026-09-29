@@ -85,6 +85,16 @@ impl std::fmt::Display for SendError {
 pub trait Sink: Send + Sync {
     async fn table_exists(&self, table: &str) -> Result<bool>;
 
+    /// An existing `table`'s columns: name -> type, as this destination spells
+    /// it. `None` when the sink can't tell, which the planner treats as "don't
+    /// change any column's type" (see `transform::ExistingColumns`).
+    async fn column_types(
+        &self,
+        _table: &str,
+    ) -> Result<Option<std::collections::HashMap<String, String>>> {
+        Ok(None)
+    }
+
     /// Create `table` (auto-generated DDL/schema from `columns` + `cfg`'s
     /// key/order_by/partition_by/engine — interpreted per destination).
     async fn create_table(
@@ -366,6 +376,7 @@ mod tests {
             arrow: DataType::Int64,
             clickhouse_inner: "Int64".into(),
             arbitrary_precision_decimal: false,
+            declared_decimal: None,
         }
     }
 

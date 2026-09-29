@@ -5,10 +5,11 @@
 Rows are decoded straight off the wire into Apache Arrow, in Rust — no per-row
 Python, no intermediate DataFrame. Tables are split into ranges and read in
 parallel, and decoding overlaps uploading. On a laptop-class box a 1M-row,
-20-column full refresh runs at **hundreds of thousands of rows per second**
-while peak memory stays flat (under ~180 MB) no matter how much you parallelize.
-Reproduce it with `python benchmarks/bench_transfer.py`. For quickhouse measured
-head-to-head against other tools, see the [Benchmark](benchmark.md) page.
+20-column full refresh runs at **hundreds of thousands of rows per second**,
+and memory is bounded by `max_memory_bytes` rather than by table size (see
+[what memory scales with](#what-memory-scales-with) below). Reproduce it with
+`python benchmarks/bench_transfer.py`. For quickhouse measured head-to-head
+against other tools, see the [Benchmark](benchmark.md) page.
 
 ## Parallelism and batching
 
@@ -33,10 +34,32 @@ head-to-head against other tools, see the [Benchmark](benchmark.md) page.
       <div class="qh-params__name">max_memory_bytes</div>
       <div class="qh-params__type">int = 512 MiB</div>
     </div>
-    <p class="qh-params__desc">The <strong>hard ceiling</strong> on total in-flight batch memory across all partitions and uploads, measured against each batch's real Arrow allocation. Decoding overlaps with concurrent uploads and blocks (backpressure) when the ceiling is reached, so peak RSS stays bounded regardless of <code>parallelism</code> or row width. <code>0</code> disables the ceiling.</p>
+    <p class="qh-params__desc">The <strong>hard ceiling</strong> on total in-flight batch memory across all partitions and uploads, measured against each batch's real Arrow allocation. Decoding overlaps with concurrent uploads and blocks (backpressure) when the ceiling is reached, so batch memory stays bounded regardless of <code>parallelism</code> or row width. Each stream also has working memory outside it; see below. <code>0</code> disables the ceiling.</p>
   </div>
 </div>
 ```
+
+(what-memory-scales-with)=
+## What memory scales with
+
+Memory never grows with table size, but it does grow with `parallelism`. Each
+stream collects up to `insert_bytes` (32 MiB) of batches before it sends an
+insert, and those count against `max_memory_bytes`. Each stream also has
+working memory the ceiling doesn't cover: the batch being decoded and the insert
+being serialized.
+
+Peak RSS measured on a 2-vCPU VM, PostgreSQL → ClickHouse, TPC-H `lineitem`
+(6M rows, 16 columns), default settings:
+
+| `parallelism` | 1 | 2 | 4 | 8 | 16 |
+| --- | --- | --- | --- | --- | --- |
+| Peak RSS | ~300–390 MB | ~350–450 MB | ~490–540 MB | ~620–700 MB | ~850–930 MB |
+
+On that box the extra streams added no speed: every one of those runs took
+about 25 s, because the source, ClickHouse and quickhouse shared two cores. More
+streams pay off when the source has idle cores to serialize `COPY` output. To
+hold memory down, lower `insert_bytes` or `max_memory_bytes` before lowering
+`parallelism`.
 
 ## Being gentle on a small production database
 

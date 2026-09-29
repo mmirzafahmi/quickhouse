@@ -592,6 +592,46 @@ def _mysql_scalar(mysql_conn, sql: str):
         return cur.fetchone()[0]
 
 
+def test_declared_decimal_lands_as_exact_decimal(
+    mysql_conn, ch_client, mysql_source, ch_target_zstd, unique_name
+):
+    """MySQL DECIMAL(P, S) always declares its precision, so it lands as the
+    exact Decimal(P, S), signed or UNSIGNED. DECIMAL(65, 30) is past
+    Decimal128's 38 digits and stays Float64."""
+    table = unique_name
+    with mysql_conn.cursor() as cur:
+        cur.execute(f"DROP TABLE IF EXISTS `{table}`")
+        cur.execute(
+            f"CREATE TABLE `{table}` (id BIGINT PRIMARY KEY, amount DECIMAL(15, 2) NOT NULL, "
+            "fee DECIMAL(10, 4) UNSIGNED, wide DECIMAL(65, 30))"
+        )
+        cur.execute(
+            f"INSERT INTO `{table}` VALUES (1, 32.90, 0.1250, 1.5), "
+            "(2, -1234567890123.45, NULL, NULL)"
+        )
+    _drop_ch(ch_client, table)
+    try:
+        quickhouse.sync(
+            mysql_source, ch_target_zstd, dest_table=table, source_table=table,
+            mode="full", key=["id"], create_if_missing=True,
+        )
+        types = dict(
+            ch_client.query(
+                "SELECT name, type FROM system.columns "
+                f"WHERE database = currentDatabase() AND table = '{table}'"
+            ).result_rows
+        )
+        assert types["amount"] == "Nullable(Decimal(15, 2))"
+        assert types["fee"] == "Nullable(Decimal(10, 4))"
+        assert types["wide"] == "Nullable(Float64)"
+        rows = ch_client.query(
+            f"SELECT id, toString(amount), toString(fee) FROM `{table}` ORDER BY id"
+        ).result_rows
+        assert rows == [(1, "32.9", "0.125"), (2, "-1234567890123.45", None)]
+    finally:
+        _drop_ch(ch_client, table)
+
+
 def test_collapsed_tinyint1_names_the_column_it_flattened(
     mysql_conn, ch_client, mysql_source, ch_target, unique_name
 ):

@@ -363,7 +363,7 @@ pub struct ClickHouseConfig {
     pub database: String,
     pub user: String,
     pub password: String,
-    /// `"none" | "gzip" | "zstd"` — HTTP body compression for inserts.
+    /// `"none" | "lz4" | "zstd" | "gzip"` — HTTP body compression for inserts.
     pub compression: Compression,
     /// Attach a generated `insert_deduplication_token` to every insert, making
     /// the retry path exactly-once instead of at-least-once. `false` (default).
@@ -425,10 +425,17 @@ pub struct ClickHouseConfig {
     pub archive: Option<ArchiveConfig>,
 }
 
+/// HTTP body compression for ClickHouse inserts. Measured single-core on
+/// 32 MiB ArrowStream inserts of TPC-H `lineitem`: zstd (level 3) ~280 MB/s at
+/// a 4.2x ratio, lz4 ~610 MB/s at 2.35x, gzip ~22 MB/s at 4.75x. So zstd for a
+/// constrained link (WAN, ClickHouse Cloud), lz4 or none on a fast one where
+/// CPU rather than bandwidth is the limit, and gzip effectively never: it caps
+/// each upload at roughly its compression speed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Compression {
     None,
     Gzip,
+    Lz4,
     Zstd,
 }
 
@@ -1251,8 +1258,10 @@ pub struct TransferConfig {
     /// Default destination type for **every** arbitrary-precision decimal
     /// column (PostgreSQL `numeric`, MySQL `DECIMAL`/`NEWDECIMAL`, BigQuery
     /// `NUMERIC`) that has no `type_overrides` entry of its own — e.g.
-    /// `"Decimal(38, 9)"`. `None` (default) keeps the historical `Float64`
-    /// mapping.
+    /// `"Decimal(38, 9)"`, or `"Float64"` for the historical mapping. `None`
+    /// (default) maps a column that declares its precision to that exact
+    /// `Decimal(P, S)`, within the limits `transform::declared_decimal_default`
+    /// documents, and anything else to `Float64`.
     ///
     /// **Why this exists (bug report B7b).** Those source types are exact
     /// decimals with no `f64` equivalent, so the default mapping round-trips
@@ -1266,10 +1275,12 @@ pub struct TransferConfig {
     /// be remembered for every affected column in every table, and forgetting it
     /// is silent. Setting this once covers them all.
     ///
-    /// Not the default, because it changes the *destination column type*:
-    /// against a table that already exists with a `Float64`/`FLOAT64` column,
-    /// switching the decode type to `Decimal128` would mean writing a decimal
-    /// into a float column. Choose the precision and scale deliberately —
+    /// A blanket decimal isn't the default because it changes the
+    /// *destination column type* of every decimal column at once: against a
+    /// table that already exists with a `Float64`/`FLOAT64` column, switching
+    /// the decode type to `Decimal128` would mean writing a decimal into a
+    /// float column. (The declared-precision default checks the destination
+    /// first; this setting doesn't.) Choose the precision and scale deliberately —
     /// a value that doesn't fit is coerced to NULL (counted and warned about,
     /// see `warn_coerced_decimals`), so pick a scale that covers the column's
     /// real range. P > 38 needs `Decimal256`, which isn't supported yet.

@@ -1136,8 +1136,21 @@ async fn run_transfer_impl(
     // NULL (see `transform::plan_with`), so it is the only one whose NOT NULL
     // date/decimal columns stay NOT NULL at the destination.
     let source_may_coerce = !matches!(source.as_ref(), Source::ClickHouse(_));
-    let mut plan: SelectPlan =
-        transform::plan_with(&source_cols, &cfg, sink.dest_kind(), source_may_coerce)?;
+    // A column that declares its precision defaults to that exact decimal, but
+    // never against a destination column that already holds something else —
+    // so the destination is only consulted when such a column exists.
+    let existing = if source_cols.iter().any(|c| c.declared_decimal.is_some()) {
+        existing_columns(sink.as_ref(), &cfg.dest_table).await?
+    } else {
+        transform::ExistingColumns::NoTable
+    };
+    let mut plan: SelectPlan = transform::plan_for_destination(
+        &source_cols,
+        &cfg,
+        sink.dest_kind(),
+        source_may_coerce,
+        &existing,
+    )?;
     if matches!(source.as_ref(), Source::Postgres(_)) {
         crate::source::postgres::pin_transformed_wire_types(&mut plan);
     }
@@ -3260,6 +3273,7 @@ async fn transfer_keyset_postgres(
         tracing::debug!("keyset chunk: {copy_sql}");
         let stream = source.copy_stream(&client, &copy_sql).await?;
         futures::pin_mut!(stream);
+        let mut chunks = CopyChunks::new(stream);
         let mut decoder =
             CopyDecoder::with_batch_bytes(&plan.dest_columns, cfg.batch_rows, cfg.batch_bytes)?;
         let mut sends: JoinSet<Result<()>> = JoinSet::new();
@@ -3274,12 +3288,12 @@ async fn transfer_keyset_postgres(
         // the concurrent decode below neither trips it nor inflates read_secs.
         let idle = cfg.read_idle_timeout_secs;
         let scope = format!("partition '{}'", partition.label);
-        let mut pending = await_source(stream.next(), &ctx.counters, idle, &scope).await?;
+        let mut pending = await_source(chunks.next_chunk(), &ctx.counters, idle, &scope).await?;
         while let Some(bytes) = pending {
             let bytes = bytes?;
             let decoding = feed_off_reactor(decoder, bytes);
             let (next, joined) = tokio::join!(
-                await_source(stream.next(), &ctx.counters, idle, &scope),
+                await_source(chunks.next_chunk(), &ctx.counters, idle, &scope),
                 decoding
             );
             pending = next?;
@@ -3749,6 +3763,7 @@ async fn read_one_partition_postgres(
 
     let stream = source.copy_stream(&client, &copy_sql).await?;
     futures::pin_mut!(stream);
+    let mut chunks = CopyChunks::new(stream);
 
     let mut decoder =
         CopyDecoder::with_batch_bytes(&plan.dest_columns, cfg.batch_rows, cfg.batch_bytes)?;
@@ -3762,18 +3777,19 @@ async fn read_one_partition_postgres(
 
     // Read/parse overlap: each chunk's parse runs on the blocking pool while
     // the next chunk is pulled off the socket, so the COPY stream keeps draining
-    // instead of idling for the duration of every parse.
+    // instead of idling for the duration of every parse. A chunk is every row
+    // that has already arrived, not one `CopyData` message — see `CopyChunks`.
     // The idle timer wraps the source await and nothing else: it is recorded
     // *inside* `await_source`, at the moment the chunk arrives, so the
     // concurrent decode below neither trips it nor inflates read_secs.
     let idle = cfg.read_idle_timeout_secs;
     let scope = format!("partition '{}'", partition.label);
-    let mut pending = await_source(stream.next(), &ctx.counters, idle, &scope).await?;
+    let mut pending = await_source(chunks.next_chunk(), &ctx.counters, idle, &scope).await?;
     while let Some(chunk) = pending {
         let chunk = chunk?;
         let decoding = feed_off_reactor(decoder, chunk);
         let (next, joined) = tokio::join!(
-            await_source(stream.next(), &ctx.counters, idle, &scope),
+            await_source(chunks.next_chunk(), &ctx.counters, idle, &scope),
             decoding
         );
         pending = next?;
@@ -5177,6 +5193,85 @@ async fn compute_partitions_mysql(
         .await
 }
 
+/// The size at which [`CopyChunks`] stops adding messages to a chunk, in bytes
+/// of raw `COPY` data.
+///
+/// Only a ceiling: rows are never held back to reach it, so a slow source still
+/// gets small chunks. It bounds the transient buffer; beyond a few dozen rows
+/// per chunk its exact value stops mattering (64 KiB and 1 MiB measured the
+/// same).
+const COPY_CHUNK_BYTES: usize = 256 * 1024;
+
+/// A binary `COPY` stream regrouped into multi-row chunks for the decoder.
+///
+/// PostgreSQL sends a binary `COPY` as one `CopyData` message **per row**, and
+/// tokio-postgres yields one stream item per message. Handed straight to
+/// [`feed_off_reactor`], every row paid a blocking-pool round trip — a thread
+/// wake-up in each direction, several times the cost of parsing the row itself.
+/// Measured on TPC-H `lineitem` (6M rows, PostgreSQL → ClickHouse, 2 vCPUs):
+/// 6,001,216 decode tasks and 72–78s, against 23s once chunked.
+///
+/// [`next_chunk`](Self::next_chunk) waits for one message, then takes every
+/// further message that has *already arrived*, without waiting, until the chunk
+/// reaches [`COPY_CHUNK_BYTES`]. Rows are never held back to fill a chunk: a
+/// trickling source is decoded as it arrives, and `read_idle_timeout_secs`
+/// still times the wait for the next row.
+///
+/// Two details are load-bearing:
+/// - The inner stream is fused. A drain can reach the end of the stream in the
+///   middle of a chunk, and tokio-postgres's `CopyOutStream` does not report
+///   the end again if polled after `CopyDone`: the next protocol message
+///   surfaces as an "unexpected message" error instead.
+/// - An error met mid-drain is held back until the rows ahead of it have been
+///   returned, so the decoder sees every byte the server sent before failing.
+struct CopyChunks<S, E> {
+    stream: futures::stream::Fuse<S>,
+    pending_error: Option<E>,
+}
+
+impl<S, E> CopyChunks<S, E>
+where
+    S: futures::Stream<Item = std::result::Result<Bytes, E>> + Unpin,
+{
+    fn new(stream: S) -> Self {
+        CopyChunks {
+            stream: stream.fuse(),
+            pending_error: None,
+        }
+    }
+
+    /// The next chunk: one or more whole `CopyData` messages, concatenated.
+    /// `None` once the stream has ended.
+    async fn next_chunk(&mut self) -> Option<std::result::Result<Bytes, E>> {
+        if let Some(e) = self.pending_error.take() {
+            return Some(Err(e));
+        }
+        let first = match self.stream.next().await? {
+            Ok(bytes) => bytes,
+            Err(e) => return Some(Err(e)),
+        };
+        if first.len() >= COPY_CHUNK_BYTES {
+            return Some(Ok(first));
+        }
+        // Sized for the usual case — a few dozen rows ready at once — rather
+        // than for the ceiling; the buffer grows if more has arrived.
+        let mut chunk = bytes::BytesMut::with_capacity(64 * 1024);
+        chunk.extend_from_slice(&first);
+        while chunk.len() < COPY_CHUNK_BYTES {
+            match futures::FutureExt::now_or_never(self.stream.next()) {
+                Some(Some(Ok(bytes))) => chunk.extend_from_slice(&bytes),
+                Some(Some(Err(e))) => {
+                    self.pending_error = Some(e);
+                    break;
+                }
+                // Nothing more has arrived yet, or the stream has ended.
+                Some(None) | None => break,
+            }
+        }
+        Some(Ok(chunk.freeze()))
+    }
+}
+
 /// Hand one `COPY` chunk to `CopyDecoder::feed` on Tokio's blocking pool,
 /// returning the decoder along with the result.
 ///
@@ -5189,6 +5284,10 @@ async fn compute_partitions_mysql(
 /// blocking pool fixes the first; polling the next chunk concurrently with this
 /// future (see the call sites) fixes the second.
 ///
+/// A chunk must hold many rows, not one `CopyData` message: the hand-off itself
+/// costs more than parsing a row. The call sites get chunks from
+/// [`CopyChunks`].
+///
 /// The decoder is passed by value and handed back rather than borrowed: it
 /// carries builder state across chunks, so it can't be shared with a
 /// `'static` task any other way.
@@ -5199,6 +5298,18 @@ fn feed_off_reactor(
     tokio::task::spawn_blocking(move || {
         let decoded = decoder.feed(&chunk);
         (decoder, decoded)
+    })
+}
+
+/// What the destination table already holds, for
+/// `transform::plan_for_destination`.
+async fn existing_columns(sink: &dyn Sink, table: &str) -> Result<transform::ExistingColumns> {
+    if !sink.table_exists(table).await? {
+        return Ok(transform::ExistingColumns::NoTable);
+    }
+    Ok(match sink.column_types(table).await? {
+        Some(cols) => transform::ExistingColumns::Known(cols),
+        None => transform::ExistingColumns::Unknown,
     })
 }
 
@@ -5608,6 +5719,7 @@ mod tests {
             arrow: DataType::Int64,
             clickhouse_inner: "Int64".into(),
             arbitrary_precision_decimal: false,
+            declared_decimal: None,
         }
     }
 
@@ -5915,6 +6027,115 @@ mod tests {
             "{}",
             out[0].message
         );
+    }
+
+    /// One step of a scripted `COPY` byte stream for exercising `CopyChunks`.
+    enum Step {
+        Item(std::result::Result<Bytes, &'static str>),
+        /// The next message has not arrived yet: `Pending`, re-waking itself.
+        NotYet,
+        End,
+    }
+
+    fn row(bytes: &'static [u8]) -> Step {
+        Step::Item(Ok(Bytes::from_static(bytes)))
+    }
+
+    /// Plays back a script. Polling past the end of the script reports an
+    /// error, the way tokio-postgres's `CopyOutStream` does if it is polled
+    /// again after `CopyDone`.
+    struct Scripted(std::collections::VecDeque<Step>);
+
+    impl futures::Stream for Scripted {
+        type Item = std::result::Result<Bytes, &'static str>;
+
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            use std::task::Poll;
+            match self.0.pop_front() {
+                Some(Step::Item(item)) => Poll::Ready(Some(item)),
+                Some(Step::NotYet) => {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+                Some(Step::End) => Poll::Ready(None),
+                None => Poll::Ready(Some(Err("polled after the end"))),
+            }
+        }
+    }
+
+    fn chunks_of(steps: Vec<Step>) -> CopyChunks<Scripted, &'static str> {
+        CopyChunks::new(Scripted(steps.into()))
+    }
+
+    #[tokio::test]
+    async fn copy_chunks_join_the_rows_that_have_already_arrived() {
+        let mut chunks = chunks_of(vec![row(b"row1"), row(b"row2"), row(b"row3"), Step::End]);
+        assert_eq!(
+            chunks.next_chunk().await,
+            Some(Ok(Bytes::from_static(b"row1row2row3")))
+        );
+        // The drain already saw the end. The fused stream is not polled past
+        // it — `Scripted`, like `CopyOutStream`, would answer with an error.
+        assert_eq!(chunks.next_chunk().await, None);
+        assert_eq!(chunks.next_chunk().await, None);
+    }
+
+    #[tokio::test]
+    async fn copy_chunks_never_wait_for_rows_that_have_not_arrived() {
+        let mut chunks = chunks_of(vec![row(b"row1"), Step::NotYet, row(b"row2"), Step::End]);
+        assert_eq!(
+            chunks.next_chunk().await,
+            Some(Ok(Bytes::from_static(b"row1")))
+        );
+        assert_eq!(
+            chunks.next_chunk().await,
+            Some(Ok(Bytes::from_static(b"row2")))
+        );
+        assert_eq!(chunks.next_chunk().await, None);
+    }
+
+    #[tokio::test]
+    async fn copy_chunks_return_the_rows_ahead_of_an_error_first() {
+        let mut chunks = chunks_of(vec![
+            row(b"row1"),
+            row(b"row2"),
+            Step::Item(Err("connection reset")),
+            row(b"row3"),
+        ]);
+        assert_eq!(
+            chunks.next_chunk().await,
+            Some(Ok(Bytes::from_static(b"row1row2")))
+        );
+        assert_eq!(chunks.next_chunk().await, Some(Err("connection reset")));
+    }
+
+    #[tokio::test]
+    async fn copy_chunks_close_at_the_ceiling_and_pass_a_bigger_row_whole() {
+        let big = Bytes::from(vec![9u8; COPY_CHUNK_BYTES + 1024]);
+        let small = Bytes::from(vec![7u8; COPY_CHUNK_BYTES / 2 + 1]);
+        let mut steps = vec![Step::Item(Ok(big.clone()))];
+        steps.extend((0..3).map(|_| Step::Item(Ok(small.clone()))));
+        steps.push(Step::End);
+        let mut chunks = chunks_of(steps);
+
+        let mut sizes = Vec::new();
+        let mut all = Vec::new();
+        while let Some(chunk) = chunks.next_chunk().await {
+            let chunk = chunk.unwrap();
+            sizes.push(chunk.len());
+            all.extend_from_slice(&chunk);
+        }
+        // A row over the ceiling goes through alone and unsplit; the next chunk
+        // closes on the row that takes it past the ceiling.
+        assert_eq!(sizes, vec![big.len(), 2 * small.len(), small.len()]);
+        let mut expected = big.to_vec();
+        for _ in 0..3 {
+            expected.extend_from_slice(&small);
+        }
+        assert_eq!(all, expected);
     }
 
     #[tokio::test]
@@ -6369,6 +6590,7 @@ mod tests {
             arrow: DataType::Int64,
             clickhouse_inner: "Int64".into(),
             arbitrary_precision_decimal: false,
+            declared_decimal: None,
         };
         assert_eq!(
             window_key(&cfg, &[int_col("id", false)]),
@@ -6493,6 +6715,7 @@ mod tests {
             arrow,
             clickhouse_inner: "Int64".into(),
             arbitrary_precision_decimal: false,
+            declared_decimal: None,
         }
     }
 
@@ -6960,6 +7183,7 @@ mod tests {
                 arrow: arrow.clone(),
                 clickhouse_inner: "x".into(),
                 arbitrary_precision_decimal: false,
+                declared_decimal: None,
             },
             col_typed(
                 "wm",

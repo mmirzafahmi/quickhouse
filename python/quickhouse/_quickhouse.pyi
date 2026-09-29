@@ -1,5 +1,10 @@
 """Type stubs for the compiled ``quickhouse._quickhouse`` extension module."""
 
+# The docs build imports this stub as real Python (docs/conf.py), where an
+# annotation naming a class defined further down (BigQuery's `archive`, typed
+# with S3Archive / GcsArchive) would otherwise be evaluated too early.
+from __future__ import annotations
+
 from typing import Callable, List, Mapping, Optional, Sequence, Tuple, Union
 
 # A declared API-source schema: a list of (name, bq_type) / (name, bq_type,
@@ -442,10 +447,15 @@ class ClickHouse:
 
         .. versionadded:: 0.16.0
     compression:
-        HTTP insert body compression: ``"zstd"`` (default), ``"gzip"``, or
-        ``"none"``. zstd-fast is faster than gzip at a similar/better ratio;
-        use ``"none"`` on a fast local network where CPU, not bandwidth, is
-        the bottleneck.
+        HTTP insert body compression: ``"zstd"`` (default), ``"lz4"``,
+        ``"none"``, or ``"gzip"``. zstd suits a constrained link (WAN,
+        ClickHouse Cloud); ``"lz4"`` or ``"none"`` suit a fast network where
+        CPU, not bandwidth, is the bottleneck. ``"gzip"`` is accepted but not
+        recommended: at roughly 22 MB/s per core it caps every insert near
+        that rate, and a transfer that uses it logs a warning.
+
+        .. versionchanged:: 0.21.0
+           Added ``"lz4"``.
     archive:
         Optional :class:`S3Archive` or :class:`GcsArchive` (or the result of
         :func:`~quickhouse.backup`) — also write every synced batch as
@@ -958,19 +968,30 @@ def sync(
       is then rejected by ClickHouse. Only affects DDL generated *before* a
       destination table exists — see the ``engine``/``order_by`` note below
       for how an existing table's nullability is otherwise handled.
+    - A decimal column that declares its precision (PostgreSQL
+      ``numeric(P, S)``, MySQL ``DECIMAL(P, S)``, ``P <= 38``) lands as the
+      exact ``Decimal(P, S)`` by default, for a table or column created fresh
+      and for a column that is already a decimal. A column the destination
+      already holds as ``Float64`` keeps that type, and on BigQuery a type past
+      ``NUMERIC``'s 9 fractional or 29 integer digits stays ``FLOAT64``. An
+      unconstrained PostgreSQL ``numeric`` and a BigQuery ``NUMERIC`` stay
+      ``Float64``.
     - ``numeric_as_decimal="Decimal(38, 9)"`` decodes **every**
       arbitrary-precision decimal source column (PostgreSQL ``numeric``, MySQL
-      ``DECIMAL``, BigQuery ``NUMERIC``) exactly, instead of through the default
-      lossy ``Float64`` round-trip that turns a stored ``32.9`` into
-      ``32.89999999999999``. Equivalent to writing
-      ``type_overrides={col: "Decimal(38, 9)"}`` for each of them, which is the
-      point: one argument instead of an audit, since a column you forget loses
-      precision silently. A per-column ``type_overrides`` entry still wins.
-      Not the default — it changes the destination column type, so against an
-      already-created ``Float64`` column you'd be writing a decimal into a
-      float. Pick the scale for the column's real range: a value that doesn't
-      fit is coerced to ``NULL`` (counted and warned about). ``P > 38`` needs
-      ``Decimal256``, which isn't supported yet.
+      ``DECIMAL``, BigQuery ``NUMERIC``) exactly, unconstrained ones included,
+      instead of through the lossy ``Float64`` round-trip that turns a stored
+      ``32.9`` into ``32.89999999999999``. Equivalent to writing
+      ``type_overrides={col: "Decimal(38, 9)"}`` for each of them. A per-column
+      ``type_overrides`` entry still wins. It changes the destination column
+      type, so against an already-created ``Float64`` column you'd be writing a
+      decimal into a float. Pick the scale for the column's real range: a value
+      that doesn't fit is coerced to ``NULL`` (counted and warned about).
+      ``P > 38`` needs ``Decimal256``, which isn't supported yet.
+      ``numeric_as_decimal="Float64"`` restores the old mapping for every
+      decimal column, declared precision or not.
+
+      .. versionchanged:: 0.21.0
+         Declared-precision decimals map to ``Decimal(P, S)`` by default.
     - ``tinyint1_as_bool=False`` (MySQL sources) reads a ``tinyint(1)`` column
       as the integer it is (``Int8``, or ``UInt8`` when UNSIGNED) rather than as
       a boolean. MySQL's ``BOOL`` is an alias for ``tinyint(1)``, so display
@@ -1115,8 +1136,11 @@ def sync(
       memory across all partitions and all uploads currently in flight,
       measured against each batch's real Arrow allocation. Decoding overlaps
       with concurrent uploads and blocks (backpressure) when this ceiling is
-      reached, so peak RSS stays bounded regardless of ``parallelism`` or row
-      width. Default 512 MiB; ``0`` disables the ceiling (unbounded). Raising
+      reached, so batch memory stays bounded regardless of ``parallelism`` or
+      row width. Each stream also has working memory outside the ceiling
+      (decode buffers, the insert being serialized), so process RSS still
+      grows with ``parallelism``. Default 512 MiB; ``0`` disables the ceiling
+      (unbounded). Raising
       ``insert_bytes`` does not raise this: batches still hold reservations while
       they accumulate, and the destination serializes its payload incrementally
       rather than buffering it whole.

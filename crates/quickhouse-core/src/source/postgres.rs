@@ -219,6 +219,11 @@ impl PgSource {
                 type_name: c.type_().name().to_string(),
             })?;
             let nullable = !not_null.contains(c.name());
+            let declared_decimal = if pg_oid == oid::NUMERIC {
+                numeric_precision_scale(c.type_modifier())
+            } else {
+                None
+            };
             cols.push(ColumnType {
                 name: c.name().to_string(),
                 type_id: pg_oid,
@@ -226,6 +231,7 @@ impl PgSource {
                 arrow,
                 clickhouse_inner: ch_inner,
                 arbitrary_precision_decimal: pg_oid == oid::NUMERIC,
+                declared_decimal,
             });
         }
         Ok(cols)
@@ -652,6 +658,27 @@ pub(crate) fn is_range_partitionable(column_oid: u32) -> bool {
     matches!(column_oid, oid::INT2 | oid::INT4 | oid::INT8)
 }
 
+/// Precision and scale a `numeric` column declares, from its type modifier.
+///
+/// The modifier packs `((precision << 16) | scale) + VARHDRSZ`, with the
+/// scale an 11-bit signed field (PostgreSQL 15 allows a negative scale), and is
+/// -1 for an unconstrained `numeric`. The prepared statement reports it for a
+/// plain column and for a `CAST(... AS numeric(P, S))` alike. `None` unless the
+/// result fits `Decimal128`: `1 <= P <= 38`, `0 <= S <= P`.
+fn numeric_precision_scale(type_modifier: i32) -> Option<(u8, i8)> {
+    const VARHDRSZ: i32 = 4;
+    if type_modifier < VARHDRSZ {
+        return None;
+    }
+    let packed = type_modifier - VARHDRSZ;
+    let precision = (packed >> 16) & 0xFFFF;
+    let scale = ((packed & 0x7FF) ^ 1024) - 1024;
+    if !(1..=38).contains(&precision) || !(0..=precision).contains(&scale) {
+        return None;
+    }
+    Some((precision as u8, scale as i8))
+}
+
 pub(crate) fn quote_pg(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
@@ -713,6 +740,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn numeric_type_modifier_yields_precision_and_scale() {
+        // numeric(15, 2): ((15 << 16) | 2) + 4.
+        assert_eq!(numeric_precision_scale((15 << 16 | 2) + 4), Some((15, 2)));
+        assert_eq!(numeric_precision_scale((38 << 16 | 10) + 4), Some((38, 10)));
+        assert_eq!(numeric_precision_scale((10 << 16) + 4), Some((10, 0)));
+        // Unconstrained numeric: no modifier, no declared precision.
+        assert_eq!(numeric_precision_scale(-1), None);
+        // Wider than Decimal128.
+        assert_eq!(numeric_precision_scale((50 << 16 | 2) + 4), None);
+        // PostgreSQL 15's negative scale, numeric(5, -2): 11-bit two's complement.
+        assert_eq!(
+            numeric_precision_scale((5 << 16 | (-2i32 & 0x7FF)) + 4),
+            None
+        );
+    }
+
+    #[test]
     fn transformed_columns_are_cast_to_their_decode_type() {
         use arrow_schema::DataType;
         let col = |name: &str, type_id: u32, arrow: DataType| ColumnType {
@@ -722,6 +766,7 @@ mod tests {
             arrow,
             clickhouse_inner: "String".into(),
             arbitrary_precision_decimal: false,
+            declared_decimal: None,
         };
         let mut plan = crate::transform::SelectPlan {
             source_columns: vec!["payload".into(), "ratio".into(), "name".into()],
