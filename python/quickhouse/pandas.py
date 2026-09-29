@@ -476,8 +476,9 @@ def from_pandas(
 
     Returns
     -------
-    The same :class:`TransferResult` :func:`quickhouse.sync` returns, including
-    ``warnings``.
+    TransferResult
+        The same result :func:`quickhouse.sync` returns, including
+        ``warnings``.
 
     Examples
     --------

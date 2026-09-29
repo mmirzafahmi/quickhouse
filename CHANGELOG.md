@@ -54,6 +54,14 @@ any breaking change is called out explicitly.
   cell was allocated and copied twice. Measured MySQL → ClickHouse, TPC-H
   `lineitem` (6M rows): 23.0s to 22.0s.
 
+### Documentation
+- **The memory claim is corrected.** The README and performance guide said peak
+  memory stays flat, under ~180 MB, however far you parallelize. Since insert
+  batching (0.14.0) it doesn't: each stream buffers up to `insert_bytes` before
+  an insert, and has working memory outside `max_memory_bytes`. The performance
+  guide now says what memory scales with and gives measured numbers: ~300–390 MB
+  at `parallelism=1` rising to ~850–930 MB at 16, on TPC-H `lineitem`.
+
 ## [0.20.0] — 2026-09-26
 
 ### Fixed — silent data loss and corruption

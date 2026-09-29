@@ -1,5 +1,10 @@
 """Type stubs for the compiled ``quickhouse._quickhouse`` extension module."""
 
+# The docs build imports this stub as real Python (docs/conf.py), where an
+# annotation naming a class defined further down (BigQuery's `archive`, typed
+# with S3Archive / GcsArchive) would otherwise be evaluated too early.
+from __future__ import annotations
+
 from typing import Callable, List, Mapping, Optional, Sequence, Tuple, Union
 
 # A declared API-source schema: a list of (name, bq_type) / (name, bq_type,
@@ -1131,8 +1136,11 @@ def sync(
       memory across all partitions and all uploads currently in flight,
       measured against each batch's real Arrow allocation. Decoding overlaps
       with concurrent uploads and blocks (backpressure) when this ceiling is
-      reached, so peak RSS stays bounded regardless of ``parallelism`` or row
-      width. Default 512 MiB; ``0`` disables the ceiling (unbounded). Raising
+      reached, so batch memory stays bounded regardless of ``parallelism`` or
+      row width. Each stream also has working memory outside the ceiling
+      (decode buffers, the insert being serialized), so process RSS still
+      grows with ``parallelism``. Default 512 MiB; ``0`` disables the ceiling
+      (unbounded). Raising
       ``insert_bytes`` does not raise this: batches still hold reservations while
       they accumulate, and the destination serializes its payload incrementally
       rather than buffering it whole.
