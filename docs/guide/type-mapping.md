@@ -16,12 +16,17 @@ MySQL `DECIMAL(P, S)` — lands as the exact **`Decimal(P, S)`** (BigQuery
 `numeric`, whose type carries no precision to use. BigQuery sources are
 unchanged: their `NUMERIC` stays `Float64` unless you ask for more.
 
-Two limits keep the default from breaking a table that already exists:
+Three limits keep the default from breaking a table that already exists:
 
 - **An existing column keeps its type.** The exact type applies to a table or
   column created fresh, and to a column that is already a decimal. A column
   created as `Float64` by an earlier version keeps receiving floats. To move it
   to a decimal, change the column (or recreate the table) yourself.
+- **A new column follows the table.** When `evolve_schema` adds a column to a
+  table whose other declared-precision columns are all `Float64`, the new one is
+  `Float64` too, so one table never mixes the two (ClickHouse has no arithmetic
+  or common type across `Decimal` and `Float64`). A table that already mixes
+  them gets a `decimal_mapping_mixed` warning naming both sets.
 - **BigQuery `NUMERIC` holds at most 9 fractional and 29 integer digits.** A
   declared type past either stays `FLOAT64`; pin a type with `type_overrides` if
   you need it exact.

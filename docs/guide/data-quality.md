@@ -77,8 +77,8 @@ destination (dedup happens lazily via `ReplacingMergeTree`). When you attach a
 the gate has something to check, then promotes it with `INSERT … SELECT` — the
 `ReplacingMergeTree` still dedups the promoted rows exactly as a direct insert
 would. The only paths with no single staging table to gate are `append` mode (a
-bronze-landing direct insert) and `chunk_rows` (keyset resumable reads commit
-each chunk straight into the destination); attaching `validate=` to either
+bronze-landing direct insert) and `chunk_rows` (keyset resumable reads land
+each chunk in the destination before reading the next); attaching `validate=` to either
 raises a clear error rather than silently skipping validation.
 
 ## Reacting to results

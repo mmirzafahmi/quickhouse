@@ -242,7 +242,10 @@ impl CoercionTally {
             | WarningKind::UnclusteredMergeTarget
             | WarningKind::IncompleteExport
             | WarningKind::IgnoredSourceArchive
-            | WarningKind::UnindexedWatermark => None,
+            | WarningKind::UnindexedWatermark
+            | WarningKind::DecimalMappingMixed
+            | WarningKind::WatermarkNotAdvanced
+            | WarningKind::WatermarkAheadOfSource => None,
         }
     }
 

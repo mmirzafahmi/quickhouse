@@ -70,6 +70,7 @@ use google_cloud_bigquery::http::table::{
     TableSchema, TimePartitionType, TimePartitioning,
 };
 use google_cloud_bigquery::http::tabledata::insert_all::{InsertAllRequest, Row as InsertRow};
+use google_cloud_bigquery::http::types::ErrorProto;
 use google_cloud_bigquery::query::row::Row as QueryRow;
 use google_cloud_bigquery::storage_write::stream::committed::CommittedStream;
 use google_cloud_bigquery::storage_write::AppendRowsRequestBuilder;
@@ -1000,30 +1001,51 @@ impl BigQuerySink {
     /// Submit `query` as a job and wait for it to finish. Shared by the
     /// `MERGE` and the `DELETE` paths so both get the same unique job id and
     /// the same terminal-state polling.
+    ///
+    /// A job BigQuery fails for a rate limit applied nothing, so it is
+    /// resubmitted, as a new job, after a backoff. Back-to-back chunk `MERGE`s
+    /// and state writes (`chunk_rows`) are what reach BigQuery's per-table
+    /// limit on DML and metadata updates.
     async fn run_query_job(&self, query: String, prefix: &str, table: &str) -> Result<Job> {
-        let job = Job {
-            job_reference: JobReference {
-                project_id: self.project_id.clone(),
-                job_id: unique_job_id(prefix, table),
-                location: None,
-            },
-            configuration: JobConfiguration {
-                job: JobType::Query(JobConfigurationQuery {
-                    query,
-                    use_legacy_sql: Some(false),
+        let mut attempt = 1;
+        loop {
+            let job = Job {
+                job_reference: JobReference {
+                    project_id: self.project_id.clone(),
+                    job_id: unique_job_id(prefix, table),
+                    location: None,
+                },
+                configuration: JobConfiguration {
+                    job: JobType::Query(JobConfigurationQuery {
+                        query: query.clone(),
+                        use_legacy_sql: Some(false),
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }),
+                },
                 ..Default::default()
-            },
-            ..Default::default()
-        };
-        let created = self
-            .client
-            .job()
-            .create(&job)
-            .await
-            .map_err(|e| EtlError::other(format!("bigquery {prefix} job error: {e}")))?;
-        self.poll_job_until_done(created).await
+            };
+            let created = self
+                .client
+                .job()
+                .create(&job)
+                .await
+                .map_err(|e| EtlError::other(format!("bigquery {prefix} job error: {e}")))?;
+            let done = self.wait_for_job(created).await?;
+            match &done.status.error_result {
+                Some(err) if is_rate_limited(err) && attempt < RATE_LIMITED_JOB_ATTEMPTS => {
+                    let wait = rate_limit_backoff(attempt);
+                    tracing::warn!(
+                        "bigquery {prefix} job on '{table}' hit a rate limit ({}); retrying in \
+                         {wait:?} (attempt {attempt} of {RATE_LIMITED_JOB_ATTEMPTS})",
+                        err.message.as_deref().unwrap_or("no message"),
+                    );
+                    tokio::time::sleep(wait).await;
+                    attempt += 1;
+                }
+                _ => return job_outcome(done),
+            }
+        }
     }
 
     /// Idempotent, matching ClickHouse's `DROP TABLE IF EXISTS`: a
@@ -1077,8 +1099,8 @@ impl BigQuerySink {
     /// EXISTS`, BigQuery's table creation has no such clause, so the
     /// existence check happens here explicitly.
     pub async fn ensure_state_table(&self, state_table: &str) -> Result<()> {
-        if self.table_exists(state_table).await? {
-            return Ok(());
+        if let Some(t) = self.get_table(state_table).await? {
+            return self.migrate_state_table(t).await;
         }
         let field = |name: &str, data_type: TableFieldType| TableFieldSchema {
             name: name.to_string(),
@@ -1099,7 +1121,10 @@ impl BigQuerySink {
                     field("last_watermark", TableFieldType::String),
                     field("rows", TableFieldType::Integer),
                     field("run_ts", TableFieldType::Timestamp),
-                ],
+                ]
+                .into_iter()
+                .chain(state_chunk_fields())
+                .collect(),
             }),
             ..Default::default()
         };
@@ -1111,7 +1136,61 @@ impl BigQuerySink {
         Ok(())
     }
 
+    /// `table`'s metadata, or `None` when it doesn't exist.
+    async fn get_table(&self, table: &str) -> Result<Option<Table>> {
+        match self
+            .client
+            .table()
+            .get(&self.project_id, &self.dataset_id, table)
+            .await
+        {
+            Ok(t) => Ok(Some(t)),
+            Err(e) if is_not_found(&e) => Ok(None),
+            Err(e) => Err(EtlError::other(format!("bigquery table get error: {e}"))),
+        }
+    }
+
+    /// Add the chunk-resume columns (`chunk_cursor`, `chunk_upper`) to a state
+    /// table created before BigQuery destinations supported `chunk_rows`.
+    ///
+    /// At most once per table: one that has them is left alone, so no run pays
+    /// for a metadata patch, which BigQuery rate-limits per table. When two runs
+    /// race to add them, the loser's patch fails on the moved etag; it re-reads
+    /// the table and succeeds if the columns are now there.
+    async fn migrate_state_table(&self, mut t: Table) -> Result<()> {
+        let mut fields = t.schema.take().map(|s| s.fields).unwrap_or_default();
+        let missing = missing_state_chunk_fields(&fields);
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let table_id = t.table_reference.table_id.clone();
+        tracing::info!("adding chunk-resume columns to state table '{table_id}'");
+        fields.extend(missing);
+        t.schema = Some(TableSchema { fields });
+        match self.client.table().patch(&t).await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let now = self.get_table(&table_id).await?;
+                let fields = now
+                    .and_then(|t| t.schema)
+                    .map(|s| s.fields)
+                    .unwrap_or_default();
+                if missing_state_chunk_fields(&fields).is_empty() {
+                    Ok(())
+                } else {
+                    Err(EtlError::other(format!(
+                        "bigquery state table migration error: {e}"
+                    )))
+                }
+            }
+        }
+    }
+
     /// Read the last persisted watermark for this `(state_key, dest_table)` pair.
+    ///
+    /// An empty string reads as no cursor: a chunk-resume marker, or a chunked
+    /// run that finished with nothing to advance to, records the committed
+    /// cursor, and on a first run there is none.
     pub async fn read_last_watermark(&self, cfg: &TransferConfig) -> Result<Option<String>> {
         if !self.table_exists(&cfg.state_table_name).await? {
             return Ok(None);
@@ -1143,9 +1222,85 @@ impl BigQuerySink {
         {
             Some(row) => row
                 .column::<Option<String>>(0)
+                .map(|w| w.filter(|w| !w.is_empty()))
                 .map_err(|e| EtlError::other(format!("bigquery column error: {e}"))),
             None => Ok(None),
         }
+    }
+
+    /// Read an in-progress chunk-resume marker `(cursor, upper)` for this
+    /// `(state_key, dest_table)`: the latest state row's chunk columns. `None`
+    /// when there is no state yet, when the table predates the chunk columns
+    /// (read before `ensure_state_table` has migrated it, so no marker can
+    /// exist), or when the latest row carries none: `persist_watermark` leaves
+    /// them NULL, which is how a finished run clears the marker.
+    pub async fn read_chunk_state(&self, cfg: &TransferConfig) -> Result<Option<(String, String)>> {
+        let Some(t) = self.get_table(&cfg.state_table_name).await? else {
+            return Ok(None);
+        };
+        let fields = t.schema.map(|s| s.fields).unwrap_or_default();
+        if !missing_state_chunk_fields(&fields).is_empty() {
+            return Ok(None);
+        }
+        let request = QueryRequest {
+            query: build_read_chunk_state_sql(
+                &self.project_id,
+                &self.dataset_id,
+                &cfg.state_table_name,
+                &cfg.effective_state_key(),
+                &cfg.dest_table,
+            ),
+            ..Default::default()
+        };
+        let mut iter = self
+            .client
+            .query::<QueryRow>(&self.project_id, request)
+            .await
+            .map_err(|e| EtlError::other(format!("bigquery query error: {e}")))?;
+        let Some(row) = iter
+            .next()
+            .await
+            .map_err(|e| EtlError::other(format!("bigquery row error: {e}")))?
+        else {
+            return Ok(None);
+        };
+        let column = |i: usize| {
+            row.column::<Option<String>>(i)
+                .map_err(|e| EtlError::other(format!("bigquery column error: {e}")))
+        };
+        Ok(match (column(0)?, column(1)?) {
+            (Some(cursor), upper) if !cursor.is_empty() => {
+                Some((cursor, upper.unwrap_or_default()))
+            }
+            _ => None,
+        })
+    }
+
+    /// Persist a per-chunk resume marker: the committed cursor stays in
+    /// `last_watermark`, and the chunk's keyset cursor and frozen upper bound
+    /// go in the chunk columns.
+    pub async fn persist_chunk_cursor(
+        &self,
+        cfg: &TransferConfig,
+        committed: Option<&str>,
+        cursor: &str,
+        upper: &str,
+        rows: u64,
+    ) -> Result<()> {
+        let query = build_persist_chunk_cursor_sql(
+            &self.project_id,
+            &self.dataset_id,
+            &cfg.state_table_name,
+            &cfg.effective_state_key(),
+            &cfg.dest_table,
+            committed.unwrap_or(""),
+            cursor,
+            upper,
+            rows,
+        );
+        self.run_query_job(query, "persist_chunk", &cfg.dest_table)
+            .await?;
+        Ok(())
     }
 
     /// Persist a new watermark after a successful incremental run, via a
@@ -1167,34 +1322,20 @@ impl BigQuerySink {
             watermark,
             rows,
         );
-        let job = Job {
-            job_reference: JobReference {
-                project_id: self.project_id.clone(),
-                job_id: unique_job_id("persist_watermark", &cfg.dest_table),
-                location: None,
-            },
-            configuration: JobConfiguration {
-                job: JobType::Query(JobConfigurationQuery {
-                    query,
-                    use_legacy_sql: Some(false),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let created =
-            self.client.job().create(&job).await.map_err(|e| {
-                EtlError::other(format!("bigquery persist_watermark job error: {e}"))
-            })?;
-        self.poll_job_until_done(created).await?;
+        self.run_query_job(query, "persist_watermark", &cfg.dest_table)
+            .await?;
         Ok(())
     }
 
     /// Poll a submitted job (copy or DML query) until it reaches `DONE`,
     /// then surface any job-level failure — same poll-until-done idiom
     /// already used by the read side (`source/bigquery.rs::run_query`).
-    async fn poll_job_until_done(&self, mut job: Job) -> Result<Job> {
+    async fn poll_job_until_done(&self, job: Job) -> Result<Job> {
+        job_outcome(self.wait_for_job(job).await?)
+    }
+
+    /// Poll a submitted job until it reaches `DONE`, failed or not.
+    async fn wait_for_job(&self, mut job: Job) -> Result<Job> {
         while job.status.state != JobState::Done {
             tokio::time::sleep(Duration::from_millis(500)).await;
             job = self
@@ -1210,21 +1351,67 @@ impl BigQuerySink {
                 .await
                 .map_err(|e| EtlError::other(format!("bigquery job get error: {e}")))?;
         }
-        if let Some(err) = &job.status.error_result {
-            return Err(EtlError::other(format!(
-                "bigquery job {} failed: {}",
-                job.job_reference.job_id,
-                err.message.as_deref().unwrap_or("unknown error")
-            )));
-        }
         Ok(job)
     }
 }
 
+/// A finished job, or its failure as an error.
+fn job_outcome(job: Job) -> Result<Job> {
+    if let Some(err) = &job.status.error_result {
+        return Err(EtlError::other(format!(
+            "bigquery job {} failed: {}",
+            job.job_reference.job_id,
+            err.message.as_deref().unwrap_or("unknown error")
+        )));
+    }
+    Ok(job)
+}
+
+/// Total attempts for a query job BigQuery failed for a rate limit.
+const RATE_LIMITED_JOB_ATTEMPTS: u32 = 6;
+
+/// Whether a failed job hit a rate limit rather than a real error. Such a job
+/// applied nothing, so running the statement again is safe.
+fn is_rate_limited(err: &ErrorProto) -> bool {
+    matches!(
+        err.reason.as_deref(),
+        Some("rateLimitExceeded" | "jobRateLimitExceeded")
+    )
+}
+
+/// Wait before retry `attempt` (1-based) of a rate-limited job: 2s, 4s, 8s,
+/// 16s, then 32s. BigQuery's per-table limit on DML and metadata updates is
+/// counted over seconds, so the millisecond insert backoff would only spend
+/// the retries inside the same window.
+fn rate_limit_backoff(attempt: u32) -> Duration {
+    Duration::from_secs(2u64 << attempt.saturating_sub(1).min(4))
+}
+
+/// The state table's chunk-resume columns. `NULLABLE`, so a state table can
+/// gain them in place and `persist_watermark`, which doesn't write them,
+/// leaves them NULL.
+fn state_chunk_fields() -> [TableFieldSchema; 2] {
+    ["chunk_cursor", "chunk_upper"].map(|name| TableFieldSchema {
+        name: name.to_string(),
+        data_type: TableFieldType::String,
+        mode: Some(TableFieldMode::Nullable),
+        ..Default::default()
+    })
+}
+
+/// The chunk-resume columns `fields` lacks (names compared case-insensitively,
+/// as BigQuery does).
+fn missing_state_chunk_fields(fields: &[TableFieldSchema]) -> Vec<TableFieldSchema> {
+    state_chunk_fields()
+        .into_iter()
+        .filter(|c| !fields.iter().any(|f| f.name.eq_ignore_ascii_case(&c.name)))
+        .collect()
+}
+
 /// Thin delegation to the inherent methods above. BigQuery overrides the
-/// staging/merge capability (no engine-level dedup) and keeps the default
-/// chunk-resume methods (chunked reads are ClickHouse-only, so BigQuery is
-/// never asked to persist a chunk cursor).
+/// staging/merge capability (no engine-level dedup) and the chunk-resume
+/// methods (a chunked read merges each chunk through its own staging table;
+/// see `sync::ChunkStager`).
 #[async_trait]
 impl Sink for BigQuerySink {
     async fn table_exists(&self, table: &str) -> Result<bool> {
@@ -1274,6 +1461,19 @@ impl Sink for BigQuerySink {
         rows: u64,
     ) -> Result<()> {
         BigQuerySink::persist_watermark(self, cfg, watermark, rows).await
+    }
+    async fn read_chunk_state(&self, cfg: &TransferConfig) -> Result<Option<(String, String)>> {
+        BigQuerySink::read_chunk_state(self, cfg).await
+    }
+    async fn persist_chunk_cursor(
+        &self,
+        cfg: &TransferConfig,
+        committed: Option<&str>,
+        cursor: &str,
+        upper: &str,
+        rows: u64,
+    ) -> Result<()> {
+        BigQuerySink::persist_chunk_cursor(self, cfg, committed, cursor, upper, rows).await
     }
     async fn add_missing_columns(
         &self,
@@ -1527,6 +1727,48 @@ fn build_persist_watermark_sql(
         escape_sql_string(source_id),
         escape_sql_string(dest_table),
         escape_sql_string(watermark),
+    )
+}
+
+/// The latest state row's chunk-resume columns for one `(state_key,
+/// dest_table)`.
+fn build_read_chunk_state_sql(
+    project_id: &str,
+    dataset_id: &str,
+    state_table: &str,
+    source_id: &str,
+    dest_table: &str,
+) -> String {
+    format!(
+        "SELECT chunk_cursor, chunk_upper FROM `{project_id}`.`{dataset_id}`.`{state_table}` \
+         WHERE source_table = '{}' AND dest_table = '{}' \
+         ORDER BY run_ts DESC LIMIT 1",
+        escape_sql_string(source_id),
+        escape_sql_string(dest_table),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_persist_chunk_cursor_sql(
+    project_id: &str,
+    dataset_id: &str,
+    state_table: &str,
+    source_id: &str,
+    dest_table: &str,
+    committed: &str,
+    cursor: &str,
+    upper: &str,
+    rows: u64,
+) -> String {
+    format!(
+        "INSERT INTO `{project_id}`.`{dataset_id}`.`{state_table}` \
+         (source_table, dest_table, last_watermark, `rows`, run_ts, chunk_cursor, chunk_upper) \
+         VALUES ('{}', '{}', '{}', {rows}, CURRENT_TIMESTAMP(), '{}', '{}')",
+        escape_sql_string(source_id),
+        escape_sql_string(dest_table),
+        escape_sql_string(committed),
+        escape_sql_string(cursor),
+        escape_sql_string(upper),
     )
 }
 
@@ -2631,6 +2873,80 @@ mod tests {
             sql.contains("VALUES ('orders', 'orders_dest', '2024-06-01', 42, CURRENT_TIMESTAMP())"),
             "{sql}"
         );
+    }
+
+    /// Issue #4: a chunk marker keeps the committed cursor in
+    /// `last_watermark` and puts the keyset cursor and frozen bound in the
+    /// chunk columns, escaped like every other literal here.
+    #[test]
+    fn chunk_state_sql_reads_and_writes_the_chunk_columns() {
+        let read = build_read_chunk_state_sql("p", "d", "_quickhouse_state", "o'k", "dest");
+        assert!(
+            read.starts_with("SELECT chunk_cursor, chunk_upper FROM `p`.`d`.`_quickhouse_state`"),
+            "{read}"
+        );
+        assert!(read.contains(r"source_table = 'o\'k'"), "{read}");
+        assert!(read.ends_with("ORDER BY run_ts DESC LIMIT 1"), "{read}");
+
+        let write = build_persist_chunk_cursor_sql(
+            "p",
+            "d",
+            "_quickhouse_state",
+            "orders",
+            "dest",
+            "2024-06-01 00:00:00",
+            "41",
+            "2024-06-10 00:00:00",
+            7,
+        );
+        assert!(
+            write.contains(
+                "(source_table, dest_table, last_watermark, `rows`, run_ts, chunk_cursor, \
+                 chunk_upper) VALUES ('orders', 'dest', '2024-06-01 00:00:00', 7, \
+                 CURRENT_TIMESTAMP(), '41', '2024-06-10 00:00:00')"
+            ),
+            "{write}"
+        );
+    }
+
+    #[test]
+    fn state_table_migration_adds_only_missing_nullable_chunk_columns() {
+        let named = |n: &str| TableFieldSchema {
+            name: n.to_string(),
+            ..Default::default()
+        };
+        let old = vec![named("source_table"), named("last_watermark")];
+        let missing = missing_state_chunk_fields(&old);
+        assert_eq!(
+            missing.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+            ["chunk_cursor", "chunk_upper"]
+        );
+        assert!(missing
+            .iter()
+            .all(|f| f.mode == Some(TableFieldMode::Nullable)));
+        let migrated = vec![
+            named("source_table"),
+            named("CHUNK_CURSOR"),
+            named("chunk_upper"),
+        ];
+        assert!(missing_state_chunk_fields(&migrated).is_empty());
+    }
+
+    #[test]
+    fn only_a_rate_limit_is_retried() {
+        let err = |reason: &str| ErrorProto {
+            reason: Some(reason.to_string()),
+            ..Default::default()
+        };
+        assert!(is_rate_limited(&err("rateLimitExceeded")));
+        assert!(is_rate_limited(&err("jobRateLimitExceeded")));
+        // A daily quota or a bad statement won't clear by waiting.
+        assert!(!is_rate_limited(&err("quotaExceeded")));
+        assert!(!is_rate_limited(&err("invalidQuery")));
+        assert!(!is_rate_limited(&ErrorProto::default()));
+        assert_eq!(rate_limit_backoff(1), Duration::from_secs(2));
+        assert_eq!(rate_limit_backoff(3), Duration::from_secs(8));
+        assert_eq!(rate_limit_backoff(9), Duration::from_secs(32));
     }
 
     #[test]

@@ -84,6 +84,23 @@ For daily syncs that need to catch late-arriving or edited rows, set
 creating duplicates. Requires `key` or `order_by`, and a date/timestamp
 watermark. `0` (default) disables lookback.
 
+### When the cursor can't advance
+
+A cursor the source can't compare shows up as a run that succeeds with 0 rows,
+and every run after it does the same. quickhouse checks for this on every
+incremental run that has a cursor:
+
+- **Before reading,** it evaluates the lower bound on the source
+  (`SELECT (<bound>) IS NULL`, one round trip that touches no table). If the
+  bound is `NULL`, the run fails with an error naming the `state_key` and the
+  cursor, since `watermark > NULL` matches nothing. BigQuery sources skip this:
+  their typed literals fail the query outright instead.
+- **From the `MAX(watermark)` probe,** at no extra cost, it raises
+  `watermark_ahead_of_source` when the cursor is past the source's MAX, and
+  `watermark_not_advanced` when the MAX is past the lower bound but the read
+  returned nothing. Neither applies when the probe was skipped (see
+  `probe_max_cost`).
+
 ### Cursor control
 
 A few knobs make the incremental cursor robust in the real world (all
@@ -124,7 +141,7 @@ incremental-mode only):
       <div class="qh-params__name">chunk_rows</div>
       <div class="qh-params__type">Optional[int] = None &mdash; experimental</div>
     </div>
-    <p class="qh-params__desc">Reads the source in keyset-ordered chunks of <code>N</code> rows, committing the cursor per chunk so a mid-read failure resumes instead of restarting. <strong>ClickHouse destination + incremental only</strong>, and the keyset column (<code>partition_column</code>, else the first <code>key</code>) must be a <strong>unique, NOT NULL integer</strong>. Single-stream (<code>parallelism</code> is ignored). <code>None</code> (default) = one read.</p>
+    <p class="qh-params__desc">Reads the source in keyset-ordered chunks of <code>N</code> rows, committing the cursor per chunk so a mid-read failure resumes instead of restarting. <strong>Incremental only</strong>, and the keyset column (<code>partition_column</code>, else the first <code>key</code>) must be a <strong>unique, NOT NULL integer</strong>. Single-stream (<code>parallelism</code> is ignored). <code>None</code> (default) = one read. On BigQuery each chunk is staged and <code>MERGE</code>d on its own, so a destination clustered by <code>key</code> keeps each merge to its own key range, while an unclustered one is scanned in full once per chunk.</p>
   </div>
 </div>
 ```

@@ -701,3 +701,269 @@ def test_collapsed_tinyint1_names_the_column_it_flattened(
         ch_client.command(f"DROP TABLE IF EXISTS `{table}`")
         with mysql_conn.cursor() as cur:
             cur.execute(f"DROP TABLE IF EXISTS `{table}`")
+
+
+def _stream_cursor_sync(mysql_source, ch_target, table, **kw):
+    """Incremental sync whose MAX probe is skipped (``probe_max_cost=1.0`` on an
+    unindexed watermark), so the cursor is taken from the read stream."""
+    return quickhouse.sync(
+        mysql_source,
+        ch_target,
+        dest_table=table,
+        source_table=table,
+        mode="incremental",
+        watermark="write_date",
+        key=["id"],
+        create_if_missing=True,
+        engine="ReplacingMergeTree",
+        order_by=["id"],
+        lookback_seconds=60,
+        probe_max_cost=1.0,
+        **kw,
+    )
+
+
+def _latest_cursor(ch_client, table):
+    return ch_client.command(
+        "SELECT last_watermark FROM _quickhouse_state FINAL "
+        f"WHERE dest_table = '{table}' ORDER BY run_ts DESC LIMIT 1"
+    )
+
+
+def _add_newer_rows(mysql_conn, table):
+    with mysql_conn.cursor() as cur:
+        cur.executemany(
+            f"INSERT INTO `{table}` (id, name, amount, qty, is_active, write_date) "
+            f"VALUES (%s, %s, %s, %s, %s, %s)",
+            [(i, f"row-{i}", i * 1.5, i, True, "2024-02-01 00:00:00") for i in range(101, 151)],
+        )
+
+
+def test_stream_cursor_is_saved_in_a_form_mysql_can_compare(
+    mysql_conn, ch_client, mysql_source, ch_target, unique_name
+):
+    """Issue #2: a cursor folded from the read stream was saved as
+    ``...+00``, which MySQL can't parse as a DATETIME. The next run's lower
+    bound became NULL, it read 0 rows and succeeded, and so did every run after
+    it."""
+    table = unique_name
+    _seed_table(mysql_conn, table, 100, base_ts="2024-01-01 00:00:00")
+    _drop_ch(ch_client, table)
+    try:
+        r1 = _stream_cursor_sync(mysql_source, ch_target, table)
+        assert r1.rows_written == 100
+        assert "unindexed_watermark" in {w.kind for w in r1.warnings}, r1.warnings
+        cursor = _latest_cursor(ch_client, table)
+        assert cursor == "2024-01-01 00:00:00.000000", cursor
+
+        _add_newer_rows(mysql_conn, table)
+        r2 = _stream_cursor_sync(mysql_source, ch_target, table)
+        # The 50 new rows, plus the 100 run-1 rows the 60s lookback re-reads
+        # (they sit exactly on the cursor). Before the fix this was 0.
+        assert r2.rows_written == 150
+        assert int(ch_client.command(f"SELECT count() FROM `{table}` FINAL")) == 150
+        assert _latest_cursor(ch_client, table) == "2024-02-01 00:00:00.000000"
+    finally:
+        _drop_ch(ch_client, table)
+
+
+def test_a_saved_utc_offset_cursor_is_healed_on_read(
+    mysql_conn, ch_client, mysql_source, ch_target, unique_name
+):
+    """State written by 0.18-0.20.1 still holds ``...+00`` cursors. Reading one
+    back strips the zero offset (without converting it), so a frozen table
+    resumes on upgrade with no manual state edit. Covers the bare-literal
+    ``lookback_seconds=0`` form as well as the ``CAST(...)`` lookback form."""
+    table = unique_name
+    _seed_table(mysql_conn, table, 100, base_ts="2024-01-01 00:00:00")
+    _drop_ch(ch_client, table)
+    try:
+        assert _stream_cursor_sync(mysql_source, ch_target, table).rows_written == 100
+        state_key = ch_client.command(
+            f"SELECT source_table FROM _quickhouse_state WHERE dest_table = '{table}' LIMIT 1"
+        )
+        for frozen in ("2024-01-01 00:00:00.000000+00", "2024-01-01 00:00:00+00:00"):
+            ch_client.command(
+                "INSERT INTO _quickhouse_state "
+                "(source_table, dest_table, last_watermark, rows, chunk_cursor, chunk_upper) "
+                f"VALUES ('{state_key}', '{table}', '{frozen}', 0, '', '')"
+            )
+            with mysql_conn.cursor() as cur:
+                cur.execute(f"DELETE FROM `{table}` WHERE id > 100")
+            _add_newer_rows(mysql_conn, table)
+            # 50 new rows + the 100 on the cursor that the lookback re-reads.
+            assert _stream_cursor_sync(mysql_source, ch_target, table).rows_written == 150, frozen
+            assert _latest_cursor(ch_client, table) == "2024-02-01 00:00:00.000000"
+
+        # The MAX-probe path with lookback_seconds=0 compares the bare literal.
+        ch_client.command(
+            "INSERT INTO _quickhouse_state "
+            "(source_table, dest_table, last_watermark, rows, chunk_cursor, chunk_upper) "
+            f"VALUES ('{state_key}', '{table}', '2024-01-01 00:00:00.000000+00', 0, '', '')"
+        )
+        r = quickhouse.sync(
+            mysql_source,
+            ch_target,
+            dest_table=table,
+            source_table=table,
+            mode="incremental",
+            watermark="write_date",
+            key=["id"],
+            probe_max_cost=0.0,
+        )
+        assert r.rows_written == 50
+    finally:
+        _drop_ch(ch_client, table)
+
+
+def _column_types(ch_client, table):
+    return dict(
+        ch_client.query(
+            "SELECT name, type FROM system.columns "
+            f"WHERE database = currentDatabase() AND table = '{table}'"
+        ).result_rows
+    )
+
+
+def test_a_decimal_column_added_to_a_float_table_follows_the_table(
+    mysql_conn, ch_client, mysql_source, ch_target, unique_name
+):
+    """Issue #5: on a table created under the pre-0.20.1 Float64 default,
+    ``evolve_schema`` adds a new DECIMAL(P, S) column as Float64 like its
+    siblings, not as the one Decimal in a table of floats."""
+    table = unique_name
+    with mysql_conn.cursor() as cur:
+        cur.execute(f"DROP TABLE IF EXISTS `{table}`")
+        cur.execute(
+            f"CREATE TABLE `{table}` (id BIGINT PRIMARY KEY, "
+            "price DECIMAL(15, 2), discount DECIMAL(15, 2))"
+        )
+        cur.execute(f"INSERT INTO `{table}` VALUES (1, 32.90, 1.50)")
+    _drop_ch(ch_client, table)
+    ch_client.command(
+        f"CREATE TABLE `{table}` (id Int64, price Nullable(Float64)) "
+        "ENGINE = MergeTree ORDER BY id"
+    )
+    try:
+        r = quickhouse.sync(
+            mysql_source, ch_target, dest_table=table, source_table=table,
+            mode="full", evolve_schema=True,
+        )
+        assert _column_types(ch_client, table)["discount"] == "Nullable(Float64)"
+        assert "decimal_mapping_mixed" not in {w.kind for w in r.warnings}, r.warnings
+        rows = ch_client.query(f"SELECT price - discount FROM `{table}`").result_rows
+        assert rows == [(31.4,)]
+    finally:
+        _drop_ch(ch_client, table)
+
+
+def test_a_table_that_already_mixes_decimals_and_floats_is_reported(
+    mysql_conn, ch_client, mysql_source, ch_target, unique_name
+):
+    """A table 0.20.1 already left mixed has no single convention to follow: a
+    new column keeps the Decimal default, and the run says which columns
+    disagree."""
+    table = unique_name
+    with mysql_conn.cursor() as cur:
+        cur.execute(f"DROP TABLE IF EXISTS `{table}`")
+        cur.execute(
+            f"CREATE TABLE `{table}` (id BIGINT PRIMARY KEY, "
+            "price DECIMAL(15, 2), discount DECIMAL(15, 2), tax DECIMAL(15, 2))"
+        )
+        cur.execute(f"INSERT INTO `{table}` VALUES (1, 32.90, 1.50, 0.25)")
+    _drop_ch(ch_client, table)
+    ch_client.command(
+        f"CREATE TABLE `{table}` (id Int64, price Nullable(Float64), "
+        "discount Nullable(Decimal(15, 2))) ENGINE = MergeTree ORDER BY id"
+    )
+    try:
+        r = quickhouse.sync(
+            mysql_source, ch_target, dest_table=table, source_table=table,
+            mode="full", evolve_schema=True,
+        )
+        assert _column_types(ch_client, table)["tax"] == "Nullable(Decimal(15, 2))"
+        mixed = [w for w in r.warnings if w.kind == "decimal_mapping_mixed"]
+        assert len(mixed) == 1, r.warnings
+        assert mixed[0].column is None
+        assert "discount" in mixed[0].message and "price" in mixed[0].message
+    finally:
+        _drop_ch(ch_client, table)
+
+
+def _cursor_warnings(result):
+    return [w for w in result.warnings if w.kind.startswith("watermark_")]
+
+
+def _insert_state(ch_client, table, cursor):
+    state_key = ch_client.command(
+        f"SELECT source_table FROM _quickhouse_state WHERE dest_table = '{table}' LIMIT 1"
+    )
+    ch_client.command(
+        "INSERT INTO _quickhouse_state "
+        "(source_table, dest_table, last_watermark, rows, chunk_cursor, chunk_upper) "
+        f"VALUES ('{state_key}', '{table}', '{cursor}', 0, '', '')"
+    )
+    return state_key
+
+
+def test_a_lower_bound_that_evaluates_to_null_fails_the_run(
+    mysql_conn, ch_client, mysql_source, ch_target, unique_name
+):
+    """Issue #3 (A): outside strict mode MySQL turns an unparseable
+    ``CAST(... AS DATETIME)`` into NULL, so ``write_date > NULL`` matched
+    nothing and the run succeeded with 0 rows, as did every run after it. It
+    now fails before reading, naming the state key and the cursor."""
+    table = unique_name
+    _seed_table(mysql_conn, table, 100, base_ts="2024-01-01 00:00:00")
+    _drop_ch(ch_client, table)
+    kw = dict(
+        dest_table=table, source_table=table, mode="incremental", watermark="write_date",
+        key=["id"], create_if_missing=True, engine="ReplacingMergeTree", order_by=["id"],
+        lookback_seconds=60,
+    )
+    try:
+        assert quickhouse.sync(mysql_source, ch_target, **kw).rows_written == 100
+        state_key = _insert_state(ch_client, table, "2024-13-45 00:00:00")
+        _add_newer_rows(mysql_conn, table)
+        with pytest.raises(Exception, match="evaluates to NULL on the source") as err:
+            quickhouse.sync(mysql_source, ch_target, **kw)
+        assert f"state_key '{state_key}'" in str(err.value)
+        assert "2024-13-45 00:00:00" in str(err.value)
+        # Failed, so nothing moved: the bad cursor is still there to repair.
+        assert _latest_cursor(ch_client, table) == "2024-13-45 00:00:00"
+    finally:
+        _drop_ch(ch_client, table)
+
+
+def test_a_cursor_ahead_of_the_source_is_reported(
+    mysql_conn, ch_client, mysql_source, ch_target, unique_name
+):
+    """Issue #3 (C): a cursor past the source's MAX (shifted by a time-zone
+    conversion, or seeded from another table) is reported. An ordinary quiet
+    run, where the MAX equals the cursor, reports nothing."""
+    table = unique_name
+    _seed_table(mysql_conn, table, 100, base_ts="2024-01-01 00:00:00")
+    _drop_ch(ch_client, table)
+    kw = dict(
+        dest_table=table, source_table=table, mode="incremental", watermark="write_date",
+        key=["id"], create_if_missing=True, engine="ReplacingMergeTree", order_by=["id"],
+        probe_max_cost=0.0,
+    )
+    try:
+        assert quickhouse.sync(mysql_source, ch_target, **kw).rows_written == 100
+        quiet = quickhouse.sync(mysql_source, ch_target, **kw)
+        assert quiet.rows_written == 0
+        assert _cursor_warnings(quiet) == [], quiet.warnings
+
+        _insert_state(ch_client, table, "2024-01-02 00:00:00")
+        r = quickhouse.sync(mysql_source, ch_target, **kw)
+        assert r.rows_written == 0
+        (ahead,) = _cursor_warnings(r)
+        assert ahead.kind == "watermark_ahead_of_source"
+        assert ahead.column == "write_date"
+        assert ahead.sample == "2024-01-02 00:00:00"
+        # The probe's MAX is saved as the cursor, so the next run is quiet.
+        assert _latest_cursor(ch_client, table) == "2024-01-01 00:00:00"
+        assert _cursor_warnings(quickhouse.sync(mysql_source, ch_target, **kw)) == []
+    finally:
+        _drop_ch(ch_client, table)
