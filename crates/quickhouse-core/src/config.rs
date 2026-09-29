@@ -1070,10 +1070,11 @@ pub struct TransferConfig {
     pub read_idle_timeout_secs: u64,
 
     // ---- 0.5.0 block (kept contiguous; append new fields here) ----
-    /// Incremental + ClickHouse-destination only: read the source in
-    /// keyset-ordered chunks of this many rows, committing the watermark per
-    /// chunk so a mid-read failure resumes instead of restarting from the last
-    /// run's watermark. `None` (default) = one unbounded read per partition, as
+    /// Incremental only: read the source in keyset-ordered chunks of this many
+    /// rows, committing the watermark per chunk so a mid-read failure resumes
+    /// instead of restarting from the last run's watermark. A destination that
+    /// stages incremental loads (BigQuery) merges each chunk through its own
+    /// staging table before committing it, one `MERGE` per chunk. `None` (default) = one unbounded read per partition, as
     /// before. Requires a keyset ordering column (see [`Self::keyset_column`])
     /// that is a **unique, NOT NULL integer** — ties or NULLs would silently
     /// skip rows. Chunked mode runs single-stream (range partitioning is off).
@@ -1554,6 +1555,14 @@ impl TransferConfig {
                      would delete the ENTIRE destination history outside the current batch",
                 ));
             }
+            if self.chunk_rows.is_some() {
+                return Err(EtlError::config(
+                    "delete_stale_in_window is not supported together with chunk_rows: it \
+                     deletes the destination rows in the window that the staged batch doesn't \
+                     hold, and each chunk holds only part of the window, so every chunk would \
+                     delete the rows the others land",
+                ));
+            }
         }
         Ok(())
     }
@@ -1679,6 +1688,27 @@ pub enum WarningKind {
     /// defect of this family was once measured reading 4,991 of 146,852
     /// records (3.40%) and reporting the run clean.
     IncompleteExport,
+    /// The destination already mixes exact decimals and non-decimal columns
+    /// (`Float64` / `FLOAT64`) among the columns fed by a source that declares
+    /// its precision. ClickHouse defines no arithmetic between `Decimal` and
+    /// `Float64`, and no common supertype for `if`, `coalesce` or `UNION ALL`,
+    /// so models that treat the columns alike fail. Typically left by 0.20.1,
+    /// whose schema evolution added a new declared-precision column as
+    /// `Decimal(P, S)` to a table of floats. Table-level: `column` is `None`
+    /// and the message names both sets.
+    DecimalMappingMixed,
+    /// The `MAX(watermark)` probe found a value past the run's lower bound,
+    /// yet the read returned 0 rows. The row holding that MAX satisfies the
+    /// filter, so the two facts contradict each other: something between the
+    /// bound and the predicate is wrong (a cursor the source compares
+    /// differently than it was written), or that row changed between the probe
+    /// and the read. Only raised when the probe ran.
+    WatermarkNotAdvanced,
+    /// The saved cursor (or `seed_watermark`) is past the source's current
+    /// `MAX(watermark)`: a cursor shifted by a time-zone conversion, seeded
+    /// from the wrong table, or a source whose newest rows were deleted. Only
+    /// raised when the probe ran.
+    WatermarkAheadOfSource,
 }
 
 impl WarningKind {
@@ -1697,6 +1727,9 @@ impl WarningKind {
             WarningKind::IgnoredSourceArchive => "ignored_source_archive",
             WarningKind::IncompleteExport => "incomplete_export",
             WarningKind::UnindexedWatermark => "unindexed_watermark",
+            WarningKind::DecimalMappingMixed => "decimal_mapping_mixed",
+            WarningKind::WatermarkNotAdvanced => "watermark_not_advanced",
+            WarningKind::WatermarkAheadOfSource => "watermark_ahead_of_source",
         }
     }
 }
@@ -2250,6 +2283,14 @@ mod tests {
         let mut c = cfg(SyncMode::Incremental, Some("write_date"));
         c.chunk_rows = Some(1000);
         assert!(c.validate().is_ok());
+        // A window-scoped delete can't be split across chunks.
+        c.delete_stale_in_window = true;
+        c.merge_prune_partition_by = Some("order_date".into());
+        let msg = c.validate().unwrap_err().to_string();
+        assert!(
+            msg.contains("delete_stale_in_window") && msg.contains("chunk_rows"),
+            "{msg}"
+        );
     }
 
     #[test]

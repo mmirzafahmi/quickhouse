@@ -9,6 +9,62 @@ any breaking change is called out explicitly.
 
 ## [Unreleased]
 
+### Fixed
+- **`chunk_rows` with `delete_stale_in_window` is refused up front.** On
+  ClickHouse the pair failed with a message about `validate=`, which wasn't
+  set; the real conflict is that a window-scoped delete can't be split across
+  chunks. (#4)
+- **MySQL incremental syncs no longer freeze on a stream-derived cursor.**
+  When the `MAX(watermark)` probe was skipped as too costly (`probe_max_cost`)
+  and `lookback_seconds > 0`, the cursor was taken from the read stream and a
+  tz-aware watermark (the default for MySQL `DATETIME`/`TIMESTAMP`) was saved
+  as `...+00`. MySQL can't parse that offset, so the next run's lower bound was
+  NULL (or failed with `1525 Incorrect DATETIME value` in strict mode): it read
+  0 rows and succeeded, and so did every run after it. The cursor is now saved
+  with no offset, the same form the MAX-probe path saves. A `+00` / `+00:00`
+  cursor already saved is read back without its zero offset (nothing is
+  converted), so a frozen table resumes on upgrade with no state edit.
+  PostgreSQL cursors are unchanged. Affects 0.18.0 to 0.20.1. (#2)
+- **A decimal column added to an existing table follows the table.** In
+  0.20.1, `evolve_schema` added a new declared-precision column (`numeric(P, S)`
+  / `DECIMAL(P, S)`) as `Decimal(P, S)` even when every other such column in
+  the table was `Float64`, and ClickHouse has no arithmetic or common type
+  across the two. A new column now lands as `Float64` when its siblings all
+  are. A new table, or one whose declared-precision columns are already
+  decimals, keeps the 0.20.1 mapping. `type_overrides` and
+  `numeric_as_decimal` still win. (#5)
+
+### Added
+- **`chunk_rows` works with a BigQuery destination.** Keyset resumable reads
+  were ClickHouse-only, so a large table on a source that cancels long queries
+  (a hot standby's recovery-conflict window) needed a hand-written chunking
+  loop to land in BigQuery. Each chunk is now loaded into a staging table of
+  its own, `MERGE`d into the destination and dropped, and only then is its
+  cursor committed; a run cut short resumes at the next chunk from its own
+  `state_key`. Each chunk is a separate `MERGE`: on a destination clustered by
+  `key` each scans about its own key range, while an unclustered destination
+  is scanned in full once per chunk. The BigQuery state table gains two
+  nullable columns, `chunk_cursor` and `chunk_upper`, added in place the first
+  time a run sees it. A BigQuery query job that fails with `rateLimitExceeded`
+  is now retried with a backoff. (#4)
+- **An incremental run fails when its lower bound evaluates to NULL.** Before
+  reading, the lower bound is evaluated on the source (`SELECT (<bound>) IS
+  NULL`: one round trip, no table touched). A `NULL` bound matches no row, so
+  such a run used to read 0 rows and succeed, and so did every run after it
+  (this is how #2 went unnoticed for 12 days). It is now an error naming the
+  `state_key` and the cursor. PostgreSQL, MySQL and ClickHouse sources;
+  BigQuery's typed literals already fail outright. (#3)
+- **`WarningKind::WatermarkNotAdvanced`** (`"watermark_not_advanced"`) and
+  **`WarningKind::WatermarkAheadOfSource`** (`"watermark_ahead_of_source"`).
+  When the `MAX(watermark)` probe ran, it is now compared with the cursor as
+  the watermark's type orders them. The first is raised when the MAX is past
+  the lower bound but the read returned 0 rows; the second when the cursor is
+  past the MAX. No extra query. (#3)
+- **`WarningKind::DecimalMappingMixed`** (`"decimal_mapping_mixed"`). Raised
+  when the destination already mixes exact decimals and `Float64` among the
+  columns fed by a declared-precision source column, as 0.20.1 could leave it.
+  Columns with their own `type_overrides` entry don't count. (#5)
+
 ## [0.20.1] — 2026-09-29
 
 ### Changed — please read before upgrading

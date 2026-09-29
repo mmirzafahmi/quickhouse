@@ -234,6 +234,9 @@ Each warning carries `.kind` (stable, machine-readable — match on this, never 
 | `coerced_scalar` | An API source's scalar didn't parse as its declared type and became `NULL`. |
 | `full_refresh_shrink` | A full refresh left the destination smaller than it was, permitted by `allow_full_refresh_shrink=True`. (Without that flag the same condition is a hard error.) |
 | `unclustered_merge_target` | A BigQuery `MERGE` ran against a destination not clustered by the merge key, so the key bound pruned nothing and the statement scanned the whole table. A cost problem, not a data one. |
+| `watermark_not_advanced` | The `MAX(watermark)` probe found a value past the run's lower bound, yet the read returned 0 rows. The row holding that MAX matches the filter, so the cursor and the predicate disagree: the cursor may never advance again. Only raised when the probe ran. |
+| `watermark_ahead_of_source` | The saved cursor (or `seed_watermark`) is past the source's `MAX(watermark)`: shifted by a time-zone conversion, seeded from another table, or the source's newest rows were deleted. Rows between the cursor's true position and the MAX may have been skipped. Only raised when the probe ran. |
+| `decimal_mapping_mixed` | The destination mixes exact `Decimal` and `Float64` columns that are all fed by declared-precision source decimals. ClickHouse has no arithmetic or common type across the two. |
 
 Nothing is raised for you: these are values, and which of them should fail a
 pipeline is a decision about your data, not about quickhouse.

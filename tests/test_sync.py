@@ -780,3 +780,39 @@ def _pg_scalar(pg_conn, sql: str):
     with pg_conn.cursor() as cur:
         cur.execute(sql)
         return cur.fetchone()[0]
+
+
+def test_quiet_incremental_runs_raise_no_cursor_warnings(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """Issue #3's checks compare the MAX probe with the saved cursor. A run with
+    nothing new must say nothing, including on a ``timestamptz``, whose MAX
+    renders with the session's offset, and with a lookback."""
+    table = unique_name
+    with pg_conn.cursor() as cur:
+        cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+        cur.execute(
+            f'CREATE TABLE "{table}" (id bigint PRIMARY KEY, write_date timestamptz NOT NULL)'
+        )
+        cur.execute(
+            f"INSERT INTO \"{table}\" SELECT g, '2024-01-01 00:00:00+00' "
+            "FROM generate_series(1, 10) g"
+        )
+    for lookback in (0, 3600):
+        dest = f"{table}_{lookback}"
+        _drop_ch(ch_client, dest)
+        kw = dict(
+            dest_table=dest, source_table=table, mode="incremental", watermark="write_date",
+            key=["id"], create_if_missing=True, engine="ReplacingMergeTree", order_by=["id"],
+            lookback_seconds=lookback, probe_max_cost=0.0,
+        )
+        try:
+            assert quickhouse.sync(pg_source, ch_target, **kw).rows_written == 10
+            quiet = quickhouse.sync(pg_source, ch_target, **kw)
+            kinds = {w.kind for w in quiet.warnings}
+            assert not {"watermark_not_advanced", "watermark_ahead_of_source"} & kinds, (
+                lookback,
+                quiet.warnings,
+            )
+        finally:
+            _drop_ch(ch_client, dest)

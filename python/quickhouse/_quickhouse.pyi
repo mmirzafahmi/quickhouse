@@ -597,6 +597,23 @@ class TransferWarning:
       itself, which is why it is reported rather than logged: a defect of this
       family was once measured reading 4,991 of 146,852 records (3.40%) and
       reporting the run clean. ``count`` is the number of records actually read.
+    - ``"decimal_mapping_mixed"`` — the destination already holds exact
+      ``Decimal`` columns beside ``Float64`` ones, all fed by source columns
+      that declare a precision. ClickHouse has no arithmetic between the two
+      and no common type for them in ``if``/``coalesce``/``UNION ALL``. Usually
+      left by 0.20.1's ``evolve_schema``, which added a new ``DECIMAL(P, S)``
+      column as ``Decimal`` to a table of floats. ``column`` is ``None``; the
+      message names both sets. New in 0.20.2.
+    - ``"watermark_not_advanced"`` — the ``MAX(watermark)`` probe found a
+      value past this run's lower bound, yet the read returned 0 rows. The row
+      holding that MAX matches the filter, so the cursor and the predicate
+      disagree, and the cursor may never advance again. ``sample`` is the
+      cursor. Only raised when the probe ran. New in 0.20.2.
+    - ``"watermark_ahead_of_source"`` — the saved cursor (or
+      ``seed_watermark``) is past the source's ``MAX(watermark)``: shifted by a
+      time-zone conversion, seeded from another table, or the source's newest
+      rows were deleted. ``sample`` is the cursor. Only raised when the probe
+      ran. New in 0.20.2.
     """
 
     column: Optional[str]
@@ -820,8 +837,8 @@ def sync(
 
     **Experimental features** (may change without a major-version bump, and carry
     sharper edges — read their notes before relying on them):
-    ``chunk_rows`` (keyset resumable reads; ClickHouse-destination incremental
-    only, and requires a unique NOT-NULL integer keyset column),
+    ``chunk_rows`` (keyset resumable reads; incremental only, and requires a
+    unique NOT-NULL integer keyset column),
     ``BigQuery(write_method="storage_write")``, ``merge_prune_partition_by`` and
     ``delete_stale_in_window`` (both can insert duplicate keys or delete history
     if pointed at the wrong column), and ``column_transforms`` (injects raw SQL
@@ -880,11 +897,20 @@ def sync(
     - ``chunk_rows`` reads the source in keyset-ordered chunks of this many rows,
       committing the cursor per chunk so a mid-read failure resumes instead of
       restarting — for very large tables on a source that cancels long queries
-      (e.g. a hot-standby replica). MVP scope: **incremental mode + a ClickHouse
-      destination only**, and the keyset column (``partition_column`` else the
-      first ``key``) must be a **unique, NOT NULL integer** (ties or NULLs would
-      silently skip rows). Chunked mode is single-stream (``parallelism`` is
-      ignored). ``None`` (default) = one read, as before.
+      (e.g. a hot-standby replica). **Incremental mode only**, and the keyset
+      column (``partition_column`` else the first ``key``) must be a **unique,
+      NOT NULL integer** (ties or NULLs would silently skip rows). Chunked mode
+      is single-stream (``parallelism`` is ignored). ``None`` (default) = one
+      read, as before. Not combinable with ``validate=`` or
+      ``delete_stale_in_window``.
+
+      On a BigQuery destination each chunk is staged in its own table and
+      merged into the destination before its cursor is committed, so a
+      run is one ``MERGE`` per chunk. On a destination clustered by ``key``
+      each ``MERGE`` scans about its own key range and the total stays close
+      to one large ``MERGE``; on an unclustered one every ``MERGE`` scans the
+      whole table, so cost grows with the number of chunks (the
+      ``unclustered_merge_target`` warning says when). New in 0.20.2.
 
     Robustness & schema:
 

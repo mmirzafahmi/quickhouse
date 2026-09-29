@@ -424,6 +424,17 @@ impl MySqlSource {
             .map_err(|e| EtlError::from(e).context("reading mysql max watermark"))
     }
 
+    /// Whether `expr`, a scalar expression with no table reference, evaluates
+    /// to NULL here — as `CAST('<unparseable>' AS DATETIME)` does outside
+    /// strict mode, with only a warning. One round trip on a fresh connection.
+    pub async fn is_null(&self, expr: &str) -> Result<bool> {
+        let mut conn = self.connect().await?;
+        conn.query_first::<i64, _>(format!("SELECT ({expr}) IS NULL"))
+            .await
+            .map(|v| v == Some(1))
+            .map_err(|e| EtlError::from(e).context("checking the mysql lower bound"))
+    }
+
     /// The SQL [`Self::max_watermark`] would run. Exposed so a caller can
     /// `EXPLAIN` the exact statement before deciding to pay for it.
     pub fn max_watermark_sql(

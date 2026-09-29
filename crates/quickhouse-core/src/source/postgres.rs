@@ -513,6 +513,18 @@ impl PgSource {
         Ok(row.get::<_, Option<String>>(0))
     }
 
+    /// Whether `expr`, a scalar expression with no table reference, evaluates
+    /// to NULL here. One round trip on a fresh connection: the incremental
+    /// lower-bound check (`sync::ensure_lower_bound_not_null`) runs after
+    /// setup's connection is gone.
+    pub async fn is_null(&self, expr: &str) -> Result<bool> {
+        let client = self.connect().await?;
+        let row = client
+            .query_one(&format!("SELECT ({expr}) IS NULL"), &[])
+            .await?;
+        Ok(row.get::<_, bool>(0))
+    }
+
     /// The SQL [`Self::max_watermark`] would run. Exposed so a caller can
     /// `EXPLAIN` the exact statement before deciding to pay for it.
     pub fn max_watermark_sql(

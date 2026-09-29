@@ -182,6 +182,87 @@ async fn promote_staged_incremental(
     Ok(rows_deleted)
 }
 
+/// Per-chunk staging for a keyset-chunked read (`chunk_rows`) into a
+/// destination that stages incremental loads for a `MERGE` (BigQuery).
+///
+/// A chunked read resumes correctly only if each chunk is *in the destination*
+/// before its cursor is committed. On a direct-insert destination (ClickHouse)
+/// the flush alone does that. Here each chunk is loaded into its own staging
+/// table, merged, and the table dropped, and only then does the read loop
+/// persist the cursor. A crash between the merge and the cursor re-reads that
+/// one chunk, and merging it again is idempotent.
+///
+/// Each chunk's table gets a name never used before, cloned from the run's own
+/// (empty) staging table. BigQuery can refuse streaming inserts into a table
+/// recreated under a recently deleted name (see [`staging_name`]), so one
+/// table truncated or recreated per chunk is not an option.
+struct ChunkStager {
+    sink: Arc<dyn Sink>,
+    dest_table: String,
+    /// The run's staging table. Never written: each chunk's table is cloned
+    /// from it, and it is dropped with the run.
+    template: String,
+    key: Vec<String>,
+    columns: Vec<ColumnType>,
+    merge_prune_partition_by: Option<String>,
+    merge_prune_key_range: bool,
+    merge_prune_key_list_max: usize,
+    dedup_order: Option<String>,
+    warnings: Warnings,
+    next: AtomicU64,
+    /// The chunk table currently open, so a failed run can drop it too.
+    open: Mutex<Option<String>>,
+}
+
+impl ChunkStager {
+    /// Create the next chunk's staging table and return its name.
+    async fn open(&self) -> Result<String> {
+        let n = self.next.fetch_add(1, Ordering::Relaxed);
+        let table = format!("{}_c{n}", self.template);
+        self.sink
+            .clone_table_structure(&table, &self.template)
+            .await?;
+        *self.open.lock().unwrap() = Some(table.clone());
+        Ok(table)
+    }
+
+    /// Merge a loaded chunk into the destination and drop its table. A chunk
+    /// that read nothing skips the merge, which would still scan the
+    /// destination.
+    async fn commit(&self, table: &str, rows: u64) -> Result<()> {
+        if rows > 0 {
+            promote_staged_incremental(
+                self.sink.as_ref(),
+                &self.dest_table,
+                table,
+                &self.key,
+                &self.columns,
+                self.merge_prune_partition_by.as_deref(),
+                self.merge_prune_key_range,
+                self.merge_prune_key_list_max,
+                false,
+                &None,
+                rows,
+                self.dedup_order.as_deref(),
+                &self.warnings,
+            )
+            .await?;
+        } else {
+            self.sink.drop_table(table).await?;
+        }
+        *self.open.lock().unwrap() = None;
+        Ok(())
+    }
+
+    /// Best-effort drop of the chunk table a failed run left open.
+    async fn cleanup(&self) {
+        let open = self.open.lock().unwrap().take();
+        if let Some(table) = open {
+            cleanup_staging(&self.sink, &table).await;
+        }
+    }
+}
+
 /// Warn when a staged `MERGE` is about to run against a destination that is not
 /// clustered by the merge key.
 ///
@@ -298,8 +379,10 @@ struct WatermarkTracker {
 enum WatermarkUnit {
     /// `Timestamp(_, None)` — rendered as a naive `YYYY-MM-DD HH:MM:SS.ffffff`.
     NaiveMicros,
-    /// `Timestamp(_, Some(tz))` — rendered with a `+00` offset, matching what
-    /// PostgreSQL's `timestamptz::text` produces for a UTC session.
+    /// `Timestamp(_, Some(tz))` on PostgreSQL — rendered with a `+00` offset,
+    /// matching what `timestamptz::text` produces for a UTC session. Never used
+    /// for MySQL, whose `DATETIME` literal can't carry that offset (see
+    /// [`WatermarkTracker::new`]).
     UtcMicros,
     /// `Date32` — days since epoch, rendered `YYYY-MM-DD`.
     Days,
@@ -308,11 +391,23 @@ enum WatermarkUnit {
 impl WatermarkTracker {
     /// `None` when the watermark is not a type whose maximum can be folded and
     /// rendered back into a comparable SQL literal, or is not in the projection.
-    fn new(watermark: &str, plan: &SelectPlan) -> Option<Self> {
+    ///
+    /// `utc_offset` says whether the source parses a tz-aware cursor's `+00`
+    /// suffix. PostgreSQL's `timestamptz` does. MySQL doesn't: its `DATETIME`
+    /// literal takes an offset only as `+hh:mm`, so `+00` makes the next run's
+    /// bound NULL (non-strict `sql_mode`) or fails with 1525 (strict), and even
+    /// `+00:00` is converted into the session time zone, shifting the cursor.
+    /// The MySQL decoder reads a naive `DATETIME` as UTC, so the bare digits
+    /// are the exact round trip — the same form `CAST(MAX(w) AS CHAR)` gives
+    /// the MAX-probe path.
+    fn new(watermark: &str, plan: &SelectPlan, utc_offset: bool) -> Option<Self> {
         let idx = plan.source_columns.iter().position(|c| c == watermark)?;
         let unit = match plan.dest_columns.get(idx).map(|c| &c.arrow)? {
             DataType::Timestamp(TimeUnit::Microsecond, None) => WatermarkUnit::NaiveMicros,
-            DataType::Timestamp(TimeUnit::Microsecond, Some(_)) => WatermarkUnit::UtcMicros,
+            DataType::Timestamp(TimeUnit::Microsecond, Some(_)) if utc_offset => {
+                WatermarkUnit::UtcMicros
+            }
+            DataType::Timestamp(TimeUnit::Microsecond, Some(_)) => WatermarkUnit::NaiveMicros,
             DataType::Date32 => WatermarkUnit::Days,
             _ => return None,
         };
@@ -553,6 +648,9 @@ struct SendCtx {
     /// than from a `MAX(watermark)` probe. Shared by every partition, so the
     /// maximum folds across all of them.
     watermark_max: Option<Arc<WatermarkTracker>>,
+    /// `Some` for a chunked read into a destination that merges staged
+    /// incremental loads: each chunk then goes through its own staging table.
+    chunk_stager: Option<Arc<ChunkStager>>,
 }
 
 /// One partition's accumulator of decoded batches, so an insert carries a
@@ -612,6 +710,29 @@ impl InsertBuffer {
 }
 
 impl SendCtx {
+    /// The context one keyset chunk writes through: this one, or for a staged
+    /// destination a copy aimed at a fresh per-chunk staging table.
+    async fn begin_chunk(&self) -> Result<SendCtx> {
+        let Some(stager) = &self.chunk_stager else {
+            return Ok(self.clone());
+        };
+        let table = stager.open().await?;
+        Ok(SendCtx {
+            target_table: Arc::new(table),
+            ..self.clone()
+        })
+    }
+
+    /// Land a chunk written through `chunk` (from [`Self::begin_chunk`]) in
+    /// the destination, once its inserts are durable and before its cursor is
+    /// committed. Nothing to do for a direct-insert destination.
+    async fn end_chunk(&self, chunk: &SendCtx, rows: u64) -> Result<()> {
+        match &self.chunk_stager {
+            Some(stager) => stager.commit(&chunk.target_table, rows).await,
+            None => Ok(()),
+        }
+    }
+
     /// Buffer one decoded batch, uploading the accumulated group once it's big
     /// enough. This is the backpressure point: if the pipeline's memory ceiling
     /// is reached, the caller (decoder) stalls here until in-flight uploads
@@ -1055,24 +1176,20 @@ async fn run_transfer_impl(
         ));
     }
 
-    // Keyset resumable reads (MVP) commit per chunk straight into the
-    // destination, which only works where incremental inserts directly (no
-    // staging + swap/merge) — i.e. ClickHouse.
-    if cfg.chunk_rows.is_some() && sink.requires_staging_for_incremental() {
-        return Err(EtlError::config(
-            "chunk_rows (keyset resumable reads) is only supported for a ClickHouse destination \
-             in this version",
-        ));
-    }
-    // ...and chunked reads can't be gated: each chunk commits straight into the
-    // destination as it's read, so there is no single staging table to validate.
-    if cfg.chunk_rows.is_some() && force_stage_incremental {
+    // Keyset resumable reads land each chunk in the destination before reading
+    // the next: straight in, or through its own staging table and MERGE on a
+    // destination that stages incremental loads (see `ChunkStager`). Either
+    // way no staging table ever holds the whole run, so it can't be gated...
+    if cfg.chunk_rows.is_some() && on_staged.is_some() {
         return Err(EtlError::config(
             "data-quality validation (validate=) is not supported together with chunk_rows: \
-             chunked keyset reads commit each chunk directly into the destination, leaving no \
-             single staging table to gate. Drop chunk_rows to validate, or validate downstream.",
+             each chunk lands in the destination before the next is read, so no single staging \
+             table holds the run to gate, and a gate failing on a later chunk would leave the \
+             earlier ones applied. Drop chunk_rows to validate, or validate downstream.",
         ));
     }
+    // (Nor can the window-scoped delete be split across chunks: see
+    // `TransferConfig::validate`.)
 
     let base_table = cfg.source_table.clone();
     let base_query = cfg.source_query.clone();
@@ -1151,6 +1268,11 @@ async fn run_transfer_impl(
         source_may_coerce,
         &existing,
     )?;
+    if let transform::ExistingDecimals::Mixed { decimal, float } =
+        transform::existing_decimals(&source_cols, &cfg, sink.dest_kind(), &existing)
+    {
+        warn_mixed_decimals(&cfg.dest_table, &decimal, &float, &warnings);
+    }
     if matches!(source.as_ref(), Source::Postgres(_)) {
         crate::source::postgres::pin_transformed_wire_types(&mut plan);
     }
@@ -1191,7 +1313,10 @@ async fn run_transfer_impl(
         )));
     }
     let watermark_tracker = match (stream_max_cursor, cfg.watermark.as_deref()) {
-        (true, Some(w)) => WatermarkTracker::new(w, &plan).map(Arc::new),
+        (true, Some(w)) => {
+            let utc_offset = matches!(source.as_ref(), Source::Postgres(_));
+            WatermarkTracker::new(w, &plan, utc_offset).map(Arc::new)
+        }
         _ => None,
     };
     if stream_max_cursor && watermark_tracker.is_none() {
@@ -1209,7 +1334,9 @@ async fn run_transfer_impl(
 
     // --- Incremental: read watermark state, build the "since last run" filter,
     // and (for chunked reads) the keyset resume plan. ---
-    let (extra_filter, mut new_watermark, chunk_plan) = if cfg.mode == SyncMode::Incremental {
+    let (extra_filter, mut new_watermark, chunk_plan, cursor_check) = if cfg.mode
+        == SyncMode::Incremental
+    {
         let watermark = cfg.watermark.as_ref().unwrap();
         // The committed cursor from the last fully-successful run (None first run).
         let committed = sink.read_last_watermark(&cfg).await?;
@@ -1298,6 +1425,30 @@ async fn run_transfer_impl(
                 unreachable!("BigQuery is handled via the early return in run_transfer")
             }
         };
+        if let Some(l) = last.as_deref() {
+            let bound = lower_bound_sql(
+                source.as_ref(),
+                l,
+                cfg.lookback_seconds,
+                watermark,
+                &source_cols,
+                watermark_type.as_deref(),
+            );
+            ensure_lower_bound_not_null(source.as_ref(), &bound, &cfg, l, committed.is_some())
+                .await?;
+        }
+        // Only a fresh probe describes the source now: a chunk resume reads up
+        // to the interrupted run's frozen bound, and a stream-derived cursor
+        // had no probe at all.
+        let cursor_check = match (last.as_deref(), snapshot_max.as_deref()) {
+            (Some(l), Some(m)) if resume.is_none() => {
+                check_cursor_against_max(watermark, l, m, cfg.lookback_seconds, &source_cols)
+            }
+            _ => None,
+        };
+        if let Some(c) = &cursor_check {
+            c.warn_if_cursor_ahead(&cfg, &warnings);
+        }
         let chunk_plan = match cfg.chunk_rows {
             Some(limit) => Some(build_chunk_plan(
                 &cfg,
@@ -1310,9 +1461,9 @@ async fn run_transfer_impl(
             )?),
             None => None,
         };
-        (filter, effective_upper, chunk_plan)
+        (filter, effective_upper, chunk_plan, cursor_check)
     } else {
-        (None, None, None)
+        (None, None, None, None)
     };
 
     // --- Ensure destination / staging tables exist. ---
@@ -1330,6 +1481,24 @@ async fn run_transfer_impl(
     let used_staging = target_table != cfg.dest_table;
     let cleanup_sink = sink.clone();
     let cleanup_staging_name = staging.clone();
+    let chunk_stager = (chunk_plan.is_some() && used_staging).then(|| {
+        Arc::new(ChunkStager {
+            sink: sink.clone(),
+            dest_table: cfg.dest_table.clone(),
+            template: staging.clone(),
+            key: cfg.key.clone(),
+            columns: plan.dest_columns.clone(),
+            merge_prune_partition_by: cfg.merge_prune_partition_by.clone(),
+            merge_prune_key_range: cfg.merge_prune_key_range,
+            merge_prune_key_list_max: cfg.merge_prune_key_list_max,
+            dedup_order: cfg.watermark.clone(),
+            warnings: warnings.clone(),
+            next: AtomicU64::new(0),
+            open: Mutex::new(None),
+        })
+    });
+    let cleanup_stager = chunk_stager.clone();
+    let staged_per_chunk = chunk_stager.is_some();
 
     // The whole fallible tail runs inside this block so that, on ANY error, we
     // best-effort drop the per-run staging table below — a unique-per-run name
@@ -1366,6 +1535,7 @@ async fn run_transfer_impl(
             throttle,
             warnings: warnings.clone(),
             watermark_max: watermark_tracker.clone(),
+            chunk_stager,
         };
         let stage_started = Instant::now();
 
@@ -1469,7 +1639,11 @@ async fn run_transfer_impl(
         // stage and have nothing to promote), then persist the new watermark. ---
         let mut rows_deleted = 0u64;
         if cfg.mode == SyncMode::Incremental {
-            if used_staging {
+            if staged_per_chunk {
+                // Every chunk was merged as it was read; only the empty
+                // template its tables were cloned from is left.
+                sink.drop_table(&staging).await?;
+            } else if used_staging {
                 rows_deleted = promote_staged_incremental(
                     sink.as_ref(),
                     &cfg.dest_table,
@@ -1500,6 +1674,9 @@ async fn run_transfer_impl(
                         "no rows read, so no watermark to advance to (cursor unchanged)"
                     ),
                 }
+            }
+            if let Some(c) = &cursor_check {
+                c.warn_if_not_advanced(&cfg, counters.rows_read.load(Ordering::Relaxed), &warnings);
             }
             if let Some(w) = &new_watermark {
                 if cfg.advance_watermark {
@@ -1552,8 +1729,13 @@ async fn run_transfer_impl(
     }
     .await;
 
-    if outcome.is_err() && used_staging {
-        cleanup_staging(&cleanup_sink, &cleanup_staging_name).await;
+    if outcome.is_err() {
+        if let Some(stager) = &cleanup_stager {
+            stager.cleanup().await;
+        }
+        if used_staging {
+            cleanup_staging(&cleanup_sink, &cleanup_staging_name).await;
+        }
     }
     outcome
 }
@@ -1633,7 +1815,7 @@ async fn run_transfer_bigquery(
 
     let plan: SelectPlan = transform::plan(&source_cols, &cfg, sink.dest_kind())?;
 
-    let (row_restriction, new_watermark) = if cfg.mode == SyncMode::Incremental {
+    let (row_restriction, new_watermark, cursor_check) = if cfg.mode == SyncMode::Incremental {
         let watermark = cfg.watermark.as_ref().unwrap();
         ensure_watermark_column(watermark, &source_cols)?;
         ensure_lookback_compatible(watermark, cfg.lookback_seconds, &source_cols)?;
@@ -1658,9 +1840,22 @@ async fn run_transfer_bigquery(
             cfg.lookback_seconds,
             &source_cols,
         );
-        (filter, snapshot_max)
+        // No lower-bound NULL check here: every BigQuery bound is a typed
+        // literal (`CAST('...' AS DATETIME)`, `TIMESTAMP '...'`), which fails
+        // the query outright on a value it can't parse rather than yielding
+        // NULL.
+        let cursor_check = match (last.as_deref(), snapshot_max.as_deref()) {
+            (Some(l), Some(m)) => {
+                check_cursor_against_max(watermark, l, m, cfg.lookback_seconds, &source_cols)
+            }
+            _ => None,
+        };
+        if let Some(c) = &cursor_check {
+            c.warn_if_cursor_ahead(&cfg, &warnings);
+        }
+        (filter, snapshot_max, cursor_check)
     } else {
-        (None, None)
+        (None, None, None)
     };
 
     // Force a staging table for a gated incremental run into a directly-inserting
@@ -1716,6 +1911,7 @@ async fn run_transfer_bigquery(
             throttle: None,
             warnings: warnings.clone(),
             watermark_max: None,
+            chunk_stager: None,
         };
         let stage_started = Instant::now();
 
@@ -1816,6 +2012,9 @@ async fn run_transfer_bigquery(
                     &warnings,
                 )
                 .await?;
+            }
+            if let Some(c) = &cursor_check {
+                c.warn_if_not_advanced(&cfg, counters.rows_read.load(Ordering::Relaxed), &warnings);
             }
             if let Some(w) = &new_watermark {
                 if cfg.advance_watermark {
@@ -2182,6 +2381,7 @@ async fn run_transfer_api(
             throttle: None,
             warnings: warnings.clone(),
             watermark_max: None,
+            chunk_stager: None,
         };
         let stage_started = Instant::now();
         let mut batcher = ApiBatcher::new(&plan.dest_columns, &lookups, cfg.batch_rows, cfg.batch_bytes)?;
@@ -2626,6 +2826,7 @@ async fn run_transfer_frame(
             throttle: None,
             warnings: warnings.clone(),
             watermark_max: None,
+            chunk_stager: None,
         };
         let stage_started = Instant::now();
         let schema: SchemaRef = Arc::new(Schema::new(
@@ -3256,6 +3457,7 @@ async fn transfer_keyset_postgres(
     );
 
     loop {
+        let chunk_ctx = ctx.begin_chunk().await?;
         let keyset = Keyset {
             col_quoted: col_quoted.clone(),
             cursor: cursor.clone(),
@@ -3307,7 +3509,8 @@ async fn transfer_keyset_postgres(
                 if let Some(w) = archive_writer.as_mut() {
                     w.write(&batch).await?;
                 }
-                ctx.push_batch(&mut sends, &mut insert_buf, schema.clone(), batch)
+                chunk_ctx
+                    .push_batch(&mut sends, &mut insert_buf, schema.clone(), batch)
                     .await;
                 if let Some(t) = &ctx.throttle {
                     t.acquire(rows).await;
@@ -3327,12 +3530,15 @@ async fn transfer_keyset_postgres(
             if let Some(w) = archive_writer.as_mut() {
                 w.write(&batch).await?;
             }
-            ctx.push_batch(&mut sends, &mut insert_buf, schema.clone(), batch)
+            chunk_ctx
+                .push_batch(&mut sends, &mut insert_buf, schema.clone(), batch)
                 .await;
         }
         // Force this chunk's rows durable in the destination BEFORE advancing
         // the cursor — the invariant that makes a crash resumable.
-        ctx.flush(&mut sends, &mut insert_buf, schema.clone()).await;
+        chunk_ctx
+            .flush(&mut sends, &mut insert_buf, schema.clone())
+            .await;
         reap(&mut sends, true).await?;
 
         let rows_this_chunk = decoder.rows_total;
@@ -3341,6 +3547,9 @@ async fn transfer_keyset_postgres(
             .fetch_add(rows_this_chunk, Ordering::Relaxed);
         report_coercions("keyset read", decoder.coercions(), &ctx.warnings);
 
+        // Land the chunk in the destination before its cursor is committed
+        // below (a no-op where the flush above already did).
+        ctx.end_chunk(&chunk_ctx, rows_this_chunk).await?;
         if rows_this_chunk == 0 {
             break; // empty read — nothing (more) to sync
         }
@@ -3886,6 +4095,7 @@ async fn transfer_keyset_mysql(
     );
 
     loop {
+        let chunk_ctx = ctx.begin_chunk().await?;
         let keyset = Keyset {
             col_quoted: col_quoted.clone(),
             cursor: cursor.clone(),
@@ -3934,7 +4144,8 @@ async fn transfer_keyset_mysql(
                 if let Some(w) = archive_writer.as_mut() {
                     w.write(&batch).await?;
                 }
-                ctx.push_batch(&mut sends, &mut insert_buf, schema.clone(), batch)
+                chunk_ctx
+                    .push_batch(&mut sends, &mut insert_buf, schema.clone(), batch)
                     .await;
                 reap(&mut sends, false).await?;
                 if let Some(t) = &ctx.throttle {
@@ -3949,10 +4160,13 @@ async fn transfer_keyset_mysql(
             if let Some(w) = archive_writer.as_mut() {
                 w.write(&batch).await?;
             }
-            ctx.push_batch(&mut sends, &mut insert_buf, schema.clone(), batch)
+            chunk_ctx
+                .push_batch(&mut sends, &mut insert_buf, schema.clone(), batch)
                 .await;
         }
-        ctx.flush(&mut sends, &mut insert_buf, schema.clone()).await;
+        chunk_ctx
+            .flush(&mut sends, &mut insert_buf, schema.clone())
+            .await;
         reap(&mut sends, true).await?;
 
         let rows_this_chunk = batcher.rows_total;
@@ -3961,6 +4175,9 @@ async fn transfer_keyset_mysql(
             .fetch_add(rows_this_chunk, Ordering::Relaxed);
         report_coercions("keyset read", batcher.coercions(), &ctx.warnings);
 
+        // Land the chunk in the destination before its cursor is committed
+        // below (a no-op where the flush above already did).
+        ctx.end_chunk(&chunk_ctx, rows_this_chunk).await?;
         if rows_this_chunk == 0 {
             break;
         }
@@ -4275,6 +4492,7 @@ async fn transfer_keyset_clickhouse(
     );
 
     loop {
+        let chunk_ctx = ctx.begin_chunk().await?;
         let keyset = Keyset {
             col_quoted: col_quoted.clone(),
             cursor: cursor.clone(),
@@ -4312,7 +4530,8 @@ async fn transfer_keyset_clickhouse(
                 if let Some(w) = archive_writer.as_mut() {
                     w.write(&batch).await?;
                 }
-                ctx.push_batch(&mut sends, &mut insert_buf, schema.clone(), batch)
+                chunk_ctx
+                    .push_batch(&mut sends, &mut insert_buf, schema.clone(), batch)
                     .await;
                 reap(&mut sends, false).await?;
                 if let Some(t) = &ctx.throttle {
@@ -4321,7 +4540,9 @@ async fn transfer_keyset_clickhouse(
             }
         }
         decoder.finish()?;
-        ctx.flush(&mut sends, &mut insert_buf, schema.clone()).await;
+        chunk_ctx
+            .flush(&mut sends, &mut insert_buf, schema.clone())
+            .await;
         reap(&mut sends, true).await?;
 
         let rows_this_chunk = decoder.rows_total;
@@ -4329,6 +4550,9 @@ async fn transfer_keyset_clickhouse(
             .rows_read
             .fetch_add(rows_this_chunk, Ordering::Relaxed);
 
+        // Land the chunk in the destination before its cursor is committed
+        // below (a no-op where the flush above already did).
+        ctx.end_chunk(&chunk_ctx, rows_this_chunk).await?;
         if rows_this_chunk == 0 {
             break;
         }
@@ -4500,7 +4724,10 @@ fn coercion_message(kind: WarningKind, column: &str, n: u64) -> String {
         | WarningKind::UnclusteredMergeTarget
         | WarningKind::IncompleteExport
         | WarningKind::IgnoredSourceArchive
-        | WarningKind::UnindexedWatermark => {
+        | WarningKind::UnindexedWatermark
+        | WarningKind::DecimalMappingMixed
+        | WarningKind::WatermarkNotAdvanced
+        | WarningKind::WatermarkAheadOfSource => {
             format!("column '{column}': {n} affected row(s)")
         }
     }
@@ -5301,6 +5528,30 @@ fn feed_off_reactor(
     })
 }
 
+/// Raise [`WarningKind::DecimalMappingMixed`]: the destination holds exact
+/// decimals beside `Float64` for source columns that declare their precision.
+/// A column new to such a table keeps the 0.20.1 `Decimal(P, S)` default,
+/// since there's no single convention left to follow.
+fn warn_mixed_decimals(table: &str, decimal: &[String], float: &[String], warnings: &Warnings) {
+    let message = format!(
+        "destination '{table}' mixes exact decimal columns ({}) with non-decimal ones ({}), \
+         all fed by source columns that declare a precision. ClickHouse has no arithmetic \
+         between Decimal and Float64 and no common type for them in if/coalesce/UNION ALL, so \
+         queries treating these columns alike fail. ALTER one side to match the other, or pin \
+         the mapping with numeric_as_decimal / type_overrides.",
+        decimal.join(", "),
+        float.join(", "),
+    );
+    tracing::warn!("{message}");
+    warnings.push(TransferWarning {
+        kind: WarningKind::DecimalMappingMixed,
+        column: None,
+        count: (decimal.len() + float.len()) as u64,
+        sample: None,
+        message,
+    });
+}
+
 /// What the destination table already holds, for
 /// `transform::plan_for_destination`.
 async fn existing_columns(sink: &dyn Sink, table: &str) -> Result<transform::ExistingColumns> {
@@ -5352,6 +5603,222 @@ fn new_run_id() -> String {
 async fn cleanup_staging(sink: &Arc<dyn Sink>, staging: &str) {
     if let Err(e) = sink.drop_table(staging).await {
         tracing::warn!("failed to drop staging table '{staging}' after a failed transfer: {e}");
+    }
+}
+
+/// The lower bound the incremental filter compares against, exactly as
+/// `build_watermark_filter_{pg,mysql,clickhouse}` embed it (they call the same
+/// `lookback_lower_bound_*`), for [`ensure_lower_bound_not_null`].
+fn lower_bound_sql(
+    source: &Source,
+    last: &str,
+    lookback_seconds: u64,
+    watermark: &str,
+    source_cols: &[ColumnType],
+    watermark_type: Option<&str>,
+) -> String {
+    match source {
+        Source::Postgres(_) => lookback_lower_bound_pg(
+            last,
+            lookback_seconds,
+            watermark_pg_is_tz_aware(watermark, source_cols),
+        ),
+        Source::MySql(_) => lookback_lower_bound_mysql(last, lookback_seconds),
+        Source::ClickHouse(_) => lookback_lower_bound_clickhouse(
+            last,
+            lookback_seconds,
+            watermark_type.filter(|t| is_clickhouse_temporal_type(t)),
+        ),
+        Source::BigQuery(_) => {
+            unreachable!("BigQuery is handled via the early return in run_transfer")
+        }
+    }
+}
+
+/// Refuse to read when the lower bound evaluates to NULL on the source.
+///
+/// `watermark > NULL` matches no row, so the run would read 0 rows and
+/// succeed, the cursor would never move, and every run after it would do the
+/// same. That is how a `+00` cursor MySQL couldn't parse (issue #2) froze 19
+/// tables for 12 days with every run green. Whatever puts an unparseable
+/// cursor in the state table next, this fails the first run it affects. One
+/// round trip that touches no table.
+async fn ensure_lower_bound_not_null(
+    source: &Source,
+    bound: &str,
+    cfg: &TransferConfig,
+    cursor: &str,
+    from_state: bool,
+) -> Result<()> {
+    let is_null = match source {
+        Source::Postgres(s) => s.is_null(bound).await?,
+        Source::MySql(s) => s.is_null(bound).await?,
+        Source::ClickHouse(s) => s.is_null(bound).await?,
+        Source::BigQuery(_) => {
+            unreachable!("BigQuery is handled via the early return in run_transfer")
+        }
+    };
+    if !is_null {
+        return Ok(());
+    }
+    let origin = if from_state {
+        "saved cursor"
+    } else {
+        "seed_watermark"
+    };
+    Err(EtlError::other(format!(
+        "lower bound for state_key '{key}' evaluates to NULL on the source ({origin} \
+         '{cursor}', bound {bound}). `{watermark} > NULL` matches no row, so this run, and \
+         every run after it, would read 0 rows and report success. The {origin} is in a form \
+         the source can't parse: correct it, or append a state row with a cursor the source \
+         can compare.",
+        key = cfg.effective_state_key(),
+        watermark = cfg.watermark.as_deref().unwrap_or("?"),
+    )))
+}
+
+/// What the `MAX(watermark)` probe says about the cursor, from values the run
+/// already has — no extra query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CursorCheck {
+    watermark: String,
+    cursor: String,
+    max: String,
+    /// The cursor is past everything the source holds.
+    cursor_ahead: bool,
+    /// The source's MAX is past the lower bound, so the read has to return at
+    /// least the row(s) holding it: they satisfy both `> lower` and `<= MAX`.
+    max_above_lower_bound: bool,
+}
+
+/// Compare the cursor with the source's MAX, as the watermark's type orders
+/// them. `None` when either value doesn't parse as that type, or one carries a
+/// UTC offset and the other doesn't: ordering those would mean guessing the
+/// naive one's zone, and a wrong guess raises a false warning.
+fn check_cursor_against_max(
+    watermark: &str,
+    cursor: &str,
+    max: &str,
+    lookback_seconds: u64,
+    source_cols: &[ColumnType],
+) -> Option<CursorCheck> {
+    let arrow = &source_cols.iter().find(|c| c.name == watermark)?.arrow;
+    let (c, m, lookback) = match arrow {
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64 => (
+            cursor.trim().parse::<i64>().ok()?,
+            max.trim().parse::<i64>().ok()?,
+            0,
+        ),
+        DataType::Date32 | DataType::Date64 | DataType::Timestamp(_, _) => {
+            let (c, c_offset) = parse_temporal_micros(cursor)?;
+            let (m, m_offset) = parse_temporal_micros(max)?;
+            if c_offset != m_offset {
+                return None;
+            }
+            // BigQuery rounds a DATE lookback up to whole days, so its real
+            // bound can only sit lower than this one: never a false warning.
+            (
+                c,
+                m,
+                i64::try_from(lookback_seconds)
+                    .ok()?
+                    .checked_mul(1_000_000)?,
+            )
+        }
+        _ => return None,
+    };
+    Some(CursorCheck {
+        watermark: watermark.to_string(),
+        cursor: cursor.to_string(),
+        max: max.to_string(),
+        cursor_ahead: c > m,
+        max_above_lower_bound: m > c.saturating_sub(lookback),
+    })
+}
+
+/// A temporal watermark literal as microseconds since the epoch, and whether
+/// it carried a UTC offset (already applied when it did). Takes what the MAX
+/// probes and the stream cursor render: `YYYY-MM-DD`, and
+/// `YYYY-MM-DD[ T]HH:MM:SS[.ffffff]` bare or with `+07`, `+05:30` or `Z`.
+fn parse_temporal_micros(v: &str) -> Option<(i64, bool)> {
+    let v = v.trim();
+    let zoned = v.strip_suffix('Z').map(|n| format!("{n}+00"));
+    let zoned = zoned.as_deref().unwrap_or(v);
+    for f in ["%Y-%m-%d %H:%M:%S%.f%#z", "%Y-%m-%dT%H:%M:%S%.f%#z"] {
+        if let Ok(dt) = chrono::DateTime::parse_from_str(zoned, f) {
+            return Some((dt.timestamp_micros(), true));
+        }
+    }
+    for f in ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S%.f"] {
+        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(v, f) {
+            return Some((dt.and_utc().timestamp_micros(), false));
+        }
+    }
+    let d = chrono::NaiveDate::parse_from_str(v, "%Y-%m-%d").ok()?;
+    Some((d.and_hms_opt(0, 0, 0)?.and_utc().timestamp_micros(), false))
+}
+
+impl CursorCheck {
+    /// `watermark_ahead_of_source`: raised before the read.
+    fn warn_if_cursor_ahead(&self, cfg: &TransferConfig, warnings: &Warnings) {
+        if !self.cursor_ahead {
+            return;
+        }
+        let message = format!(
+            "the incremental cursor for state_key '{key}' ({cursor}) is ahead of the source's \
+             MAX({w}) ({max}). Typical causes: a cursor converted into the wrong time zone, one \
+             seeded from another table, or the source's newest rows deleted. This run saves the \
+             source's MAX as the cursor. If the cursor had been shifted, rows between its true \
+             position and that MAX may never have been read; re-sync that range.",
+            key = cfg.effective_state_key(),
+            cursor = self.cursor,
+            w = self.watermark,
+            max = self.max,
+        );
+        tracing::warn!("{message}");
+        warnings.push(TransferWarning {
+            kind: WarningKind::WatermarkAheadOfSource,
+            column: Some(self.watermark.clone()),
+            count: 0,
+            sample: Some(self.cursor.clone()),
+            message,
+        });
+    }
+
+    /// `watermark_not_advanced`: raised after the read, when it returned
+    /// nothing although the probe says it had to return something.
+    fn warn_if_not_advanced(&self, cfg: &TransferConfig, rows_read: u64, warnings: &Warnings) {
+        if !self.max_above_lower_bound || rows_read > 0 {
+            return;
+        }
+        let message = format!(
+            "the source's MAX({w}) is {max}, past this run's lower bound (cursor {cursor}, \
+             lookback_seconds={lookback}), yet the read returned 0 rows for state_key '{key}'. \
+             The row holding that MAX satisfies the filter, so something between the bound and \
+             the predicate is wrong, typically a cursor the source compares differently than it \
+             was written. (Or that row changed between the MAX probe and the read, in which \
+             case the next run reads it.)",
+            w = self.watermark,
+            max = self.max,
+            cursor = self.cursor,
+            lookback = cfg.lookback_seconds,
+            key = cfg.effective_state_key(),
+        );
+        tracing::warn!("{message}");
+        warnings.push(TransferWarning {
+            kind: WarningKind::WatermarkNotAdvanced,
+            column: Some(self.watermark.clone()),
+            count: 0,
+            sample: Some(self.cursor.clone()),
+            message,
+        });
     }
 }
 
@@ -5639,11 +6106,34 @@ fn lookback_lower_bound_pg(last: &str, lookback_seconds: u64, tz_aware: bool) ->
 }
 
 fn lookback_lower_bound_mysql(last: &str, lookback_seconds: u64) -> String {
-    let l = last.replace('\\', "\\\\").replace('\'', "''");
+    let l = strip_zero_utc_offset(last)
+        .replace('\\', "\\\\")
+        .replace('\'', "''");
     if lookback_seconds == 0 {
         return format!("'{l}'");
     }
     format!("(CAST('{l}' AS DATETIME) - INTERVAL {lookback_seconds} SECOND)")
+}
+
+/// A MySQL cursor with its zero UTC offset (`+00` or `+00:00`) removed, and
+/// nothing converted. 0.18 to 0.20.1 saved a stream-derived cursor on a
+/// tz-aware watermark as `...+00`, which MySQL can't compare (see
+/// [`WatermarkTracker::new`]); every run after that read 0 rows and succeeded.
+/// Stripping it on the way back in is what lets a table frozen that way resume
+/// on upgrade with no state edit. Only a datetime is touched, and only a zero
+/// offset: any other offset is left for MySQL to convert as it documents.
+fn strip_zero_utc_offset(cursor: &str) -> &str {
+    for suffix in ["+00:00", "+00"] {
+        if let Some(naive) = cursor.strip_suffix(suffix) {
+            let is_datetime = ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S%.f"]
+                .iter()
+                .any(|f| chrono::NaiveDateTime::parse_from_str(naive, f).is_ok());
+            if is_datetime {
+                return naive;
+            }
+        }
+    }
+    cursor
 }
 
 /// `DATE_SUB` has no sub-day granularity, so a sub-day `lookback_seconds`
@@ -6357,6 +6847,388 @@ mod tests {
             max: AtomicI64::new(19_723), // 2024-01-01
         };
         assert_eq!(t.render().as_deref(), Some("2024-01-01"));
+    }
+
+    /// Issue #2: MySQL can't parse the `+00` a PostgreSQL `timestamptz` cursor
+    /// carries, so the same tz-aware column renders bare for MySQL.
+    #[test]
+    fn a_tz_aware_cursor_carries_an_offset_only_for_postgres() {
+        let utc = DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into()));
+        let plan = SelectPlan {
+            source_columns: vec!["wm".to_string()],
+            source_select_exprs: vec![None],
+            dest_columns: vec![col_typed("wm", utc)],
+        };
+        let pg = WatermarkTracker::new("wm", &plan, true).unwrap();
+        let my = WatermarkTracker::new("wm", &plan, false).unwrap();
+        for t in [&pg, &my] {
+            t.max.store(1_704_067_200_000_000, Ordering::Relaxed);
+        }
+        assert_eq!(
+            pg.render().as_deref(),
+            Some("2024-01-01 00:00:00.000000+00")
+        );
+        assert_eq!(my.render().as_deref(), Some("2024-01-01 00:00:00.000000"));
+    }
+
+    /// A destination that stages incremental loads, recording every call a
+    /// chunked run makes of it, in order.
+    #[derive(Default)]
+    struct RecordingSink(Mutex<Vec<String>>);
+
+    impl RecordingSink {
+        fn log(&self, call: String) {
+            self.0.lock().unwrap().push(call);
+        }
+        fn calls(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Sink for RecordingSink {
+        async fn table_exists(&self, _: &str) -> Result<bool> {
+            unreachable!()
+        }
+        async fn create_table(&self, _: &str, _: &[ColumnType], _: &TransferConfig) -> Result<()> {
+            unreachable!()
+        }
+        async fn clone_table_structure(&self, new_table: &str, like: &str) -> Result<()> {
+            self.log(format!("clone {new_table} like {like}"));
+            Ok(())
+        }
+        async fn insert_batches(&self, _: &str, _: SchemaRef, _: &[RecordBatch]) -> Result<u64> {
+            unreachable!()
+        }
+        async fn atomic_swap(&self, _: &str, _: &str, _: &[ColumnType]) -> Result<()> {
+            unreachable!()
+        }
+        async fn current_row_count(&self, _: &str) -> Result<Option<u64>> {
+            unreachable!()
+        }
+        async fn drop_table(&self, table: &str) -> Result<()> {
+            self.log(format!("drop {table}"));
+            Ok(())
+        }
+        async fn ensure_state_table(&self, _: &str) -> Result<()> {
+            unreachable!()
+        }
+        async fn read_last_watermark(&self, _: &TransferConfig) -> Result<Option<String>> {
+            unreachable!()
+        }
+        async fn persist_watermark(&self, _: &TransferConfig, _: &str, _: u64) -> Result<()> {
+            unreachable!()
+        }
+        async fn add_missing_columns(
+            &self,
+            _: &str,
+            _: &[ColumnType],
+            _: &TransferConfig,
+        ) -> Result<Vec<String>> {
+            unreachable!()
+        }
+        fn dest_kind(&self) -> crate::config::DestKind {
+            crate::config::DestKind::BigQuery
+        }
+        fn namespace(&self) -> &str {
+            "ds"
+        }
+        fn requires_staging_for_incremental(&self) -> bool {
+            true
+        }
+        async fn merge_into(
+            &self,
+            dest: &str,
+            staging: &str,
+            key: &[String],
+            _: &[ColumnType],
+            _: Option<&str>,
+            _: bool,
+            _: usize,
+            delete_stale: bool,
+            dedup_order: Option<&str>,
+        ) -> Result<()> {
+            self.log(format!(
+                "merge {staging} into {dest} on {key:?} (delete_stale={delete_stale}, \
+                 newest by {dedup_order:?})"
+            ));
+            Ok(())
+        }
+    }
+
+    fn stager(sink: &Arc<RecordingSink>) -> Arc<ChunkStager> {
+        Arc::new(ChunkStager {
+            sink: sink.clone(),
+            dest_table: "orders".into(),
+            template: "orders_stg".into(),
+            key: vec!["id".into()],
+            columns: vec![],
+            merge_prune_partition_by: None,
+            merge_prune_key_range: true,
+            merge_prune_key_list_max: 0,
+            dedup_order: Some("write_date".into()),
+            warnings: Warnings::default(),
+            next: AtomicU64::new(0),
+            open: Mutex::new(None),
+        })
+    }
+
+    fn send_ctx(sink: Arc<dyn Sink>, chunk_stager: Option<Arc<ChunkStager>>) -> SendCtx {
+        SendCtx {
+            sink,
+            budget: MemoryBudget::new(1 << 20),
+            target_table: Arc::new("orders_stg".into()),
+            counters: Arc::new(Counters::default()),
+            progress: None,
+            started: Instant::now(),
+            archive: None,
+            throttle: None,
+            warnings: Warnings::default(),
+            watermark_max: None,
+            chunk_stager,
+        }
+    }
+
+    /// Issue #4: on a destination that stages incremental loads, every chunk
+    /// is loaded into a table of its own, merged, and dropped before the next
+    /// one opens, so its cursor can be committed.
+    #[tokio::test]
+    async fn each_chunk_is_merged_through_its_own_staging_table() {
+        let sink = Arc::new(RecordingSink::default());
+        let ctx = send_ctx(sink.clone(), Some(stager(&sink)));
+
+        let first = ctx.begin_chunk().await.unwrap();
+        assert_eq!(first.target_table.as_str(), "orders_stg_c0");
+        ctx.end_chunk(&first, 40).await.unwrap();
+        // The read that finds nothing left: no merge, which would still scan.
+        let last = ctx.begin_chunk().await.unwrap();
+        assert_eq!(last.target_table.as_str(), "orders_stg_c1");
+        ctx.end_chunk(&last, 0).await.unwrap();
+
+        assert_eq!(
+            sink.calls(),
+            [
+                "clone orders_stg_c0 like orders_stg",
+                "merge orders_stg_c0 into orders on [\"id\"] (delete_stale=false, newest by \
+                 Some(\"write_date\"))",
+                "drop orders_stg_c0",
+                "clone orders_stg_c1 like orders_stg",
+                "drop orders_stg_c1",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_chunk_leaves_no_staging_table_behind() {
+        let sink = Arc::new(RecordingSink::default());
+        let stager = stager(&sink);
+        let ctx = send_ctx(sink.clone(), Some(stager.clone()));
+        let done = ctx.begin_chunk().await.unwrap();
+        ctx.end_chunk(&done, 5).await.unwrap();
+        let _failed = ctx.begin_chunk().await.unwrap();
+        stager.cleanup().await;
+        // Nothing left open, so a second cleanup is a no-op.
+        stager.cleanup().await;
+        let calls = sink.calls();
+        assert_eq!(calls.last().map(String::as_str), Some("drop orders_stg_c1"));
+        assert_eq!(calls.iter().filter(|c| c.starts_with("drop ")).count(), 2);
+    }
+
+    /// A direct-insert destination: a chunk writes where the run writes, and
+    /// the flush alone lands it.
+    #[tokio::test]
+    async fn a_direct_insert_chunk_needs_no_staging() {
+        let sink = Arc::new(RecordingSink::default());
+        let ctx = send_ctx(sink.clone(), None);
+        let chunk = ctx.begin_chunk().await.unwrap();
+        assert_eq!(chunk.target_table.as_str(), "orders_stg");
+        ctx.end_chunk(&chunk, 40).await.unwrap();
+        assert!(sink.calls().is_empty());
+    }
+
+    fn check(cursor: &str, max: &str, lookback: u64, arrow: DataType) -> Option<CursorCheck> {
+        check_cursor_against_max("wm", cursor, max, lookback, &[col_typed("wm", arrow)])
+    }
+
+    /// Issue #3, checks B and C: the cursor and the probe's MAX are ordered by
+    /// the watermark's type, never as strings.
+    #[test]
+    fn cursor_check_orders_values_by_the_watermarks_type() {
+        let naive = DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None);
+        let utc = DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into()));
+        let flags = |c: CursorCheck| (c.cursor_ahead, c.max_above_lower_bound);
+
+        // Numbers, not strings: "99" sorts after "100" lexicographically.
+        assert_eq!(
+            flags(check("99", "100", 0, DataType::Int64).unwrap()),
+            (false, true)
+        );
+        // One instant in two renderings (a PostgreSQL MAX in a +07 session, a
+        // stream cursor in UTC) is a quiet run: nothing to say.
+        assert_eq!(
+            flags(
+                check(
+                    "2024-01-01 00:00:00.000000+00",
+                    "2024-01-01 07:00:00+07",
+                    0,
+                    utc.clone()
+                )
+                .unwrap()
+            ),
+            (false, false)
+        );
+        // Stream and probe renderings of the same MySQL DATETIME.
+        assert_eq!(
+            flags(
+                check(
+                    "2024-01-01 00:00:00.000000",
+                    "2024-01-01 00:00:00",
+                    0,
+                    utc.clone()
+                )
+                .unwrap()
+            ),
+            (false, false)
+        );
+        // New rows at the source.
+        assert_eq!(
+            flags(
+                check(
+                    "2024-01-01 00:00:00",
+                    "2024-02-01T00:00:00",
+                    0,
+                    naive.clone()
+                )
+                .unwrap()
+            ),
+            (false, true)
+        );
+        // A cursor shifted +7h past the source...
+        assert_eq!(
+            flags(
+                check(
+                    "2024-01-01 07:00:00",
+                    "2024-01-01 00:00:00",
+                    0,
+                    naive.clone()
+                )
+                .unwrap()
+            ),
+            (true, false)
+        );
+        // ...which a wide enough lookback still reaches back under.
+        assert_eq!(
+            flags(
+                check(
+                    "2024-01-01 07:00:00",
+                    "2024-01-01 00:00:00",
+                    8 * 3600,
+                    naive.clone()
+                )
+                .unwrap()
+            ),
+            (true, true)
+        );
+        assert_eq!(
+            flags(check("2024-01-02", "2024-01-01", 0, DataType::Date32).unwrap()),
+            (true, false)
+        );
+        assert_eq!(
+            flags(
+                check(
+                    "2024-01-01T00:00:00Z",
+                    "2024-01-01 00:00:01+00",
+                    0,
+                    utc.clone()
+                )
+                .unwrap()
+            ),
+            (false, true)
+        );
+
+        // Not compared: an offset against a naive value (whose zone is
+        // unknown), anything unparseable, and types with no ordering here.
+        assert!(check("2024-01-01 00:00:00+00", "2024-01-01 00:00:00", 0, utc).is_none());
+        assert!(check("garbage", "2024-01-01", 0, DataType::Date32).is_none());
+        assert!(check("a", "b", 0, DataType::Utf8).is_none());
+        assert!(check_cursor_against_max(
+            "other",
+            "1",
+            "2",
+            0,
+            &[col_typed("wm", DataType::Int64)]
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn cursor_check_warns_only_on_the_contradiction_it_describes() {
+        let mut cfg = crate::config::default_test_config();
+        cfg.watermark = Some("wm".into());
+        let kinds = |w: &Warnings| w.drain().into_iter().map(|w| w.kind).collect::<Vec<_>>();
+
+        let due = check("1", "5", 0, DataType::Int64).unwrap();
+        let w = Warnings::default();
+        due.warn_if_cursor_ahead(&cfg, &w);
+        due.warn_if_not_advanced(&cfg, 4, &w);
+        assert!(kinds(&w).is_empty(), "rows were read: nothing to report");
+        due.warn_if_not_advanced(&cfg, 0, &w);
+        assert_eq!(kinds(&w), vec![WarningKind::WatermarkNotAdvanced]);
+
+        let quiet = check("5", "5", 0, DataType::Int64).unwrap();
+        quiet.warn_if_cursor_ahead(&cfg, &w);
+        quiet.warn_if_not_advanced(&cfg, 0, &w);
+        assert!(
+            kinds(&w).is_empty(),
+            "MAX equals the cursor: an ordinary quiet run"
+        );
+
+        let ahead = check("9", "5", 0, DataType::Int64).unwrap();
+        ahead.warn_if_cursor_ahead(&cfg, &w);
+        ahead.warn_if_not_advanced(&cfg, 0, &w);
+        let out = w.drain();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].kind, WarningKind::WatermarkAheadOfSource);
+        assert_eq!(out[0].column.as_deref(), Some("wm"));
+        assert_eq!(out[0].sample.as_deref(), Some("9"));
+    }
+
+    /// A `+00` cursor saved by 0.18 to 0.20.1 is read back without its zero
+    /// offset, in both bound forms, and without converting the time.
+    #[test]
+    fn a_saved_mysql_cursor_loses_its_zero_offset_and_nothing_else() {
+        for saved in [
+            "2026-09-16 13:05:03.000000+00",
+            "2026-09-16 13:05:03.000000+00:00",
+        ] {
+            assert_eq!(
+                lookback_lower_bound_mysql(saved, 10800),
+                "(CAST('2026-09-16 13:05:03.000000' AS DATETIME) - INTERVAL 10800 SECOND)"
+            );
+            assert_eq!(
+                lookback_lower_bound_mysql(saved, 0),
+                "'2026-09-16 13:05:03.000000'"
+            );
+        }
+        assert_eq!(
+            strip_zero_utc_offset("2026-09-16 13:05:03+00"),
+            "2026-09-16 13:05:03"
+        );
+        assert_eq!(
+            strip_zero_utc_offset("2026-09-16T13:05:03+00:00"),
+            "2026-09-16T13:05:03"
+        );
+        // Left alone: a non-zero offset (MySQL converts it, as documented),
+        // an already-bare cursor, and anything that isn't a datetime.
+        for kept in [
+            "2026-09-16 13:05:03+07:00",
+            "2026-09-16 13:05:03.000000",
+            "2026-09-16",
+            "1200",
+            "order+00",
+        ] {
+            assert_eq!(strip_zero_utc_offset(kept), kept);
+        }
     }
 
     fn wplan(min: i64, max: i64, step: u64, floor: u64) -> WindowPlan {

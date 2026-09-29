@@ -432,6 +432,22 @@ impl ClickHouseSource {
         Ok((max, type_name))
     }
 
+    /// Whether `expr`, a scalar expression with no table reference, evaluates
+    /// to NULL here. One round trip.
+    pub async fn is_null(&self, expr: &str) -> Result<bool> {
+        let rows = self
+            .query_rows(&format!("SELECT ({expr}) IS NULL FORMAT TabSeparated"))
+            .await
+            .map_err(|e| e.context("checking the clickhouse lower bound"))?;
+        Ok(rows
+            .first()
+            .and_then(|r| r.first())
+            .cloned()
+            .flatten()
+            .as_deref()
+            == Some("1"))
+    }
+
     /// Count rows whose watermark value is NULL — see
     /// `PgSource::count_null_watermark` for why this matters.
     pub async fn count_null_watermark(
