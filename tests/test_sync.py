@@ -755,6 +755,27 @@ def test_numeric_as_decimal_float64_restores_the_old_mapping(
         _drop_ch(ch_client, table)
 
 
+def test_lz4_compressed_inserts_land_intact(
+    pg_conn, ch_client, pg_source, ch_target_lz4, unique_name
+):
+    table = unique_name
+    n = 5000
+    _seed_table(pg_conn, table, n)
+    _drop_ch(ch_client, table)
+    try:
+        result = quickhouse.sync(
+            pg_source, ch_target_lz4, dest_table=table, source_table=table,
+            mode="full", key=["id"], create_if_missing=True,
+        )
+        assert result.rows_written == n
+        assert int(ch_client.command(f"SELECT count() FROM `{table}`")) == n
+        pg_sum = _pg_scalar(pg_conn, f'SELECT sum(amount) FROM "{table}"')
+        ch_sum = float(ch_client.command(f"SELECT sum(amount) FROM `{table}`"))
+        assert abs(pg_sum - ch_sum) < 1e-6
+    finally:
+        _drop_ch(ch_client, table)
+
+
 def _pg_scalar(pg_conn, sql: str):
     with pg_conn.cursor() as cur:
         cur.execute(sql)

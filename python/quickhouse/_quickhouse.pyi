@@ -442,10 +442,15 @@ class ClickHouse:
 
         .. versionadded:: 0.16.0
     compression:
-        HTTP insert body compression: ``"zstd"`` (default), ``"gzip"``, or
-        ``"none"``. zstd-fast is faster than gzip at a similar/better ratio;
-        use ``"none"`` on a fast local network where CPU, not bandwidth, is
-        the bottleneck.
+        HTTP insert body compression: ``"zstd"`` (default), ``"lz4"``,
+        ``"none"``, or ``"gzip"``. zstd suits a constrained link (WAN,
+        ClickHouse Cloud); ``"lz4"`` or ``"none"`` suit a fast network where
+        CPU, not bandwidth, is the bottleneck. ``"gzip"`` is accepted but not
+        recommended: at roughly 22 MB/s per core it caps every insert near
+        that rate, and a transfer that uses it logs a warning.
+
+        .. versionchanged:: 0.21.0
+           Added ``"lz4"``.
     archive:
         Optional :class:`S3Archive` or :class:`GcsArchive` (or the result of
         :func:`~quickhouse.backup`) — also write every synced batch as

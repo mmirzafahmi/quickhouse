@@ -37,6 +37,13 @@ pub struct ClickHouseSink {
 
 impl ClickHouseSink {
     pub fn new(cfg: ClickHouseConfig) -> Result<Self> {
+        if cfg.compression == Compression::Gzip {
+            tracing::warn!(
+                "compression=\"gzip\" compresses at roughly 20 MB/s per core, which caps every \
+                 insert near that rate; \"zstd\" (the default) compresses about as well at over \
+                 10x the speed, and \"lz4\" or \"none\" suit a fast network"
+            );
+        }
         let client = Client::builder().build().map_err(EtlError::from)?;
         Ok(Self {
             client,
@@ -420,6 +427,10 @@ impl ClickHouseSink {
                 Compression::Gzip => {
                     req = req.header("Content-Encoding", "gzip");
                     gzip_body(ipc, sent.clone())
+                }
+                Compression::Lz4 => {
+                    req = req.header("Content-Encoding", "lz4");
+                    lz4_body(ipc, sent.clone())
                 }
                 Compression::Zstd => {
                     req = req.header("Content-Encoding", "zstd");
@@ -911,7 +922,7 @@ fn escape_sql_string(s: &str) -> String {
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use async_compression::tokio::bufread::{GzipEncoder, ZstdEncoder};
+use async_compression::tokio::bufread::{GzipEncoder, Lz4Encoder, ZstdEncoder};
 use bytes::Bytes;
 use futures::TryStreamExt;
 use tokio::io::BufReader;
@@ -945,6 +956,17 @@ where
     S: futures::Stream<Item = std::io::Result<Bytes>> + Send + Sync + 'static,
 {
     let enc = GzipEncoder::new(BufReader::new(StreamReader::new(source)));
+    let stream = ReaderStream::new(enc);
+    reqwest::Body::wrap_stream(count_stream(stream, counter))
+}
+
+/// lz4-compressed streamed body, in the LZ4 frame format ClickHouse expects for
+/// `Content-Encoding: lz4` (compression happens incrementally).
+fn lz4_body<S>(source: S, counter: Arc<AtomicU64>) -> reqwest::Body
+where
+    S: futures::Stream<Item = std::io::Result<Bytes>> + Send + Sync + 'static,
+{
+    let enc = Lz4Encoder::new(BufReader::new(StreamReader::new(source)));
     let stream = ReaderStream::new(enc);
     reqwest::Body::wrap_stream(count_stream(stream, counter))
 }

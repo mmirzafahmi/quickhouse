@@ -30,7 +30,7 @@ arrow-schema = "53"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "gzip"] }
 bytes = "1"
 tokio-util = { version = "0.7", features = ["io"] }
-async-compression = { version = "0.4", features = ["tokio", "gzip", "zstd"] }
+async-compression = { version = "0.4", features = ["tokio", "gzip", "lz4", "zstd"] }
 thiserror = "1"
 anyhow = "1"
 tracing = "0.1"
