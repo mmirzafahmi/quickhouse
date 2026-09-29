@@ -9,6 +9,19 @@ any breaking change is called out explicitly.
 
 ## [Unreleased]
 
+### Performance
+- **PostgreSQL reads decode many rows per hand-off instead of one.** PostgreSQL
+  sends a binary `COPY` as one message per row, and since 0.14.0 each message
+  went to the blocking pool as its own decode task: a thread wake-up in each
+  direction per row, several times the cost of parsing the row. On a large
+  table that hand-off, not the source or the destination, was most of the
+  transfer. Messages that have already arrived are now decoded together, in
+  chunks of up to 256 KiB; no row is held back to fill a chunk, so a slow source
+  still streams. Measured PostgreSQL → ClickHouse, one stream: a 44-column Odoo
+  `sale_order_line` read from a PostgreSQL 16 replica went from 4.86s to 1.98s
+  for 300k rows and from 15.3s to 6.2s for 1M rows; TPC-H `lineitem` (6M rows)
+  from 72–78s to 23s. MySQL, ClickHouse and BigQuery sources are unchanged.
+
 ## [0.20.0] — 2026-09-26
 
 ### Fixed — silent data loss and corruption

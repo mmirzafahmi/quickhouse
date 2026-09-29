@@ -612,6 +612,62 @@ def test_rapid_successive_full_refreshes_both_succeed(pg_conn, ch_client, pg_sou
             ch_client.command(f"DROP TABLE IF EXISTS `{name}`")
 
 
+def test_rows_of_every_size_survive_copy_chunking(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """PostgreSQL sends a binary COPY as one message per row, and quickhouse
+    regroups the messages into multi-row chunks before decoding them. Every row
+    must still arrive byte-for-byte, on both PostgreSQL read paths (one-shot and
+    keyset-chunked): short rows, NULLs, and rows bigger than a whole chunk (a
+    300 KiB value is a single message over the 256 KiB chunk ceiling)."""
+    table = unique_name
+    n = 20_000
+    big = {i: f"{i:08d}" + "x" * (300 * 1024) for i in (1, 2, 5_000, 12_345, n)}
+
+    def body(i):
+        return big.get(i) or (None if i % 7 == 0 else f"row-{i}")
+
+    with pg_conn.cursor() as cur:
+        cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+        cur.execute(
+            f'CREATE TABLE "{table}" '
+            "(id bigint PRIMARY KEY, body text, write_date timestamp NOT NULL)"
+        )
+        with cur.copy(f'COPY "{table}" (id, body, write_date) FROM STDIN') as copy:
+            for i in range(1, n + 1):
+                copy.write_row((i, body(i), "2024-01-01 00:00:00"))
+    expected = [(i, body(i)) for i in range(1, n + 1)]
+
+    read_paths = {
+        "one_shot": dict(mode="full", parallelism=2),
+        "keyset": dict(
+            mode="incremental",
+            watermark="write_date",
+            chunk_rows=3_000,
+            engine="ReplacingMergeTree",
+            order_by=["id"],
+        ),
+    }
+    for label, kwargs in read_paths.items():
+        dest = f"{table}_{label}"
+        _drop_ch(ch_client, dest)
+        try:
+            result = quickhouse.sync(
+                pg_source,
+                ch_target,
+                dest_table=dest,
+                source_table=table,
+                key=["id"],
+                create_if_missing=True,
+                **kwargs,
+            )
+            assert result.rows_written == n, label
+            got = ch_client.query(f"SELECT id, body FROM `{dest}` ORDER BY id").result_rows
+            assert got == expected, label
+        finally:
+            _drop_ch(ch_client, dest)
+
+
 def _pg_scalar(pg_conn, sql: str):
     with pg_conn.cursor() as cur:
         cur.execute(sql)
