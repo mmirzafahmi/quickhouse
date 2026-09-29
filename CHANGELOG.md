@@ -9,6 +9,8 @@ any breaking change is called out explicitly.
 
 ## [Unreleased]
 
+## [0.20.3] — 2026-09-29
+
 ### Added
 - **`chunk_rows` works with `source_query`.** Every column of a PostgreSQL
   `source_query` resolves as nullable, so a keyset column there was always
