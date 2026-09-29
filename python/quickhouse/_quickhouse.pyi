@@ -800,7 +800,10 @@ def sync(
     serve it, so every incremental run does a full scan regardless of table
     size. Have ``source_query`` additionally project the raw, indexed column
     under a second name (e.g. ``write_date AS write_date_raw``) and set
-    ``watermark_source_expr="write_date_raw"``.
+    ``watermark_source_expr="write_date_raw"``. It needs the ``MAX`` probe to
+    run: when the probe is skipped as too costly (see ``probe_max_cost``), the
+    cursor would be taken from the projected ``watermark`` values, a different
+    domain from the filter, so the run is refused instead.
 
     ``partition_source_expr`` (new in 0.14.0; PostgreSQL/MySQL/ClickHouse sources only) is
     the same idea applied to parallel reads, and it is what makes

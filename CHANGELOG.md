@@ -9,6 +9,32 @@ any breaking change is called out explicitly.
 
 ## [Unreleased]
 
+### Fixed
+- **A PostgreSQL `numeric` decoded to `Float64` is correctly rounded.** Each
+  base-10000 digit was multiplied by an inexact `10000^power` and summed, so
+  values often landed one ulp off the nearest double: `-0.03` as
+  `-0.030000000000000002`, `0.12` as `0.12000000000000001`. The digits are now
+  read as one exact integer and scaled once (Clinger's fast path), falling back
+  to Rust's correctly rounded parser for wider values, and match `::float8` bit
+  for bit. Affects unconstrained `numeric` and declared ones that don't take
+  the exact `Decimal(P, S)` path. (#8)
+- **`watermark_source_expr` is refused with a stream-derived cursor.** When the
+  `MAX` probe was skipped as too costly, the cursor came from the projected
+  `watermark`, while the filter compared `watermark_source_expr`: a projection
+  shifted 7h ahead persisted a cursor 7h ahead of the filter and skipped those
+  rows for good. The run now fails with the same fix as the `column_transforms`
+  case: an index, or `probe_max_cost=0`. (#9)
+- **`type_overrides` `DATETIME` / `TIMESTAMP` keep microseconds on ClickHouse.**
+  Written into the DDL verbatim, ClickHouse read them as its second-precision
+  `DateTime` and truncated every value. A new table now gets `DateTime64(6)` /
+  `DateTime64(6, 'UTC')`. `DateTime` spelled ClickHouse's way still means
+  seconds, and existing columns keep their type. (#10)
+- **A ClickHouse engine's version and sign columns are created non-nullable.**
+  `engine="ReplacingMergeTree(ver)"` (and `is_deleted`, a `CollapsingMergeTree`
+  sign, a `VersionedCollapsingMergeTree` sign and version) now get the same
+  treatment as the sort key. Every `source_query` column resolves as nullable,
+  so a computed version column failed the `CREATE` with `Code: 169`. (#11)
+
 ## [0.20.3] — 2026-09-29
 
 ### Added

@@ -60,6 +60,26 @@ fn datetime_override_tz(dest_type: &str) -> Option<Option<Arc<str>>> {
     None
 }
 
+/// The ClickHouse type a portable `type_overrides` datetime name stands for.
+///
+/// `DATETIME` and `TIMESTAMP` are the BigQuery spellings of a naive and a UTC
+/// datetime, and the docs present them as working for either destination.
+/// ClickHouse, though, reads both as aliases of its *second*-precision
+/// `DateTime`, so written into the DDL verbatim they silently dropped every
+/// microsecond on insert. Here they become the microsecond types they stand
+/// for. ClickHouse's own `DateTime`, spelled that way, is left alone: that
+/// caller asked for seconds.
+fn clickhouse_datetime_spelling(dest_type: String) -> String {
+    let trimmed = dest_type.trim();
+    if trimmed.eq_ignore_ascii_case("DATETIME") && trimmed != "DateTime" {
+        "DateTime64(6)".to_string()
+    } else if trimmed.eq_ignore_ascii_case("TIMESTAMP") {
+        "DateTime64(6, 'UTC')".to_string()
+    } else {
+        dest_type
+    }
+}
+
 /// Extract a single-quoted timezone argument (e.g. `UTC` from
 /// `DateTime64(6, 'UTC')`), or `None` when the type carries no timezone.
 fn extract_quoted_tz(s: &str) -> Option<Arc<str>> {
@@ -421,6 +441,16 @@ pub fn plan_for_destination(
         .collect();
 
     let decimals = existing_decimals(source, cfg, dest_kind, existing);
+    // Columns the ClickHouse engine's own parameters name (a
+    // `ReplacingMergeTree(ver)` version, a collapsing sign), which it refuses
+    // as Nullable just as it does a sort key. A `source_query` resolves every
+    // column as nullable, so without this a computed version column failed
+    // the CREATE with `Code: 169`.
+    let engine_columns = if dest_kind == DestKind::ClickHouse {
+        crate::ddl::engine_parameter_columns(&cfg.effective_engine())
+    } else {
+        Vec::new()
+    };
     let mut source_columns = Vec::with_capacity(included.len());
     let mut source_select_exprs = Vec::with_capacity(included.len());
     let mut dest_columns = Vec::with_capacity(included.len());
@@ -464,6 +494,11 @@ pub fn plan_for_destination(
             // documents.
             .or_else(|| declared_decimal_default(c, &dest_name, dest_kind, existing, &decimals))
             .unwrap_or_else(|| c.clickhouse_inner.clone());
+        let ch_inner = if dest_kind == DestKind::ClickHouse {
+            clickhouse_datetime_spelling(ch_inner)
+        } else {
+            ch_inner
+        };
         let is_key = key_columns.contains(dest_name.as_str());
         // ClickHouse's ReplacingMergeTree also rejects a Nullable version
         // column outright (`Code: 169 BAD_TYPE_OF_FIELD`), same restriction
@@ -480,7 +515,8 @@ pub fn plan_for_destination(
         let is_ch_version_column = is_watermark
             && cfg.effective_engine() == "ReplacingMergeTree"
             && dest_kind == DestKind::ClickHouse;
-        let force_non_nullable = is_key || is_ch_version_column;
+        let is_engine_column = engine_columns.iter().any(|e| e == &dest_name);
+        let force_non_nullable = is_key || is_ch_version_column || is_engine_column;
         // Date32/Timestamp columns are otherwise forced nullable regardless
         // of the source's own NOT NULL constraint: their decoders coerce
         // unrepresentable values (zero-dates, out-of-ch_range years) to NULL
@@ -1214,7 +1250,57 @@ mod tests {
             ts(None),
             "override must flip tz-aware -> naive"
         );
+        // Issue #10: spelled as the microsecond type it stands for, not
+        // ClickHouse's second-precision `DATETIME` alias...
+        assert_eq!(p.dest_columns[0].clickhouse_inner, "DateTime64(6)");
+        // ...while BigQuery keeps its own name.
+        let p = plan(&src, &cfg, DestKind::BigQuery).unwrap();
         assert_eq!(p.dest_columns[0].clickhouse_inner, "DATETIME");
+    }
+
+    /// Issue #11: an explicit engine's version and is_deleted columns are
+    /// created non-nullable, as its sort key is; BigQuery has no engine.
+    #[test]
+    fn engine_parameter_columns_are_forced_non_nullable_on_clickhouse() {
+        let src = vec![
+            typed_col("id", DataType::Int64, true),
+            typed_col("write_date", ts(None), true),
+            typed_col("is_deleted", DataType::UInt8, true),
+            typed_col("other", DataType::Int64, true),
+        ];
+        let mut cfg = cfg();
+        cfg.engine = Some("ReplacingMergeTree(`write_date`, is_deleted)".into());
+        let nullable = |p: &SelectPlan| {
+            p.dest_columns
+                .iter()
+                .map(|c| (c.name.clone(), c.nullable))
+                .collect::<HashMap<_, _>>()
+        };
+        let ch = nullable(&plan(&src, &cfg, DestKind::ClickHouse).unwrap());
+        assert!(!ch["write_date"] && !ch["is_deleted"]);
+        assert!(ch["other"]);
+        let bq = nullable(&plan(&src, &cfg, DestKind::BigQuery).unwrap());
+        assert!(bq["is_deleted"]);
+    }
+
+    #[test]
+    fn portable_datetime_names_keep_microseconds_on_clickhouse() {
+        for (given, want) in [
+            ("DATETIME", "DateTime64(6)"),
+            ("datetime", "DateTime64(6)"),
+            ("TIMESTAMP", "DateTime64(6, 'UTC')"),
+            // ClickHouse's own names mean what they say, seconds included.
+            ("DateTime", "DateTime"),
+            ("DateTime64(3)", "DateTime64(3)"),
+            ("DateTime('Asia/Jakarta')", "DateTime('Asia/Jakarta')"),
+            ("String", "String"),
+        ] {
+            assert_eq!(
+                clickhouse_datetime_spelling(given.to_string()),
+                want,
+                "{given}"
+            );
+        }
     }
 
     /// The reverse: an override to `TIMESTAMP` promotes a naive timestamp

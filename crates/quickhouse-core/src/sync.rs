@@ -1317,6 +1317,25 @@ async fn run_transfer_impl(
             cfg.watermark.as_deref().unwrap_or("?"),
         )));
     }
+    // `watermark_source_expr` is the other way the filter and the projection
+    // part: the filter reads the raw expression, while a stream cursor folds
+    // the projected column, which is whatever `source_query` makes of it.
+    if stream_max_cursor {
+        if let Some(expr) = cfg.watermark_source_expr.as_deref() {
+            return Err(EtlError::config(format!(
+                "watermark_source_expr cannot be used with a stream-derived cursor: the \
+                 MAX(watermark) probe was skipped as too costly (see the unindexed_watermark \
+                 warning above), so the cursor would be the largest '{}' value this run reads, \
+                 while the incremental filter compares against watermark_source_expr ({expr}). \
+                 Whenever the projection transforms the column (a time-zone shift, a cast) \
+                 those are different values, and a cursor from one compared against the other \
+                 silently skips or re-reads rows. Add an index on what watermark_source_expr \
+                 reads so the MAX probe runs, or set probe_max_cost=0 to force it \
+                 unconditionally.",
+                cfg.watermark.as_deref().unwrap_or("?"),
+            )));
+        }
+    }
     let watermark_tracker = match (stream_max_cursor, cfg.watermark.as_deref()) {
         (true, Some(w)) => {
             let utc_offset = matches!(source.as_ref(), Source::Postgres(_));

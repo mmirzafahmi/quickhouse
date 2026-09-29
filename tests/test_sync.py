@@ -912,3 +912,104 @@ def test_chunk_rows_refuses_a_keyset_a_query_can_null_unless_asserted(
         _drop_ch(ch_client, table)
         with pg_conn.cursor() as cur:
             cur.execute(f'DROP TABLE IF EXISTS "{table}", "{other}"')
+
+
+def test_numeric_decodes_to_the_correctly_rounded_float(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """Issue #8: an unconstrained numeric landed one ulp off the nearest
+    double (-0.03 as -0.030000000000000002). It now equals PostgreSQL's own
+    ::float8, bit for bit."""
+    table = unique_name
+    values = ["-0.03", "0.12", "-0.06", "32.9", "0.1", "123456789.123456789", "1e-20"]
+    with pg_conn.cursor() as cur:
+        cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+        cur.execute(f'CREATE TABLE "{table}" (id int PRIMARY KEY, v numeric)')
+        for i, v in enumerate(values):
+            cur.execute(f'INSERT INTO "{table}" VALUES (%s, %s::numeric)', (i, v))
+        cur.execute(f'SELECT id, v::float8 FROM "{table}" ORDER BY id')
+        expected = cur.fetchall()
+    _drop_ch(ch_client, table)
+    try:
+        quickhouse.sync(
+            pg_source, ch_target, dest_table=table, source_table=table, mode="full",
+            key=["id"], create_if_missing=True,
+        )
+        got = ch_client.query(f"SELECT id, v FROM `{table}` ORDER BY id").result_rows
+        assert [(i, float(v)) for i, v in got] == expected
+    finally:
+        _drop_ch(ch_client, table)
+
+
+def test_portable_datetime_overrides_keep_microseconds_on_clickhouse(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """Issue #10: type_overrides {"c": "DATETIME"} created ClickHouse's
+    second-precision DateTime alias and dropped the microseconds. The portable
+    names now create DateTime64(6) / DateTime64(6, 'UTC'); ClickHouse's own
+    DateTime still means seconds."""
+    table = unique_name
+    with pg_conn.cursor() as cur:
+        cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+        cur.execute(
+            f'CREATE TABLE "{table}" (id int PRIMARY KEY, a timestamp, b timestamp, c timestamp)'
+        )
+        cur.execute(
+            f"INSERT INTO \"{table}\" VALUES (1, '2026-09-21 17:21:00.002835', "
+            "'2026-09-21 17:21:00.002835', '2026-09-21 17:21:00.002835')"
+        )
+    _drop_ch(ch_client, table)
+    try:
+        quickhouse.sync(
+            pg_source, ch_target, dest_table=table, source_table=table, mode="full",
+            key=["id"], create_if_missing=True,
+            type_overrides={"a": "DATETIME", "b": "TIMESTAMP", "c": "DateTime"},
+        )
+        types = _ch_types(ch_client, table)
+        assert types["a"] == "Nullable(DateTime64(6))", types
+        assert types["b"] == "Nullable(DateTime64(6, 'UTC'))", types
+        assert types["c"] == "Nullable(DateTime)", types
+        row = ch_client.query(
+            f"SELECT toString(a), toString(b), toString(c) FROM `{table}`"
+        ).result_rows[0]
+        assert row == (
+            "2026-09-21 17:21:00.002835",
+            "2026-09-21 17:21:00.002835",
+            "2026-09-21 17:21:00",
+        )
+    finally:
+        _drop_ch(ch_client, table)
+
+
+def test_an_engine_version_column_from_a_source_query_is_created_non_nullable(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """Issue #11: every source_query column resolves as nullable, so a
+    computed ReplacingMergeTree(ver) column was declared Nullable and the
+    CREATE failed with Code 169. It is now forced non-nullable, as a sort key
+    is, with or without an explicit not_null."""
+    table = unique_name
+    with pg_conn.cursor() as cur:
+        cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+        cur.execute(f'CREATE TABLE "{table}" (id int PRIMARY KEY, write_date timestamp)')
+        cur.execute(f"INSERT INTO \"{table}\" VALUES (1, '2024-01-01'), (2, NULL)")
+    query = (
+        "SELECT id, (COALESCE(write_date, TIMESTAMP '1987-12-01') + INTERVAL '7 hours') "
+        f'AS write_date FROM "{table}"'
+    )
+    try:
+        for i, extra in enumerate(({}, {"not_null": ["write_date"]})):
+            dest = f"{table}_{i}"
+            _drop_ch(ch_client, dest)
+            r = quickhouse.sync(
+                pg_source, ch_target, dest_table=dest, source_query=query, mode="incremental",
+                watermark="id", key=["id"], order_by=["id"], create_if_missing=True,
+                engine="ReplacingMergeTree(`write_date`)", **extra,
+            )
+            assert r.rows_written == 2
+            assert _ch_types(ch_client, dest)["write_date"] == "DateTime64(6)", extra
+    finally:
+        for i in range(2):
+            _drop_ch(ch_client, f"{table}_{i}")
+        with pg_conn.cursor() as cur:
+            cur.execute(f'DROP TABLE IF EXISTS "{table}"')

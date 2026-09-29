@@ -415,3 +415,48 @@ def test_skip_to_max_refuses_rather_than_full_scanning_when_the_probe_is_skipped
 
     finally:
         _drop_ch(ch_client, table)
+
+
+def test_stream_derived_watermark_refuses_watermark_source_expr(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """Issue #9: with watermark_source_expr the filter reads the raw
+    expression, but a stream cursor folds the projected column. A projection
+    shifted 7h ahead would persist a cursor 7h ahead of what the next filter
+    compares, skipping those rows for good, so the pairing is refused. With
+    the probe forced on, the cursor comes from the raw expression and it runs."""
+    table = unique_name
+    _seed_nullable_wm(pg_conn, table, rows=50, nulls=0, indexed=False)
+    shifted = (
+        f"SELECT id, name, (write_date + INTERVAL '7 hours') AS write_date, "
+        f'write_date AS write_date_raw FROM "{table}"'
+    )
+    kw = dict(
+        source_query=shifted,
+        watermark_source_expr="write_date_raw",
+        lookback_seconds=3600,
+    )
+    _drop_ch(ch_client, table)
+    try:
+        try:
+            quickhouse.sync(
+                pg_source, ch_target, dest_table=table, mode="incremental",
+                watermark="write_date", key=["id"], create_if_missing=True,
+                engine="ReplacingMergeTree", order_by=["id"], probe_max_cost=1.0, **kw,
+            )
+            assert False, "expected a RuntimeError"
+        except RuntimeError as e:
+            msg = str(e)
+            assert "watermark_source_expr" in msg and "probe_max_cost=0" in msg, msg
+        assert int(ch_client.command(f"EXISTS TABLE `{table}`")) == 0
+
+        r = quickhouse.sync(
+            pg_source, ch_target, dest_table=table, mode="incremental",
+            watermark="write_date", key=["id"], create_if_missing=True,
+            engine="ReplacingMergeTree", order_by=["id"], probe_max_cost=0.0, **kw,
+        )
+        assert r.rows_written == 50
+        # The cursor is the raw column's MAX, the domain the filter compares.
+        assert r.new_watermark.startswith("2024-01-01 00:00:00"), r.new_watermark
+    finally:
+        _drop_ch(ch_client, table)

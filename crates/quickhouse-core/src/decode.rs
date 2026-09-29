@@ -321,17 +321,71 @@ fn decode_numeric(buf: &[u8]) -> Result<f64> {
             buf.len()
         )));
     }
-    let mut value = 0f64;
+    let magnitude = numeric_digits_to_f64(&buf[8..8 + ndigits * 2], weight)?;
+    Ok(if sign == 0x4000 {
+        -magnitude
+    } else {
+        magnitude
+    })
+}
+
+/// A `numeric`'s base-10000 digits (big-endian `u16` pairs, the first worth
+/// `digit * 10000^weight`) as the nearest `f64`: the correctly rounded value
+/// `SELECT v::float8` and every other client give.
+///
+/// Summing `digit * 10000^power` digit by digit is not correctly rounded:
+/// `10000^-1` has no exact binary form, so each fractional digit carried its
+/// own rounding error, and `-0.03` (digit 300 at weight -1) arrived as
+/// `-0.030000000000000002`. Here the digits are read as one exact integer and
+/// scaled by a power of ten once. When both are exact in an `f64` (the
+/// integer at most 2^53, the power at most 10^22), that one multiply or divide
+/// is correctly rounded (Clinger's fast path), which covers the values a
+/// column normally holds. Anything wider is spelled out and handed to Rust's
+/// float parser, which is correctly rounded for any number of digits.
+fn numeric_digits_to_f64(digits: &[u8], weight: i32) -> Result<f64> {
+    const MAX_EXACT_INT: u64 = 1 << 53;
+    const POW10: [f64; 23] = [
+        1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16,
+        1e17, 1e18, 1e19, 1e20, 1e21, 1e22,
+    ];
+    let ndigits = digits.len() / 2;
+    if ndigits == 0 {
+        return Ok(0.0);
+    }
+    let digit = |i: usize| u64::from(u16::from_be_bytes([digits[2 * i], digits[2 * i + 1]]));
+    // The power of ten the last digit's units sit at.
+    let last_exp10 = 4 * (weight - (ndigits as i32 - 1));
+
+    let mut mantissa = Some(0u64);
     for i in 0..ndigits {
-        let off = 8 + i * 2;
-        let digit = i16::from_be_bytes([buf[off], buf[off + 1]]) as f64;
-        let power = weight - i as i32;
-        value += digit * 10_000f64.powi(power);
+        mantissa = mantissa
+            .and_then(|m| m.checked_mul(10_000))
+            .and_then(|m| m.checked_add(digit(i)));
     }
-    if sign == 0x4000 {
-        value = -value;
+    if let Some(mut m) = mantissa {
+        let mut exp10 = last_exp10;
+        while m != 0 && m % 10 == 0 {
+            m /= 10;
+            exp10 += 1;
+        }
+        if m <= MAX_EXACT_INT && exp10.unsigned_abs() <= 22 {
+            let scale = POW10[exp10.unsigned_abs() as usize];
+            return Ok(if exp10 < 0 {
+                m as f64 / scale
+            } else {
+                m as f64 * scale
+            });
+        }
     }
-    Ok(value)
+
+    let mut text = String::with_capacity(ndigits * 4 + 8);
+    for i in 0..ndigits {
+        text.push_str(&format!("{:04}", digit(i)));
+    }
+    text.push_str(&format!("e{last_exp10}"));
+    text.parse::<f64>().map_err(|e| {
+        EtlError::internal(format!("numeric digits '{text}' did not parse as f64: {e}"))
+    })
 }
 
 /// A PostgreSQL `numeric` binary payload parsed exactly (no `f64` round
@@ -1040,6 +1094,106 @@ mod tests {
             .downcast_ref::<arrow_array::Decimal128Array>()
             .unwrap();
         assert_eq!(arr.value(0), 0);
+    }
+
+    /// PostgreSQL's binary `numeric` for a plain decimal string (`-0.03`,
+    /// `123.456`): base-10000 groups aligned on the decimal point, leading and
+    /// trailing zero groups dropped, as the server sends it.
+    fn numeric_wire_for(text: &str) -> Vec<u8> {
+        let (negative, unsigned) = match text.strip_prefix('-') {
+            Some(rest) => (true, rest),
+            None => (false, text),
+        };
+        let (int, frac) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+        let int = format!("{}{int}", "0".repeat((4 - int.len() % 4) % 4));
+        let frac = format!("{frac}{}", "0".repeat((4 - frac.len() % 4) % 4));
+        let groups: Vec<i16> = format!("{int}{frac}")
+            .as_bytes()
+            .chunks(4)
+            .map(|g| std::str::from_utf8(g).unwrap().parse().unwrap())
+            .collect();
+        let mut weight = (int.len() / 4) as i16 - 1;
+        let mut start = 0;
+        while start < groups.len() && groups[start] == 0 {
+            start += 1;
+            weight -= 1;
+        }
+        let mut end = groups.len();
+        while end > start && groups[end - 1] == 0 {
+            end -= 1;
+        }
+        if start == end {
+            return numeric_wire(0, 0, &[]);
+        }
+        numeric_wire(
+            weight,
+            if negative { 0x4000 } else { 0 },
+            &groups[start..end],
+        )
+    }
+
+    /// Issue #8: the Float64 path is correctly rounded, the value `::float8`
+    /// and Rust's own parser give, not one ulp off.
+    #[test]
+    fn decode_numeric_f64_is_correctly_rounded() {
+        for text in [
+            "-0.03",
+            "0.12",
+            "-0.06",
+            "32.9",
+            "0.1",
+            "0.00000000000000000001",
+            "123456789.123456789",
+            "98765432109876543210.0123456789012345",
+            "0.000000000000000000000000000000000000000000000123456789",
+            "1797693134862315700000000000000000000000000000000000000000000000000000",
+            "9007199254740993",
+            "0",
+            "-1",
+            "10000",
+            "0.0001",
+        ] {
+            let want: f64 = text.parse().unwrap();
+            let got = decode_numeric(&numeric_wire_for(text)).unwrap();
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "{text}: got {got}, want {want}"
+            );
+        }
+    }
+
+    /// The same, over random decimal strings of every shape a column holds:
+    /// short and long, integral and fractional, tiny and huge.
+    #[test]
+    fn decode_numeric_f64_matches_the_parser_on_random_decimals() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..50_000 {
+            let int_len = (next() % 22) as usize;
+            let frac_len = (next() % 26) as usize;
+            let int: String = (0..int_len)
+                .map(|_| char::from(b'0' + (next() % 10) as u8))
+                .collect();
+            let frac: String = (0..frac_len)
+                .map(|_| char::from(b'0' + (next() % 10) as u8))
+                .collect();
+            let sign = if next() % 2 == 0 { "-" } else { "" };
+            let int = if int.is_empty() { "0".to_string() } else { int };
+            let text = if frac.is_empty() {
+                format!("{sign}{int}")
+            } else {
+                format!("{sign}{int}.{frac}")
+            };
+            let want: f64 = text.parse().unwrap();
+            let got = decode_numeric(&numeric_wire_for(&text)).unwrap();
+            assert_eq!(got.abs().to_bits(), want.abs().to_bits(), "{text}");
+        }
     }
 
     #[test]

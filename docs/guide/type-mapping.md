@@ -66,7 +66,9 @@ qh.sync(..., type_overrides={"created_at": "DATETIME"})
 ```
 
 This flips the actual wire encoding, not just the declared type, so it works on
-the Storage Write path too.
+the Storage Write path too. On ClickHouse, `DATETIME` and `TIMESTAMP` create
+`DateTime64(6)` and `DateTime64(6, 'UTC')`, keeping microseconds; ClickHouse's
+own `DateTime`, spelled that way, still means second precision.
 
 PostgreSQL keeps the distinction natively: `timestamptz` → UTC-aware,
 `timestamp` → naive.

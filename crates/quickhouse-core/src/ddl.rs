@@ -44,6 +44,54 @@ fn is_row_merging_engine(engine: &str) -> bool {
     ROW_MERGING_ENGINES.contains(&family)
 }
 
+/// The columns a ClickHouse engine's own parameters name, which it rejects as
+/// `Nullable` (`Code: 169`): `ReplacingMergeTree(ver[, is_deleted])`,
+/// `CollapsingMergeTree(sign)` and `VersionedCollapsingMergeTree(sign,
+/// version)`, and their `Replicated*` forms, whose leading ZooKeeper path and
+/// replica arguments are string literals and are skipped. Names come back
+/// without their backticks or double quotes. Empty for any other engine, and
+/// for one written without parameters.
+pub fn engine_parameter_columns(engine: &str) -> Vec<String> {
+    let Some((family, args)) = engine.split_once('(') else {
+        return Vec::new();
+    };
+    let family = family.trim();
+    let family = family.strip_prefix("Replicated").unwrap_or(family);
+    if !matches!(
+        family,
+        "ReplacingMergeTree" | "CollapsingMergeTree" | "VersionedCollapsingMergeTree"
+    ) {
+        return Vec::new();
+    }
+    let args = args.trim_end();
+    let args = args.strip_suffix(')').unwrap_or(args);
+    let mut parts = Vec::new();
+    let (mut current, mut quoted) = (String::new(), false);
+    for ch in args.chars() {
+        match ch {
+            '\'' => {
+                quoted = !quoted;
+                current.push(ch);
+            }
+            ',' if !quoted => parts.push(std::mem::take(&mut current)),
+            _ => current.push(ch),
+        }
+    }
+    parts.push(current);
+    parts
+        .iter()
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty() && !p.starts_with('\''))
+        .map(|p| {
+            p.strip_prefix('`')
+                .and_then(|p| p.strip_suffix('`'))
+                .or_else(|| p.strip_prefix('"').and_then(|p| p.strip_suffix('"')))
+                .unwrap_or(p)
+                .to_string()
+        })
+        .collect()
+}
+
 /// Build a `CREATE TABLE IF NOT EXISTS` statement for the destination.
 ///
 /// `columns` are the *destination* columns (post-rename / post-cast), each with
@@ -235,6 +283,32 @@ mod tests {
             clickhouse_inner: ch.into(),
             arbitrary_precision_decimal: false,
             declared_decimal: None,
+        }
+    }
+
+    /// Issue #11: the columns an engine's parameters name, which ClickHouse
+    /// refuses as Nullable.
+    #[test]
+    fn engine_parameter_columns_names_version_sign_and_is_deleted() {
+        let cols = engine_parameter_columns;
+        assert_eq!(cols("ReplacingMergeTree(`write_date`)"), ["write_date"]);
+        assert_eq!(
+            cols("ReplacingMergeTree(ver, is_deleted)"),
+            ["ver", "is_deleted"]
+        );
+        assert_eq!(cols("CollapsingMergeTree(\"sign\")"), ["sign"]);
+        assert_eq!(cols("VersionedCollapsingMergeTree(sign, v)"), ["sign", "v"]);
+        assert_eq!(
+            cols("ReplicatedReplacingMergeTree('/clickhouse/{shard}/t', '{replica}', ver)"),
+            ["ver"]
+        );
+        for none in [
+            "ReplacingMergeTree",
+            "ReplacingMergeTree()",
+            "MergeTree",
+            "SummingMergeTree(x)",
+        ] {
+            assert!(cols(none).is_empty(), "{none}");
         }
     }
 
