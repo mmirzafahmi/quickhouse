@@ -21,6 +21,10 @@ any breaking change is called out explicitly.
   `sale_order_line` read from a PostgreSQL 16 replica went from 4.86s to 1.98s
   for 300k rows and from 15.3s to 6.2s for 1M rows; TPC-H `lineitem` (6M rows)
   from 72–78s to 23s. MySQL, ClickHouse and BigQuery sources are unchanged.
+- **MySQL rows are decoded without copying every value.** The decoder cloned
+  each cell out of the row before converting it, so every string and `DECIMAL`
+  cell was allocated and copied twice. Measured MySQL → ClickHouse, TPC-H
+  `lineitem` (6M rows): 23.0s to 22.0s.
 
 ## [0.20.0] — 2026-09-26
 
