@@ -9,6 +9,18 @@ any breaking change is called out explicitly.
 
 ## [Unreleased]
 
+### Documentation
+- **The benchmark moves 10 million rows, not ~300k.** Same tables, same
+  identical-SQL and primary-key-merge method, with quickhouse 0.20.4, Sling
+  1.6.4 and dlt 1.30.0 on a 2 vCPU VM, every destination table checked against
+  the source's own row count, distinct-key count and checksum. Into ClickHouse
+  quickhouse took 35 s against Sling's 300 s and dlt's 1,256 s; into BigQuery
+  90–111 s against 282 s and 1,244 s, billing 1.3–1.5× fewer bytes. Two of the
+  300k-row conclusions did not hold and the page says so: at 10M rows the
+  BigQuery `MERGE` is ~12% of quickhouse's run (streaming the rows in is ~85%),
+  and Sling, like dlt, takes the same time into either destination. The landing
+  page, the design notes and the performance guide quote the new run.
+
 ## [0.20.4] — 2026-09-29
 
 ### Fixed

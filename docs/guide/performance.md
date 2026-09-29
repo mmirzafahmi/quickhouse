@@ -259,8 +259,10 @@ print(f"read {r.read_secs:.1f}s  stage {r.stage_secs:.1f}s  promote {r.promote_s
   into the destination (or this run's staging table).
 - **`promote_secs`** — what follows: the full-refresh swap, the incremental
   `MERGE` or insert-select, the window-scoped delete, the watermark persist. On a
-  BigQuery destination this is usually most of the run — a measured 299,540-row
-  window spent 70–85% of its time in the `MERGE` and ~9% in the read.
+  BigQuery destination it dominates small runs — a measured 299,540-row window
+  spent 70–85% of its time in the `MERGE` and ~9% in the read — while a
+  10M-row run spent most of its time in `stage_secs` (76–96 s, against an
+  11–12 s `MERGE`).
 
 If `promote_secs` dominates, tune the destination DDL (clustering, the merge
 prunes above). If `read_secs / parallelism` approaches `stage_secs`, the source

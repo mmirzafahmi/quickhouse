@@ -206,9 +206,10 @@ Non-obvious fixes in `bench`. Each exists for a reason worth keeping.
 ### Numbers that must agree
 
 Landing hero `TransferResult`, `guide/benchmark.md`, and the teaser carousel
-all quote the same run: **299,540 rows / 0.94 s**. BigQuery cost figures are
-1,000 × per-run bytes at on-demand $6.25/TiB — 28 MiB → $0.17, 122 MiB → $0.73,
-200 MiB → $1.19. Change one, change all.
+all quote the same run: **10,000,000 rows / 33.29 s** (`duration_secs`; 35.5 s
+wall clock, the median of three into ClickHouse). BigQuery cost figures are
+1,000 × mean per-run bytes at on-demand $6.25/TiB — 3,393 MiB → $20, 4,330 MiB
+→ $26, 4,964 MiB → $30. Change one, change all.
 
 The announce strip, the `.qh-newband` tag and the changelog's newest entry all
 claim the same headline feature. Change one, change all three.

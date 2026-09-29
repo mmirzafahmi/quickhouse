@@ -67,16 +67,16 @@ qh.<span class="n">sync</span>(
       </div>
       <div class="qh-result">
         <div class="qh-result__label">TransferResult</div>
-        <div class="qh-result__row"><span>rows_read</span><b>299_540</b></div>
-        <div class="qh-result__row"><span>rows_written</span><b>299_540</b></div>
-        <div class="qh-result__row"><span>duration_secs</span><b class="qh-hi">0.94</b></div>
+        <div class="qh-result__row"><span>rows_read</span><b>10_000_000</b></div>
+        <div class="qh-result__row"><span>rows_written</span><b>10_000_000</b></div>
+        <div class="qh-result__row"><span>duration_secs</span><b class="qh-hi">33.29</b></div>
         <div class="qh-result__row"><span>new_watermark</span><b>None</b></div>
       </div>
     </div>
   </div>
 
   <dl class="qh-stats">
-    <div><dt>0.9s</dt><dd>300k-row merge, MySQL → ClickHouse. <a href="guide/benchmark.html">See the benchmark</a>.</dd></div>
+    <div><dt>35s</dt><dd>10M-row merge, MySQL → ClickHouse. <a href="guide/benchmark.html">See the benchmark</a>.</dd></div>
     <div><dt>Arrow</dt><dd>Zero-copy batches end to end. Memory stays flat.</dd></div>
     <div><dt>5</dt><dd>Sources, two destinations, one uniform API.</dd></div>
     <div><dt>0</dt><dd>Toolchains to install. Prebuilt wheels, MIT licensed.</dd></div>
@@ -85,50 +85,50 @@ qh.<span class="n">sync</span>(
   <div class="qh-split">
     <div class="qh-teaser">
       <div class="qh-teaser__head">
-        <span class="qh-teaser__title">300k-row merge → ClickHouse, wall clock</span>
+        <span class="qh-teaser__title">10M-row merge → ClickHouse, wall clock</span>
         <a href="guide/benchmark.html">benchmark &rarr;</a>
       </div>
 
       <div class="qh-teaser__slide"
-           data-title="300k-row merge → ClickHouse, wall clock"
+           data-title="10M-row merge → ClickHouse, wall clock"
            data-note="lower is better · 3 runs">
         <div class="qh-bars">
           <div class="qh-bar qh-bar--lead">
             <span class="qh-bar__name">quickhouse</span>
-            <span class="qh-bar__track"><span class="qh-bar__fill" style="--qh-w:2%;--qh-delay:80ms"></span></span>
-            <span class="qh-bar__value">0.9 s</span>
+            <span class="qh-bar__track"><span class="qh-bar__fill" style="--qh-w:3%;--qh-delay:80ms"></span></span>
+            <span class="qh-bar__value">35.5 s</span>
           </div>
           <div class="qh-bar">
             <span class="qh-bar__name">Sling</span>
-            <span class="qh-bar__track"><span class="qh-bar__fill" style="--qh-w:21%;--qh-delay:200ms"></span></span>
-            <span class="qh-bar__value">10.7 s</span>
+            <span class="qh-bar__track"><span class="qh-bar__fill" style="--qh-w:24%;--qh-delay:200ms"></span></span>
+            <span class="qh-bar__value">300 s</span>
           </div>
           <div class="qh-bar">
             <span class="qh-bar__name">dlt</span>
             <span class="qh-bar__track"><span class="qh-bar__fill" style="--qh-w:100%;--qh-delay:320ms"></span></span>
-            <span class="qh-bar__value">50.6 s</span>
+            <span class="qh-bar__value">1,256 s</span>
           </div>
         </div>
       </div>
 
       <div class="qh-teaser__slide" hidden
-           data-title="300k-row merge → BigQuery, cost per 1,000 syncs"
+           data-title="10M-row merge → BigQuery, cost per 1,000 syncs"
            data-note="lower is better · on-demand at $6.25/TiB">
         <div class="qh-bars">
           <div class="qh-bar qh-bar--lead">
             <span class="qh-bar__name">quickhouse</span>
-            <span class="qh-bar__track"><span class="qh-bar__fill" style="--qh-w:14%;--qh-delay:80ms"></span></span>
-            <span class="qh-bar__value">$0.17</span>
-          </div>
-          <div class="qh-bar">
-            <span class="qh-bar__name">dlt</span>
-            <span class="qh-bar__track"><span class="qh-bar__fill" style="--qh-w:61%;--qh-delay:200ms"></span></span>
-            <span class="qh-bar__value">$0.73</span>
+            <span class="qh-bar__track"><span class="qh-bar__fill" style="--qh-w:68%;--qh-delay:80ms"></span></span>
+            <span class="qh-bar__value">$20</span>
           </div>
           <div class="qh-bar">
             <span class="qh-bar__name">Sling</span>
+            <span class="qh-bar__track"><span class="qh-bar__fill" style="--qh-w:87%;--qh-delay:200ms"></span></span>
+            <span class="qh-bar__value">$26</span>
+          </div>
+          <div class="qh-bar">
+            <span class="qh-bar__name">dlt</span>
             <span class="qh-bar__track"><span class="qh-bar__fill" style="--qh-w:100%;--qh-delay:320ms"></span></span>
-            <span class="qh-bar__value">$1.19</span>
+            <span class="qh-bar__value">$30</span>
           </div>
         </div>
       </div>
