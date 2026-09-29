@@ -454,7 +454,7 @@ class ClickHouse:
         recommended: at roughly 22 MB/s per core it caps every insert near
         that rate, and a transfer that uses it logs a warning.
 
-        .. versionchanged:: 0.21.0
+        .. versionchanged:: 0.20.1
            Added ``"lz4"``.
     archive:
         Optional :class:`S3Archive` or :class:`GcsArchive` (or the result of
@@ -990,7 +990,7 @@ def sync(
       ``numeric_as_decimal="Float64"`` restores the old mapping for every
       decimal column, declared precision or not.
 
-      .. versionchanged:: 0.21.0
+      .. versionchanged:: 0.20.1
          Declared-precision decimals map to ``Decimal(P, S)`` by default.
     - ``tinyint1_as_bool=False`` (MySQL sources) reads a ``tinyint(1)`` column
       as the integer it is (``Int8``, or ``UInt8`` when UNSIGNED) rather than as

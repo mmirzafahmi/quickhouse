@@ -9,6 +9,8 @@ any breaking change is called out explicitly.
 
 ## [Unreleased]
 
+## [0.20.1] — 2026-09-29
+
 ### Changed — please read before upgrading
 - **Declared-precision decimals land as exact `Decimal(P, S)`.** A PostgreSQL
   `numeric(P, S)` or MySQL `DECIMAL(P, S)` column (`P <= 38`) used to land as
