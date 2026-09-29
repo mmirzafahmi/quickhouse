@@ -9,6 +9,8 @@ any breaking change is called out explicitly.
 
 ## [Unreleased]
 
+## [0.20.4] — 2026-09-29
+
 ### Fixed
 - **A PostgreSQL `numeric` decoded to `Float64` is correctly rounded.** Each
   base-10000 digit was multiplied by an inexact `10000^power` and summed, so
