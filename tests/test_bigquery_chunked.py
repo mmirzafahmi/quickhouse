@@ -21,6 +21,11 @@ import pytest
 
 import quickhouse
 
+try:
+    from google.api_core.exceptions import NotFound
+except ImportError:  # the live tests skip without google-cloud-bigquery anyway
+    NotFound = Exception
+
 BQ_DATASET = os.environ.get("QUICKHOUSE_BQ_DATASET")
 BQ_PROJECT = os.environ.get("QUICKHOUSE_BQ_PROJECT")
 
@@ -48,9 +53,12 @@ def dest(bq, pg_conn, unique_name):
     for t in bq.list_tables(f"{bq.project}.{BQ_DATASET}"):
         if t.table_id.startswith(unique_name):
             bq.delete_table(t, not_found_ok=True)
-    bq.query(
-        f"DELETE FROM {_fq(bq, '_quickhouse_state')} WHERE dest_table = '{unique_name}'"
-    ).result()
+    try:
+        bq.query(
+            f"DELETE FROM {_fq(bq, '_quickhouse_state')} WHERE dest_table = '{unique_name}'"
+        ).result()
+    except NotFound:
+        pass  # no test in this run used the default state table
     with pg_conn.cursor() as cur:
         cur.execute(f'DROP TABLE IF EXISTS "{unique_name}"')
 
@@ -197,3 +205,54 @@ def test_gaps_in_the_key_keep_chunks_bounded(bq, pg_conn, pg_source, bq_target, 
     markers = [int(s.chunk_cursor) for s in _state(bq, dest) if s.chunk_cursor]
     # Keyset, not arithmetic: each chunk is the next 40 ids that exist.
     assert markers == [ids[39], ids[79], ids[-1]]
+
+
+def test_a_state_table_from_an_earlier_version_gains_the_chunk_columns(
+    bq, pg_conn, pg_source, bq_target, dest
+):
+    """A state table created before 0.20.2 has no chunk columns. The first
+    chunked run reads it without error (there can be no marker yet), adds the
+    columns in place, keeps the rows it holds, and resumes from them."""
+    bigquery = pytest.importorskip("google.cloud.bigquery")
+    state_table = f"{dest}_state"
+    old = bigquery.Table(
+        f"{bq.project}.{BQ_DATASET}.{state_table}",
+        schema=[
+            bigquery.SchemaField("source_table", "STRING", mode="REQUIRED"),
+            bigquery.SchemaField("dest_table", "STRING", mode="REQUIRED"),
+            bigquery.SchemaField("last_watermark", "STRING", mode="REQUIRED"),
+            bigquery.SchemaField("rows", "INTEGER", mode="REQUIRED"),
+            bigquery.SchemaField("run_ts", "TIMESTAMP", mode="REQUIRED"),
+        ],
+    )
+    bq.create_table(old)
+    _seed(pg_conn, dest, range(1, 101))
+    kw = dict(state_table_name=state_table, chunk_rows=None)
+    # An earlier, unchunked run: its cursor lands in the old-schema table.
+    assert _sync(pg_source, bq_target, dest, **kw).rows_written == 100
+    assert {f.name for f in bq.get_table(old).schema} >= {"chunk_cursor", "chunk_upper"}
+    # (The migration already ran on that first incremental run; put the old
+    # schema back to take the chunked run through it as an upgrade would.)
+    bq.delete_table(old)
+    bq.create_table(old)
+    bq.query(
+        f"INSERT INTO {_fq(bq, state_table)} (source_table, dest_table, last_watermark, `rows`, "
+        f"run_ts) VALUES ('{dest}', '{dest}', '2024-01-01 00:00:00', 100, CURRENT_TIMESTAMP())"
+    ).result()
+
+    with pg_conn.cursor() as cur:
+        cur.execute(
+            f"INSERT INTO \"{dest}\" SELECT g, g * 1.5, '2024-02-01' FROM generate_series(101, 190) g"
+        )
+    kw["chunk_rows"] = 40
+    assert _sync(pg_source, bq_target, dest, **kw).rows_written == 90
+    assert _landed(bq, dest) == (190, 190)
+    rows = list(
+        bq.query(
+            f"SELECT last_watermark, chunk_cursor FROM {_fq(bq, state_table)} ORDER BY run_ts"
+        ).result()
+    )
+    assert rows[0].last_watermark == "2024-01-01 00:00:00"  # kept
+    assert [r.chunk_cursor for r in rows if r.chunk_cursor] == ["140", "180", "190"]
+    assert rows[-1].chunk_cursor is None
+    assert rows[-1].last_watermark == "2024-02-01 00:00:00"
