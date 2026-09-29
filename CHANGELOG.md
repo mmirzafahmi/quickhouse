@@ -9,6 +9,21 @@ any breaking change is called out explicitly.
 
 ## [Unreleased]
 
+## [0.20.2] — 2026-09-29
+
+### Changed — please read before upgrading
+- **An incremental run whose lower bound evaluates to NULL now fails.** It
+  used to read 0 rows and report success, and every run after it did the same
+  (see #2). The error names the `state_key` and the cursor to repair. A
+  pipeline that was silently frozen this way will start failing on upgrade
+  instead, unless its cursor is one of the MySQL `+00` cursors this release
+  heals on its own.
+- **The BigQuery `_quickhouse_state` table gains two nullable columns,**
+  `chunk_cursor` and `chunk_upper`. The first incremental run after upgrading
+  adds them in place with one schema patch (the credentials need
+  `bigquery.tables.update` on the dataset, which BigQuery Data Editor has).
+  Earlier versions keep reading and writing the table unchanged.
+
 ### Fixed
 - **`chunk_rows` with `delete_stale_in_window` is refused up front.** On
   ClickHouse the pair failed with a message about `validate=`, which wasn't
