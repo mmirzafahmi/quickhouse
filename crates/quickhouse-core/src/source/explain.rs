@@ -35,11 +35,16 @@
 pub enum ProbeCost {
     /// The planner returned an estimate.
     Known(f64),
-    /// The plan carried no cost but did report how it reaches rows. MySQL omits
-    /// `cost_info` for shapes its optimizer resolves away (`MAX()` over an
-    /// indexed column) and for some derived-table queries. Absent cost is not
-    /// evidence of cheapness, so the access path decides instead.
+    /// The plan carried no cost but did report how it reaches rows, as MySQL
+    /// does for some derived-table queries. Absent cost is not evidence of
+    /// cheapness, so the access path decides instead.
     AccessPath { full_scan: bool },
+    /// The optimizer answered the query itself, without reading table rows.
+    /// MySQL evaluates `MAX()` over an indexed column from the index while
+    /// planning, and its plan then carries neither `cost_info` nor an
+    /// `access_type` — only a `message` such as `"Select tables optimized
+    /// away"`. See `MYSQL_RESOLVED_MESSAGES`.
+    Resolved,
     /// The planner could not be asked — EXPLAIN failed, was itself cancelled,
     /// or returned something unparseable.
     Unknown,
@@ -64,6 +69,7 @@ impl ProbeCost {
         match self {
             ProbeCost::Known(c) => *c > max_cost,
             ProbeCost::AccessPath { full_scan } => *full_scan,
+            ProbeCost::Resolved => false,
             ProbeCost::Unknown => true,
         }
     }
@@ -79,6 +85,9 @@ impl ProbeCost {
             }
             ProbeCost::AccessPath { full_scan: false } => {
                 "planner reported an indexed access path (no cost estimate available)".to_string()
+            }
+            ProbeCost::Resolved => {
+                "planner answered the query without reading the table".to_string()
             }
             ProbeCost::Unknown => {
                 "the planner could not be asked (EXPLAIN failed or was cancelled)".to_string()
@@ -133,10 +142,11 @@ pub(crate) fn pg_plan_can_null_columns(plan: &serde_json::Value) -> bool {
 
 /// Query cost from `EXPLAIN FORMAT=JSON` output.
 ///
-/// `query_block.cost_info.query_cost` when present. When it is not — the
-/// optimizer resolved the query away, or it is a derived-table shape MySQL
-/// does not cost — fall back to whether any `access_type` in the tree is
-/// `ALL`, which is MySQL's marker for a full table scan.
+/// `query_block.cost_info.query_cost` when present. When it is not — a
+/// derived-table shape MySQL does not cost — fall back to whether any
+/// `access_type` in the tree is `ALL`, which is MySQL's marker for a full
+/// table scan. A plan with neither is one the optimizer answered without
+/// reading the table, if its `message` says so ([`MYSQL_RESOLVED_MESSAGES`]).
 pub(crate) fn parse_mysql_cost(json: &str) -> ProbeCost {
     let v: serde_json::Value = match serde_json::from_str(json) {
         Ok(v) => v,
@@ -160,38 +170,68 @@ pub(crate) fn parse_mysql_cost(json: &str) -> ProbeCost {
     }
     let mut saw_access = false;
     let mut full_scan = false;
-    walk_access_types(qb, &mut |t| {
+    walk_plan_strings(qb, "access_type", &mut |t| {
         saw_access = true;
         if t == "ALL" {
             full_scan = true;
         }
     });
     if saw_access {
-        ProbeCost::AccessPath { full_scan }
+        return ProbeCost::AccessPath { full_scan };
+    }
+    let mut saw_message = false;
+    let mut all_resolved = true;
+    walk_plan_strings(qb, "message", &mut |m| {
+        saw_message = true;
+        all_resolved &= MYSQL_RESOLVED_MESSAGES.contains(&m);
+    });
+    if saw_message && all_resolved {
+        ProbeCost::Resolved
     } else {
         ProbeCost::Unknown
     }
 }
 
-/// Visit every `access_type` string anywhere in a MySQL plan tree. The shape
-/// nests differently per query form (`table`, `nested_loop`, `ordering_operation`,
-/// `materialized_from_subquery`, …), so walk generically rather than encode
-/// one layout.
-fn walk_access_types(v: &serde_json::Value, f: &mut impl FnMut(&str)) {
+/// The plan `message`s MySQL reports in place of any table access when the
+/// optimizer found the answer without scanning: it evaluated `MIN()`/`MAX()`
+/// from an index, proved the result empty, or read only single-row `const`
+/// tables (primary-key or unique lookups). These are the `zero_result_cause`
+/// values of MySQL 8.4's `sql/sql_optimizer.cc`, plus `"No tables used"` from
+/// `sql/opt_explain.cc`.
+///
+/// Any other message — `"Plan isn't ready yet"`, say — is not evidence of
+/// cheapness and stays [`ProbeCost::Unknown`].
+const MYSQL_RESOLVED_MESSAGES: &[&str] = &[
+    "Select tables optimized away",
+    "No matching min/max row",
+    "Impossible WHERE",
+    "Impossible HAVING",
+    "Impossible WHERE noticed after reading const tables",
+    "Impossible HAVING noticed after reading const tables",
+    "no matching row in const table",
+    "Zero limit",
+    "No tables used",
+];
+
+/// Visit every string stored under `key` anywhere in a MySQL plan tree. The
+/// shape nests differently per query form (`table`, `nested_loop`,
+/// `ordering_operation`, `materialized_from_subquery`, …), so walk generically
+/// rather than encode one layout.
+fn walk_plan_strings(v: &serde_json::Value, key: &str, f: &mut impl FnMut(&str)) {
     match v {
         serde_json::Value::Object(map) => {
             for (k, val) in map {
-                if k == "access_type" {
+                if k == key {
                     if let Some(s) = val.as_str() {
                         f(s);
                     }
                 }
-                walk_access_types(val, f);
+                walk_plan_strings(val, key, f);
             }
         }
         serde_json::Value::Array(items) => {
             for item in items {
-                walk_access_types(item, f);
+                walk_plan_strings(item, key, f);
             }
         }
         _ => {}
@@ -303,8 +343,7 @@ mod tests {
 
     #[test]
     fn mysql_without_cost_falls_back_to_access_type() {
-        // Measured: MySQL omits cost_info for MAX() over an indexed column
-        // (resolved away) and for some derived-table shapes.
+        // Measured: MySQL omits cost_info for some derived-table shapes.
         let full = r#"{"query_block":{"table":{"access_type":"ALL"}}}"#;
         assert_eq!(
             parse_mysql_cost(full),
@@ -324,6 +363,40 @@ mod tests {
             {"table":{"access_type":"ALL"}}]}}}"#;
         assert_eq!(
             parse_mysql_cost(nested),
+            ProbeCost::AccessPath { full_scan: true }
+        );
+    }
+
+    #[test]
+    fn a_plan_the_optimizer_answered_itself_runs_the_probe() {
+        // Verbatim from MySQL 8.4.11. MAX() over an indexed column is
+        // evaluated from the index while planning, so the plan has no
+        // cost_info and no access_type. Read as Unknown, this skipped every
+        // indexed MySQL MAX probe and sent each incremental run into the
+        // windowed sweep.
+        let max_indexed =
+            r#"{ "query_block": { "select_id": 1, "message": "Select tables optimized away" } }"#;
+        let max_of_nothing =
+            r#"{ "query_block": { "select_id": 1, "message": "No matching min/max row" } }"#;
+        let impossible = r#"{ "query_block": { "select_id": 1, "message": "Impossible WHERE" } }"#;
+        for plan in [max_indexed, max_of_nothing, impossible] {
+            assert_eq!(parse_mysql_cost(plan), ProbeCost::Resolved, "{plan}");
+            assert!(
+                !parse_mysql_cost(plan).should_skip(DEFAULT_PROBE_MAX_COST),
+                "{plan}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_known_message_means_resolved() {
+        let not_ready = r#"{"query_block":{"select_id":1,"message":"Plan isn't ready yet"}}"#;
+        assert_eq!(parse_mysql_cost(not_ready), ProbeCost::Unknown);
+        // A full scan anywhere in the tree outranks a message beside it.
+        let scan_too = r#"{"query_block":{"message":"Select tables optimized away",
+            "materialized_from_subquery":{"table":{"access_type":"ALL"}}}}"#;
+        assert_eq!(
+            parse_mysql_cost(scan_too),
             ProbeCost::AccessPath { full_scan: true }
         );
     }
@@ -420,6 +493,7 @@ mod tests {
     fn describe_names_the_evidence() {
         assert!(ProbeCost::Known(3_031_034.0).describe().contains("3031034"));
         assert!(ProbeCost::Unknown.describe().contains("could not be asked"));
+        assert!(ProbeCost::Resolved.describe().contains("without reading"));
         assert!(ProbeCost::AccessPath { full_scan: true }
             .describe()
             .contains("full table scan"));

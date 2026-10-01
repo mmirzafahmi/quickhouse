@@ -20,6 +20,8 @@ MYSQL_PORT = int(os.environ.get("QUICKHOUSE_MYSQL_PORT", "3306"))
 MYSQL_USER = os.environ.get("QUICKHOUSE_MYSQL_USER", "etl")
 MYSQL_PASSWORD = os.environ.get("QUICKHOUSE_MYSQL_PASSWORD", "etl")
 MYSQL_DB = os.environ.get("QUICKHOUSE_MYSQL_DB", "etl")
+# Only for tests that change server-wide settings (the default time zone).
+MYSQL_ROOT_PASSWORD = os.environ.get("QUICKHOUSE_MYSQL_ROOT_PASSWORD", "etl")
 CH_URL = os.environ.get("QUICKHOUSE_CH_URL", "http://localhost:8123")
 CH_HOST = os.environ.get("QUICKHOUSE_CH_HOST", "localhost")
 CH_PORT = int(os.environ.get("QUICKHOUSE_CH_PORT", "8123"))

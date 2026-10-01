@@ -71,6 +71,18 @@ pub struct MySqlConfig {
     /// mTLS: path to the client private key (DER or PEM). Must be set together
     /// with `client_cert_file`.
     pub client_key_file: Option<String>,
+    /// Run every connection in UTC (`SET time_zone = '+00:00'`), so a
+    /// `TIMESTAMP` column reads as the instant it stores.
+    ///
+    /// MySQL renders a `TIMESTAMP` in the session's time zone, and quickhouse
+    /// stores the wall-clock time it receives as UTC. Left off, a server whose
+    /// zone is not UTC lands every `TIMESTAMP` value shifted by its offset, and
+    /// [`WarningKind::ShiftedTimestamp`] names the columns. Off by default
+    /// because turning it on moves those values, and a cursor saved from a
+    /// `TIMESTAMP` watermark, by the same offset. It also changes what
+    /// `NOW()` and `CURDATE()` return in a `source_query`. `DATETIME` columns
+    /// carry no zone and read the same either way.
+    pub utc_session: bool,
 }
 
 /// Where to read from, when the source is Google BigQuery.
@@ -1724,6 +1736,14 @@ pub enum WarningKind {
     /// from the wrong table, or a source whose newest rows were deleted. Only
     /// raised when the probe ran.
     WatermarkAheadOfSource,
+    /// A MySQL `TIMESTAMP` column is read in a session whose time zone is not
+    /// UTC. MySQL renders each value in that zone and quickhouse stores the
+    /// wall-clock time as UTC, so every value lands shifted by the offset.
+    /// Raised at setup, once per column, with `count` `0` and the session's
+    /// offset as `sample`. Not raised for a column overridden to a naive
+    /// type, which asks for that wall-clock time. See
+    /// [`MySqlConfig::utc_session`].
+    ShiftedTimestamp,
 }
 
 impl WarningKind {
@@ -1745,6 +1765,7 @@ impl WarningKind {
             WarningKind::DecimalMappingMixed => "decimal_mapping_mixed",
             WarningKind::WatermarkNotAdvanced => "watermark_not_advanced",
             WarningKind::WatermarkAheadOfSource => "watermark_ahead_of_source",
+            WarningKind::ShiftedTimestamp => "shifted_timestamp",
         }
     }
 }

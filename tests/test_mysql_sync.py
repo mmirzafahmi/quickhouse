@@ -13,9 +13,13 @@ Run against the services in ``docker-compose.yml`` after building the module:
 
 from __future__ import annotations
 
+import contextlib
+import datetime as dt
+
 import pytest
 
 import quickhouse
+from conftest import MYSQL_DSN, MYSQL_HOST, MYSQL_PORT, MYSQL_ROOT_PASSWORD
 
 
 def _seed_table(mysql_conn, table: str, rows: int, base_ts: str = "2024-01-01 00:00:00"):
@@ -1002,3 +1006,118 @@ def test_chunk_rows_takes_a_source_querys_keyset_nullability_from_mysql(
         _drop_ch(ch_client, table)
         with mysql_conn.cursor() as cur:
             cur.execute(f"DROP TABLE IF EXISTS `{other}`")
+
+
+def test_an_indexed_watermark_is_probed_not_swept(
+    mysql_conn, ch_client, mysql_source, ch_target, unique_name
+):
+    """MySQL plans MAX() over an indexed column as "Select tables optimized
+    away", with neither a cost nor an access path. quickhouse read that plan as
+    a probe it could not price: every incremental run on a primary key or an
+    indexed column reported unindexed_watermark and swept the whole key range
+    in windows, opening a connection for each."""
+    table = unique_name
+    _seed_table(mysql_conn, table, 100)
+    _drop_ch(ch_client, table)
+    kw = dict(
+        dest_table=table, source_table=table, mode="incremental", watermark="id",
+        key=["id"], create_if_missing=True, engine="ReplacingMergeTree", order_by=["id"],
+    )
+    try:
+        first = quickhouse.sync(mysql_source, ch_target, **kw)
+        assert first.rows_written == 100
+        _add_newer_rows(mysql_conn, table)
+        second = quickhouse.sync(mysql_source, ch_target, **kw)
+        assert second.rows_written == 50
+        for r in (first, second):
+            assert "unindexed_watermark" not in {w.kind for w in r.warnings}, r.warnings
+    finally:
+        _drop_ch(ch_client, table)
+        with mysql_conn.cursor() as cur:
+            cur.execute(f"DROP TABLE IF EXISTS `{table}`")
+
+
+@contextlib.contextmanager
+def _server_time_zone(zone: str):
+    """Give new connections a default time zone of `zone`, as on a server
+    configured for local time. Needs root, which docker-compose.yml has."""
+    pymysql = pytest.importorskip("pymysql")
+    try:
+        root = pymysql.connect(
+            host=MYSQL_HOST, port=MYSQL_PORT, user="root",
+            password=MYSQL_ROOT_PASSWORD, autocommit=True,
+        )
+    except Exception as e:  # noqa: BLE001
+        pytest.skip(f"changing the server time zone needs MySQL root: {e}")
+    try:
+        with root.cursor() as cur:
+            cur.execute("SELECT @@GLOBAL.time_zone")
+            (before,) = cur.fetchone()
+            cur.execute("SET GLOBAL time_zone = %s", (zone,))
+        try:
+            yield
+        finally:
+            with root.cursor() as cur:
+                cur.execute("SET GLOBAL time_zone = %s", (before,))
+    finally:
+        root.close()
+
+
+def test_a_timestamp_lands_shifted_unless_the_session_is_utc(
+    mysql_conn, ch_client, ch_target, unique_name
+):
+    """MySQL renders a TIMESTAMP in the session's time zone, and quickhouse
+    stores that wall-clock time as UTC. On a server at +07:00, the instant
+    01:00 UTC landed as 08:00 UTC, silently. The run now names the column, and
+    utc_session=True reads the instant itself. A column overridden to naive
+    DATETIME asked for the wall-clock time, so it is not reported; a DATETIME
+    column carries no zone and reads the same either way."""
+    table = unique_name
+    instant = int(dt.datetime(2026, 9, 30, 1, tzinfo=dt.timezone.utc).timestamp())
+    with mysql_conn.cursor() as cur:
+        cur.execute(f"DROP TABLE IF EXISTS `{table}`")
+        cur.execute(
+            f"CREATE TABLE `{table}` (id BIGINT PRIMARY KEY, at TIMESTAMP(6) NULL, "
+            "local_at TIMESTAMP(6) NULL, civil DATETIME(6) NULL)"
+        )
+        # FROM_UNIXTIME and the TIMESTAMP store convert through the same
+        # session zone, so both columns hold the instant whatever that zone is.
+        cur.execute(
+            f"INSERT INTO `{table}` VALUES "
+            "(1, FROM_UNIXTIME(%s), FROM_UNIXTIME(%s), '2026-09-30 01:00:00')",
+            (instant, instant),
+        )
+    _drop_ch(ch_client, table)
+
+    def run(source):
+        result = quickhouse.sync(
+            source, ch_target, dest_table=table, source_table=table, mode="full",
+            key=["id"], create_if_missing=True, type_overrides={"local_at": "DATETIME"},
+        )
+        landed = ch_client.query(
+            f"SELECT toString(at), toString(local_at), toString(civil) FROM `{table}`"
+        ).result_rows
+        shifted = {(w.column, w.sample) for w in result.warnings if w.kind == "shifted_timestamp"}
+        return landed, shifted
+
+    try:
+        with _server_time_zone("+07:00"):
+            landed, shifted = run(quickhouse.MySQL(MYSQL_DSN))
+            assert landed == [(
+                "2026-09-30 08:00:00.000000",
+                "2026-09-30 08:00:00.000000",
+                "2026-09-30 01:00:00.000000",
+            )]
+            assert shifted == {("at", "UTC+07:00")}
+
+            landed, shifted = run(quickhouse.MySQL(MYSQL_DSN, utc_session=True))
+            assert landed == [(
+                "2026-09-30 01:00:00.000000",
+                "2026-09-30 01:00:00.000000",
+                "2026-09-30 01:00:00.000000",
+            )]
+            assert shifted == set()
+    finally:
+        _drop_ch(ch_client, table)
+        with mysql_conn.cursor() as cur:
+            cur.execute(f"DROP TABLE IF EXISTS `{table}`")

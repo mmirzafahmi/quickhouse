@@ -55,8 +55,32 @@ has no time-of-day type.
 ## MySQL `DATETIME` / `TIMESTAMP`
 
 These map to a **UTC-aware timestamp** (BigQuery `TIMESTAMP`, ClickHouse
-`DateTime64(6, 'UTC')`) — the wall-clock value is read as UTC, matching how a
-`TIMESTAMP` column expects it and what the legacy pandas/`to_gbq` path stored.
+`DateTime64(6, 'UTC')`): the wall-clock value MySQL sends is read as UTC, which
+is also what the legacy pandas/`to_gbq` path stored.
+
+**A `TIMESTAMP` is only right when the session runs in UTC.** MySQL stores a
+`TIMESTAMP` as an instant but sends it rendered in the session's time zone. On a
+server whose zone isn't UTC, every value lands shifted by the offset: at
+`+07:00`, the instant `01:00 UTC` lands as `08:00 UTC`. quickhouse reports each
+such column with a `shifted_timestamp` warning. Pass `utc_session=True` to read
+them as the instants they store:
+
+```python
+qh.MySQL("mysql://user:pw@host:3306/db", utc_session=True)
+```
+
+This runs every connection with `SET time_zone = '+00:00'`, which also changes
+what `NOW()` and `CURDATE()` return inside a `source_query`. `DATETIME` columns
+carry no zone and read the same either way.
+
+Switching an existing pipeline moves every `TIMESTAMP` value by the offset:
+
+- **Rows already landed** keep the shifted value until they are written again.
+  A full refresh rewrites them.
+- **A cursor saved from a `TIMESTAMP` watermark** moves too. On a server east of
+  UTC it jumps ahead by the offset, and rows inside that jump are skipped. Give
+  the first incremental run after the switch a `lookback_seconds` of at least
+  the offset (`25200` for `+07:00`), or a new `state_key`.
 
 To land a column as a **naive** BigQuery `DATETIME` (or ClickHouse
 `DateTime64(6)`) instead, opt out per column:
@@ -64,6 +88,9 @@ To land a column as a **naive** BigQuery `DATETIME` (or ClickHouse
 ```python
 qh.sync(..., type_overrides={"created_at": "DATETIME"})
 ```
+
+A naive `TIMESTAMP` column keeps the wall-clock time the session renders it in,
+so it isn't reported as `shifted_timestamp`.
 
 This flips the actual wire encoding, not just the declared type, so it works on
 the Storage Write path too. On ClickHouse, `DATETIME` and `TIMESTAMP` create

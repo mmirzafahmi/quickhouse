@@ -67,6 +67,20 @@ class MySQL:
     require_tls:
         Require TLS for the connection. MySQL has no `sslmode`-style DSN
         parameter convention, so this is explicit (unlike ``Postgres``).
+    utc_session:
+        Run every connection in UTC (``SET time_zone = '+00:00'``), so a
+        ``TIMESTAMP`` column reads as the instant it stores. MySQL renders a
+        ``TIMESTAMP`` in the session's time zone and quickhouse stores the
+        wall-clock time it receives as UTC, so with this off, a server whose
+        zone isn't UTC lands every ``TIMESTAMP`` value shifted by its offset
+        (reported as a ``"shifted_timestamp"`` warning). Off by default because
+        turning it on moves those values, and a cursor saved from a
+        ``TIMESTAMP`` watermark, by the same offset: see the type-mapping guide
+        before switching an existing pipeline. It also changes what ``NOW()``
+        and ``CURDATE()`` return in a ``source_query``. ``DATETIME`` columns
+        read the same either way.
+
+        .. versionadded:: 0.20.5
     """
 
     def __init__(
@@ -83,6 +97,7 @@ class MySQL:
         require_tls: bool = False,
         client_cert_file: Optional[str] = None,
         client_key_file: Optional[str] = None,
+        utc_session: bool = False,
     ) -> None:
         """Pass either ``dsn`` or discrete ``host``/``port``/``user``/
         ``password``/``database`` fields (not both). The discrete fields are
@@ -614,6 +629,14 @@ class TransferWarning:
       time-zone conversion, seeded from another table, or the source's newest
       rows were deleted. ``sample`` is the cursor. Only raised when the probe
       ran. New in 0.20.2.
+    - ``"shifted_timestamp"`` — a MySQL ``TIMESTAMP`` column is read in a
+      session whose time zone isn't UTC. MySQL renders each value in that zone
+      and quickhouse stores the wall-clock time as UTC, so every value lands
+      shifted by the offset. Raised once per column at setup; ``sample`` is the
+      offset, e.g. ``"UTC+07:00"``. Pass ``utc_session=True`` to
+      :class:`MySQL`, or override the column to a naive type to keep the
+      wall-clock time on purpose (such a column is not reported). New in
+      0.20.5.
     """
 
     column: Optional[str]

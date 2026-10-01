@@ -9,6 +9,42 @@ any breaking change is called out explicitly.
 
 ## [Unreleased]
 
+### Added
+- **`MySQL(..., utc_session=True)` reads a `TIMESTAMP` as the instant it
+  stores.** MySQL sends a `TIMESTAMP` rendered in the session's time zone, and
+  quickhouse stores the wall-clock time it receives as UTC, so on a server whose
+  zone isn't UTC every value landed shifted by the offset: at `+07:00`, the
+  instant `01:00 UTC` as `08:00 UTC`. The option runs every connection with
+  `SET time_zone = '+00:00'`. It is off by default because switching moves
+  values already landed, and a cursor saved from a `TIMESTAMP` watermark, by
+  the same offset; the type-mapping guide says how to switch an existing
+  pipeline. `DATETIME` columns read the same either way.
+- **`WarningKind::ShiftedTimestamp`** (`"shifted_timestamp"`) names each MySQL
+  `TIMESTAMP` column a run lands shifted, with the session's offset as `sample`
+  (`"UTC+07:00"`). When a run reads a `TIMESTAMP` column, one query that
+  touches no table checks the session's offset in January and July, so a zone
+  on UTC for only half the year is caught too. A
+  column overridden to a naive `DATETIME` keeps the wall-clock time on purpose
+  and isn't reported.
+
+### Fixed
+- **A MySQL incremental on an indexed watermark no longer sweeps the whole
+  table.** MySQL evaluates `MAX()` over an indexed column while planning, and
+  explains it as `"Select tables optimized away"`, with neither a cost nor an
+  access path. The probe gate read that plan as one it couldn't price. Since
+  0.18.0, every MySQL incremental on a primary key or an indexed column
+  reported `unindexed_watermark` and recommended creating the index it already
+  had. Since 0.20.0, it also read the table in key windows from `MIN` to `MAX`,
+  opening a connection for each. Measured locally, 100 rows with ids spread to
+  1e9 took 216–217 connections and 0.36–0.72 s per run; they now take 3–4
+  connections and 0.03–0.04 s. A
+  plan whose message says the optimizer answered without reading the table
+  (MySQL 8.4's `zero_result_cause` values) now counts as cheap. Until you
+  upgrade, `probe_max_cost=0` avoids it.
+- **The type-mapping guide no longer promises a correct MySQL `TIMESTAMP`.** It
+  said reading the wall-clock value as UTC matched "how a `TIMESTAMP` column
+  expects it", which holds only when the session runs in UTC.
+
 ### Documentation
 - **The benchmark moves 10 million rows, not ~300k.** Same tables, same
   identical-SQL and primary-key-merge method, with quickhouse 0.20.4, Sling

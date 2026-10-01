@@ -237,6 +237,7 @@ Each warning carries `.kind` (stable, machine-readable — match on this, never 
 | `watermark_not_advanced` | The `MAX(watermark)` probe found a value past the run's lower bound, yet the read returned 0 rows. The row holding that MAX matches the filter, so the cursor and the predicate disagree: the cursor may never advance again. Only raised when the probe ran. |
 | `watermark_ahead_of_source` | The saved cursor (or `seed_watermark`) is past the source's `MAX(watermark)`: shifted by a time-zone conversion, seeded from another table, or the source's newest rows were deleted. Rows between the cursor's true position and the MAX may have been skipped. Only raised when the probe ran. |
 | `decimal_mapping_mixed` | The destination mixes exact `Decimal` and `Float64` columns that are all fed by declared-precision source decimals. ClickHouse has no arithmetic or common type across the two. |
+| `shifted_timestamp` | A MySQL `TIMESTAMP` column is read in a session whose time zone isn't UTC. MySQL renders each value in that zone and quickhouse stores the wall-clock time as UTC, so every value lands shifted by the offset (the `sample`, e.g. `UTC+07:00`). Fix it with `utc_session=True` on `MySQL(...)`: see [type mapping](type-mapping.md). |
 
 Nothing is raised for you: these are values, and which of them should fail a
 pipeline is a decision about your data, not about quickhouse.

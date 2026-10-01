@@ -31,6 +31,13 @@ mod type_code {
     pub const LONG: u32 = 3;
     pub const LONGLONG: u32 = 8;
     pub const INT24: u32 = 9;
+    pub const TIMESTAMP: u32 = 7;
+}
+
+/// Whether a resolved column is a MySQL `TIMESTAMP`, the one datetime type
+/// MySQL converts to the session's time zone when it renders a value.
+pub(crate) fn is_timestamp(col: &ColumnType) -> bool {
+    col.type_id == type_code::TIMESTAMP
 }
 
 fn build_opts(
@@ -68,6 +75,23 @@ fn build_opts(
     Ok(builder.into())
 }
 
+/// The `SET` a new connection runs, if any: the statement timeout and, with
+/// `utc_session`, a UTC session time zone. One statement, so setup costs one
+/// round trip however many are set.
+fn session_setup_sql(statement_timeout_secs: u64, utc_session: bool) -> Option<String> {
+    let mut vars = Vec::new();
+    if statement_timeout_secs > 0 {
+        vars.push(format!(
+            "MAX_EXECUTION_TIME = {}",
+            statement_timeout_secs * 1000
+        ));
+    }
+    if utc_session {
+        vars.push("time_zone = '+00:00'".to_string());
+    }
+    (!vars.is_empty()).then(|| format!("SET SESSION {}", vars.join(", ")))
+}
+
 pub struct MySqlSource {
     dsn: String,
     statement_timeout_secs: u64,
@@ -75,6 +99,7 @@ pub struct MySqlSource {
     require_tls: bool,
     client_cert_file: Option<String>,
     client_key_file: Option<String>,
+    utc_session: bool,
 }
 
 /// Decode a MySQL wire `Value` as an `i128`, whichever protocol produced it.
@@ -105,6 +130,7 @@ impl MySqlSource {
         require_tls: bool,
         client_cert_file: Option<String>,
         client_key_file: Option<String>,
+        utc_session: bool,
     ) -> Self {
         Self {
             dsn: dsn.into(),
@@ -113,7 +139,14 @@ impl MySqlSource {
             require_tls,
             client_cert_file,
             client_key_file,
+            utc_session,
         }
+    }
+
+    /// Whether every connection runs in UTC — see
+    /// [`crate::config::MySqlConfig::utc_session`].
+    pub fn utc_session(&self) -> bool {
+        self.utc_session
     }
 
     /// Open a fresh connection. Each parallel query stream should use its own.
@@ -128,15 +161,32 @@ impl MySqlSource {
         let mut conn = Conn::new(opts)
             .await
             .map_err(|e| EtlError::from(e).context("connecting to mysql"))?;
-        if self.statement_timeout_secs > 0 {
-            conn.query_drop(format!(
-                "SET SESSION MAX_EXECUTION_TIME = {}",
-                self.statement_timeout_secs * 1000
-            ))
-            .await
-            .map_err(|e| EtlError::from(e).context("setting mysql session timeout"))?;
+        if let Some(sql) = session_setup_sql(self.statement_timeout_secs, self.utc_session) {
+            conn.query_drop(sql)
+                .await
+                .map_err(|e| EtlError::from(e).context("setting mysql session variables"))?;
         }
         Ok(conn)
+    }
+
+    /// The session's offset from UTC in seconds, at the start of January and
+    /// of July 2025. Two instants, so that a zone on UTC for only half the
+    /// year (`Europe/London`) still shows its daylight offset. `[0, 0]` means
+    /// the session renders `TIMESTAMP` values as UTC, or that the server gave
+    /// no answer.
+    pub async fn session_utc_offsets(&self, conn: &mut Conn) -> Result<[i64; 2]> {
+        // UNIX_TIMESTAMP() reads a datetime literal in the session time zone.
+        let offsets: Option<(Option<i64>, Option<i64>)> = conn
+            .query_first(
+                "SELECT 1735689600 - UNIX_TIMESTAMP('2025-01-01 00:00:00'), \
+                 1751328000 - UNIX_TIMESTAMP('2025-07-01 00:00:00')",
+            )
+            .await
+            .map_err(|e| EtlError::from(e).context("reading the mysql session time zone"))?;
+        Ok(match offsets {
+            Some((Some(jan), Some(jul))) => [jan, jul],
+            _ => [0, 0],
+        })
     }
 
     /// Resolve all output columns of `select_sql` (name, type, nullability).
@@ -202,10 +252,12 @@ impl MySqlSource {
     /// Ask the optimizer what `sql` would cost, without running it. See
     /// [`crate::source::PgSource::explain_cost`] for the rationale.
     ///
-    /// MySQL omits `cost_info` for shapes its optimizer resolves away — notably
-    /// `MAX()` over an indexed column — and for some derived-table queries. In
-    /// that case [`ProbeCost::AccessPath`] carries whether any step is a full
-    /// scan (`access_type: ALL`) instead. Cost is preferred where available
+    /// MySQL omits `cost_info` in two cases. A query its optimizer answers
+    /// without reading the table — `MAX()` over an indexed column — carries
+    /// only a `message`, and reads as [`ProbeCost::Resolved`]. Some
+    /// derived-table queries carry an access path but no cost, and
+    /// [`ProbeCost::AccessPath`] records whether any step is a full scan
+    /// (`access_type: ALL`) instead. Cost is preferred where available
     /// because access type alone is not sufficient: a measured probe on a real
     /// table reported `access_type: ref` at a cost of 3,951,736.
     pub async fn explain_cost(&self, conn: &mut Conn, sql: &str) -> ProbeCost {
@@ -649,8 +701,25 @@ mod tests {
     }
 
     #[test]
+    fn session_setup_is_one_statement_or_none() {
+        assert_eq!(session_setup_sql(0, false), None);
+        assert_eq!(
+            session_setup_sql(30, false).as_deref(),
+            Some("SET SESSION MAX_EXECUTION_TIME = 30000")
+        );
+        assert_eq!(
+            session_setup_sql(0, true).as_deref(),
+            Some("SET SESSION time_zone = '+00:00'")
+        );
+        assert_eq!(
+            session_setup_sql(30, true).as_deref(),
+            Some("SET SESSION MAX_EXECUTION_TIME = 30000, time_zone = '+00:00'")
+        );
+    }
+
+    #[test]
     fn select_sql_with_table_and_filters() {
-        let src = MySqlSource::new("mysql://x", 0, None, false, None, None);
+        let src = MySqlSource::new("mysql://x", 0, None, false, None, None, false);
         let part = Partition {
             label: "r0".into(),
             predicate: Some("`id` >= 1 AND `id` <= 100".into()),
@@ -673,7 +742,7 @@ mod tests {
 
     #[test]
     fn select_sql_with_query() {
-        let src = MySqlSource::new("mysql://x", 0, None, false, None, None);
+        let src = MySqlSource::new("mysql://x", 0, None, false, None, None, false);
         let part = Partition {
             label: "all".into(),
             predicate: None,
@@ -692,7 +761,7 @@ mod tests {
 
     #[test]
     fn select_sql_transform_and_keyset() {
-        let src = MySqlSource::new("mysql://x", 0, None, false, None, None);
+        let src = MySqlSource::new("mysql://x", 0, None, false, None, None, false);
         let part = Partition {
             label: "all".into(),
             predicate: None,

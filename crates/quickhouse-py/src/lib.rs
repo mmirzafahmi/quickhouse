@@ -178,12 +178,13 @@ struct MySQL {
     require_tls: bool,
     client_cert_file: Option<String>,
     client_key_file: Option<String>,
+    utc_session: bool,
 }
 
 #[pymethods]
 impl MySQL {
     #[new]
-    #[pyo3(signature = (dsn=None, *, host=None, port=None, user=None, password=None, database=None, statement_timeout_secs=0, ca_cert_file=None, require_tls=false, client_cert_file=None, client_key_file=None))]
+    #[pyo3(signature = (dsn=None, *, host=None, port=None, user=None, password=None, database=None, statement_timeout_secs=0, ca_cert_file=None, require_tls=false, client_cert_file=None, client_key_file=None, utc_session=false))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         dsn: Option<String>,
@@ -197,6 +198,7 @@ impl MySQL {
         require_tls: bool,
         client_cert_file: Option<String>,
         client_key_file: Option<String>,
+        utc_session: bool,
     ) -> PyResult<Self> {
         let dsn = resolve_dsn("mysql", "MySQL", dsn, host, port, user, password, database)?;
         Ok(MySQL {
@@ -206,6 +208,7 @@ impl MySQL {
             require_tls,
             client_cert_file,
             client_key_file,
+            utc_session,
         })
     }
 
@@ -621,6 +624,7 @@ impl From<AnySource> for core::SourceConfig {
                 require_tls: m.require_tls,
                 client_cert_file: m.client_cert_file,
                 client_key_file: m.client_key_file,
+                utc_session: m.utc_session,
             }),
             AnySource::BigQuery(b) => core::SourceConfig::BigQuery(core::BigQueryConfig {
                 project_id: b.project_id,

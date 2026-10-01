@@ -345,6 +345,7 @@ async fn read_source_keys(source_cfg: &SourceConfig, cfg: &ReconcileConfig) -> R
                 my.require_tls,
                 my.client_cert_file.clone(),
                 my.client_key_file.clone(),
+                my.utc_session,
             );
             let mut conn = source.connect().await?;
             source

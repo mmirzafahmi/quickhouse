@@ -42,7 +42,7 @@ use crate::types::{may_coerce_to_null, ColumnType};
 ///
 /// Recognizes BigQuery names (`TIMESTAMP`/`DATETIME`) and ClickHouse names
 /// (`DateTime`/`DateTime64(...)`), case-insensitively.
-fn datetime_override_tz(dest_type: &str) -> Option<Option<Arc<str>>> {
+pub(crate) fn datetime_override_tz(dest_type: &str) -> Option<Option<Arc<str>>> {
     let trimmed = dest_type.trim();
     let upper = trimmed.to_ascii_uppercase();
     // BigQuery scalar names are exact.

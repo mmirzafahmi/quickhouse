@@ -1150,6 +1150,7 @@ async fn run_transfer_impl(
             my.require_tls,
             my.client_cert_file.clone(),
             my.client_key_file.clone(),
+            my.utc_session,
         )),
         SourceConfig::ClickHouse(ch) => Source::ClickHouse(ClickHouseSource::new(ch)?),
         SourceConfig::BigQuery(_) => unreachable!("handled via early return above"),
@@ -3221,6 +3222,7 @@ async fn setup_mysql(
     let source_cols = s
         .resolve_columns(&mut control, &schema_probe, cfg.tinyint1_as_bool)
         .await?;
+    warn_on_shifted_timestamps(s, &mut control, &source_cols, cfg, warnings).await;
 
     // Only needed for incremental mode (the value is discarded otherwise) —
     // skip it in full-refresh so a watermark column left set alongside
@@ -4786,7 +4788,8 @@ fn coercion_message(kind: WarningKind, column: &str, n: u64) -> String {
         | WarningKind::UnindexedWatermark
         | WarningKind::DecimalMappingMixed
         | WarningKind::WatermarkNotAdvanced
-        | WarningKind::WatermarkAheadOfSource => {
+        | WarningKind::WatermarkAheadOfSource
+        | WarningKind::ShiftedTimestamp => {
             format!("column '{column}': {n} affected row(s)")
         }
     }
@@ -5007,6 +5010,92 @@ fn warn_on_costly_watermark(
         sample: None,
         message,
     });
+}
+
+/// Report each MySQL `TIMESTAMP` column this run lands shifted by the
+/// session's time zone — see [`WarningKind::ShiftedTimestamp`]. Advisory: if
+/// the server can't say what zone the session is in, the run goes on without
+/// the check.
+async fn warn_on_shifted_timestamps(
+    s: &MySqlSource,
+    conn: &mut mysql_async::Conn,
+    cols: &[ColumnType],
+    cfg: &TransferConfig,
+    warnings: &Warnings,
+) {
+    if s.utc_session() {
+        return;
+    }
+    let columns = utc_landed_timestamps(cols, cfg);
+    if columns.is_empty() {
+        return;
+    }
+    let offsets = match s.session_utc_offsets(conn).await {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::debug!("skipping the TIMESTAMP time-zone check: {e}");
+            return;
+        }
+    };
+    if offsets == [0, 0] {
+        return;
+    }
+    let offset = describe_utc_offsets(offsets);
+    for column in columns {
+        let message = format!(
+            "column '{column}' is a MySQL TIMESTAMP read in a session at {offset}. MySQL renders \
+             it in that zone and quickhouse stores the wall-clock time as UTC, so every value \
+             lands shifted by that offset. Pass utc_session=True to MySQL(...) to read it as the \
+             instant it stores (rows already landed, and a cursor saved from this column, keep \
+             the shift until re-read), or override it to a naive type to keep the wall-clock \
+             time on purpose: type_overrides={{'{column}': 'DATETIME'}}."
+        );
+        tracing::warn!("{message}");
+        warnings.push(TransferWarning {
+            kind: WarningKind::ShiftedTimestamp,
+            column: Some(column.to_string()),
+            count: 0,
+            sample: Some(offset.clone()),
+            message,
+        });
+    }
+}
+
+/// The MySQL `TIMESTAMP` columns this run lands as UTC instants: transferred
+/// (`include` / `exclude`), not replaced by a `column_transforms` expression,
+/// and not overridden to a naive type, which asks for the wall-clock time as
+/// MySQL renders it.
+fn utc_landed_timestamps<'a>(cols: &'a [ColumnType], cfg: &TransferConfig) -> Vec<&'a str> {
+    cols.iter()
+        .filter(|c| crate::source::mysql::is_timestamp(c))
+        .filter(|c| cfg.include.is_empty() || cfg.include.contains(&c.name))
+        .filter(|c| !cfg.exclude.contains(&c.name))
+        .filter(|c| !cfg.column_transforms.contains_key(&c.name))
+        .filter(|c| {
+            let dest = cfg.rename.get(&c.name).unwrap_or(&c.name);
+            let over = cfg
+                .type_overrides
+                .get(&c.name)
+                .or_else(|| cfg.type_overrides.get(dest));
+            over.and_then(|t| transform::datetime_override_tz(t)) != Some(None)
+        })
+        .map(|c| c.name.as_str())
+        .collect()
+}
+
+/// `UTC+07:00`, or `UTC+00:00 (January) / UTC+01:00 (July)` for a zone with
+/// daylight saving time.
+fn describe_utc_offsets([jan, jul]: [i64; 2]) -> String {
+    let utc = |secs: i64| {
+        let sign = if secs < 0 { '-' } else { '+' };
+        let abs = secs.unsigned_abs();
+        format!("UTC{sign}{:02}:{:02}", abs / 3600, abs % 3600 / 60)
+    };
+    if jan == jul {
+        utc(jan)
+    } else {
+        format!("{} (January) / {} (July)", utc(jan), utc(jul))
+    }
 }
 
 /// Bug report B3: a `WHERE watermark > x` predicate never matches a NULL
@@ -7654,6 +7743,52 @@ mod tests {
     fn watermark_column_present_ok() {
         let cols = vec![col("id"), col("write_date")];
         assert!(ensure_watermark_column("write_date", &cols).is_ok());
+    }
+
+    /// A MySQL column of wire type `type_id`: 7 is `TIMESTAMP`, 12 `DATETIME`.
+    fn my_col(name: &str, type_id: u32) -> ColumnType {
+        ColumnType {
+            type_id,
+            ..col(name)
+        }
+    }
+
+    #[test]
+    fn only_timestamps_landed_as_utc_instants_are_checked() {
+        let cols = vec![
+            my_col("created_ts", 7),
+            my_col("created_dt", 12),
+            my_col("naive_ts", 7),
+            my_col("renamed_naive_ts", 7),
+            my_col("dropped_ts", 7),
+            my_col("transformed_ts", 7),
+        ];
+        let mut cfg = crate::config::default_test_config();
+        cfg.exclude = vec!["dropped_ts".into()];
+        cfg.rename =
+            std::collections::HashMap::from([("renamed_naive_ts".into(), "ts_local".into())]);
+        cfg.type_overrides = std::collections::HashMap::from([
+            ("naive_ts".into(), "DATETIME".into()),
+            // Keyed by the destination name, as `transform::plan` also accepts.
+            ("ts_local".into(), "DateTime64(6)".into()),
+            // Still a UTC instant, so still shifted.
+            ("created_ts".into(), "DateTime64(6, 'UTC')".into()),
+        ]);
+        cfg.column_transforms = std::collections::HashMap::from([(
+            "transformed_ts".into(),
+            "UNIX_TIMESTAMP(`transformed_ts`)".into(),
+        )]);
+        assert_eq!(utc_landed_timestamps(&cols, &cfg), vec!["created_ts"]);
+    }
+
+    #[test]
+    fn a_session_offset_reads_as_utc_plus_or_minus() {
+        assert_eq!(describe_utc_offsets([25_200, 25_200]), "UTC+07:00");
+        assert_eq!(describe_utc_offsets([-16_200, -16_200]), "UTC-04:30");
+        assert_eq!(
+            describe_utc_offsets([0, 3_600]),
+            "UTC+00:00 (January) / UTC+01:00 (July)"
+        );
     }
 
     #[test]

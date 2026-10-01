@@ -245,7 +245,8 @@ impl CoercionTally {
             | WarningKind::UnindexedWatermark
             | WarningKind::DecimalMappingMixed
             | WarningKind::WatermarkNotAdvanced
-            | WarningKind::WatermarkAheadOfSource => None,
+            | WarningKind::WatermarkAheadOfSource
+            | WarningKind::ShiftedTimestamp => None,
         }
     }
 
