@@ -9,6 +9,8 @@ any breaking change is called out explicitly.
 
 ## [Unreleased]
 
+## [0.20.5] — 2026-10-01
+
 ### Added
 - **`MySQL(..., utc_session=True)` reads a `TIMESTAMP` as the instant it
   stores.** MySQL sends a `TIMESTAMP` rendered in the session's time zone, and
