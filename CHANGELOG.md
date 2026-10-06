@@ -9,6 +9,8 @@ any breaking change is called out explicitly.
 
 ## [Unreleased]
 
+## [0.20.7] — 2026-10-06
+
 ### Fixed
 - **A `chunk_rows` read into BigQuery no longer loses every row when its
   watermark is too costly to probe.** When the `MAX(watermark)` probe priced
