@@ -5,7 +5,7 @@
 # with S3Archive / GcsArchive) would otherwise be evaluated too early.
 from __future__ import annotations
 
-from typing import Callable, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Callable, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 # A declared API-source schema: a list of (name, bq_type) / (name, bq_type,
 # path) tuples, or a {name: bq_type} dict.
@@ -558,14 +558,17 @@ class TransferWarning:
     flattened a column to a boolean, or excluded every NULL-watermark row
     forever, reported success and the damage surfaced weeks later.
 
-    Nothing is raised. These are values on :class:`TransferResult`; it is the
-    caller who decides which of them should fail their pipeline::
+    By default nothing is raised: these are values on :class:`TransferResult`.
+    To fail a pipeline on some of them, name the kinds in ``fail_on_warnings``,
+    which stops the run inside the transfer, before the step that would make
+    anything permanent (0.20.7)::
 
-        result = quickhouse.sync(...)
-        fatal = {"collapsed_bool", "null_watermark", "coerced_decimal"}
-        for w in result.warnings:
-            if w.kind in fatal:
-                raise RuntimeError(str(w))
+        quickhouse.sync(..., fail_on_warnings={"collapsed_bool", "null_watermark",
+                                               "coerced_decimal"})
+
+    Raising on ``result.warnings`` after :func:`sync` returns can't do that: by
+    then the rows are written and the cursor is saved, so an orchestrator's
+    retry starts past the rows the warning was about, and goes green.
 
     Named ``TransferWarning`` rather than ``Warning`` because ``Warning`` is a
     Python builtin exception class.
@@ -585,7 +588,11 @@ class TransferWarning:
       NULL.
     - ``"null_watermark"`` — the watermark column is nullable and rows hold a
       NULL there, so they are excluded from this and every future incremental
-      run. The most dangerous of these.
+      run. The most dangerous of these. Also raised, with ``count`` the rows
+      read, when an incremental read returns rows of which none has a
+      watermark: there is no cursor to save, so every run reads them all
+      again. That is caught from the read itself, even when the NULL-count
+      probe was skipped as too costly (0.20.7).
     - ``"full_refresh_shrink"`` — a full refresh left the destination smaller,
       permitted by ``allow_full_refresh_shrink``.
     - ``"unclustered_merge_target"`` — a BigQuery ``MERGE`` ran against a
@@ -596,14 +603,13 @@ class TransferWarning:
       passed as the ``source``, where it does nothing: archiving is read from
       the destination only, so no backup was written for that run. New in
       0.19.0.
-    - ``"unindexed_watermark"`` — the planner estimated a setup-phase
-      watermark probe as too costly to run (see ``probe_max_cost``), meaning
+    - ``"unindexed_watermark"`` — the planner priced the ``MAX(watermark)``
+      probe as too costly to run (see ``probe_max_cost``), meaning
       ``WHERE watermark > x`` has no index to use and scans the whole table
-      every run. The message quotes the estimate. **Read it**: where the
-      nullable-watermark completeness count was skipped, the condition behind
-      ``"null_watermark"`` would go undetected. A first run still pays for that
-      count, since it reads the whole table anyway. The durable fix is an index
-      on the watermark column.
+      every run. The message quotes the estimate. quickhouse then skips the
+      probe, takes the cursor from the read when it can, and sweeps the read in
+      key windows. The durable fix is an index on the watermark column. A
+      skipped NULL-watermark count is reported as ``"null_check_skipped"``.
     - ``"incomplete_export"`` — an API export finished in a state that means the
       destination holds fewer records than the source has, and the run still
       succeeded. Raised for a CleverTap paging chain that ended on a repeated
@@ -629,7 +635,12 @@ class TransferWarning:
       ``seed_watermark``) is past the source's ``MAX(watermark)``: shifted by a
       time-zone conversion, seeded from another table, or the source's newest
       rows were deleted. ``sample`` is the cursor. Only raised when the probe
-      ran. New in 0.20.2.
+      ran. New in 0.20.2. With a ``source_query``, whose filter can leave its
+      MAX below a correct cursor, the cursor is checked against
+      ``source_table``'s unfiltered MAX when that is set, and nothing is
+      raised unless it is ahead of that too; without it, the message names the
+      filter as a possible cause (0.20.7). Either way the cursor goes back to
+      the MAX, which costs a re-read at most.
     - ``"shifted_timestamp"`` — a MySQL ``TIMESTAMP`` column is read in a
       session whose time zone isn't UTC. MySQL renders each value in that zone
       and quickhouse stores the wall-clock time as UTC, so every value lands
@@ -638,6 +649,28 @@ class TransferWarning:
       :class:`MySQL`, or override the column to a naive type to keep the
       wall-clock time on purpose (such a column is not reported). New in
       0.20.5.
+    - ``"window_bounds_unavailable"`` — the read should have been swept in key
+      windows, but the key-bounds probe that windowing needs failed (after
+      retries, for a transient error), so it ran in one pass: the long scan a
+      hot standby tends to cancel. ``column`` is the window key. New in 0.20.7.
+    - ``"null_check_skipped"`` — the nullable watermark's completeness count
+      was too costly to run (see ``probe_max_cost``), so the run can't say
+      whether rows hold a NULL watermark. Reported as ``unindexed_watermark``
+      before 0.20.7, which it isn't: an indexed watermark with many NULLs
+      prices the count high too. New in 0.20.7.
+    - ``"retried_after_partial_write"`` — ``retry_max_attempts`` re-ran the
+      transfer after an attempt that had already written ``count`` rows into
+      the destination, and the retry writes them again. A
+      ``ReplacingMergeTree`` collapses the copies at its next merge; an engine
+      that keeps duplicates keeps them. Table-level. New in 0.20.7.
+    - ``"storage_write_count_mismatch"`` — a BigQuery Storage Write stream
+      finalized with a row count other than the rows appended to it, so a
+      retried append was duplicated or one was lost. ``count`` is the
+      difference and ``sample`` the table. It fails the run before the
+      ``MERGE`` or swap that would promote that staging table, and before a
+      ``chunk_rows`` chunk is committed, whether or not ``fail_on_warnings``
+      names it; an append, whose rows are in the destination already, reports
+      it. Use ``write_method="insert_all"`` if it recurs. New in 0.20.7.
     """
 
     column: Optional[str]
@@ -699,6 +732,30 @@ class TransferResult:
     warnings: List[TransferWarning]
     """Structured warnings, aggregated per ``(kind, column)`` and ordered
     most-affected first. Empty on a clean run. New in 0.15.0."""
+
+    rows_written_failed_attempts: int
+    """Rows that attempts which then failed had already written into the
+    destination, before ``retry_max_attempts`` ran the transfer again.
+    ``rows_written`` counts the successful attempt only. ``0`` when no retry
+    followed a partial write. New in 0.20.7."""
+
+class StateKey:
+    """One incremental cursor in the state table, as :func:`state_keys` lists
+    it. New in 0.20.7."""
+
+    state_key: str
+    """``state_key=``, or the ``source_table`` / ``source_query`` text it
+    defaults to (stored in the table's ``source_table`` column)."""
+
+    dest_table: str
+    last_watermark: str
+    """The cursor a sync reads: the newest row's."""
+
+    last_run: str
+    """When the newest row was written (UTC, as the destination renders it)."""
+
+    state_rows: int
+    """How many rows the key holds. :func:`compact_state` leaves one."""
 
 class ReconcileResult:
     """What a :func:`reconcile_keys` diff found, and what it did about it."""
@@ -768,6 +825,7 @@ def sync(
     chunk_rows: Optional[int] = None,
     keyset_not_null: bool = False,
     retry_max_attempts: int = 1,
+    fail_on_warnings: Optional[Union[Iterable[str], str]] = None,
     probe_max_cost: float = 50_000.0,
     read_window_rows: Optional[int] = None,
     window_target_secs: Optional[float] = None,
@@ -930,7 +988,14 @@ def sync(
       NOT NULL integer** (ties or NULLs would silently skip rows). Chunked mode
       is single-stream (``parallelism`` is ignored). ``None`` (default) = one
       read, as before. Not combinable with ``validate=`` or
-      ``delete_stale_in_window``.
+      ``delete_stale_in_window``. A chunked read is never swept in key
+      windows. A run that resumes reads up to the bound its interrupted run
+      recorded with its last chunk, and saves that as the cursor, so a row in
+      a chunk read before the interruption that changed since is read again
+      by the next run. Past a marker that records none (written by 0.20.6,
+      say) it keeps the committed cursor; a first run, which has none to
+      keep, takes one from what it reads, as an uninterrupted read would
+      (0.20.7).
 
       With ``source_query``, the keyset column's NOT NULL can't be read from a
       table constraint. On PostgreSQL it is accepted when the column is a
@@ -968,7 +1033,11 @@ def sync(
       from the rows actually read instead, which requires
       ``lookback_seconds > 0``. Cost units are each engine's own and mean
       nothing absolute; the default separates the two measured populations.
-      Skipping is reported as ``"unindexed_watermark"``.
+      A skipped ``MAX`` is reported as ``"unindexed_watermark"``, and a
+      skipped count as ``"null_check_skipped"``. With both ``source_table``
+      and ``source_query`` set, a ``MAX`` too costly through the query is
+      probed on the table instead: it bounds the read, and the cursor is the
+      largest watermark the read returned (0.20.7).
     - ``read_window_rows`` (default ``None``) caps the width of a **windowed
       read** (a runaway guard, not the governor \u2014 see ``window_target_secs``): when
       the watermark column has no usable index, the read is swept in bounded
@@ -994,9 +1063,25 @@ def sync(
       max 82s, all at the same target.
     - ``retry_max_attempts`` (default ``1`` = no retry) re-runs the whole
       transfer on a *transient source* error — PostgreSQL hot-standby recovery
-      conflict / statement cancel, MySQL server-gone-away / lock-wait / deadlock.
-      Each retry starts clean (fresh staging; cursor advances only on success).
-      Sink/write blips are retried separately and always.
+      conflict / statement cancel, MySQL server-gone-away / lock-wait / deadlock /
+      interrupted query / ``MAX_EXECUTION_TIME``. Each retry starts clean (fresh staging; cursor advances only on success).
+      Sink/write blips are retried separately and always. What a failed
+      attempt already inserted is inserted again, so for a ClickHouse
+      incremental into an engine that keeps duplicates (a ``MergeTree`` other
+      than ``ReplacingMergeTree``) each attempt is staged and moved into the
+      destination at the end; elsewhere a retry after a partial write raises
+      ``"retried_after_partial_write"`` and counts the rows in
+      ``rows_written_failed_attempts`` (0.20.7).
+    - ``fail_on_warnings={"collapsed_bool", ...}`` fails the run on those
+      :class:`TransferWarning` kinds, checked before each step that makes
+      anything permanent: before a full refresh's swap, before an incremental
+      ``MERGE`` or insert-select, before the cursor is saved, and before each
+      ``chunk_rows`` chunk is committed. Stopped before its ``MERGE`` or swap
+      the destination is untouched; an incremental that inserts straight into
+      ClickHouse has written its rows, but the cursor isn't saved, so the next
+      run reads the same range again. The error names the kind, the column, the
+      count and what was left in place. An unknown kind is an error. New in
+      0.20.7.
     - ``column_transforms={col: "<SQL expr>"}`` applies a per-column SQL value
       transform in the source SELECT (e.g. ``{"amt": "ROUND(amt, 9)"}``,
       ``{"ts": "ts AT TIME ZONE 'UTC'"}``) over ``source_table=`` — so range
@@ -1280,6 +1365,38 @@ def sync(
       encoding, not just the declared destination type, so it works on the
       Storage Write path too. PostgreSQL keeps the distinction from the source
       type: ``timestamptz`` → UTC-aware, ``timestamp`` → naive.
+    """
+    ...
+
+def compact_state(
+    target: Union[ClickHouse, BigQuery],
+    *,
+    state_table_name: str = "_quickhouse_state",
+) -> int:
+    """Delete every state-table row that isn't the newest for its
+    ``(state_key, dest_table)``, and return how many were deleted. New in
+    0.20.7.
+
+    Every incremental run appends a cursor row and nothing removes old ones.
+    On ClickHouse the table is a ``ReplacingMergeTree`` that merges them away
+    in the background (this runs ``OPTIMIZE ... FINAL``); on BigQuery it only
+    grows, one row per run, per chunk with ``chunk_rows``, so every cursor
+    read scans more. The cursor each sync reads is the newest row's, so it is
+    the same afterwards, and a sync that writes during the compaction only
+    adds a newer row: safe to run between syncs.
+    """
+    ...
+
+def state_keys(
+    target: Union[ClickHouse, BigQuery],
+    *,
+    state_table_name: str = "_quickhouse_state",
+    idle_days: Optional[int] = None,
+) -> List[StateKey]:
+    """Every key in the state table with its newest cursor and when it was
+    written, oldest first. With ``idle_days``, only the keys no sync has
+    written in that many days: a renamed ``state_key`` leaves its old rows
+    behind for good, which is what these usually are. New in 0.20.7.
     """
     ...
 

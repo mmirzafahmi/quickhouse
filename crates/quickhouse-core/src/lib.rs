@@ -26,6 +26,7 @@ pub mod memory;
 pub mod reconcile;
 pub mod sink;
 pub mod source;
+pub mod state;
 pub mod sync;
 pub mod transform;
 pub mod types;
@@ -40,7 +41,8 @@ pub use config::{
 };
 pub use error::{EtlError, Result};
 pub use reconcile::{reconcile_keys, ReconcileConfig, ReconcileResult};
-pub use sink::{build_sink, BigQuerySink, ClickHouseSink, Sink};
+pub use sink::{build_sink, BigQuerySink, ClickHouseSink, Sink, StateKey};
+pub use state::{compact_state, state_keys};
 pub use sync::{run_transfer, Progress, ProgressCb, StagedInfo, StagedValidationCb};
 
 /// Run a transfer to completion on a dedicated multi-threaded Tokio runtime.
@@ -58,6 +60,28 @@ pub fn run_transfer_blocking(
         .build()
         .map_err(EtlError::from)?;
     runtime.block_on(run_transfer(source_cfg, dest, cfg, progress, on_staged))
+}
+
+/// [`compact_state`] on a dedicated Tokio runtime, for synchronous callers.
+pub fn compact_state_blocking(dest: DestinationConfig, state_table: &str) -> Result<u64> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(EtlError::from)?;
+    runtime.block_on(compact_state(dest, state_table))
+}
+
+/// [`state_keys`] on a dedicated Tokio runtime, for synchronous callers.
+pub fn state_keys_blocking(
+    dest: DestinationConfig,
+    state_table: &str,
+    idle_days: Option<u32>,
+) -> Result<Vec<StateKey>> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(EtlError::from)?;
+    runtime.block_on(state_keys(dest, state_table, idle_days))
 }
 
 /// Run a keyset reconciliation to completion on a dedicated Tokio runtime.

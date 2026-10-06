@@ -555,7 +555,7 @@ pub(crate) fn quote_ch_table(table: &str) -> String {
 /// string), and the format escapes tab, newline, carriage return and backslash
 /// itself — so a `String` column holding a newline arrives as `\n` and has to
 /// be put back, or it would silently truncate the value at the escape.
-fn tsv_field(raw: &str) -> Option<String> {
+pub(crate) fn tsv_field(raw: &str) -> Option<String> {
     if raw == "\\N" {
         return None;
     }

@@ -155,8 +155,11 @@ def test_unindexed_watermark_ongoing_run_skips_and_says_so(
         assert "unindexed_watermark" in _kinds(r), r.warnings
         w = _warning(r, "unindexed_watermark")
         assert w.column == "write_date"
-        assert "SKIPPED" in w.message, w.message
         assert "CREATE INDEX CONCURRENTLY" in w.message, w.message
+        # The skipped count is its own warning (issue #16), and says so.
+        skipped = _warning(r, "null_check_skipped")
+        assert skipped is not None and skipped.column == "write_date", r.warnings
+        assert "SKIPPED" in skipped.message, skipped.message
         # The count was not paid for, so the condition cannot be reported.
         assert "null_watermark" not in _kinds(r), r.warnings
     finally:
@@ -458,5 +461,37 @@ def test_stream_derived_watermark_refuses_watermark_source_expr(
         assert r.rows_written == 50
         # The cursor is the raw column's MAX, the domain the filter compares.
         assert r.new_watermark.startswith("2024-01-01 00:00:00"), r.new_watermark
+    finally:
+        _drop_ch(ch_client, table)
+
+
+def test_a_timestamptz_stream_cursor_keeps_its_offset_under_a_naive_override(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """A timestamptz watermark overridden to a naive destination type still
+    compares as an instant on PostgreSQL. Saved without its `+00`, the cursor
+    was read back in the session's TimeZone, which quickhouse never sets."""
+    table = unique_name
+    with pg_conn.cursor() as cur:
+        cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+        cur.execute(
+            f'CREATE TABLE "{table}" (id bigint PRIMARY KEY, write_date timestamptz NOT NULL)'
+        )
+        cur.execute(
+            f"INSERT INTO \"{table}\" SELECT g, '2024-01-01 00:00:00+00' "
+            "FROM generate_series(1, 20) g"
+        )
+    _drop_ch(ch_client, table)
+    try:
+        r = _sync(
+            pg_source, ch_target, table, lookback_seconds=3600, probe_max_cost=1.0,
+            type_overrides={"write_date": "DateTime64(6)"},
+        )
+        assert r.rows_written == 20
+        assert r.new_watermark == "2024-01-01 00:00:00.000000+00", r.new_watermark
+        assert _sync(
+            pg_source, ch_target, table, lookback_seconds=3600, probe_max_cost=1.0,
+            type_overrides={"write_date": "DateTime64(6)"},
+        ).rows_written == 20, "the lookback band is read again, nothing more"
     finally:
         _drop_ch(ch_client, table)

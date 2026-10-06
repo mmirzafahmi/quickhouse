@@ -697,6 +697,7 @@ mod tests {
             read_idle_timeout_secs: 0,
             chunk_rows: None,
             retry_max_attempts: 1,
+            fail_on_warnings: Vec::new(),
             probe_max_cost: crate::source::DEFAULT_PROBE_MAX_COST,
             read_window_rows: None,
             window_target_secs: None,

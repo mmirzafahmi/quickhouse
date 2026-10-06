@@ -335,6 +335,8 @@ impl MySqlSource {
         column_type_id: u32,
         n: usize,
         column_nullable: bool,
+        // Split only the keys above this one: see `sync::partitions_above`.
+        above: Option<i64>,
     ) -> Result<Vec<Partition>> {
         let single = || {
             vec![Partition {
@@ -353,10 +355,13 @@ impl MySqlSource {
         let key = source_expr
             .map(str::to_string)
             .unwrap_or_else(|| quote_my(column));
+        let above_pred = above
+            .map(|c| format!(" WHERE {key} > {c}"))
+            .unwrap_or_default();
         let sql = match base_query {
-            Some(q) => format!("SELECT MIN({key}), MAX({key}) FROM ({q}) AS _src"),
+            Some(q) => format!("SELECT MIN({key}), MAX({key}) FROM ({q}) AS _src{above_pred}"),
             None => format!(
-                "SELECT MIN({key}), MAX({key}) FROM {t}",
+                "SELECT MIN({key}), MAX({key}) FROM {t}{above_pred}",
                 t = quote_my_table(from_table.expect("table or query required")),
             ),
         };
@@ -368,15 +373,19 @@ impl MySqlSource {
         // gracefully falling back to a single partition like every other
         // non-partitionable case below.
         let row: Option<(Option<Value>, Option<Value>)> =
-            conn.query_first(sql).await.map_err(|e| match source_expr {
-                // A bad `partition_source_expr` surfaces here as an opaque SQL
-                // error; name the knob so the fix is obvious.
-                Some(expr) => EtlError::config(format!(
-                    "partition_source_expr='{expr}' could not be probed for a MIN/MAX range: {e}. \
-                     It must be a raw SQL expression over a column source_query projects, and it \
-                     must resolve to an integer type."
-                )),
-                None => EtlError::from(e).context("computing mysql partition bounds"),
+            conn.query_first(sql).await.map_err(|e| {
+                let e = EtlError::from(e);
+                match source_expr {
+                    // A bad `partition_source_expr` surfaces here as an opaque
+                    // SQL error; name the knob so the fix is obvious. A
+                    // transient failure stays one, so a retry can still help.
+                    Some(expr) if !e.is_transient_source() => EtlError::config(format!(
+                        "partition_source_expr='{expr}' could not be probed for a MIN/MAX range: \
+                         {e}. It must be a raw SQL expression over a column source_query \
+                         projects, and it must resolve to an integer type."
+                    )),
+                    _ => e.context("computing mysql partition bounds"),
+                }
             })?;
         let as_i128 = mysql_value_to_i128;
         let (lo, hi) = match row {
@@ -386,9 +395,13 @@ impl MySqlSource {
             },
             _ => return Ok(single()),
         };
+        // From just past the cursor rather than the lowest key found above it,
+        // so a key committed into that gap after the probe is still covered.
+        let lo = above.map_or(lo, |c| i128::from(c) + 1);
 
         let mut parts = super::range_partitions(lo, hi, n, &key);
-        if column_nullable {
+        // Above a cursor the read is `key > cursor`, which no NULL key matches.
+        if column_nullable && above.is_none() {
             parts.push(Partition {
                 label: "null-key".into(),
                 predicate: Some(format!("{key} IS NULL")),
@@ -480,7 +493,11 @@ impl MySqlSource {
     /// to NULL here — as `CAST('<unparseable>' AS DATETIME)` does outside
     /// strict mode, with only a warning. One round trip on a fresh connection.
     pub async fn is_null(&self, expr: &str) -> Result<bool> {
-        let mut conn = self.connect().await?;
+        Self::is_null_on(&mut self.connect().await?, expr).await
+    }
+
+    /// [`Self::is_null`] on a connection already open.
+    pub async fn is_null_on(conn: &mut Conn, expr: &str) -> Result<bool> {
         conn.query_first::<i64, _>(format!("SELECT ({expr}) IS NULL"))
             .await
             .map(|v| v == Some(1))

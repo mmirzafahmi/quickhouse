@@ -109,17 +109,39 @@ consult when the transfer reads through a `source_query`, whereas `EXPLAIN`
 plans the real statement.
 
 When the `MAX` probe is skipped, the cursor is taken from the rows actually
-read. That needs `lookback_seconds > 0` — see below.
+read. That needs `lookback_seconds > 0` — see below. A skipped `MAX` is what
+`unindexed_watermark` reports, and what switches the read to a sweep of bounded
+key windows; a skipped NULL count alone does neither (an indexed watermark with
+many `NULL`s prices that count high too), and is reported as
+`null_check_skipped`.
+
+Through a `source_query`, the `MAX` inherits the query's filter: `MAX(id)` over
+`... WHERE is_test = 0` can't come from the primary key, even though the read
+itself, `WHERE id > x` pushed into the query, is a range scan. Set `source_table`
+as well, and a `MAX` too costly through the query is probed on the table,
+unfiltered. It then only bounds the read: the cursor saved is the largest
+watermark the read actually returned, so a row the filter excludes can't carry
+the cursor past rows not read yet. This assumes `source_query` projects the
+table's watermark column unchanged; for one it converts (a time-zone shift,
+say), set `probe_max_cost=0` and the query's own `MAX` is always used. The
+table is not probed for a `chunk_rows` read, a `watermark_source_expr`, a
+watermark the transfer leaves out, transforms or overrides, a `skip_to_max`
+first run, or a table whose `MAX` doesn't read as the query column's own type:
+those keep the query's plan. With a cursor, a watermark that is the window key
+itself is never swept either: the read's own `key > cursor` already bounds it.
 
 ```{admonition} The skipped check is a real check
 :class: warning
 Where the nullable-watermark completeness count is skipped, quickhouse can no
 longer tell you whether rows hold a NULL watermark — and such rows are excluded
-from this and every future incremental run. The `unindexed_watermark` warning
-says so, and quotes the estimate that caused it. A **first** run still pays for
-the count. Treat the warning as a prompt to add the index:
+from this and every future incremental run. The `null_check_skipped` warning
+says so, and quotes the estimate that caused it. (A read that returns rows with
+no watermark at all is still reported, as `null_watermark`.) Treat the warning
+as a prompt to add the index:
 
-    CREATE INDEX CONCURRENTLY ON your_table (your_watermark_column);
+    CREATE INDEX CONCURRENTLY ON your_table (your_watermark_column);  -- PostgreSQL
+    ALTER TABLE your_table ADD INDEX (your_watermark_column),
+        ALGORITHM=INPLACE, LOCK=NONE;                                 -- MySQL
 ```
 
 ```{admonition} Why the stream cursor needs a lookback
@@ -129,7 +151,10 @@ read too, so the cursor can land *above* the `MAX` that bound would have used �
 and anything in that widened band which was not read would then be skipped. A
 lookback exceeding the read's own duration re-covers it on the next run. With
 `lookback_seconds=0` quickhouse pays for the `MAX` scan rather than take that
-risk.
+risk. A read of several statements (a sweep of windows, range partitions,
+`chunk_rows`) can take longer than the lookback, so its cursor is moved back by
+the difference: a row updated in a window already read is then read on the next
+run.
 ```
 
 The filter itself still scans — nothing but an index fixes that. On a hot
@@ -190,8 +215,14 @@ rather than for the destination's worst day.
 - **Automatic retries.** Transient sink/write blips are retried with backoff.
   `retry_max_attempts` (default `1` = no retry) additionally re-runs the whole
   transfer on a *transient source* error — PostgreSQL hot-standby
-  recovery-conflict/statement-cancel, MySQL server-gone-away/lock-wait/deadlock.
-  Each retry starts clean.
+  recovery-conflict/statement-cancel, MySQL server-gone-away/lock-wait/deadlock/
+  interrupted query/`MAX_EXECUTION_TIME`. Each retry starts clean, so rows a
+  failed attempt already inserted are inserted again. Into a ClickHouse engine
+  that keeps those copies (a `MergeTree` other than `ReplacingMergeTree`), an
+  incremental run with retries stages each attempt and moves it into the
+  destination at the end, so a failed one leaves nothing behind. Anywhere else
+  a retry after a partial write raises `retried_after_partial_write` and counts
+  the rows in `TransferResult.rows_written_failed_attempts`.
 - **Messy data is coerced, not fatal.** MySQL zero-dates and out-of-range
   timestamps become `NULL` with a warning instead of aborting the run (see
   [Type mapping](type-mapping.md)).
@@ -213,13 +244,28 @@ log lines an orchestrator can't branch on:
 
 ```python
 result = qh.sync(...)
-
-FATAL = {"collapsed_bool", "null_watermark", "coerced_decimal"}
 for w in result.warnings:
     print(f"{w.kind} {w.column}: {w.count}")
-    if w.kind in FATAL:
-        raise RuntimeError(str(w))
 ```
+
+To fail a run on some of them, name them in `fail_on_warnings` (0.20.7):
+
+```python
+qh.sync(..., fail_on_warnings={"collapsed_bool", "null_watermark", "coerced_decimal"})
+```
+
+The check runs inside the transfer, before each step that makes anything
+permanent: before a full refresh's swap, before an incremental `MERGE` or
+insert-select, before the cursor is saved, and before each `chunk_rows` chunk is
+committed. Stopped before its `MERGE` or swap, the destination is untouched. An
+incremental that inserts straight into ClickHouse has written its rows, but the
+cursor isn't saved, so once the cause is fixed the next run reads the same range
+again (a `ReplacingMergeTree` converges on it). The error names the kind, the
+column, the count and what was left in place.
+
+Raising on `result.warnings` after `sync()` returns can't do that. By then the
+cursor is saved: the run goes red once, the orchestrator's retry starts past
+the rows the warning was about, and goes green.
 
 Each warning carries `.kind` (stable, machine-readable — match on this, never on
 `.message`), `.column`, `.count`, `.sample` and `.message`, aggregated per
@@ -227,7 +273,7 @@ Each warning carries `.kind` (stable, machine-readable — match on this, never 
 
 | `kind` | What happened |
 | --- | --- |
-| `null_watermark` | The watermark column is nullable and rows hold `NULL` there. `WHERE watermark > x` never matches `NULL`, so those rows are excluded from this and **every future** incremental run. The most dangerous one — the transfer reports success while permanently dropping rows. |
+| `null_watermark` | The watermark column is nullable and rows hold `NULL` there. `WHERE watermark > x` never matches `NULL`, so those rows are excluded from this and **every future** incremental run. The most dangerous one — the transfer reports success while permanently dropping rows. Also raised when an incremental read returns rows and none has a watermark: there is no cursor to save, so every run re-reads them all. |
 | `collapsed_bool` | A MySQL `tinyint(1)` value outside `{0, 1}` was flattened to a boolean, losing e.g. the difference between 2 and 3. `type_overrides` can't repair it after the fact, so early detection is the only defence — see `tinyint1_as_bool=False`. |
 | `coerced_decimal` | A decimal became `NULL`: it exceeded the declared `Decimal(P,S)`, or was NaN/Infinity. Silent data loss with a correct-looking row count. |
 | `coerced_date` | A date/datetime became `NULL` — a zero-date, or a year outside ClickHouse's representable 1900–2299 window. |
@@ -235,12 +281,17 @@ Each warning carries `.kind` (stable, machine-readable — match on this, never 
 | `full_refresh_shrink` | A full refresh left the destination smaller than it was, permitted by `allow_full_refresh_shrink=True`. (Without that flag the same condition is a hard error.) |
 | `unclustered_merge_target` | A BigQuery `MERGE` ran against a destination not clustered by the merge key, so the key bound pruned nothing and the statement scanned the whole table. A cost problem, not a data one. |
 | `watermark_not_advanced` | The `MAX(watermark)` probe found a value past the run's lower bound, yet the read returned 0 rows. The row holding that MAX matches the filter, so the cursor and the predicate disagree: the cursor may never advance again. Only raised when the probe ran. |
-| `watermark_ahead_of_source` | The saved cursor (or `seed_watermark`) is past the source's `MAX(watermark)`: shifted by a time-zone conversion, seeded from another table, or the source's newest rows were deleted. Rows between the cursor's true position and the MAX may have been skipped. Only raised when the probe ran. |
+| `watermark_ahead_of_source` | The saved cursor (or `seed_watermark`) is past the source's `MAX(watermark)`: shifted by a time-zone conversion, seeded from another table, or the source's newest rows were deleted. Rows between the cursor's true position and the MAX may have been skipped. Only raised when the probe ran. A `source_query` that filters out the newest rows also has a MAX below a correct cursor: set `source_table` too and the cursor is checked against the unfiltered table instead, with nothing raised unless it is ahead of that as well; without it, the message names the filter as a possible cause. Either way the cursor goes back to the MAX, which costs a re-read at most. |
 | `decimal_mapping_mixed` | The destination mixes exact `Decimal` and `Float64` columns that are all fed by declared-precision source decimals. ClickHouse has no arithmetic or common type across the two. |
 | `shifted_timestamp` | A MySQL `TIMESTAMP` column is read in a session whose time zone isn't UTC. MySQL renders each value in that zone and quickhouse stores the wall-clock time as UTC, so every value lands shifted by the offset (the `sample`, e.g. `UTC+07:00`). Fix it with `utc_session=True` on `MySQL(...)`: see [type mapping](type-mapping.md). |
+| `window_bounds_unavailable` | The read plans as a sequential scan and should have been swept in key windows, but the key-bounds probe that windowing needs failed (after retries, for a transient error), so the read ran in one pass: the long scan a hot standby tends to cancel. Set `source_table` alongside a filtered `source_query` so the bounds come from the table. |
+| `null_check_skipped` | The nullable watermark's completeness count was too costly to run (see `probe_max_cost`), so the run can't say whether rows hold a `NULL` watermark. Its own kind since 0.20.7: an indexed watermark with many `NULL`s prices the count high too, and that says nothing about the read. |
+| `retried_after_partial_write` | `retry_max_attempts` re-ran the transfer after an attempt that had already written `count` rows into the destination, and the retry writes them again. A `ReplacingMergeTree` collapses the copies at its next merge; an engine that keeps duplicates keeps them. |
+| `storage_write_count_mismatch` | A BigQuery Storage Write stream finalized with a row count other than the rows appended to it: a retried append was duplicated, or one was lost. `count` is the difference. It fails the run before the `MERGE` or swap that would promote that staging table, and before a `chunk_rows` chunk is committed, whether or not `fail_on_warnings` names it; an append, whose rows are in the destination already, reports it. Use `write_method="insert_all"` if it recurs. |
 
-Nothing is raised for you: these are values, and which of them should fail a
-pipeline is a decision about your data, not about quickhouse.
+Unless you name them in `fail_on_warnings`, nothing is raised for you: these
+are values, and which of them should fail a pipeline is a decision about your
+data, not about quickhouse.
 
 ## Where the time actually went
 

@@ -1132,6 +1132,8 @@ struct TransferResult {
     new_watermark: Option<String>,
     #[pyo3(get)]
     warnings: Vec<Py<TransferWarning>>,
+    #[pyo3(get)]
+    rows_written_failed_attempts: u64,
 }
 
 #[pymethods]
@@ -1140,7 +1142,7 @@ impl TransferResult {
         format!(
             "TransferResult(rows_read={}, rows_written={}, bytes_written={}, rows_deleted={}, \
              duration_secs={:.3}, read_secs={:.3}, stage_secs={:.3}, promote_secs={:.3}, \
-             new_watermark={:?}, warnings={})",
+             new_watermark={:?}, warnings={}, rows_written_failed_attempts={})",
             self.rows_read,
             self.rows_written,
             self.bytes_written,
@@ -1151,6 +1153,7 @@ impl TransferResult {
             self.promote_secs,
             self.new_watermark,
             self.warnings.len(),
+            self.rows_written_failed_attempts,
         )
     }
 }
@@ -1240,6 +1243,34 @@ fn parse_bq_write_method(m: &str) -> PyResult<core::BigQueryWriteMethod> {
     }
 }
 
+/// `fail_on_warnings=`: any iterable of kind names (a set, a list), or one
+/// name, as `TransferWarning.kind` spells them. An unknown name is an error
+/// rather than a kind that silently never fires.
+fn parse_warning_kinds(kinds: &Bound<'_, PyAny>) -> PyResult<Vec<core::WarningKind>> {
+    let names: Vec<String> = match kinds.extract::<String>() {
+        Ok(one) => vec![one],
+        Err(_) => kinds
+            .iter()?
+            .map(|k| k.and_then(|k| k.extract::<String>()))
+            .collect::<PyResult<_>>()?,
+    };
+    names
+        .iter()
+        .map(|name| {
+            core::WarningKind::from_name(name).ok_or_else(|| {
+                let known = core::WarningKind::ALL
+                    .iter()
+                    .map(|k| k.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                PyRuntimeError::new_err(format!(
+                    "fail_on_warnings: unknown warning kind {name:?}; the kinds are: {known}"
+                ))
+            })
+        })
+        .collect()
+}
+
 fn parse_parquet_compression(c: &str) -> PyResult<core::ParquetCompression> {
     match c.to_ascii_lowercase().as_str() {
         "zstd" | "zst" => Ok(core::ParquetCompression::Zstd),
@@ -1293,6 +1324,7 @@ fn parse_parquet_compression(c: &str) -> PyResult<core::ParquetCompression> {
     chunk_rows=None,
     keyset_not_null=false,
     retry_max_attempts=1,
+    fail_on_warnings=None,
     probe_max_cost=core::source::DEFAULT_PROBE_MAX_COST,
     read_window_rows=None,
     window_target_secs=None,
@@ -1352,6 +1384,7 @@ fn sync(
     chunk_rows: Option<usize>,
     keyset_not_null: bool,
     retry_max_attempts: u32,
+    fail_on_warnings: Option<Bound<'_, PyAny>>,
     probe_max_cost: f64,
     read_window_rows: Option<u64>,
     window_target_secs: Option<f64>,
@@ -1386,6 +1419,10 @@ fn sync(
         (Some(v), false) => core::WatermarkSeed::Value(v),
         (None, true) => core::WatermarkSeed::CurrentMax,
         (None, false) => core::WatermarkSeed::None,
+    };
+    let fail_on_warnings = match fail_on_warnings {
+        Some(kinds) => parse_warning_kinds(&kinds)?,
+        None => Vec::new(),
     };
     let cfg = core::TransferConfig {
         source_archive_ignored,
@@ -1423,6 +1460,7 @@ fn sync(
         chunk_rows,
         keyset_not_null,
         retry_max_attempts,
+        fail_on_warnings,
         probe_max_cost,
         read_window_rows,
         window_target_secs,
@@ -1502,6 +1540,7 @@ fn sync(
         promote_secs: result.promote_secs,
         new_watermark: result.new_watermark,
         warnings,
+        rows_written_failed_attempts: result.rows_written_failed_attempts,
     })
 }
 
@@ -1570,6 +1609,75 @@ fn reconcile_keys(
     })
 }
 
+/// One cursor in the state table: see `state_keys()`.
+#[pyclass]
+struct StateKey {
+    #[pyo3(get)]
+    state_key: String,
+    #[pyo3(get)]
+    dest_table: String,
+    #[pyo3(get)]
+    last_watermark: String,
+    #[pyo3(get)]
+    last_run: String,
+    #[pyo3(get)]
+    state_rows: u64,
+}
+
+#[pymethods]
+impl StateKey {
+    fn __repr__(&self) -> String {
+        format!(
+            "StateKey(state_key={:?}, dest_table={:?}, last_watermark={:?}, last_run={:?}, \
+             state_rows={})",
+            self.state_key, self.dest_table, self.last_watermark, self.last_run, self.state_rows
+        )
+    }
+}
+
+/// Delete every row of the state table that isn't the newest for its
+/// `(state_key, dest_table)`, so cursor reads stay cheap. Returns the rows
+/// deleted. The cursor every sync reads is unchanged; safe between syncs.
+#[pyfunction]
+#[pyo3(signature = (target, *, state_table_name="_quickhouse_state".to_string()))]
+fn compact_state(
+    py: Python<'_>,
+    target: AnyDestination,
+    state_table_name: String,
+) -> PyResult<u64> {
+    init_logging();
+    let dest_cfg = target.into_config()?;
+    py.allow_threads(|| core::compact_state_blocking(dest_cfg, &state_table_name))
+        .map_err(map_err)
+}
+
+/// Every key in the state table with its newest cursor, oldest first. With
+/// `idle_days`, only the keys no sync has written in that many days.
+#[pyfunction]
+#[pyo3(signature = (target, *, state_table_name="_quickhouse_state".to_string(), idle_days=None))]
+fn state_keys(
+    py: Python<'_>,
+    target: AnyDestination,
+    state_table_name: String,
+    idle_days: Option<u32>,
+) -> PyResult<Vec<StateKey>> {
+    init_logging();
+    let dest_cfg = target.into_config()?;
+    let keys = py
+        .allow_threads(|| core::state_keys_blocking(dest_cfg, &state_table_name, idle_days))
+        .map_err(map_err)?;
+    Ok(keys
+        .into_iter()
+        .map(|k| StateKey {
+            state_key: k.state_key,
+            dest_table: k.dest_table,
+            last_watermark: k.last_watermark,
+            last_run: k.last_run,
+            state_rows: k.state_rows,
+        })
+        .collect())
+}
+
 /// Return the package version compiled into the extension.
 #[pyfunction]
 fn version() -> &'static str {
@@ -1592,8 +1700,11 @@ fn _quickhouse(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TransferResult>()?;
     m.add_class::<TransferWarning>()?;
     m.add_class::<ReconcileResult>()?;
+    m.add_class::<StateKey>()?;
     m.add_function(wrap_pyfunction!(sync, m)?)?;
     m.add_function(wrap_pyfunction!(reconcile_keys, m)?)?;
+    m.add_function(wrap_pyfunction!(compact_state, m)?)?;
+    m.add_function(wrap_pyfunction!(state_keys, m)?)?;
     m.add_function(wrap_pyfunction!(version, m)?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())

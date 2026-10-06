@@ -110,6 +110,11 @@ pub struct BigQuerySink {
     /// partitions can't mint the same `insertId` for different rows. Only ever
     /// incremented, never reset — a retry reuses the value it already took.
     insert_id_epoch: Arc<AtomicU64>,
+    /// Count mismatches the Storage Write finalize reported, waiting for
+    /// [`Sink::take_write_warnings`].
+    write_warnings: Arc<std::sync::Mutex<Vec<crate::config::TransferWarning>>>,
+    /// The dataset's location, read once when a job lookup needs it.
+    location: Arc<tokio::sync::OnceCell<Option<String>>>,
 }
 
 impl BigQuerySink {
@@ -141,6 +146,8 @@ impl BigQuerySink {
                 .unix_timestamp_nanos()
                 .to_string(),
             insert_id_epoch: Arc::new(AtomicU64::new(0)),
+            write_warnings: Arc::default(),
+            location: Arc::default(),
         })
     }
 
@@ -210,6 +217,7 @@ impl BigQuerySink {
         columns: &[ColumnType],
         cfg: &TransferConfig,
     ) -> Result<()> {
+        self.forget_table(table);
         let t = build_table(&self.project_id, &self.dataset_id, table, columns, cfg)?;
         tracing::debug!(
             "creating BigQuery table {}.{}.{}",
@@ -266,12 +274,7 @@ impl BigQuerySink {
             },
             ..Default::default()
         };
-        let created = self
-            .client
-            .job()
-            .create(&job)
-            .await
-            .map_err(|e| EtlError::other(format!("bigquery clone-table job error: {e}")))?;
+        let created = self.create_job(&job, "clone-table").await?;
         self.poll_job_until_done(created).await?;
         Ok(())
     }
@@ -450,16 +453,38 @@ impl BigQuerySink {
             "projects/{}/datasets/{}/tables/{table}",
             self.project_id, self.dataset_id
         );
-        let stream = self
-            .client
-            .committed_storage_writer()
-            .create_write_stream(&resource)
-            .await
-            .map_err(|e| {
-                EtlError::other(format!(
-                    "bigquery storage-write: open committed stream for {resource}: {e}"
-                ))
-            })?;
+        // The table is a staging table this run created moments ago, and the
+        // Storage Write API can report one that new as not found for a short
+        // while. With chunk_rows every chunk clones a fresh one, so every chunk
+        // meets that delay.
+        let mut attempt = 1u32;
+        let stream = loop {
+            match self
+                .client
+                .committed_storage_writer()
+                .create_write_stream(&resource)
+                .await
+            {
+                Ok(stream) => break stream,
+                Err(e)
+                    if e.code() == google_cloud_gax::grpc::Code::NotFound
+                        && attempt < MAX_INSERT_ATTEMPTS =>
+                {
+                    let delay = backoff_delay(attempt);
+                    tracing::warn!(
+                        "bigquery storage-write: {resource} not found yet ({e}); retrying in \
+                         {delay:?}"
+                    );
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                }
+                Err(e) => {
+                    return Err(EtlError::other(format!(
+                        "bigquery storage-write: open committed stream for {resource}: {e}"
+                    )))
+                }
+            }
+        };
 
         let mut total_bytes = 0u64;
         // Next offset to write, in rows, relative to this stream's start.
@@ -518,13 +543,14 @@ impl BigQuerySink {
         // many rows the stream actually holds — a free end-to-end check that
         // the offsets did what they're supposed to.
         match stream.finalize().await {
-            Ok(row_count) if row_count != offset => tracing::warn!(
-                "bigquery storage-write into {}.{table}: stream finalized with {row_count} row(s) \
-                 but {offset} were appended — offsets may not have deduplicated a retry as \
-                 expected; check the destination for duplicate or missing rows",
-                self.dataset_id
-            ),
-            Ok(_) => {}
+            Ok(row_count) => {
+                if let Some(w) =
+                    finalized_row_count_warning(&self.dataset_id, table, row_count, offset)
+                {
+                    tracing::warn!("{}", w.message);
+                    self.write_warnings.lock().unwrap().push(w);
+                }
+            }
             // A finalize failure loses nothing: every append was already
             // committed, so this is cleanup, not correctness.
             Err(e) => tracing::warn!(
@@ -635,12 +661,7 @@ impl BigQuerySink {
             },
             ..Default::default()
         };
-        let created = self
-            .client
-            .job()
-            .create(&job)
-            .await
-            .map_err(|e| EtlError::other(format!("bigquery swap job error: {e}")))?;
+        let created = self.create_job(&job, "swap").await?;
         self.poll_job_until_done(created).await?;
         Ok(())
     }
@@ -875,6 +896,12 @@ impl BigQuerySink {
     /// `None` when it has none / is not visible. Diagnostic: it tells the
     /// caller whether the merge's key bound can prune anything at all.
     pub async fn clustering_columns(&self, table: &str) -> Result<Option<Vec<String>>> {
+        let key = self.table_key(table);
+        if let Some((read_at, cached)) = clustering_cache().lock().unwrap().get(&key) {
+            if read_at.elapsed() < CLUSTERING_CACHE_TTL {
+                return Ok(cached.clone());
+            }
+        }
         let query = format!(
             "SELECT column_name FROM `{}`.`{}`.INFORMATION_SCHEMA.COLUMNS \
              WHERE table_name = '{}' AND clustering_ordinal_position IS NOT NULL \
@@ -884,7 +911,26 @@ impl BigQuerySink {
             escape_sql_string(table),
         );
         let cols = self.query_strings(&query, "clustering columns").await?;
-        Ok(if cols.is_empty() { None } else { Some(cols) })
+        let cols = if cols.is_empty() { None } else { Some(cols) };
+        clustering_cache()
+            .lock()
+            .unwrap()
+            .insert(key, (std::time::Instant::now(), cols.clone()));
+        Ok(cols)
+    }
+
+    /// `project.dataset.table`, the key of this process's per-table caches.
+    fn table_key(&self, table: &str) -> String {
+        format!("{}.{}.{table}", self.project_id, self.dataset_id)
+    }
+
+    /// Drop what this process cached about `table`, which it is about to
+    /// create, replace or drop.
+    fn forget_table(&self, table: &str) {
+        clustering_cache()
+            .lock()
+            .unwrap()
+            .remove(&self.table_key(table));
     }
 
     /// The declared BigQuery `data_type` of one column, from
@@ -1025,19 +1071,15 @@ impl BigQuerySink {
                 },
                 ..Default::default()
             };
-            let created = self
-                .client
-                .job()
-                .create(&job)
-                .await
-                .map_err(|e| EtlError::other(format!("bigquery {prefix} job error: {e}")))?;
+            let created = self.create_job(&job, prefix).await?;
             let done = self.wait_for_job(created).await?;
             match &done.status.error_result {
-                Some(err) if is_rate_limited(err) && attempt < RATE_LIMITED_JOB_ATTEMPTS => {
+                Some(err) if is_retryable_job_error(err) && attempt < RATE_LIMITED_JOB_ATTEMPTS => {
                     let wait = rate_limit_backoff(attempt);
                     tracing::warn!(
-                        "bigquery {prefix} job on '{table}' hit a rate limit ({}); retrying in \
+                        "bigquery {prefix} job on '{table}' failed with {} ({}); retrying in \
                          {wait:?} (attempt {attempt} of {RATE_LIMITED_JOB_ATTEMPTS})",
+                        err.reason.as_deref().unwrap_or("no reason"),
                         err.message.as_deref().unwrap_or("no message"),
                     );
                     tokio::time::sleep(wait).await;
@@ -1051,6 +1093,7 @@ impl BigQuerySink {
     /// Idempotent, matching ClickHouse's `DROP TABLE IF EXISTS`: a
     /// not-found is success, not an error.
     pub async fn drop_table(&self, table: &str) -> Result<()> {
+        self.forget_table(table);
         match self
             .client
             .table()
@@ -1126,6 +1169,7 @@ impl BigQuerySink {
                 .chain(state_chunk_fields())
                 .collect(),
             }),
+            clustering: Some(state_clustering()),
             ..Default::default()
         };
         self.client
@@ -1157,25 +1201,46 @@ impl BigQuerySink {
     /// for a metadata patch, which BigQuery rate-limits per table. When two runs
     /// race to add them, the loser's patch fails on the moved etag; it re-reads
     /// the table and succeeds if the columns are now there.
+    ///
+    /// The same patch clusters a state table that isn't, by `(source_table,
+    /// dest_table)`: every cursor read filters on both, and unclustered it
+    /// scanned the whole append-only table, measured at about 25 MB billed
+    /// per read on a 110k-row state table. BigQuery applies a changed
+    /// clustering spec to data written after it.
     async fn migrate_state_table(&self, mut t: Table) -> Result<()> {
         let mut fields = t.schema.take().map(|s| s.fields).unwrap_or_default();
         let missing = missing_state_chunk_fields(&fields);
-        if missing.is_empty() {
+        let unclustered = !state_clustered(t.clustering.as_ref());
+        if missing.is_empty() && !unclustered {
             return Ok(());
         }
         let table_id = t.table_reference.table_id.clone();
-        tracing::info!("adding chunk-resume columns to state table '{table_id}'");
+        if !missing.is_empty() {
+            tracing::info!("adding chunk-resume columns to state table '{table_id}'");
+        }
+        if unclustered {
+            tracing::info!("clustering state table '{table_id}' by (source_table, dest_table)");
+            t.clustering = Some(state_clustering());
+        }
         fields.extend(missing);
         t.schema = Some(TableSchema { fields });
         match self.client.table().patch(&t).await {
             Ok(_) => Ok(()),
             Err(e) => {
                 let now = self.get_table(&table_id).await?;
+                let clustered = state_clustered(now.as_ref().and_then(|t| t.clustering.as_ref()));
                 let fields = now
                     .and_then(|t| t.schema)
                     .map(|s| s.fields)
                     .unwrap_or_default();
                 if missing_state_chunk_fields(&fields).is_empty() {
+                    if !clustered {
+                        // Clustering only saves bytes: a run must not fail for it.
+                        tracing::warn!(
+                            "could not cluster state table '{table_id}' ({e}); cursor reads \
+                             scan the whole table until it is"
+                        );
+                    }
                     Ok(())
                 } else {
                     Err(EtlError::other(format!(
@@ -1184,6 +1249,78 @@ impl BigQuerySink {
                 }
             }
         }
+    }
+
+    /// See [`Sink::compact_state`]. A row is stale when its key holds a newer
+    /// one; ties at the newest `run_ts` all stay, so a cursor read picks from
+    /// the same rows it did before. The state table is written by DML, never
+    /// streamed, so there is no streaming buffer to block the `DELETE`.
+    pub async fn compact_state(&self, state_table: &str) -> Result<u64> {
+        if self.get_table(state_table).await?.is_none() {
+            return Ok(0);
+        }
+        let (count_sql, delete_sql) =
+            build_compact_state_sql(&self.project_id, &self.dataset_id, state_table);
+        let stale = self
+            .query_strings(&count_sql, "stale state rows")
+            .await?
+            .first()
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or(0);
+        if stale == 0 {
+            return Ok(0);
+        }
+        let job = self
+            .run_query_job(delete_sql, "compact_state", state_table)
+            .await?;
+        // The DELETE's own count: a sync writing meanwhile can make a row
+        // stale between the count and the delete.
+        Ok(job
+            .statistics
+            .and_then(|s| s.query)
+            .and_then(|q| q.num_dml_affected_rows)
+            .and_then(|n| u64::try_from(n).ok())
+            .unwrap_or(stale))
+    }
+
+    /// See [`Sink::state_keys`].
+    pub async fn state_keys(
+        &self,
+        state_table: &str,
+        idle_days: Option<u32>,
+    ) -> Result<Vec<crate::sink::StateKey>> {
+        if self.get_table(state_table).await?.is_none() {
+            return Ok(Vec::new());
+        }
+        let request = QueryRequest {
+            query: build_state_keys_sql(&self.project_id, &self.dataset_id, state_table, idle_days),
+            ..Default::default()
+        };
+        let mut iter = self
+            .client
+            .query::<QueryRow>(&self.project_id, request)
+            .await
+            .map_err(|e| EtlError::other(format!("bigquery state_keys query error: {e}")))?;
+        let mut out = Vec::new();
+        while let Some(row) = iter
+            .next()
+            .await
+            .map_err(|e| EtlError::other(format!("bigquery state_keys row error: {e}")))?
+        {
+            let column = |i: usize| {
+                row.column::<Option<String>>(i)
+                    .map(Option::unwrap_or_default)
+                    .map_err(|e| EtlError::other(format!("bigquery state_keys column error: {e}")))
+            };
+            out.push(crate::sink::StateKey {
+                state_key: column(0)?,
+                dest_table: column(1)?,
+                last_watermark: column(2)?,
+                last_run: column(3)?,
+                state_rows: column(4)?.parse().unwrap_or(0),
+            });
+        }
+        Ok(out)
     }
 
     /// Read the last persisted watermark for this `(state_key, dest_table)` pair.
@@ -1334,24 +1471,187 @@ impl BigQuerySink {
         job_outcome(self.wait_for_job(job).await?)
     }
 
-    /// Poll a submitted job until it reaches `DONE`, failed or not.
+    /// Poll a submitted job until it reaches `DONE`, failed or not. A poll
+    /// that fails at the HTTP level is repeated for the same job id.
     async fn wait_for_job(&self, mut job: Job) -> Result<Job> {
         while job.status.state != JobState::Done {
             tokio::time::sleep(Duration::from_millis(500)).await;
             job = self
-                .client
-                .job()
-                .get(
-                    &job.job_reference.project_id,
-                    &job.job_reference.job_id,
-                    &GetJobRequest {
-                        location: job.job_reference.location.clone(),
-                    },
-                )
+                .get_job(&job.job_reference)
                 .await
                 .map_err(|e| EtlError::other(format!("bigquery job get error: {e}")))?;
         }
         Ok(job)
+    }
+
+    /// `jobs.get`, repeated on an HTTP-level failure.
+    async fn get_job(&self, reference: &JobReference) -> std::result::Result<Job, BqError> {
+        let request = GetJobRequest {
+            location: reference.location.clone(),
+        };
+        retry_job_call("bigquery jobs.get", || {
+            self.client
+                .job()
+                .get(&reference.project_id, &reference.job_id, &request)
+        })
+        .await
+    }
+
+    /// `jobs.insert`, repeated on an HTTP-level failure with the same job id.
+    /// See [`submit_job`].
+    async fn create_job(&self, job: &Job, what: &str) -> Result<Job> {
+        submit_job(
+            what,
+            || self.client.job().create(job),
+            || async {
+                // `jobs.get` needs the job's location everywhere but the US
+                // and EU multi-regions, and the reference sent to
+                // `jobs.insert` names none: BigQuery placed the job from the
+                // dataset.
+                let mut reference = job.job_reference.clone();
+                if reference.location.is_none() {
+                    reference.location = self.dataset_location().await;
+                }
+                self.get_job(&reference).await
+            },
+        )
+        .await
+        .map_err(|e| EtlError::other(format!("bigquery {what} job error: {e}")))
+    }
+
+    /// The dataset's location, read once. `None` when it can't be read, which
+    /// leaves the lookup to BigQuery's default.
+    async fn dataset_location(&self) -> Option<String> {
+        self.location
+            .get_or_init(|| async {
+                match self
+                    .client
+                    .dataset()
+                    .get(&self.project_id, &self.dataset_id)
+                    .await
+                {
+                    Ok(d) => Some(d.location),
+                    Err(e) => {
+                        tracing::debug!("could not read the location of {}: {e}", self.dataset_id);
+                        None
+                    }
+                }
+            })
+            .await
+            .clone()
+    }
+}
+
+/// Clustering columns read this process, per `project.dataset.table`.
+///
+/// The unclustered-merge check runs alongside every `MERGE`, each chunk's
+/// included with `chunk_rows`, and every read is a billed query (10 MB
+/// minimum) for an answer that only changes when the table is recreated. A
+/// table this process creates or drops is forgotten first; one re-clustered
+/// by someone else is read again once its entry is [`CLUSTERING_CACHE_TTL`]
+/// old, so a long-lived process (an orchestrator's code server) doesn't fail
+/// `fail_on_warnings={"unclustered_merge_target"}` runs for good after the fix.
+fn clustering_cache() -> &'static std::sync::Mutex<HashMap<String, ClusteringEntry>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, ClusteringEntry>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// When a table's clustering was read, and what it was.
+type ClusteringEntry = (std::time::Instant, Option<Vec<String>>);
+
+/// How long a cached clustering answer is trusted.
+const CLUSTERING_CACHE_TTL: Duration = Duration::from_secs(600);
+
+/// Total attempts at one `jobs.insert` or `jobs.get` call that fails at the
+/// HTTP level, counting the first.
+const JOB_HTTP_ATTEMPTS: u32 = 5;
+
+/// Whether a BigQuery API call failed in a way worth repeating: a 5xx or 429
+/// response (a `502 Bad Gateway` from the front end often has no JSON body,
+/// so it arrives as an `HttpClient` error carrying only the status), or no
+/// response at all.
+fn is_transient_bq(e: &BqError) -> bool {
+    match e {
+        BqError::Response(r) => r.code >= 500 || r.code == 429,
+        BqError::HttpClient(e) => e
+            .status()
+            .map_or(true, |s| s.is_server_error() || s.as_u16() == 429),
+        BqError::HttpMiddleware(_) => true,
+        BqError::TokenSource(_) => false,
+    }
+}
+
+/// `409 Already Exists`: what `jobs.insert` answers for a job id in use.
+fn is_conflict(e: &BqError) -> bool {
+    match e {
+        BqError::Response(r) => r.code == 409,
+        BqError::HttpClient(e) => e.status().is_some_and(|s| s.as_u16() == 409),
+        _ => false,
+    }
+}
+
+/// Run one job API call, repeating it with backoff while it fails transiently.
+async fn retry_job_call<T, F, Fut>(what: &str, mut call: F) -> std::result::Result<T, BqError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<T, BqError>>,
+{
+    let mut attempt = 1;
+    loop {
+        match call().await {
+            Err(e) if attempt < JOB_HTTP_ATTEMPTS && is_transient_bq(&e) => {
+                let delay = backoff_delay(attempt);
+                tracing::warn!("{what} failed on attempt {attempt} ({e}); retrying in {delay:?}");
+                tokio::time::sleep(delay).await;
+                attempt += 1;
+            }
+            outcome => return outcome,
+        }
+    }
+}
+
+/// Submit a job with `create`, repeating it on an HTTP-level failure.
+///
+/// Every attempt sends the same job id, which is what makes repeating it
+/// safe: `jobs.insert` is idempotent per id. When an attempt that looked
+/// failed had in fact reached BigQuery, the retry is refused with `409
+/// Already Exists`, and that job is fetched with `get` and polled instead of
+/// running the statement a second time. A `502` on the state `INSERT` once
+/// failed a run whose data was already merged, so the orchestrator re-ran the
+/// whole transfer.
+async fn submit_job<C, CF, G, GF>(
+    what: &str,
+    mut create: C,
+    get: G,
+) -> std::result::Result<Job, BqError>
+where
+    C: FnMut() -> CF,
+    CF: std::future::Future<Output = std::result::Result<Job, BqError>>,
+    G: FnOnce() -> GF,
+    GF: std::future::Future<Output = std::result::Result<Job, BqError>>,
+{
+    let mut attempt = 1;
+    loop {
+        match create().await {
+            Err(e) if attempt > 1 && is_conflict(&e) => {
+                tracing::info!(
+                    "bigquery {what} job: an earlier attempt reached BigQuery after all; polling \
+                     that job instead of submitting it again"
+                );
+                return get().await;
+            }
+            Err(e) if attempt < JOB_HTTP_ATTEMPTS && is_transient_bq(&e) => {
+                let delay = backoff_delay(attempt);
+                tracing::warn!(
+                    "submitting the bigquery {what} job failed on attempt {attempt} ({e}); \
+                     retrying with the same job id in {delay:?}"
+                );
+                tokio::time::sleep(delay).await;
+                attempt += 1;
+            }
+            outcome => return outcome,
+        }
     }
 }
 
@@ -1370,12 +1670,14 @@ fn job_outcome(job: Job) -> Result<Job> {
 /// Total attempts for a query job BigQuery failed for a rate limit.
 const RATE_LIMITED_JOB_ATTEMPTS: u32 = 6;
 
-/// Whether a failed job hit a rate limit rather than a real error. Such a job
-/// applied nothing, so running the statement again is safe.
-fn is_rate_limited(err: &ErrorProto) -> bool {
+/// Whether a failed job hit a rate limit or a transient BigQuery-side error
+/// (`backendError`, `internalError`, which Google's error guidance says to
+/// retry) rather than a real error. A failed job applied nothing, so running
+/// the statement again is safe.
+fn is_retryable_job_error(err: &ErrorProto) -> bool {
     matches!(
         err.reason.as_deref(),
-        Some("rateLimitExceeded" | "jobRateLimitExceeded")
+        Some("rateLimitExceeded" | "jobRateLimitExceeded" | "backendError" | "internalError")
     )
 }
 
@@ -1385,6 +1687,60 @@ fn is_rate_limited(err: &ErrorProto) -> bool {
 /// the retries inside the same window.
 fn rate_limit_backoff(attempt: u32) -> Duration {
     Duration::from_secs(2u64 << attempt.saturating_sub(1).min(4))
+}
+
+/// How the state table is clustered: by the two columns every cursor read
+/// filters on.
+fn state_clustering() -> Clustering {
+    Clustering {
+        fields: vec!["source_table".to_string(), "dest_table".to_string()],
+    }
+}
+
+/// Whether `clustering` leads with the state table's key, so a cursor read
+/// prunes on it.
+fn state_clustered(clustering: Option<&Clustering>) -> bool {
+    clustering.is_some_and(|c| {
+        c.fields.len() >= 2
+            && c.fields[0].eq_ignore_ascii_case("source_table")
+            && c.fields[1].eq_ignore_ascii_case("dest_table")
+    })
+}
+
+/// `(count, delete)` for [`BigQuerySink::compact_state`]: the stale rows, and
+/// the statement that deletes them.
+fn build_compact_state_sql(project: &str, dataset: &str, state_table: &str) -> (String, String) {
+    let t = format!("`{project}`.`{dataset}`.`{state_table}`");
+    let stale = format!(
+        "EXISTS (SELECT 1 FROM {t} AS n WHERE n.source_table = s.source_table \
+         AND n.dest_table = s.dest_table AND n.run_ts > s.run_ts)"
+    );
+    (
+        format!("SELECT CAST(COUNT(*) AS STRING) FROM {t} AS s WHERE {stale}"),
+        format!("DELETE FROM {t} AS s WHERE {stale}"),
+    )
+}
+
+/// The query behind [`BigQuerySink::state_keys`].
+fn build_state_keys_sql(
+    project: &str,
+    dataset: &str,
+    state_table: &str,
+    idle_days: Option<u32>,
+) -> String {
+    let idle = idle_days
+        .map(|d| {
+            format!(" HAVING MAX(run_ts) < TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {d} DAY)")
+        })
+        .unwrap_or_default();
+    format!(
+        "SELECT source_table, dest_table, \
+         ARRAY_AGG(last_watermark ORDER BY run_ts DESC LIMIT 1)[OFFSET(0)], \
+         FORMAT_TIMESTAMP('%Y-%m-%d %H:%M:%E6S', MAX(run_ts)), CAST(COUNT(*) AS STRING) \
+         FROM `{project}`.`{dataset}`.`{state_table}` \
+         GROUP BY source_table, dest_table{idle} \
+         ORDER BY MAX(run_ts), source_table, dest_table"
+    )
 }
 
 /// The state table's chunk-resume columns. `NULLABLE`, so a state table can
@@ -1532,6 +1888,19 @@ impl Sink for BigQuerySink {
     }
     async fn clustering_columns(&self, table: &str) -> Result<Option<Vec<String>>> {
         BigQuerySink::clustering_columns(self, table).await
+    }
+    fn take_write_warnings(&self) -> Vec<crate::config::TransferWarning> {
+        std::mem::take(&mut *self.write_warnings.lock().unwrap())
+    }
+    async fn compact_state(&self, state_table: &str) -> Result<u64> {
+        BigQuerySink::compact_state(self, state_table).await
+    }
+    async fn state_keys(
+        &self,
+        state_table: &str,
+        idle_days: Option<u32>,
+    ) -> Result<Vec<crate::sink::StateKey>> {
+        BigQuerySink::state_keys(self, state_table, idle_days).await
     }
     async fn distinct_keys(
         &self,
@@ -2377,9 +2746,98 @@ pub(crate) fn timestamp_micros_to_iso(micros: i64, has_tz: bool) -> Result<Strin
     })
 }
 
+/// The warning for a Storage Write call whose finalized stream holds a
+/// different number of rows than were appended to it, if it does.
+///
+/// More rows means an offset failed to deduplicate a retried append; fewer
+/// means an append was lost. Either way the table now holds suspect data. Into
+/// a staging table the transfer stops on it before the `MERGE` or swap that
+/// would promote it, so the destination and the cursor are untouched and the
+/// staging table is dropped (see `sync::check_fatal`). Into the destination
+/// itself (append) the rows are there already, and it is reported.
+fn finalized_row_count_warning(
+    dataset: &str,
+    table: &str,
+    row_count: i64,
+    appended: i64,
+) -> Option<crate::config::TransferWarning> {
+    if row_count == appended {
+        return None;
+    }
+    let diff = (row_count - appended).unsigned_abs();
+    let what = if row_count > appended {
+        "duplicated"
+    } else {
+        "missing"
+    };
+    Some(crate::config::TransferWarning {
+        kind: crate::config::WarningKind::StorageWriteCountMismatch,
+        column: None,
+        count: diff,
+        sample: Some(format!("{dataset}.{table}")),
+        message: format!(
+            "bigquery storage-write into {dataset}.{table} finalized its stream with \
+             {row_count} row(s), but {appended} were appended ({diff} {what}): the offsets did \
+             not deduplicate a retried append as they should. If this recurs, use \
+             write_method=\"insert_all\"."
+        ),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_state_table_is_clustered_by_its_key() {
+        assert!(state_clustered(Some(&state_clustering())));
+        assert!(!state_clustered(None));
+        assert!(!state_clustered(Some(&Clustering {
+            fields: vec!["dest_table".into(), "source_table".into()],
+        })));
+        assert!(!state_clustered(Some(&Clustering {
+            fields: vec!["source_table".into()],
+        })));
+    }
+
+    #[test]
+    fn compaction_deletes_only_rows_with_a_newer_one_for_their_key() {
+        let (count, delete) = build_compact_state_sql("p", "d", "_quickhouse_state");
+        let stale = "EXISTS (SELECT 1 FROM `p`.`d`.`_quickhouse_state` AS n WHERE \
+                     n.source_table = s.source_table AND n.dest_table = s.dest_table AND \
+                     n.run_ts > s.run_ts)";
+        assert_eq!(
+            count,
+            format!(
+                "SELECT CAST(COUNT(*) AS STRING) FROM `p`.`d`.`_quickhouse_state` AS s WHERE \
+                 {stale}"
+            )
+        );
+        assert_eq!(
+            delete,
+            format!("DELETE FROM `p`.`d`.`_quickhouse_state` AS s WHERE {stale}")
+        );
+        let keys = build_state_keys_sql("p", "d", "_quickhouse_state", Some(30));
+        assert!(keys.contains("GROUP BY source_table, dest_table"), "{keys}");
+        assert!(keys.contains("ORDER BY run_ts DESC LIMIT 1"), "{keys}");
+        assert!(keys.contains("INTERVAL 30 DAY"), "{keys}");
+        assert!(!build_state_keys_sql("p", "d", "s", None).contains("HAVING"));
+    }
+
+    #[test]
+    fn finalized_row_count_must_match_what_was_appended() {
+        assert!(finalized_row_count_warning("ds", "stg", 500, 500).is_none());
+        let dup = finalized_row_count_warning("ds", "stg", 520, 500).unwrap();
+        assert_eq!(
+            dup.kind,
+            crate::config::WarningKind::StorageWriteCountMismatch
+        );
+        assert_eq!(dup.count, 20);
+        assert_eq!(dup.sample.as_deref(), Some("ds.stg"));
+        assert!(dup.message.contains("20 duplicated"), "{}", dup.message);
+        let lost = finalized_row_count_warning("ds", "stg", 480, 500).unwrap();
+        assert!(lost.message.contains("20 missing"), "{}", lost.message);
+    }
 
     #[test]
     fn window_predicate_is_parenthesized_and_comment_safe() {
@@ -2463,6 +2921,7 @@ mod tests {
             chunk_rows: None,
             keyset_not_null: false,
             retry_max_attempts: 1,
+            fail_on_warnings: Vec::new(),
             probe_max_cost: crate::source::DEFAULT_PROBE_MAX_COST,
             read_window_rows: None,
             window_target_secs: None,
@@ -2933,18 +3392,135 @@ mod tests {
         assert!(missing_state_chunk_fields(&migrated).is_empty());
     }
 
+    fn http_error(code: u16) -> BqError {
+        BqError::Response(google_cloud_bigquery::http::error::ErrorResponse {
+            code,
+            errors: None,
+            message: format!("HTTP {code}"),
+        })
+    }
+
+    fn job_named(id: &str) -> Job {
+        Job {
+            job_reference: JobReference {
+                job_id: id.to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
     #[test]
-    fn only_a_rate_limit_is_retried() {
+    fn only_a_server_side_or_transport_failure_is_transient() {
+        assert!(is_transient_bq(&http_error(502)));
+        assert!(is_transient_bq(&http_error(503)));
+        assert!(is_transient_bq(&http_error(429)));
+        assert!(!is_transient_bq(&http_error(400)));
+        assert!(!is_transient_bq(&http_error(404)));
+        assert!(!is_transient_bq(&http_error(409)));
+        assert!(is_conflict(&http_error(409)));
+        assert!(!is_conflict(&http_error(502)));
+    }
+
+    #[tokio::test]
+    async fn a_502_on_jobs_insert_is_retried_and_the_statement_applied_once() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let job = submit_job(
+            "persist_watermark",
+            || {
+                calls.borrow_mut().push("insert");
+                let n = calls.borrow().len();
+                async move {
+                    if n == 1 {
+                        Err(http_error(502))
+                    } else {
+                        Ok(job_named("j1"))
+                    }
+                }
+            },
+            || async { panic!("nothing to poll: the retry was accepted") },
+        )
+        .await
+        .unwrap();
+        assert_eq!(job.job_reference.job_id, "j1");
+        assert_eq!(*calls.borrow(), vec!["insert", "insert"]);
+    }
+
+    #[tokio::test]
+    async fn a_retry_that_finds_the_job_already_submitted_polls_it() {
+        // The 502 hid a job that BigQuery had in fact accepted: the retry is
+        // refused as a duplicate id, and that job is polled, not run again.
+        let inserts = std::cell::Cell::new(0);
+        let job = submit_job(
+            "persist_watermark",
+            || {
+                inserts.set(inserts.get() + 1);
+                let n = inserts.get();
+                async move { Err(http_error(if n == 1 { 502 } else { 409 })) }
+            },
+            || async { Ok(job_named("j1")) },
+        )
+        .await
+        .unwrap();
+        assert_eq!(job.job_reference.job_id, "j1");
+        assert_eq!(inserts.get(), 2);
+
+        // A 409 on the very first attempt is a genuine id clash, not ours.
+        let err = submit_job(
+            "persist_watermark",
+            || async { Err(http_error(409)) },
+            || async { panic!("must not poll a job this run never submitted") },
+        )
+        .await
+        .unwrap_err();
+        assert!(is_conflict(&err));
+    }
+
+    #[tokio::test]
+    async fn a_poll_that_fails_transiently_is_repeated_for_the_same_job() {
+        let ids = std::cell::RefCell::new(Vec::new());
+        let job = retry_job_call("bigquery jobs.get", || {
+            ids.borrow_mut().push("j1");
+            let n = ids.borrow().len();
+            async move {
+                if n < 3 {
+                    Err(http_error(502))
+                } else {
+                    Ok(job_named("j1"))
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(job.job_reference.job_id, "j1");
+        assert_eq!(ids.borrow().len(), 3);
+
+        // A permanent error is returned at once.
+        let calls = std::cell::Cell::new(0);
+        let err = retry_job_call("bigquery jobs.get", || {
+            calls.set(calls.get() + 1);
+            async { Err::<Job, _>(http_error(403)) }
+        })
+        .await
+        .unwrap_err();
+        assert!(!is_transient_bq(&err));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn only_a_rate_limit_or_a_backend_error_is_retried() {
         let err = |reason: &str| ErrorProto {
             reason: Some(reason.to_string()),
             ..Default::default()
         };
-        assert!(is_rate_limited(&err("rateLimitExceeded")));
-        assert!(is_rate_limited(&err("jobRateLimitExceeded")));
+        assert!(is_retryable_job_error(&err("rateLimitExceeded")));
+        assert!(is_retryable_job_error(&err("jobRateLimitExceeded")));
+        assert!(is_retryable_job_error(&err("backendError")));
+        assert!(is_retryable_job_error(&err("internalError")));
         // A daily quota or a bad statement won't clear by waiting.
-        assert!(!is_rate_limited(&err("quotaExceeded")));
-        assert!(!is_rate_limited(&err("invalidQuery")));
-        assert!(!is_rate_limited(&ErrorProto::default()));
+        assert!(!is_retryable_job_error(&err("quotaExceeded")));
+        assert!(!is_retryable_job_error(&err("invalidQuery")));
+        assert!(!is_retryable_job_error(&ErrorProto::default()));
         assert_eq!(rate_limit_backoff(1), Duration::from_secs(2));
         assert_eq!(rate_limit_backoff(3), Duration::from_secs(8));
         assert_eq!(rate_limit_backoff(9), Duration::from_secs(32));

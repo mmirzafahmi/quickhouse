@@ -26,6 +26,19 @@ hard-deletes stays in the destination forever; this is what converges the two.
 .. autofunction:: reconcile_keys
 ```
 
+## compact_state and state_keys
+
+Maintain the cursor state table: every incremental run appends a row to it and
+nothing removes old ones. `compact_state` keeps only the newest row per cursor,
+leaving what every sync reads unchanged; `state_keys` lists the cursors, and
+with `idle_days` the ones no sync has written lately.
+
+```{eval-rst}
+.. autofunction:: compact_state
+
+.. autofunction:: state_keys
+```
+
 ## Sources
 
 Connection descriptors accepted as ``sync()``'s ``source`` argument.
@@ -78,6 +91,9 @@ Connection descriptors accepted as ``sync()``'s ``target`` argument. ``BigQuery`
    :members:
 
 .. autoclass:: ReconcileResult
+   :members:
+
+.. autoclass:: StateKey
    :members:
 
 .. autoclass:: Progress

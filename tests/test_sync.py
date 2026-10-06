@@ -1064,3 +1064,291 @@ def test_a_chunk_marker_repeated_from_an_earlier_read_still_lands(
     finally:
         _drop_ch(ch_client, table)
         ch_client.command(f"DROP TABLE IF EXISTS `{state}`")
+
+
+def test_a_rolling_source_query_filter_raises_no_false_warning(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """Issue #23, PostgreSQL: a quiet table read through a source_query whose
+    filter has dropped the newest rows. Its MAX sits below the saved cursor,
+    which raised watermark_ahead_of_source about time zones (10-01 against
+    09-21 in production). With source_table set the cursor is checked against
+    the unfiltered table: no warning. It still goes back to the MAX, which
+    costs a re-read at most."""
+    table = unique_name
+    _seed_table(pg_conn, table, 100, base_ts="2024-01-01 00:00:00")
+    with pg_conn.cursor() as cur:
+        cur.execute(
+            f"INSERT INTO \"{table}\" (id, name, write_date) "
+            "SELECT g, 'new', '2024-03-01 00:00:00' FROM generate_series(101, 110) g"
+        )
+    _drop_ch(ch_client, table)
+    state_key = f"{table}:rolling"
+    kw = dict(
+        dest_table=table, source_table=table,
+        source_query=f'SELECT id, name, write_date FROM "{table}" WHERE id <= 100',
+        mode="incremental", watermark="write_date", key=["id"], create_if_missing=True,
+        engine="ReplacingMergeTree", order_by=["id"], probe_max_cost=0.0,
+        lookback_seconds=3600, state_key=state_key,
+    )
+
+    def cursor():
+        return ch_client.command(
+            "SELECT last_watermark FROM _quickhouse_state FINAL "
+            f"WHERE source_table = '{state_key}' ORDER BY run_ts DESC LIMIT 1"
+        )
+
+    try:
+        assert quickhouse.sync(pg_source, ch_target, **kw).rows_written == 100
+        ch_client.command(
+            "INSERT INTO _quickhouse_state "
+            "(source_table, dest_table, last_watermark, rows, chunk_cursor, chunk_upper) "
+            f"VALUES ('{state_key}', '{table}', '2024-02-01 00:00:00', 0, '', '')"
+        )
+        for _ in range(2):
+            r = quickhouse.sync(pg_source, ch_target, **kw)
+            assert not [w for w in r.warnings if w.kind.startswith("watermark_")], r.warnings
+            assert cursor() == "2024-01-01 00:00:00"
+    finally:
+        _drop_ch(ch_client, table)
+
+
+def _chunked_stream_table(pg_conn, ch_client, table):
+    """200 rows keyed by an integer primary key, with a watermark no index
+    serves, so its MAX prices as a scan and the cursor comes from the rows
+    read."""
+    with pg_conn.cursor() as cur:
+        cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+        cur.execute(
+            f'CREATE TABLE "{table}" (id bigint PRIMARY KEY, v int, write_date timestamp NOT NULL)'
+        )
+        cur.execute(
+            f"INSERT INTO \"{table}\" SELECT g, 0, '2024-01-01' FROM generate_series(1, 200) g"
+        )
+    _drop_ch(ch_client, table)
+
+
+def _latest_state(ch_client, state_key):
+    return ch_client.query(
+        "SELECT last_watermark, chunk_cursor, chunk_upper FROM _quickhouse_state FINAL "
+        f"WHERE source_table = '{state_key}' ORDER BY run_ts DESC LIMIT 1"
+    ).result_rows[0]
+
+
+def test_a_resumed_chunked_stream_read_saves_the_cursor_its_marker_froze(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """Review of #13: a chunked read whose cursor comes from the rows read
+    (MAX too costly), interrupted, and resumed by a later sync. The resume
+    reads only the chunks after the marker, so a cursor taken from them would
+    pass over a row in an earlier chunk that changed in between: id=30 below,
+    updated to 02-01 while id=180, read by the resume, went to 03-01. Each
+    marker records the cursor the interrupted read could have saved, and the
+    resume reads up to it and saves it."""
+    table = unique_name
+    _chunked_stream_table(pg_conn, ch_client, table)
+    state_key = f"{table}:chunked"
+    kw = dict(
+        dest_table=table, source_table=table, mode="incremental", watermark="write_date",
+        key=["id"], create_if_missing=True, engine="ReplacingMergeTree", order_by=["id"],
+        chunk_rows=50, probe_max_cost=1.0, lookback_seconds=60, state_key=state_key,
+    )
+    try:
+        assert quickhouse.sync(pg_source, ch_target, **kw).rows_written == 200
+        committed = _latest_state(ch_client, state_key)[0]
+        # Interrupted in its third chunk, after committing two.
+        ch_client.command(f"ALTER TABLE `{table}` ADD CONSTRAINT stop_here CHECK id <= 100")
+        with pytest.raises(RuntimeError, match="stop_here"):
+            quickhouse.sync(pg_source, ch_target, **kw)
+        ch_client.command(f"ALTER TABLE `{table}` DROP CONSTRAINT stop_here")
+        last, marker, upper = _latest_state(ch_client, state_key)
+        assert (last, marker) == (committed, "100")
+        assert upper == "2024-01-01 00:00:00.000000", "the cursor the read could have saved"
+
+        with pg_conn.cursor() as cur:
+            cur.execute(f"UPDATE \"{table}\" SET v = 1, write_date = '2024-02-01' WHERE id = 30")
+            cur.execute(f"UPDATE \"{table}\" SET v = 1, write_date = '2024-03-01' WHERE id = 180")
+        r = quickhouse.sync(pg_source, ch_target, **kw)
+        assert r.rows_read == 99, "the resume reads past the marker, up to its bound"
+        assert r.new_watermark == upper
+        assert _latest_state(ch_client, state_key) == (upper, "", "")
+
+        quickhouse.sync(pg_source, ch_target, **kw)
+        assert ch_client.command(f"SELECT sum(v) FROM `{table}` FINAL WHERE id IN (30, 180)") == 2, (
+            "the row changed in a chunk the interrupted read had committed lands, and so does "
+            "the one past the resume's bound"
+        )
+    finally:
+        _drop_ch(ch_client, table)
+
+
+def test_a_resume_past_a_marker_with_no_bound_keeps_the_committed_cursor(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """A marker written by 0.20.6, or before the interrupted read saw a
+    watermark, records no bound for a stream-derived cursor. The resume can't
+    tell what changed in the chunks before it, so it keeps the committed
+    cursor, and the next run reads everything changed since."""
+    table = unique_name
+    _chunked_stream_table(pg_conn, ch_client, table)
+    state_key = f"{table}:chunked"
+    kw = dict(
+        dest_table=table, source_table=table, mode="incremental", watermark="write_date",
+        key=["id"], create_if_missing=True, engine="ReplacingMergeTree", order_by=["id"],
+        chunk_rows=50, probe_max_cost=1.0, lookback_seconds=60, state_key=state_key,
+    )
+    try:
+        assert quickhouse.sync(pg_source, ch_target, **kw).rows_written == 200
+        committed = _latest_state(ch_client, state_key)[0]
+        with pg_conn.cursor() as cur:
+            cur.execute(f"UPDATE \"{table}\" SET v = 1, write_date = '2024-02-01' WHERE id = 30")
+            cur.execute(f"UPDATE \"{table}\" SET v = 1, write_date = '2024-03-01' WHERE id = 180")
+        ch_client.command(
+            "INSERT INTO _quickhouse_state "
+            "(source_table, dest_table, last_watermark, rows, chunk_cursor, chunk_upper) "
+            f"VALUES ('{state_key}', '{table}', '{committed}', 100, '100', '')"
+        )
+        r = quickhouse.sync(pg_source, ch_target, **kw)
+        assert r.rows_read == 100
+        assert r.new_watermark is None, "the cursor stays where it was committed"
+        assert _latest_state(ch_client, state_key) == (committed, "", ""), (
+            "and the resume marker is cleared"
+        )
+
+        quickhouse.sync(pg_source, ch_target, **kw)
+        assert ch_client.command(f"SELECT v FROM `{table}` FINAL WHERE id = 30") == 1, (
+            "the row changed in a chunk the interrupted attempt had read lands"
+        )
+    finally:
+        _drop_ch(ch_client, table)
+
+
+
+def test_a_resume_past_a_marker_with_no_bound_records_none_with_a_max_of_its_own(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """Review of #13: a resume past a marker with no bound, in a run that
+    probes the MAX (an index added, say, or probe_max_cost=0), bounds its read
+    by that fresh MAX. Recorded in its own markers, it would read as a bound
+    the interrupted read froze, and a later resume would save it as the
+    cursor, past rows in the first chunks that changed in between. It records
+    none, so that later resume keeps the committed cursor too."""
+    table = unique_name
+    _chunked_stream_table(pg_conn, ch_client, table)
+    state_key = f"{table}:chunked"
+    kw = dict(
+        dest_table=table, source_table=table, mode="incremental", watermark="write_date",
+        key=["id"], create_if_missing=True, engine="ReplacingMergeTree", order_by=["id"],
+        chunk_rows=50, lookback_seconds=60, state_key=state_key,
+    )
+    try:
+        assert quickhouse.sync(pg_source, ch_target, probe_max_cost=1.0, **kw).rows_written == 200
+        committed = _latest_state(ch_client, state_key)[0]
+        with pg_conn.cursor() as cur:
+            cur.execute(f"UPDATE \"{table}\" SET v = 1, write_date = '2024-02-01' WHERE id = 30")
+            cur.execute(f"UPDATE \"{table}\" SET v = 1, write_date = '2024-03-01' WHERE id = 180")
+        ch_client.command(
+            "INSERT INTO _quickhouse_state "
+            "(source_table, dest_table, last_watermark, rows, chunk_cursor, chunk_upper) "
+            f"VALUES ('{state_key}', '{table}', '{committed}', 100, '100', '')"
+        )
+        # Resumed with the MAX probed, and interrupted again after one chunk.
+        ch_client.command(f"ALTER TABLE `{table}` ADD CONSTRAINT stop_here CHECK id <= 150")
+        with pytest.raises(RuntimeError, match="stop_here"):
+            quickhouse.sync(pg_source, ch_target, probe_max_cost=0.0, **kw)
+        ch_client.command(f"ALTER TABLE `{table}` DROP CONSTRAINT stop_here")
+        assert _latest_state(ch_client, state_key) == (committed, "150", "")
+
+        r = quickhouse.sync(pg_source, ch_target, probe_max_cost=0.0, **kw)
+        assert r.new_watermark is None
+        assert _latest_state(ch_client, state_key) == (committed, "", "")
+        quickhouse.sync(pg_source, ch_target, probe_max_cost=0.0, **kw)
+        assert ch_client.command(f"SELECT v FROM `{table}` FINAL WHERE id = 30") == 1
+    finally:
+        _drop_ch(ch_client, table)
+
+
+def test_a_resumed_first_read_lands_rows_with_no_watermark(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """Review of #13: a first read whose cursor comes from the rows read has
+    no bound, so it lands rows whose watermark is NULL. Resumed, it is held to
+    its marker's bound, and `watermark <= bound` matches no NULL: the rows
+    past the marker would never land. The resume reads them too. (Not into a
+    ReplacingMergeTree, whose version column, the watermark, can't be NULL.)"""
+    table = unique_name
+    with pg_conn.cursor() as cur:
+        cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+        cur.execute(f'CREATE TABLE "{table}" (id bigint PRIMARY KEY, v int, write_date timestamp)')
+    _drop_ch(ch_client, table)
+    state_key = f"{table}:chunked"
+    kw = dict(
+        dest_table=table, source_table=table, mode="incremental", watermark="write_date",
+        key=["id"], create_if_missing=True, engine="MergeTree", order_by=["id"],
+        chunk_rows=50, probe_max_cost=1.0, lookback_seconds=60, state_key=state_key,
+    )
+    try:
+        # An empty source: the destination is created, and no cursor saved.
+        assert quickhouse.sync(pg_source, ch_target, **kw).new_watermark is None
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                f"INSERT INTO \"{table}\" SELECT g, 0, "
+                "CASE WHEN g BETWEEN 150 AND 160 THEN NULL ELSE timestamp '2024-01-01' END "
+                "FROM generate_series(1, 200) g"
+            )
+        ch_client.command(f"ALTER TABLE `{table}` ADD CONSTRAINT stop_here CHECK id <= 100")
+        with pytest.raises(RuntimeError, match="stop_here"):
+            quickhouse.sync(pg_source, ch_target, **kw)
+        ch_client.command(f"ALTER TABLE `{table}` DROP CONSTRAINT stop_here")
+        upper = _latest_state(ch_client, state_key)[2]
+        assert upper == "2024-01-01 00:00:00.000000"
+
+        r = quickhouse.sync(pg_source, ch_target, **kw)
+        assert r.rows_read == 100
+        assert r.new_watermark == upper
+        assert ch_client.command(f"SELECT count() FROM `{table}`") == 200
+        assert ch_client.command(f"SELECT count() FROM `{table}` WHERE write_date IS NULL") == 11
+    finally:
+        _drop_ch(ch_client, table)
+
+
+
+def test_a_resume_that_reads_only_rows_with_no_watermark_saves_its_bound(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """The resume above, with every row past the marker NULL: it saves its
+    marker's bound all the same, so the read-side null_watermark, which says
+    there is no cursor to save, isn't raised (and can't fail the run)."""
+    table = unique_name
+    with pg_conn.cursor() as cur:
+        cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+        cur.execute(f'CREATE TABLE "{table}" (id bigint PRIMARY KEY, v int, write_date timestamp)')
+    _drop_ch(ch_client, table)
+    state_key = f"{table}:chunked"
+    kw = dict(
+        dest_table=table, source_table=table, mode="incremental", watermark="write_date",
+        key=["id"], create_if_missing=True, engine="MergeTree", order_by=["id"],
+        chunk_rows=50, probe_max_cost=1.0, lookback_seconds=60, state_key=state_key,
+        fail_on_warnings={"null_watermark"},
+    )
+    try:
+        assert quickhouse.sync(pg_source, ch_target, **kw).new_watermark is None
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                f"INSERT INTO \"{table}\" SELECT g, 0, "
+                "CASE WHEN g > 100 THEN NULL ELSE timestamp '2024-01-01' END "
+                "FROM generate_series(1, 200) g"
+            )
+        ch_client.command(f"ALTER TABLE `{table}` ADD CONSTRAINT stop_here CHECK id <= 100")
+        with pytest.raises(RuntimeError, match="stop_here"):
+            quickhouse.sync(pg_source, ch_target, **kw)
+        ch_client.command(f"ALTER TABLE `{table}` DROP CONSTRAINT stop_here")
+        upper = _latest_state(ch_client, state_key)[2]
+
+        r = quickhouse.sync(pg_source, ch_target, **kw)
+        assert r.rows_read == 100
+        assert not [w for w in r.warnings if w.kind == "null_watermark"], r.warnings
+        assert r.new_watermark == upper == "2024-01-01 00:00:00.000000"
+        assert _latest_state(ch_client, state_key) == (upper, "", "")
+    finally:
+        _drop_ch(ch_client, table)

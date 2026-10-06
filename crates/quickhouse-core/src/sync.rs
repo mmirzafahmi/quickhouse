@@ -212,6 +212,10 @@ struct ChunkStager {
     next: AtomicU64,
     /// The chunk table currently open, so a failed run can drop it too.
     open: Mutex<Option<String>>,
+    /// Counts the rows each commit lands in the destination, where a commit
+    /// run again would land them twice; see [`SendCtx::landed`]. `None` for a
+    /// `MERGE`, which upserts.
+    landed: Option<Arc<AtomicU64>>,
 }
 
 impl ChunkStager {
@@ -247,6 +251,9 @@ impl ChunkStager {
                 &self.warnings,
             )
             .await?;
+            if let Some(landed) = &self.landed {
+                landed.fetch_add(rows, Ordering::Relaxed);
+            }
         } else {
             self.sink.drop_table(table).await?;
         }
@@ -386,6 +393,82 @@ enum WatermarkUnit {
     UtcMicros,
     /// `Date32` — days since epoch, rendered `YYYY-MM-DD`.
     Days,
+    /// A signed integer, or an unsigned one narrower than 64 bits, rendered as
+    /// its decimal digits. Only ever bounded by a `MAX` from `source_table`
+    /// (see [`table_max_eligible`]): a stream cursor needs a lookback, which
+    /// only a temporal watermark takes.
+    Int,
+}
+
+impl WatermarkUnit {
+    /// The unit a column of type `arrow` folds in, if it can be folded. See
+    /// [`WatermarkTracker::new`] for `utc_offset`, which follows the *source*
+    /// column: a PostgreSQL `timestamptz` overridden to a naive destination
+    /// type still compares as an instant, and a cursor without its `+00` is
+    /// read in the session's own TimeZone, which quickhouse never sets.
+    fn of(arrow: &DataType, utc_offset: bool) -> Option<Self> {
+        Some(match arrow {
+            DataType::Timestamp(TimeUnit::Microsecond, _) if utc_offset => WatermarkUnit::UtcMicros,
+            DataType::Timestamp(TimeUnit::Microsecond, _) => WatermarkUnit::NaiveMicros,
+            DataType::Date32 => WatermarkUnit::Days,
+            DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32 => WatermarkUnit::Int,
+            _ => return None,
+        })
+    }
+}
+
+impl WatermarkUnit {
+    /// A cursor literal in this unit. `None` when it doesn't parse, or carries
+    /// a UTC offset where the unit has none (or the reverse).
+    fn parse(self, cursor: &str) -> Option<i64> {
+        if self == WatermarkUnit::Int {
+            return cursor.trim().parse().ok();
+        }
+        let (micros, zoned) = parse_temporal_micros(cursor)?;
+        match self {
+            WatermarkUnit::NaiveMicros => (!zoned).then_some(micros),
+            WatermarkUnit::UtcMicros => zoned.then_some(micros),
+            WatermarkUnit::Days => (!zoned).then_some(micros.div_euclid(86_400_000_000)),
+            WatermarkUnit::Int => unreachable!("returned above"),
+        }
+    }
+
+    /// [`Self::parse`] for the cursor a run started from, which only ever
+    /// floors a cursor moved back. A `timestamptz` watermark also takes a
+    /// committed cursor without an offset as UTC: what 0.20.6 saved for one
+    /// overridden to a naive type, rendered from the UTC instant. A seed is
+    /// never passed here unless it parses in the unit itself (see
+    /// [`cursor_floor`]): PostgreSQL reads an offset-less one in the session's
+    /// zone.
+    fn parse_floor(self, cursor: &str) -> Option<i64> {
+        match self {
+            WatermarkUnit::UtcMicros => parse_temporal_micros(cursor).map(|(micros, _)| micros),
+            _ => self.parse(cursor),
+        }
+    }
+}
+
+/// The largest non-NULL value of an integer column, if it is one of `$t`.
+macro_rules! fold_int_max {
+    ($col:expr, $($t:ty),+) => {{
+        let mut local = i64::MIN;
+        $(
+            if let Some(a) = $col.as_any().downcast_ref::<$t>() {
+                for i in 0..a.len() {
+                    if !a.is_null(i) {
+                        local = local.max(a.value(i) as i64);
+                    }
+                }
+            }
+        )+
+        local
+    }};
 }
 
 impl WatermarkTracker {
@@ -402,15 +485,7 @@ impl WatermarkTracker {
     /// the MAX-probe path.
     fn new(watermark: &str, plan: &SelectPlan, utc_offset: bool) -> Option<Self> {
         let idx = plan.source_columns.iter().position(|c| c == watermark)?;
-        let unit = match plan.dest_columns.get(idx).map(|c| &c.arrow)? {
-            DataType::Timestamp(TimeUnit::Microsecond, None) => WatermarkUnit::NaiveMicros,
-            DataType::Timestamp(TimeUnit::Microsecond, Some(_)) if utc_offset => {
-                WatermarkUnit::UtcMicros
-            }
-            DataType::Timestamp(TimeUnit::Microsecond, Some(_)) => WatermarkUnit::NaiveMicros,
-            DataType::Date32 => WatermarkUnit::Days,
-            _ => return None,
-        };
+        let unit = WatermarkUnit::of(&plan.dest_columns.get(idx)?.arrow, utc_offset)?;
         Some(Self {
             idx,
             unit,
@@ -450,20 +525,103 @@ impl WatermarkTracker {
                     }
                 }
             }
+            WatermarkUnit::Int => {
+                use arrow_array::{
+                    Int16Array, Int32Array, Int64Array, Int8Array, UInt16Array, UInt32Array,
+                    UInt8Array,
+                };
+                local = fold_int_max!(
+                    col,
+                    Int8Array,
+                    Int16Array,
+                    Int32Array,
+                    Int64Array,
+                    UInt8Array,
+                    UInt16Array,
+                    UInt32Array
+                );
+            }
         }
         if local > i64::MIN {
             self.max.fetch_max(local, Ordering::Relaxed);
         }
     }
 
+    /// Whether any non-NULL watermark has been read.
+    fn seen(&self) -> bool {
+        self.max.load(Ordering::Relaxed) != i64::MIN
+    }
+
+    /// The cursor to save after a read bounded by `source_table`'s unfiltered
+    /// MAX: the largest watermark actually read. `None` when nothing was read
+    /// past `floor`, the cursor the run started from, so the cursor stays put
+    /// rather than moving back into the lookback band it re-read.
+    ///
+    /// `rewind_secs` moves it back first, as [`Self::render_rewound`] does.
+    fn advance_from(&self, floor: Option<&str>, rewind_secs: u64) -> Option<String> {
+        let max = self.max.load(Ordering::Relaxed);
+        if max == i64::MIN {
+            return None;
+        }
+        let v = max.saturating_sub(self.rewind_step(rewind_secs));
+        match floor.and_then(|f| self.unit.parse_floor(f)) {
+            Some(f) if f >= v => None,
+            _ => self.render_value(v),
+        }
+    }
+
+    /// `rewind_secs` in the tracker's own unit: whole days for a `Date32`,
+    /// rounded up, and nothing for an integer.
+    fn rewind_step(&self, rewind_secs: u64) -> i64 {
+        match self.unit {
+            WatermarkUnit::NaiveMicros | WatermarkUnit::UtcMicros => i64::try_from(rewind_secs)
+                .unwrap_or(i64::MAX)
+                .saturating_mul(1_000_000),
+            WatermarkUnit::Days => i64::try_from(rewind_secs.div_ceil(86_400)).unwrap_or(i64::MAX),
+            WatermarkUnit::Int => 0,
+        }
+    }
+
     /// Render the observed maximum as the SQL literal the next run's filter
     /// will compare against. `None` when no non-NULL row was read, which
     /// correctly leaves the cursor where it was.
+    #[cfg(test)]
     fn render(&self) -> Option<String> {
-        let v = self.max.load(Ordering::Relaxed);
-        if v == i64::MIN {
+        self.render_rewound(0, None)
+    }
+
+    /// [`Self::render`], moved back by `rewind_secs` (whole days for a
+    /// `Date32` watermark, rounded up), but never below `floor`, the cursor
+    /// this run started from, when that parses in the tracker's own unit.
+    /// The floor never lifts the result above the observed maximum.
+    fn render_rewound(&self, rewind_secs: u64, floor: Option<&str>) -> Option<String> {
+        self.rewound(rewind_secs, floor)
+            .and_then(|v| self.render_value(v))
+    }
+
+    /// [`Self::render_rewound`] before it is rendered.
+    fn rewound(&self, rewind_secs: u64, floor: Option<&str>) -> Option<i64> {
+        let max = self.max.load(Ordering::Relaxed);
+        if max == i64::MIN {
             return None;
         }
+        let mut v = max;
+        if rewind_secs > 0 {
+            v = v.saturating_sub(self.rewind_step(rewind_secs));
+            if let Some(f) = floor.and_then(|f| self.unit.parse_floor(f)) {
+                v = v.max(f.min(max));
+            }
+        }
+        Some(v)
+    }
+
+    /// A cursor literal in the tracker's unit. `None` when it doesn't parse,
+    /// or carries a UTC offset where the unit has none (or the reverse).
+    fn parse(&self, cursor: &str) -> Option<i64> {
+        self.unit.parse(cursor)
+    }
+
+    fn render_value(&self, v: i64) -> Option<String> {
         match self.unit {
             WatermarkUnit::NaiveMicros => chrono::DateTime::from_timestamp_micros(v)
                 .map(|dt| dt.naive_utc().format("%Y-%m-%d %H:%M:%S%.6f").to_string()),
@@ -474,6 +632,7 @@ impl WatermarkTracker {
             }),
             WatermarkUnit::Days => chrono::DateTime::from_timestamp(v * 86_400, 0)
                 .map(|dt| dt.naive_utc().date().format("%Y-%m-%d").to_string()),
+            WatermarkUnit::Int => Some(v.to_string()),
         }
     }
 }
@@ -497,6 +656,32 @@ struct Warnings(Arc<Mutex<Vec<TransferWarning>>>);
 impl Warnings {
     fn push(&self, w: TransferWarning) {
         self.0.lock().unwrap().push(w);
+    }
+
+    /// The first collected warning of a kind in `kinds`, folded over its
+    /// `(kind, column)` as [`Self::drain`] folds it, without taking anything.
+    fn first_of(&self, kinds: &[WarningKind]) -> Option<TransferWarning> {
+        if kinds.is_empty() {
+            return None;
+        }
+        let raw = self.0.lock().unwrap();
+        let first = raw.iter().find(|w| kinds.contains(&w.kind))?;
+        let mut folded = first.clone();
+        folded.count = raw
+            .iter()
+            .filter(|w| w.kind == first.kind && w.column == first.column)
+            .map(|w| w.count)
+            .sum();
+        Some(folded)
+    }
+
+    /// Whether a warning of `kind` about `column` was already collected.
+    fn contains(&self, kind: WarningKind, column: Option<&str>) -> bool {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|w| w.kind == kind && w.column.as_deref() == column)
     }
 
     /// Take everything collected, folded per `(kind, column)` and ordered
@@ -526,6 +711,125 @@ impl Warnings {
         });
         folded
     }
+}
+
+/// Which `fail_on_warnings` checkpoint a run is at: what it has made
+/// permanent so far, which the error has to say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Before {
+    /// Anything is written.
+    Write,
+    /// A full refresh's swap.
+    Swap,
+    /// An incremental run's `MERGE` or insert-select from staging.
+    Merge,
+    /// The cursor is saved, with the rows already in the destination.
+    Cursor,
+    /// A `chunk_rows` chunk is committed.
+    Chunk,
+    /// A chunked run's cursor is saved, its chunks already committed.
+    CursorAfterChunks,
+    /// Nothing: a run that writes straight into the destination and keeps no
+    /// cursor it could leave unsaved (a frame), or one whose rows a later run
+    /// would only write again (append, which saves its cursor first).
+    Done,
+}
+
+impl Before {
+    fn describe(self) -> &'static str {
+        match self {
+            Before::Write => {
+                "Nothing was written to the destination, and the cursor was not saved."
+            }
+            Before::Swap => {
+                "The destination is untouched: the staged rows were dropped before the swap."
+            }
+            Before::Merge => {
+                "The destination is untouched (the staged rows were dropped before the merge), \
+                 and the cursor was not saved."
+            }
+            Before::Cursor => {
+                "The rows are already in the destination, but the cursor was not saved, so once \
+                 the cause is fixed the next run reads the same range again (a \
+                 ReplacingMergeTree or a MERGE converges on them)."
+            }
+            Before::Chunk => {
+                "This chunk was not committed: its cursor was not saved, so the next run resumes \
+                 at it (written straight into the destination, its rows are already there). \
+                 Earlier chunks are committed."
+            }
+            Before::CursorAfterChunks => {
+                "Every chunk is already in the destination with its resume marker saved, so the \
+                 next run carries on past them; only the cursor that finishes the run was not \
+                 saved."
+            }
+            Before::Done => {
+                "The rows are already in the destination, which this run writes straight into, \
+                 and its cursor (if it keeps one) is saved: reading them again would only write \
+                 them twice."
+            }
+        }
+    }
+}
+
+/// Fail the run if a warning kind `fail_on_warnings` names has been raised.
+///
+/// Called before every step that makes something permanent, because that is
+/// the only place the documented "fail on this warning" can mean anything: a
+/// caller raising after `sync()` returns gets one red run, while the cursor
+/// already saved sends the retry past the rows the warning was about.
+fn check_fatal_warnings(cfg: &TransferConfig, warnings: &Warnings, at: Before) -> Result<()> {
+    match warnings.first_of(&cfg.fail_on_warnings) {
+        Some(w) => Err(fatal_warning_error(&w, at, true)),
+        None => Ok(()),
+    }
+}
+
+/// [`check_fatal_warnings`] at a checkpoint of a run writing through `sink`,
+/// with what the writes themselves raised taken in first. A Storage Write
+/// stream that finalized with the wrong row count is fatal whatever
+/// `fail_on_warnings` says when its rows are about to be merged or swapped in:
+/// they are suspect, and still only in a staging table.
+fn check_fatal(
+    cfg: &TransferConfig,
+    sink: &dyn Sink,
+    warnings: &Warnings,
+    at: Before,
+) -> Result<()> {
+    for w in sink.take_write_warnings() {
+        warnings.push(w);
+    }
+    if matches!(at, Before::Swap | Before::Merge | Before::Chunk) {
+        if let Some(w) = warnings.first_of(&[WarningKind::StorageWriteCountMismatch]) {
+            return Err(fatal_warning_error(&w, at, false));
+        }
+    }
+    check_fatal_warnings(cfg, warnings, at)
+}
+
+/// The error a fatal warning stops the run with. `requested` says the caller
+/// named the kind in `fail_on_warnings`.
+fn fatal_warning_error(w: &TransferWarning, at: Before, requested: bool) -> EtlError {
+    let column = w
+        .column
+        .as_deref()
+        .map(|c| format!(" on column '{c}'"))
+        .unwrap_or_default();
+    // Carried over from the attempts before this one, it describes what they
+    // wrote, which stays where it is.
+    let state = if w.kind == WarningKind::RetriedAfterPartialWrite {
+        "This attempt has written nothing; what the failed attempts before it wrote stays in \
+         the destination."
+    } else {
+        at.describe()
+    };
+    EtlError::other(format!(
+        "{by}{kind}{column} (count {count}) stopped the run. {state} The warning: {message}",
+        by = if requested { "fail_on_warnings: " } else { "" },
+        kind = w.kind.as_str(),
+        count = w.count,
+        message = w.message,
+    ))
 }
 
 /// Await one item from a source stream, recording how long that took and
@@ -651,6 +955,10 @@ struct SendCtx {
     /// `Some` for a chunked read into a destination that merges staged
     /// incremental loads: each chunk then goes through its own staging table.
     chunk_stager: Option<Arc<ChunkStager>>,
+    /// `Some` when `target_table` is the destination itself: counts the rows
+    /// that land there, which a retried attempt writes again (see
+    /// [`run_transfer`]).
+    landed: Option<Arc<AtomicU64>>,
 }
 
 /// One partition's accumulator of decoded batches, so an insert carries a
@@ -671,10 +979,28 @@ struct SendCtx {
 struct InsertBuffer {
     batches: Vec<RecordBatch>,
     reservations: Vec<Reservation>,
+    /// Parallel to `batches`: each one's size, so [`Self::truncate`] can give
+    /// back exactly what it drops.
+    sizes: Vec<usize>,
     bytes: usize,
     /// Flush once the group reaches this many bytes of real Arrow memory
     /// (measured like `batch_bytes` and `max_memory_bytes`, not post-compression).
     target: usize,
+    /// How many times [`Self::take`] emptied the buffer: what tells a
+    /// [`BufferMark`] whether the batches it counted are still here.
+    takes: u64,
+    /// Don't ask to be sent when full: the owner sends between statements
+    /// instead ([`ReadOut::between_windows`]). Only memory pressure still
+    /// sends mid-statement, which [`SendCtx::push_batch`] needs to avoid a
+    /// deadlock.
+    deferred: bool,
+}
+
+/// A point in an [`InsertBuffer`] to roll back to: see [`InsertBuffer::truncate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BufferMark {
+    takes: u64,
+    len: usize,
 }
 
 impl InsertBuffer {
@@ -682,9 +1008,17 @@ impl InsertBuffer {
         InsertBuffer {
             batches: Vec::new(),
             reservations: Vec::new(),
+            sizes: Vec::new(),
             bytes: 0,
             target,
+            takes: 0,
+            deferred: false,
         }
+    }
+
+    /// Whether the buffer holds enough to be worth an insert.
+    fn full(&self) -> bool {
+        !self.batches.is_empty() && self.bytes >= self.target
     }
 
     fn is_empty(&self) -> bool {
@@ -695,17 +1029,96 @@ impl InsertBuffer {
     fn push(&mut self, batch: RecordBatch, reservation: Reservation, size: usize) -> bool {
         self.batches.push(batch);
         self.reservations.push(reservation);
+        self.sizes.push(size);
         self.bytes += size;
-        self.bytes >= self.target
+        !self.deferred && self.bytes >= self.target
     }
 
     /// Take everything buffered, leaving the buffer empty.
     fn take(&mut self) -> (Vec<RecordBatch>, Vec<Reservation>) {
         self.bytes = 0;
+        self.takes += 1;
+        self.sizes.clear();
         (
             std::mem::take(&mut self.batches),
             std::mem::take(&mut self.reservations),
         )
+    }
+
+    fn mark(&self) -> BufferMark {
+        BufferMark {
+            takes: self.takes,
+            len: self.batches.len(),
+        }
+    }
+
+    /// Drop everything buffered since `mark`, releasing its memory: the rows
+    /// of a window that failed and is read again. When the buffer was sent
+    /// since, everything in it now came after `mark`. What was sent can't be
+    /// taken back, which is no different from a window with a buffer of its
+    /// own.
+    fn truncate(&mut self, mark: BufferMark) {
+        let keep = if mark.takes == self.takes {
+            mark.len.min(self.batches.len())
+        } else {
+            0
+        };
+        self.batches.truncate(keep);
+        self.reservations.truncate(keep);
+        self.sizes.truncate(keep);
+        self.bytes = self.sizes.iter().sum();
+    }
+}
+
+/// Where one source statement's rows go, and the connection it reads on.
+///
+/// A partition read in one pass has its own. A windowed sweep shares one
+/// across all its windows: before, each window opened its own connection (a
+/// TLS handshake against a remote source) and flushed its own buffer, so a
+/// sweep of N windows cost N connections and N inserts, which on ClickHouse
+/// is N new parts for merges to clean up even when the windows return a
+/// handful of rows between them (measured: 18 parts and 20 MySQL connections
+/// for a sweep a single pass did with 2 and 4). The buffer now flushes on its
+/// usual size limit only, and the connection is replaced only after a window
+/// fails.
+struct ReadOut<C> {
+    conn: Option<C>,
+    sends: JoinSet<Result<()>>,
+    insert_buf: InsertBuffer,
+    /// The decoded schema, once a statement has run: what the final flush
+    /// sends under.
+    schema: Option<SchemaRef>,
+}
+
+impl<C> ReadOut<C> {
+    fn new(cfg: &TransferConfig) -> Self {
+        ReadOut {
+            conn: None,
+            sends: JoinSet::new(),
+            insert_buf: InsertBuffer::new(cfg.insert_bytes),
+            schema: None,
+        }
+    }
+
+    /// Between two windows of a sweep: send the buffer if it is full, and
+    /// surface an insert that failed, rather than at the end of the sweep.
+    async fn between_windows(&mut self, ctx: &SendCtx) -> Result<()> {
+        if self.insert_buf.full() {
+            if let Some(schema) = self.schema.clone() {
+                ctx.flush(&mut self.sends, &mut self.insert_buf, schema)
+                    .await;
+            }
+        }
+        reap(&mut self.sends, false).await
+    }
+
+    /// Send what is still buffered and wait for every insert to land.
+    async fn finish(mut self, ctx: &SendCtx) -> Result<()> {
+        if let Some(schema) = self.schema.take() {
+            ctx.flush(&mut self.sends, &mut self.insert_buf, schema)
+                .await;
+        }
+        reap(&mut self.sends, true).await
     }
 }
 
@@ -719,8 +1132,21 @@ impl SendCtx {
         let table = stager.open().await?;
         Ok(SendCtx {
             target_table: Arc::new(table),
+            // Staged: the chunk lands when the stager commits it.
+            landed: None,
             ..self.clone()
         })
+    }
+
+    /// A chunk's cursor is committed: what landed up to here isn't written
+    /// again by a retry, which resumes past it, so it stops counting.
+    fn chunk_committed(&self) {
+        if let Some(landed) = &self.landed {
+            landed.store(0, Ordering::Relaxed);
+        }
+        if let Some(landed) = self.chunk_stager.as_ref().and_then(|s| s.landed.as_ref()) {
+            landed.store(0, Ordering::Relaxed);
+        }
     }
 
     /// Land a chunk written through `chunk` (from [`Self::begin_chunk`]) in
@@ -794,6 +1220,9 @@ impl SendCtx {
             ctx.counters
                 .bytes_written
                 .fetch_add(bytes, Ordering::Relaxed);
+            if let Some(landed) = &ctx.landed {
+                landed.fetch_add(rows, Ordering::Relaxed);
+            }
             // Progress fires on *completion*, so rows_written reflects rows
             // actually landed in the destination, not merely decoded.
             emit_progress(&ctx.counters, &ctx.progress, ctx.started);
@@ -962,6 +1391,10 @@ fn join_result(res: std::result::Result<Result<()>, tokio::task::JoinError>) -> 
 struct SourceSetup {
     source_cols: Vec<ColumnType>,
     snapshot_max: Option<String>,
+    /// `snapshot_max` is `source_table`'s own, unfiltered MAX rather than
+    /// `source_query`'s: see [`table_max_eligible`]. The read is bounded by
+    /// it, and the cursor saved is the largest watermark the read returned.
+    max_from_table: bool,
     partitions: Vec<Partition>,
     /// The `MAX(watermark)` probe was too costly to run, so this run reads with
     /// no frozen upper bound and takes its cursor from the stream instead. See
@@ -977,6 +1410,17 @@ struct SourceSetup {
     /// (every `source_query` column does) but the query proves it NOT NULL
     /// (see `PgSource::result_column_not_null`).
     keyset_not_null: bool,
+    /// The connection setup probed on, for the checks that need the cursor.
+    control: Option<ControlConn>,
+}
+
+/// The connection setup probes the source on, kept for the checks that run
+/// once the cursor is known (the lower-bound guard, the cursor-ahead check)
+/// so they don't each open their own: a connection is a TLS handshake over a
+/// WAN. Dropped before the read starts.
+enum ControlConn {
+    Postgres(tokio_postgres::Client),
+    MySql(mysql_async::Conn),
 }
 
 /// Run one table transfer end to end.
@@ -1002,10 +1446,17 @@ pub async fn run_transfer(
         cfg.dest_table
     );
     let max_attempts = cfg.retry_max_attempts.max(1);
+    let landed = Arc::new(AtomicU64::new(0));
+    let first_started = Instant::now();
     if max_attempts <= 1 {
         // Fast path: byte-identical to the pre-retry behavior — one call, one
         // context wrap, no clones.
-        return run_transfer_attempt(source_cfg, dest, cfg, progress, on_staged)
+        let attempt = Attempt {
+            landed,
+            carried: vec![],
+            first_started,
+        };
+        return run_transfer_attempt(source_cfg, dest, cfg, progress, on_staged, attempt)
             .await
             .map_err(|e| e.context(table_context));
     }
@@ -1014,29 +1465,72 @@ pub async fn run_transfer(
     // success), so a full refresh stays atomic and an incremental run re-reads
     // the same window rather than skipping rows. Sink/write blips are retried
     // separately at the insert layer, so those never re-read the source here.
+    //
+    // What a failed attempt already wrote into the destination is written
+    // again, so it is counted, and the attempts after it carry a
+    // `retried_after_partial_write` warning (one a `fail_on_warnings` can stop
+    // them on).
     let mut attempt = 1u32;
+    let mut partial = 0u64;
+    let mut carried = Vec::new();
     loop {
+        landed.store(0, Ordering::Relaxed);
         let result = run_transfer_attempt(
             source_cfg.clone(),
             dest.clone(),
             cfg.clone(),
             progress.clone(),
             on_staged.clone(),
+            Attempt {
+                landed: landed.clone(),
+                carried: carried.clone(),
+                first_started,
+            },
         )
         .await;
         match result {
-            Ok(r) => return Ok(r),
+            Ok(mut r) => {
+                r.rows_written_failed_attempts = partial;
+                return Ok(r);
+            }
             Err(e) if attempt < max_attempts && e.is_transient_source() => {
                 let delay = crate::sink::backoff_delay(attempt);
                 tracing::warn!(
                     "{table_context}: attempt {attempt}/{max_attempts} failed with a transient \
                      source error ({e}); retrying the whole transfer in {delay:?}"
                 );
+                let written = landed.load(Ordering::Relaxed);
+                if written > 0 {
+                    partial += written;
+                    carried = vec![partial_write_warning(&cfg, attempt, partial)];
+                }
                 tokio::time::sleep(delay).await;
                 attempt += 1;
             }
             Err(e) => return Err(e.context(table_context)),
         }
+    }
+}
+
+/// `retried_after_partial_write`: attempts up to `attempt` failed after
+/// writing `rows` rows into the destination, and the retry writes them again.
+fn partial_write_warning(cfg: &TransferConfig, attempt: u32, rows: u64) -> TransferWarning {
+    let message = format!(
+        "attempt {attempt} of the transfer into '{dest}' failed after writing {rows} row(s) \
+         into it, and retry_max_attempts runs the transfer again from the start, so those rows \
+         are written a second time. A ReplacingMergeTree collapses the copies at its next \
+         merge (count() runs high until then); an engine that keeps duplicates keeps them. \
+         Retries stage each attempt instead for a ClickHouse MergeTree that keeps duplicates, \
+         or set chunk_rows to resume rather than restart.",
+        dest = cfg.dest_table,
+    );
+    tracing::warn!("{message}");
+    TransferWarning {
+        kind: WarningKind::RetriedAfterPartialWrite,
+        column: None,
+        count: rows,
+        sample: None,
+        message,
     }
 }
 
@@ -1050,13 +1544,29 @@ async fn run_transfer_attempt(
     cfg: TransferConfig,
     progress: Option<ProgressCb>,
     on_staged: Option<StagedValidationCb>,
+    attempt: Attempt,
 ) -> Result<TransferResult> {
     let uploads = ArchiveUploads::default();
-    let result = run_transfer_impl(source_cfg, dest, cfg, progress, on_staged, &uploads).await;
+    let result = run_transfer_impl(
+        source_cfg, dest, cfg, progress, on_staged, &uploads, attempt,
+    )
+    .await;
     if result.is_err() {
         uploads.abort_unfinished().await;
     }
     result
+}
+
+/// What one attempt of [`run_transfer`] shares with the others.
+struct Attempt {
+    /// Counts the rows this attempt writes into the destination itself (not a
+    /// staging table).
+    landed: Arc<AtomicU64>,
+    /// Warnings from the attempts before it.
+    carried: Vec<TransferWarning>,
+    /// When the first attempt started, which a chunked read's resume markers
+    /// count from: see [`ChunkPlan::marker_upper`].
+    first_started: Instant,
 }
 
 async fn run_transfer_impl(
@@ -1066,7 +1576,13 @@ async fn run_transfer_impl(
     progress: Option<ProgressCb>,
     on_staged: Option<StagedValidationCb>,
     uploads: &ArchiveUploads,
+    attempt: Attempt,
 ) -> Result<TransferResult> {
+    let Attempt {
+        landed,
+        carried,
+        first_started,
+    } = attempt;
     // Every source (Postgres, MySQL, BigQuery — directly or via reqwest/tonic's
     // own rustls-based transport) eventually needs a process-wide rustls
     // CryptoProvider selected. With both "ring" (this crate's explicit
@@ -1108,8 +1624,12 @@ async fn run_transfer_impl(
     let started = Instant::now();
     // One collector for the whole attempt. `run_transfer`'s retry loop calls
     // this function afresh per attempt, so a run that eventually succeeds
-    // reports only the successful attempt's warnings.
+    // reports only the successful attempt's warnings, plus what the retry loop
+    // carries over from the failed ones.
     let warnings = Warnings::default();
+    for w in carried {
+        warnings.push(w);
+    }
 
     // A backup configured on the source descriptor is a backup that never
     // happens: `archive` is read off the destination only. Warn rather than
@@ -1180,6 +1700,7 @@ async fn run_transfer_impl(
             archive_info,
             staging,
             warnings,
+            landed,
         )
         .await;
     }
@@ -1261,9 +1782,25 @@ async fn run_transfer_impl(
     // The same is true of a window-scoped delete on a destination whose upsert
     // cannot express one inline: the delete subtracts the staged keys, so it
     // needs the batch materialised in a table before any of it lands.
+    // So is a run whose retries would duplicate what a failed attempt wrote
+    // (see `Sink::stage_for_retries`): each attempt then writes its own
+    // staging table, dropped when it fails.
+    let stage_for_retries = cfg.mode == SyncMode::Incremental
+        && cfg.retry_max_attempts > 1
+        && !sink.requires_staging_for_incremental()
+        && sink.stage_for_retries(&cfg.dest_table, &cfg).await?;
+    if stage_for_retries {
+        tracing::info!(
+            "'{}' keeps duplicate rows, so with retry_max_attempts={} each attempt is staged and \
+             moved into it at the end: a failed attempt leaves nothing behind",
+            cfg.dest_table,
+            cfg.retry_max_attempts
+        );
+    }
     let force_stage_incremental = cfg.mode == SyncMode::Incremental
         && !sink.requires_staging_for_incremental()
         && (on_staged.is_some()
+            || stage_for_retries
             || (cfg.delete_stale_in_window && !sink.deletes_stale_within_merge()));
     if cfg.delete_stale_in_window && !sink.supports_row_delete() {
         return Err(EtlError::config(
@@ -1291,6 +1828,29 @@ async fn run_transfer_impl(
     let base_query = cfg.source_query.clone();
     let watermark = cfg.watermark.clone();
 
+    // The committed cursor from the last fully-successful run (None on a first
+    // run), and an in-progress chunk-resume marker (frozen upper + last durable
+    // cursor; chunked reads only, and only if a prior run was cut short). Read
+    // before the source is probed, because the probes can use the cursor: see
+    // `partitions_above` and `watermark_bounds_the_key`.
+    let (committed, resume) = if cfg.mode == SyncMode::Incremental {
+        let committed = sink.read_last_watermark(&cfg).await?;
+        let resume = if cfg.chunk_rows.is_some() {
+            sink.read_chunk_state(&cfg).await?
+        } else {
+            None
+        };
+        (committed, resume)
+    } else {
+        (None, None)
+    };
+    // The lower bound the read starts from, where it is known before the MAX
+    // probe: a `skip_to_max` seed is the MAX itself.
+    let cursor_hint = committed.clone().or_else(|| match &cfg.seed_watermark {
+        WatermarkSeed::Value(v) => Some(v.clone()),
+        _ => None,
+    });
+
     // --- Resolve source schema, incremental snapshot max, and partitions,
     // all on one control connection. ---
     let setup = match source.as_ref() {
@@ -1301,6 +1861,7 @@ async fn run_transfer_impl(
                 base_table.as_deref(),
                 base_query.as_deref(),
                 watermark.as_deref(),
+                cursor_hint.as_deref(),
                 &warnings,
             )
             .await?
@@ -1312,6 +1873,7 @@ async fn run_transfer_impl(
                 base_table.as_deref(),
                 base_query.as_deref(),
                 watermark.as_deref(),
+                cursor_hint.as_deref(),
                 &warnings,
             )
             .await?
@@ -1333,12 +1895,14 @@ async fn run_transfer_impl(
     };
     let SourceSetup {
         source_cols,
-        snapshot_max,
+        mut snapshot_max,
+        mut max_from_table,
         partitions,
         stream_max_cursor,
         window: window_plan,
         watermark_type,
         keyset_not_null,
+        mut control,
     } = setup;
     tracing::info!(
         "resolved {} source column(s); computed {} partition(s) for parallel read",
@@ -1428,13 +1992,32 @@ async fn run_transfer_impl(
             )));
         }
     }
-    let watermark_tracker = match (stream_max_cursor, cfg.watermark.as_deref()) {
+    let watermark_tracker = match (
+        stream_max_cursor || max_from_table,
+        cfg.watermark.as_deref(),
+    ) {
         (true, Some(w)) => {
-            let utc_offset = matches!(source.as_ref(), Source::Postgres(_));
+            // PostgreSQL parses a `+00` cursor, and a `timestamptz` cursor
+            // needs one whatever its destination type: see `WatermarkUnit::of`.
+            let utc_offset = matches!(source.as_ref(), Source::Postgres(_))
+                && watermark_pg_is_tz_aware(w, &source_cols);
             WatermarkTracker::new(w, &plan, utc_offset).map(Arc::new)
         }
         _ => None,
     };
+    if max_from_table && watermark_tracker.is_none() {
+        // The watermark can't be folded from the rows read (left out of the
+        // projection, or overridden to a type with no order to fold), and the
+        // table's MAX is no cursor: a row the filter excludes could carry it
+        // past rows not read yet. Probe source_query's own MAX instead.
+        tracing::info!(
+            "watermark '{}' can't be folded from the rows read, so source_query's own MAX is \
+             probed for the cursor instead of source_table's",
+            cfg.watermark.as_deref().unwrap_or("?")
+        );
+        snapshot_max = query_max_watermark(source.as_ref(), control.as_mut(), &cfg).await?;
+        max_from_table = false;
+    }
     if stream_max_cursor && watermark_tracker.is_none() {
         // Nothing can fold this watermark into a cursor (excluded from the
         // projection, or a type with no orderable Arrow representation). The
@@ -1448,22 +2031,15 @@ async fn run_transfer_impl(
         )));
     }
 
-    // --- Incremental: read watermark state, build the "since last run" filter,
-    // and (for chunked reads) the keyset resume plan. ---
+    // --- Incremental: build the "since last run" filter from the watermark
+    // state read above, and (for chunked reads) the keyset resume plan. ---
+    let mut cursor_plan = CursorPlan::default();
     let (extra_filter, mut new_watermark, chunk_plan, cursor_check) = if cfg.mode
         == SyncMode::Incremental
     {
         let watermark = cfg.watermark.as_ref().unwrap();
-        // The committed cursor from the last fully-successful run (None first run).
-        let committed = sink.read_last_watermark(&cfg).await?;
-        // An in-progress chunk-resume marker (frozen upper + last durable
-        // cursor), only for chunked reads and only if a prior run was cut short.
-        let resume = if cfg.chunk_rows.is_some() {
-            sink.read_chunk_state(&cfg).await?
-        } else {
-            None
-        };
         let (pinned_upper, start_cursor) = resume_bounds(resume.as_ref());
+        cursor_plan.pinned = pinned_upper.is_some();
         // Resume freezes the upper bound to the interrupted run's snapshot so it
         // reads the same window; a fresh run uses the live source MAX. (For a
         // non-chunked run `pinned_upper` is always None, so this == snapshot_max
@@ -1488,13 +2064,25 @@ async fn run_transfer_impl(
             && stream_max_cursor
         {
             return Err(EtlError::config(format!(
-                "seed_watermark=skip_to_max on '{watermark}' needs the source's current MAX, but                  the MAX(watermark) probe was skipped as too costly (see the unindexed_watermark                  warning above). Reading with no seed would run the full-table first pull                  skip_to_max exists to avoid, so this run is refused instead. Add an index on                  '{watermark}', or set probe_max_cost=0 to pay for one MAX probe regardless of                  estimated cost."
+                "seed_watermark=skip_to_max on '{watermark}' needs the source's current MAX, but \
+                 the MAX(watermark) probe was skipped as too costly (see the unindexed_watermark \
+                 warning above). Reading with no seed would run the full-table first pull \
+                 skip_to_max exists to avoid, so this run is refused instead. Add an index on \
+                 '{watermark}', or set probe_max_cost=0 to pay for one MAX probe regardless of \
+                 estimated cost."
             )));
         }
         // First run only: seed the lower bound.
         let last = committed
             .clone()
             .or_else(|| seed_value(&cfg.seed_watermark, effective_upper.as_deref()));
+        cursor_plan.seeded = committed.is_none();
+        cursor_plan.keep_committed = resume.is_some() && !cursor_plan.pinned && committed.is_some();
+        cursor_plan.floor = cursor_floor(
+            committed.as_deref(),
+            last.as_deref(),
+            watermark_tracker.as_deref(),
+        );
         tracing::info!(
             "incremental watermark on '{}': committed={:?}, upper={:?}, resuming={}",
             watermark,
@@ -1541,6 +2129,21 @@ async fn run_transfer_impl(
                 unreachable!("BigQuery is handled via the early return in run_transfer")
             }
         };
+        // A first read whose cursor comes from the rows read has no bound
+        // at all, so it reads rows whose watermark is NULL too. Resumed,
+        // it is held to its marker's bound, which no NULL is under: read
+        // them all the same, as the read it finishes would have.
+        let filter = match filter {
+            Some(f) if last.is_none() && cursor_plan.pinned && stream_max_cursor => {
+                let col = match (source_expr, source.as_ref()) {
+                    (Some(e), _) => e.to_string(),
+                    (None, Source::MySql(_)) => quote_my(watermark),
+                    (None, _) => format!("\"{}\"", watermark.replace('"', "\"\"")),
+                };
+                Some(format!("({f} OR {col} IS NULL)"))
+            }
+            other => other,
+        };
         if let Some(l) = last.as_deref() {
             let bound = lower_bound_sql(
                 source.as_ref(),
@@ -1550,8 +2153,15 @@ async fn run_transfer_impl(
                 &source_cols,
                 watermark_type.as_deref(),
             );
-            ensure_lower_bound_not_null(source.as_ref(), &bound, &cfg, l, committed.is_some())
-                .await?;
+            ensure_lower_bound_not_null(
+                source.as_ref(),
+                control.as_mut(),
+                &bound,
+                &cfg,
+                l,
+                committed.is_some(),
+            )
+            .await?;
         }
         // Only a fresh probe describes the source now: a chunk resume reads up
         // to the interrupted run's frozen bound, and a stream-derived cursor
@@ -1562,26 +2172,71 @@ async fn run_transfer_impl(
             }
             _ => None,
         };
-        if let Some(c) = &cursor_check {
-            c.warn_if_cursor_ahead(&cfg, &warnings);
+        if let Some(c) = cursor_check.as_ref().filter(|c| c.cursor_ahead) {
+            // A MAX from the table itself is unfiltered already.
+            let verdict = if cfg.source_query.is_some() && !max_from_table {
+                judge_cursor_ahead_of_query(
+                    source.as_ref(),
+                    control.as_mut(),
+                    &cfg,
+                    c,
+                    &source_cols,
+                )
+                .await
+            } else {
+                CursorAhead::Real
+            };
+            cursor_plan.rewind_to_max = verdict == CursorAhead::Real;
+            match verdict {
+                CursorAhead::Real => c.warn_if_cursor_ahead(&cfg, None, &warnings),
+                CursorAhead::WithinTable => {}
+                CursorAhead::Unexplained(why) => {
+                    c.warn_if_cursor_ahead(&cfg, Some(&why), &warnings)
+                }
+            }
         }
         let chunk_plan = match cfg.chunk_rows {
-            Some(limit) => Some(build_chunk_plan(
-                &cfg,
-                &plan,
-                &source_cols,
-                limit,
-                committed,
-                effective_upper.clone(),
-                start_cursor,
-                keyset_not_null,
-            )?),
+            Some(limit) => {
+                let mut chunk = build_chunk_plan(
+                    &cfg,
+                    &plan,
+                    &source_cols,
+                    limit,
+                    committed,
+                    effective_upper.clone(),
+                    start_cursor,
+                    keyset_not_null,
+                )?;
+                chunk.marker = if cursor_plan.keep_committed {
+                    MarkerBound::Unbounded
+                } else if chunk.effective_upper.is_some() {
+                    MarkerBound::Frozen
+                } else {
+                    MarkerBound::Stream {
+                        started: first_started,
+                        floor: cursor_plan.floor.clone(),
+                        best: Arc::new(AtomicI64::new(i64::MIN)),
+                    }
+                };
+                Some(chunk)
+            }
             None => None,
         };
+        cursor_plan.last = last;
         (filter, effective_upper, chunk_plan, cursor_check)
     } else {
         (None, None, None, None)
     };
+    // The checks that needed the setup connection are done; don't hold it open
+    // through the read.
+    drop(control);
+    // A read of several statements (windows, partitions, chunks) sees no single
+    // snapshot, so a stream-derived cursor has to allow for how long it took.
+    let read_spans_statements =
+        window_plan.is_some() || partitions.len() > 1 || chunk_plan.is_some();
+    // Setup raised its warnings already: one that is fatal stops the run here,
+    // before any table is created or written.
+    check_fatal(&cfg, sink.as_ref(), &warnings, Before::Write)?;
 
     // --- Ensure destination / staging tables exist. ---
     let target_table = prepare_target(
@@ -1612,6 +2267,7 @@ async fn run_transfer_impl(
             warnings: warnings.clone(),
             next: AtomicU64::new(0),
             open: Mutex::new(None),
+            landed: (!sink.requires_staging_for_incremental()).then(|| landed.clone()),
         })
     });
     let cleanup_stager = chunk_stager.clone();
@@ -1653,6 +2309,7 @@ async fn run_transfer_impl(
             warnings: warnings.clone(),
             watermark_max: watermark_tracker.clone(),
             chunk_stager,
+            landed: (!used_staging).then(|| landed.clone()),
         };
         let stage_started = Instant::now();
 
@@ -1746,6 +2403,7 @@ async fn run_transfer_impl(
                 &warnings,
             )
             .await?;
+            check_fatal(&cfg, sink.as_ref(), &warnings, Before::Swap)?;
             tracing::info!("swapping staging table into '{}'", cfg.dest_table);
             sink.atomic_swap(&cfg.dest_table, &staging, &plan.dest_columns).await?;
             sink.drop_table(&staging).await?;
@@ -1755,12 +2413,31 @@ async fn run_transfer_impl(
         // insert-select for a gated ClickHouse run; direct-insert runs did not
         // stage and have nothing to promote), then persist the new watermark. ---
         let mut rows_deleted = 0u64;
+        let rows_read = counters.rows_read.load(Ordering::Relaxed);
         if cfg.mode == SyncMode::Incremental {
+            // Before the promotion, so a fail_on_warnings that names it stops
+            // the MERGE too.
+            let watermark_read = match &watermark_tracker {
+                Some(t) => t.seen(),
+                // A MAX-bounded read takes the MAX as its cursor, and that MAX
+                // is NULL exactly when no row holds a watermark.
+                None => new_watermark.is_some(),
+            };
+            if rows_read == 0 {
+                if new_watermark.is_none() {
+                    tracing::info!("no rows read, so no watermark to advance to (cursor unchanged)");
+                }
+            } else if !watermark_read && cursor_plan.last.is_none() && !cursor_plan.pinned {
+                // With a lower bound the read can't return a NULL watermark; a
+                // value decoded to NULL is a coerced_date of its own.
+                warn_on_unwatermarked_read(&cfg, rows_read, &warnings);
+            }
             if staged_per_chunk {
                 // Every chunk was merged as it was read; only the empty
                 // template its tables were cloned from is left.
                 sink.drop_table(&staging).await?;
             } else if used_staging {
+                check_fatal(&cfg, sink.as_ref(), &warnings, Before::Merge)?;
                 rows_deleted = promote_staged_incremental(
                     sink.as_ref(),
                     &cfg.dest_table,
@@ -1777,24 +2454,88 @@ async fn run_transfer_impl(
                     &warnings,
                 )
                 .await?;
+                // A MERGE run again upserts the same keys: nothing to count.
+                if !sink.requires_staging_for_incremental() {
+                    landed.fetch_add(counters.rows_written.load(Ordering::Relaxed), Ordering::Relaxed);
+                }
             }
             // With no frozen upper bound, the cursor is the largest watermark
             // this run actually read. `None` means no non-NULL row was read, so
             // the cursor correctly stays where it was. Assigned to the outer
             // binding, not shadowed, so `TransferResult::new_watermark` reports
             // the value that was actually persisted.
-            if let Some(t) = &watermark_tracker {
-                new_watermark = t.render();
-                match &new_watermark {
-                    Some(w) => tracing::info!("watermark taken from the read stream: {w}"),
-                    None => tracing::info!(
-                        "no rows read, so no watermark to advance to (cursor unchanged)"
-                    ),
+            // A read of several statements can outlast the lookback: see
+            // `stream_cursor_rewind_secs`.
+            let rewind = if read_spans_statements {
+                stream_cursor_rewind_secs(stage_secs, cfg.lookback_seconds)
+            } else {
+                0
+            };
+            // A resumed chunked read saw only the chunks after its marker, so
+            // its cursor isn't taken from what it read: a row in an earlier
+            // chunk that changed since would sit below it (see `MarkerBound`).
+            if cursor_plan.pinned {
+                // The bound the marker froze, which held the read, and is in
+                // `new_watermark` already.
+                tracing::info!(
+                    "resumed a chunked read: the cursor is the bound its marker recorded, {:?}",
+                    new_watermark
+                );
+            } else if cursor_plan.keep_committed {
+                new_watermark = None;
+                tracing::info!(
+                    "resumed a chunked read whose marker recorded no upper bound (written by \
+                     0.20.6, say): the committed cursor is kept, and the next run reads every \
+                     row changed since"
+                );
+            } else if let (Some(t), true) = (&watermark_tracker, max_from_table) {
+                // Bounded by the table's MAX, the cursor is what the read
+                // actually returned under it: see `table_max_eligible`. A
+                // cursor that was really ahead of the table is moved back to
+                // that MAX instead, as through a query. The rewind is a
+                // margin here: the bound already keeps out rows changed
+                // mid-read, unless source_query converts the watermark.
+                if !cursor_plan.rewind_to_max {
+                    new_watermark = t
+                        .advance_from(cursor_plan.floor.as_deref(), rewind)
+                        .or_else(|| {
+                            // A seed is kept, as a first run's MAX would have been.
+                            cursor_plan.seeded.then(|| cursor_plan.last.clone()).flatten()
+                        });
+                    tracing::info!(
+                        "watermark taken from the rows read under source_table's MAX: {:?}",
+                        new_watermark
+                    );
+                }
+            } else if let Some(t) = &watermark_tracker {
+                new_watermark = t.render_rewound(rewind, cursor_plan.floor.as_deref());
+                if let Some(w) = &new_watermark {
+                    if rewind > 0 {
+                        tracing::info!(
+                            "watermark taken from the read stream: {w}, moved back {rewind}s \
+                             because the read took {stage_secs:.0}s, longer than \
+                             lookback_seconds={}, so rows changed in a window already read are \
+                             read again next run",
+                            cfg.lookback_seconds
+                        );
+                    } else {
+                        tracing::info!("watermark taken from the read stream: {w}");
+                    }
                 }
             }
-            if let Some(c) = &cursor_check {
-                c.warn_if_not_advanced(&cfg, counters.rows_read.load(Ordering::Relaxed), &warnings);
+            // The table's own MAX can sit above every row source_query returns,
+            // so a read of nothing contradicts nothing there.
+            if let Some(c) = cursor_check.as_ref().filter(|_| !max_from_table) {
+                c.warn_if_not_advanced(&cfg, rows_read, &warnings);
             }
+            // Last stop before the cursor moves, after every warning the read
+            // and the promotion raise.
+            let at = if chunk_plan.is_some() {
+                Before::CursorAfterChunks
+            } else {
+                Before::Cursor
+            };
+            check_fatal(&cfg, sink.as_ref(), &warnings, at)?;
             if let Some(w) = &new_watermark {
                 if cfg.advance_watermark {
                     tracing::info!("persisting new watermark: {w}");
@@ -1842,6 +2583,7 @@ async fn run_transfer_impl(
             promote_secs: promote_started.elapsed().as_secs_f64(),
             new_watermark,
             warnings: warnings.drain(),
+            rows_written_failed_attempts: 0,
         })
     }
     .await;
@@ -1872,6 +2614,9 @@ async fn run_transfer_bigquery(
     archive_info: Option<Arc<ArchiveRunInfo>>,
     staging: String,
     warnings: Warnings,
+    // See `Attempt::landed`: a stalled read (read_idle_timeout_secs) is
+    // retried like a database source's transient error.
+    landed: Arc<AtomicU64>,
 ) -> Result<TransferResult> {
     // column_transforms are injected into the SQL SELECT built for the
     // Postgres/MySQL COPY path; the BigQuery Storage Read API reads bare
@@ -1967,8 +2712,14 @@ async fn run_transfer_bigquery(
             }
             _ => None,
         };
+        // source_table wins over source_query here, so a MAX through the
+        // query has no unfiltered table to be checked against: see
+        // `judge_cursor_ahead_of_query`.
         if let Some(c) = &cursor_check {
-            c.warn_if_cursor_ahead(&cfg, &warnings);
+            let through_query = cfg.source_table.is_none() && cfg.source_query.is_some();
+            let why = "A BigQuery source reads source_query alone, so there is no \
+                           unfiltered table to check it against.";
+            c.warn_if_cursor_ahead(&cfg, through_query.then_some(why), &warnings);
         }
         (filter, snapshot_max, cursor_check)
     } else {
@@ -1981,9 +2732,16 @@ async fn run_transfer_bigquery(
     // The same is true of a window-scoped delete on a destination whose upsert
     // cannot express one inline: the delete subtracts the staged keys, so it
     // needs the batch materialised in a table before any of it lands.
+    // Staged per attempt for a destination a retry would duplicate rows in,
+    // as in the database flow (see `Sink::stage_for_retries`).
+    let stage_for_retries = cfg.mode == SyncMode::Incremental
+        && cfg.retry_max_attempts > 1
+        && !sink.requires_staging_for_incremental()
+        && sink.stage_for_retries(&cfg.dest_table, &cfg).await?;
     let force_stage_incremental = cfg.mode == SyncMode::Incremental
         && !sink.requires_staging_for_incremental()
         && (on_staged.is_some()
+            || stage_for_retries
             || (cfg.delete_stale_in_window && !sink.deletes_stale_within_merge()));
     if cfg.delete_stale_in_window && !sink.supports_row_delete() {
         return Err(EtlError::config(
@@ -1992,6 +2750,7 @@ async fn run_transfer_bigquery(
         ));
     }
 
+    check_fatal(&cfg, sink.as_ref(), &warnings, Before::Write)?;
     let target_table = prepare_target(
         &sink,
         &cfg,
@@ -2029,6 +2788,7 @@ async fn run_transfer_bigquery(
             warnings: warnings.clone(),
             watermark_max: None,
             chunk_stager: None,
+            landed: (!used_staging).then(|| landed.clone()),
         };
         let stage_started = Instant::now();
 
@@ -2106,6 +2866,7 @@ async fn run_transfer_bigquery(
                 &warnings,
             )
             .await?;
+            check_fatal(&cfg, sink.as_ref(), &warnings, Before::Swap)?;
             tracing::info!("swapping staging table into '{}'", cfg.dest_table);
             sink.atomic_swap(&cfg.dest_table, &staging, &plan.dest_columns).await?;
             sink.drop_table(&staging).await?;
@@ -2113,6 +2874,7 @@ async fn run_transfer_bigquery(
         let mut rows_deleted = 0u64;
         if cfg.mode == SyncMode::Incremental {
             if used_staging {
+                check_fatal(&cfg, sink.as_ref(), &warnings, Before::Merge)?;
                 rows_deleted = promote_staged_incremental(
                     sink.as_ref(),
                     &cfg.dest_table,
@@ -2129,10 +2891,19 @@ async fn run_transfer_bigquery(
                     &warnings,
                 )
                 .await?;
+                // A MERGE run again upserts the same keys: nothing to count.
+                if !sink.requires_staging_for_incremental() {
+                    landed.fetch_add(counters.rows_written.load(Ordering::Relaxed), Ordering::Relaxed);
+                }
+            }
+            let rows_read = counters.rows_read.load(Ordering::Relaxed);
+            if new_watermark.is_none() && rows_read > 0 {
+                warn_on_unwatermarked_read(&cfg, rows_read, &warnings);
             }
             if let Some(c) = &cursor_check {
-                c.warn_if_not_advanced(&cfg, counters.rows_read.load(Ordering::Relaxed), &warnings);
+                c.warn_if_not_advanced(&cfg, rows_read, &warnings);
             }
+            check_fatal(&cfg, sink.as_ref(), &warnings, Before::Cursor)?;
             if let Some(w) = &new_watermark {
                 if cfg.advance_watermark {
                     tracing::info!("persisting new watermark: {w}");
@@ -2164,6 +2935,7 @@ async fn run_transfer_bigquery(
             promote_secs: promote_started.elapsed().as_secs_f64(),
             new_watermark,
             warnings: warnings.drain(),
+            rows_written_failed_attempts: 0,
         })
     }
     .await;
@@ -2468,6 +3240,7 @@ async fn run_transfer_api(
         ));
     }
 
+    check_fatal(&cfg, sink.as_ref(), &warnings, Before::Write)?;
     let target_table = prepare_target(
         &sink,
         &cfg,
@@ -2499,6 +3272,7 @@ async fn run_transfer_api(
             warnings: warnings.clone(),
             watermark_max: None,
             chunk_stager: None,
+            landed: None,
         };
         let stage_started = Instant::now();
         let mut batcher = ApiBatcher::new(&plan.dest_columns, &lookups, cfg.batch_rows, cfg.batch_bytes)?;
@@ -2736,6 +3510,7 @@ async fn run_transfer_api(
                 &warnings,
             )
             .await?;
+            check_fatal(&cfg, sink.as_ref(), &warnings, Before::Swap)?;
             tracing::info!("swapping staging table into '{}'", cfg.dest_table);
             sink.atomic_swap(&cfg.dest_table, &staging, &plan.dest_columns).await?;
             sink.drop_table(&staging).await?;
@@ -2743,6 +3518,7 @@ async fn run_transfer_api(
         let mut rows_deleted = 0u64;
         if cfg.mode == SyncMode::Incremental {
             if used_staging {
+                check_fatal(&cfg, sink.as_ref(), &warnings, Before::Merge)?;
                 rows_deleted = promote_staged_incremental(
                     sink.as_ref(),
                     &cfg.dest_table,
@@ -2760,6 +3536,7 @@ async fn run_transfer_api(
                 )
                 .await?;
             }
+            check_fatal(&cfg, sink.as_ref(), &warnings, Before::Cursor)?;
             if let Some(w) = &new_watermark {
                 if cfg.advance_watermark {
                     tracing::info!("persisting new watermark (window end): {w}");
@@ -2783,6 +3560,10 @@ async fn run_transfer_api(
                     tracing::info!("append: advance_watermark=false: window end {w} NOT persisted");
                 }
             }
+            // After the cursor, unlike an incremental run: append keeps no key
+            // to converge on, so a run that read these rows again would append
+            // them a second time.
+            check_fatal(&cfg, sink.as_ref(), &warnings, Before::Done)?;
         }
 
         let duration_secs = started.elapsed().as_secs_f64();
@@ -2802,6 +3583,7 @@ async fn run_transfer_api(
             promote_secs: promote_started.elapsed().as_secs_f64(),
             new_watermark,
             warnings: warnings.drain(),
+            rows_written_failed_attempts: 0,
         })
     }
     .await;
@@ -2913,6 +3695,7 @@ async fn run_transfer_frame(
         ));
     }
 
+    check_fatal(&cfg, sink.as_ref(), &warnings, Before::Write)?;
     let target_table = prepare_target(
         &sink,
         &cfg,
@@ -2944,6 +3727,7 @@ async fn run_transfer_frame(
             warnings: warnings.clone(),
             watermark_max: None,
             chunk_stager: None,
+            landed: None,
         };
         let stage_started = Instant::now();
         let schema: SchemaRef = Arc::new(Schema::new(
@@ -3021,6 +3805,7 @@ async fn run_transfer_frame(
                 &warnings,
             )
             .await?;
+            check_fatal(&cfg, sink.as_ref(), &warnings, Before::Swap)?;
             tracing::info!("swapping staging table into '{}'", cfg.dest_table);
             sink.atomic_swap(&cfg.dest_table, &staging, &plan.dest_columns)
                 .await?;
@@ -3033,6 +3818,7 @@ async fn run_transfer_frame(
             // destinations already fall back to ordering by the key list. Pass
             // it through anyway, so a caller who *did* nominate one gets
             // last-wins ordering rather than an arbitrary winner.
+            check_fatal(&cfg, sink.as_ref(), &warnings, Before::Merge)?;
             rows_deleted = promote_staged_incremental(
                 sink.as_ref(),
                 &cfg.dest_table,
@@ -3053,7 +3839,9 @@ async fn run_transfer_frame(
         // Append inserts straight into the destination: no staging, no merge,
         // no swap. And a frame has no resumable cursor to persist either way —
         // which is why there is no `persist_watermark` call anywhere in this
-        // flow, unlike the API one.
+        // flow, unlike the API one. A run that wrote straight in, or whose
+        // MERGE raised something, can still fail on it.
+        check_fatal(&cfg, sink.as_ref(), &warnings, Before::Done)?;
 
         let duration_secs = started.elapsed().as_secs_f64();
         tracing::info!(
@@ -3072,6 +3860,7 @@ async fn run_transfer_frame(
             promote_secs: promote_started.elapsed().as_secs_f64(),
             new_watermark: None,
             warnings: warnings.drain(),
+            rows_written_failed_attempts: 0,
         })
     }
     .await;
@@ -3082,13 +3871,15 @@ async fn run_transfer_frame(
     outcome
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn setup_postgres(
     s: &PgSource,
     cfg: &TransferConfig,
     base_table: Option<&str>,
     base_query: Option<&str>,
     watermark: Option<&str>,
-    // No cursor persisted yet — this run reads the table from scratch anyway.
+    // The saved cursor (or the first run's seed), when there is one.
+    cursor: Option<&str>,
     warnings: &Warnings,
 ) -> Result<SourceSetup> {
     tracing::info!("connecting to postgres...");
@@ -3119,8 +3910,9 @@ async fn setup_postgres(
         tracing::warn!(
             "both source_table and source_query are set; schema and data come from \
              source_query. source_table is still used for the windowed read's key-bounds \
-             probe, which is why setting both is useful: the bounds come from the table's \
-             index instead of inheriting source_query's own filter"
+             probe, and to check a cursor that is ahead of source_query's MAX(watermark). \
+             That is why setting both is useful: the bounds and the check come from the \
+             table instead of inheriting source_query's own filter"
         );
     }
     let source_cols = s
@@ -3158,6 +3950,8 @@ async fn setup_postgres(
     // case (e.g. an empty table's MAX() being NULL) for a result nothing uses.
     let mut stream_max_cursor = false;
     let mut window_activated = false;
+    let mut max_from_table = false;
+    let mut report = None;
     let snapshot_max = if cfg.mode == SyncMode::Incremental {
         if let Some(w) = watermark {
             ensure_watermark_column(w, &source_cols)?;
@@ -3168,28 +3962,59 @@ async fn setup_postgres(
             // EXPLAIN plans only — nothing is executed — and unlike a catalog
             // lookup it sees straight through a `source_query`'s derived table.
             let count_sql = PgSource::count_null_watermark_sql(base_table, base_query, w, expr);
-            let max_sql = PgSource::max_watermark_sql(base_table, base_query, w, expr);
             let count_cost = if nullable {
                 s.explain_cost(&control, &count_sql).await
             } else {
                 // Never run for a NOT NULL column, so its cost is moot.
                 ProbeCost::Known(0.0)
             };
-            let max_cost = s.explain_cost(&control, &max_sql).await;
+            let query_cost = {
+                let sql = PgSource::max_watermark_sql(base_table, base_query, w, expr);
+                s.explain_cost(&control, &sql).await
+            };
+            // Only when the query's own MAX would be a scan does source_table's
+            // stand in for it: see `table_max_eligible`.
+            let mut table_max = None;
+            if query_cost.should_skip(cfg.probe_max_cost)
+                && table_max_eligible(cfg, &source_cols, w, cursor)
+            {
+                let sql = PgSource::max_watermark_sql(base_table, None, w, expr);
+                let cost = s.explain_cost(&control, &sql).await;
+                if table_max_affordable(&cost, cfg.probe_max_cost) {
+                    match s.max_watermark(&control, base_table, None, w, expr).await {
+                        // It has to read as the query's own column: a query
+                        // that converts it (`UNIX_TIMESTAMP(updated_at) AS
+                        // updated_at`) would get a bound that matches nothing.
+                        Ok(max)
+                            if !watermark_value_parses(
+                                &source_cols,
+                                w,
+                                max.as_deref(),
+                                watermark_pg_is_tz_aware(w, &source_cols),
+                            ) =>
+                        {
+                            tracing::info!(
+                                "MAX({w}) on source_table ({max:?}) doesn't read as \
+                                 source_query's '{w}'; keeping source_query's plan"
+                            )
+                        }
+                        Ok(max) => table_max = Some((max, cost)),
+                        Err(e) => tracing::info!(
+                            "MAX({w}) on source_table failed ({e}); keeping source_query's plan"
+                        ),
+                    }
+                }
+            }
+            max_from_table = table_max.is_some();
+            let (table_snapshot, max_cost) = match table_max {
+                Some((max, cost)) => (Some(max), cost),
+                None => (None, query_cost),
+            };
             let probes = plan_watermark_probes(
                 count_cost.clone(),
                 max_cost.clone(),
                 cfg.probe_max_cost,
                 cfg.lookback_seconds,
-            );
-            warn_on_costly_watermark(
-                w,
-                probes,
-                count_cost,
-                max_cost,
-                nullable,
-                cfg.lookback_seconds,
-                warnings,
             );
             if nullable && probes.count_nulls {
                 let null_count = s
@@ -3198,14 +4023,28 @@ async fn setup_postgres(
                 warn_on_null_watermark(w, null_count, warnings);
             }
             stream_max_cursor = probes.stream_max;
-            window_activated = probes.warn_costly;
-            if probes.stream_max {
+            window_activated = probes.max_too_dear;
+            report = Some(ProbeReport {
+                watermark: w,
+                plan: probes,
+                count_cost,
+                max_cost,
+                nullable,
+                lookback_seconds: cfg.lookback_seconds,
+                swept: false,
+                suggest_source_table: base_table.is_none()
+                    && table_max_possible(cfg, &source_cols, w, cursor),
+                index_ddl: pg_watermark_index_ddl(w),
+            });
+            match table_snapshot {
+                Some(max) => max,
                 // No frozen upper bound: the filter is `wm > committed` alone,
                 // and the cursor comes from the rows actually read.
-                None
-            } else {
-                s.max_watermark(&control, base_table, base_query, w, expr)
-                    .await?
+                None if probes.stream_max => None,
+                None => {
+                    s.max_watermark(&control, base_table, base_query, w, expr)
+                        .await?
+                }
             }
         } else {
             None
@@ -3223,29 +4062,28 @@ async fn setup_postgres(
     // inside a standby's conflict window — sweep it in bounded key ranges
     // instead of attempting it in one pass. No extra EXPLAIN is needed: the
     // signal is the one already computed.
-    let window = if window_activated {
+    let mut key_bounded = false;
+    // A chunked read is bounded per chunk already, and reads through its own
+    // keyset loop, which a sweep would bypass: on a staged destination the
+    // rows would land in the template table every chunk is cloned from, and
+    // be dropped with it.
+    let window = if window_activated && cfg.chunk_rows.is_none() {
         match window_key(cfg, &source_cols) {
+            Some((col, _)) if watermark_bounds_the_key(watermark, &col, cursor) => {
+                key_bounded = true;
+                None
+            }
             Some((col, nullable_key)) => {
-                let bounds = match s
+                let first = s
                     .key_bounds(&control, base_table, base_query, &col, None)
-                    .await
-                {
-                    Ok(b) => b,
-                    Err(e) => {
-                        // Never fail the run for a probe, but never fall back
-                        // silently either: without bounds there is no sweep, so
-                        // the read is attempted in one pass and gets cancelled
-                        // — the operator needs to know that is why.
-                        tracing::warn!(
-                            "the read plans as a sequential scan, but the key bounds of '{col}' \
-                             could not be probed ({e}), so it cannot be windowed and will be read \
-                             in one pass. If source_query embeds its own unindexed filter, the \
-                             probe inherits it; project the raw key and set partition_source_expr, \
-                             or index the filtered column."
-                        );
-                        None
-                    }
-                };
+                    .await;
+                // A retry gets its own connection: the error may have closed
+                // this one.
+                let bounds = key_bounds_with_retry(&col, first, warnings, || async {
+                    let c = s.connect().await?;
+                    s.key_bounds(&c, base_table, base_query, &col, None).await
+                })
+                .await;
                 plan_read_window(cfg, bounds, quote_pg(&col), nullable_key)
             }
             None => {
@@ -3259,38 +4097,48 @@ async fn setup_postgres(
     } else {
         None
     };
+    if let Some(mut r) = report {
+        r.swept = window.is_some();
+        r.warn(warnings);
+    }
 
     // A windowed read IS the sequencing: the sweep already walks the whole key
     // space in bounded steps, so fanning out range partitions on top would make
     // every partition sweep the entire space and multiply the work by
     // `parallelism`. Same reasoning as chunked reads, which are likewise always
     // single-stream.
-    let partitions = if window.is_some() {
+    // So is a read the watermark already bounds by key, which a sweep would
+    // have read: its partition probe would go through source_query's filter.
+    let partitions = if window.is_some() || key_bounded {
         vec![Partition {
             label: "all".into(),
             predicate: None,
         }]
     } else {
-        compute_partitions_pg(s, &control, cfg, &source_cols).await?
+        compute_partitions_pg(s, &control, cfg, &source_cols, cursor).await?
     };
     Ok(SourceSetup {
         source_cols,
         snapshot_max,
+        max_from_table,
         partitions,
         stream_max_cursor,
         window,
         watermark_type: None,
         keyset_not_null,
+        control: Some(ControlConn::Postgres(control)),
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn setup_mysql(
     s: &MySqlSource,
     cfg: &TransferConfig,
     base_table: Option<&str>,
     base_query: Option<&str>,
     watermark: Option<&str>,
-    // No cursor persisted yet — this run reads the table from scratch anyway.
+    // The saved cursor (or the first run's seed), when there is one.
+    cursor: Option<&str>,
     warnings: &Warnings,
 ) -> Result<SourceSetup> {
     tracing::info!("connecting to mysql...");
@@ -3306,8 +4154,11 @@ async fn setup_mysql(
     };
     if base_table.is_some() && base_query.is_some() {
         tracing::warn!(
-            "both source_table and source_query are set; source_table is ignored — \
-             schema and data both come from source_query"
+            "both source_table and source_query are set; schema and data come from \
+             source_query. source_table is still used for the windowed read's key-bounds \
+             probe, and to check a cursor that is ahead of source_query's MAX(watermark). \
+             That is why setting both is useful: the bounds and the check come from the \
+             table instead of inheriting source_query's own filter"
         );
     }
     let source_cols = s
@@ -3321,6 +4172,8 @@ async fn setup_mysql(
     // case (e.g. an empty table's MAX() being NULL) for a result nothing uses.
     let mut stream_max_cursor = false;
     let mut window_activated = false;
+    let mut max_from_table = false;
+    let mut report = None;
     let snapshot_max = if cfg.mode == SyncMode::Incremental {
         if let Some(w) = watermark {
             ensure_watermark_column(w, &source_cols)?;
@@ -3329,27 +4182,56 @@ async fn setup_mysql(
             let nullable = watermark_column_nullable(w, &source_cols);
             let expr = cfg.watermark_source_expr.as_deref();
             let count_sql = MySqlSource::count_null_watermark_sql(base_table, base_query, w, expr);
-            let max_sql = MySqlSource::max_watermark_sql(base_table, base_query, w, expr);
             let count_cost = if nullable {
                 s.explain_cost(&mut control, &count_sql).await
             } else {
                 ProbeCost::Known(0.0)
             };
-            let max_cost = s.explain_cost(&mut control, &max_sql).await;
+            let query_cost = {
+                let sql = MySqlSource::max_watermark_sql(base_table, base_query, w, expr);
+                s.explain_cost(&mut control, &sql).await
+            };
+            // Only when the query's own MAX would be a scan does source_table's
+            // stand in for it: see `table_max_eligible`.
+            let mut table_max = None;
+            if query_cost.should_skip(cfg.probe_max_cost)
+                && table_max_eligible(cfg, &source_cols, w, cursor)
+            {
+                let sql = MySqlSource::max_watermark_sql(base_table, None, w, expr);
+                let cost = s.explain_cost(&mut control, &sql).await;
+                if table_max_affordable(&cost, cfg.probe_max_cost) {
+                    match s
+                        .max_watermark(&mut control, base_table, None, w, expr)
+                        .await
+                    {
+                        // It has to read as the query's own column: a query
+                        // that converts it (`UNIX_TIMESTAMP(updated_at) AS
+                        // updated_at`) would get a bound that matches nothing.
+                        Ok(max)
+                            if !watermark_value_parses(&source_cols, w, max.as_deref(), false) =>
+                        {
+                            tracing::info!(
+                                "MAX({w}) on source_table ({max:?}) doesn't read as \
+                                 source_query's '{w}'; keeping source_query's plan"
+                            )
+                        }
+                        Ok(max) => table_max = Some((max, cost)),
+                        Err(e) => tracing::info!(
+                            "MAX({w}) on source_table failed ({e}); keeping source_query's plan"
+                        ),
+                    }
+                }
+            }
+            max_from_table = table_max.is_some();
+            let (table_snapshot, max_cost) = match table_max {
+                Some((max, cost)) => (Some(max), cost),
+                None => (None, query_cost),
+            };
             let probes = plan_watermark_probes(
                 count_cost.clone(),
                 max_cost.clone(),
                 cfg.probe_max_cost,
                 cfg.lookback_seconds,
-            );
-            warn_on_costly_watermark(
-                w,
-                probes,
-                count_cost,
-                max_cost,
-                nullable,
-                cfg.lookback_seconds,
-                warnings,
             );
             if nullable && probes.count_nulls {
                 let null_count = s
@@ -3358,12 +4240,26 @@ async fn setup_mysql(
                 warn_on_null_watermark(w, null_count, warnings);
             }
             stream_max_cursor = probes.stream_max;
-            window_activated = probes.warn_costly;
-            if probes.stream_max {
-                None
-            } else {
-                s.max_watermark(&mut control, base_table, base_query, w, expr)
-                    .await?
+            window_activated = probes.max_too_dear;
+            report = Some(ProbeReport {
+                watermark: w,
+                plan: probes,
+                count_cost,
+                max_cost,
+                nullable,
+                lookback_seconds: cfg.lookback_seconds,
+                swept: false,
+                suggest_source_table: base_table.is_none()
+                    && table_max_possible(cfg, &source_cols, w, cursor),
+                index_ddl: mysql_watermark_index_ddl(w),
+            });
+            match table_snapshot {
+                Some(max) => max,
+                None if probes.stream_max => None,
+                None => {
+                    s.max_watermark(&mut control, base_table, base_query, w, expr)
+                        .await?
+                }
             }
         } else {
             None
@@ -3379,24 +4275,28 @@ async fn setup_mysql(
     // inside a standby's conflict window — sweep it in bounded key ranges
     // instead of attempting it in one pass. No extra EXPLAIN is needed: the
     // signal is the one already computed.
-    let window = if window_activated {
+    let mut key_bounded = false;
+    // A chunked read is bounded per chunk already, and reads through its own
+    // keyset loop, which a sweep would bypass: on a staged destination the
+    // rows would land in the template table every chunk is cloned from, and
+    // be dropped with it.
+    let window = if window_activated && cfg.chunk_rows.is_none() {
         match window_key(cfg, &source_cols) {
+            Some((col, _)) if watermark_bounds_the_key(watermark, &col, cursor) => {
+                key_bounded = true;
+                None
+            }
             Some((col, nullable_key)) => {
-                let bounds = match s
+                let first = s
                     .key_bounds(&mut control, base_table, base_query, &col, None)
-                    .await
-                {
-                    Ok(b) => b,
-                    Err(e) => {
-                        // See the equivalent branch in `setup_postgres`.
-                        tracing::warn!(
-                            "the read plans as a sequential scan, but the key bounds of '{col}' \
-                             could not be probed ({e}), so it cannot be windowed and will be read \
-                             in one pass."
-                        );
-                        None
-                    }
-                };
+                    .await;
+                // See the equivalent call in `setup_postgres`.
+                let bounds = key_bounds_with_retry(&col, first, warnings, || async {
+                    let mut c = s.connect().await?;
+                    s.key_bounds(&mut c, base_table, base_query, &col, None)
+                        .await
+                })
+                .await;
                 plan_read_window(cfg, bounds, quote_my(&col), nullable_key)
             }
             None => {
@@ -3410,28 +4310,36 @@ async fn setup_mysql(
     } else {
         None
     };
+    if let Some(mut r) = report {
+        r.swept = window.is_some();
+        r.warn(warnings);
+    }
 
     // A windowed read IS the sequencing: the sweep already walks the whole key
     // space in bounded steps, so fanning out range partitions on top would make
     // every partition sweep the entire space and multiply the work by
     // `parallelism`. Same reasoning as chunked reads, which are likewise always
     // single-stream.
-    let partitions = if window.is_some() {
+    // So is a read the watermark already bounds by key, which a sweep would
+    // have read: its partition probe would go through source_query's filter.
+    let partitions = if window.is_some() || key_bounded {
         vec![Partition {
             label: "all".into(),
             predicate: None,
         }]
     } else {
-        compute_partitions_mysql(s, &mut control, cfg, &source_cols).await?
+        compute_partitions_mysql(s, &mut control, cfg, &source_cols, cursor).await?
     };
     Ok(SourceSetup {
         source_cols,
         snapshot_max,
+        max_from_table,
         partitions,
         stream_max_cursor,
         window,
         watermark_type: None,
         keyset_not_null: false,
+        control: Some(ControlConn::MySql(control)),
     })
 }
 
@@ -3467,6 +4375,62 @@ struct ChunkPlan {
     effective_upper: Option<String>,
     /// The cursor to resume past (`None` = start from the beginning).
     start_cursor: Option<String>,
+    /// What each chunk's marker records as its upper bound.
+    marker: MarkerBound,
+}
+
+/// What a chunked read records as `chunk_upper` in each resume marker: the
+/// bound a resume reads up to and then saves as the cursor. A resume reads
+/// only the chunks after the marker, so it can't take a cursor from what it
+/// reads: a row in an earlier chunk that changed after it was read sits below
+/// their newest watermark, and would never be read again.
+#[derive(Debug, Clone)]
+enum MarkerBound {
+    /// `effective_upper`, or nothing without one: the snapshot MAX, which
+    /// is no later than when the read began, or the bound the marker this run
+    /// resumed past froze.
+    Frozen,
+    /// Nothing: this run resumed past a marker that recorded no bound, so it
+    /// can't account for the chunks before that marker, and keeps the
+    /// committed cursor whatever else it reads.
+    Unbounded,
+    /// A cursor taken from the rows read: the largest, over the chunks
+    /// committed so far, of the cursor the read would have saved had it
+    /// ended with that chunk (moved back by the time it had taken beyond the
+    /// lookback, see `stream_cursor_rewind_secs`, and not below the cursor it
+    /// started from, `floor`, unless everything read is). Each, less the
+    /// lookback, is no later than when the read began, so every row changed
+    /// since is read again. Empty until a non-NULL watermark is read.
+    Stream {
+        started: Instant,
+        floor: Option<String>,
+        /// The largest so far, in the tracker's unit (`i64::MIN`: none).
+        best: Arc<AtomicI64>,
+    },
+}
+
+impl ChunkPlan {
+    /// The `chunk_upper` a chunk's resume marker records: see [`MarkerBound`].
+    fn marker_upper(&self, tracker: Option<&WatermarkTracker>, lookback_seconds: u64) -> String {
+        match &self.marker {
+            MarkerBound::Frozen => self.effective_upper.clone().unwrap_or_default(),
+            MarkerBound::Unbounded => String::new(),
+            MarkerBound::Stream {
+                started,
+                floor,
+                best,
+            } => tracker
+                .and_then(|t| {
+                    let rewind = stream_cursor_rewind_secs(
+                        started.elapsed().as_secs_f64(),
+                        lookback_seconds,
+                    );
+                    let v = t.rewound(rewind, floor.as_deref())?;
+                    t.render_value(best.fetch_max(v, Ordering::Relaxed).max(v))
+                })
+                .unwrap_or_default(),
+        }
+    }
 }
 
 /// Validate and resolve the keyset plan for a chunked read. Enforces the
@@ -3537,6 +4501,7 @@ fn build_chunk_plan(
         committed,
         effective_upper,
         start_cursor,
+        marker: MarkerBound::Frozen,
     })
 }
 
@@ -3670,6 +4635,7 @@ async fn transfer_keyset_postgres(
             ));
         }
         if let Some(batch) = decoder.finish()? {
+            let rows = batch.num_rows() as u64;
             if let Some(k) = last_int_key(&batch, chunk.keyset_idx)? {
                 cursor_candidate = Some(cursor_candidate.map_or(k, |c| c.max(k)));
             }
@@ -3677,6 +4643,9 @@ async fn transfer_keyset_postgres(
             chunk_ctx
                 .push_batch(&mut sends, &mut insert_buf, schema.clone(), batch)
                 .await;
+            if let Some(t) = &ctx.throttle {
+                t.acquire(rows).await;
+            }
         }
         // Force this chunk's rows durable in the destination BEFORE advancing
         // the cursor — the invariant that makes a crash resumable.
@@ -3693,6 +4662,7 @@ async fn transfer_keyset_postgres(
 
         // Land the chunk in the destination before its cursor is committed
         // below (a no-op where the flush above already did).
+        check_fatal(cfg, ctx.sink.as_ref(), &ctx.warnings, Before::Chunk)?;
         ctx.end_chunk(&chunk_ctx, rows_this_chunk).await?;
         if rows_this_chunk == 0 {
             break; // empty read — nothing (more) to sync
@@ -3714,10 +4684,12 @@ async fn transfer_keyset_postgres(
                 cfg,
                 chunk.committed.as_deref(),
                 &cur,
-                chunk.effective_upper.as_deref().unwrap_or(""),
+                &chunk.marker_upper(ctx.watermark_max.as_deref(), cfg.lookback_seconds),
                 ctx.counters.rows_written.load(Ordering::Relaxed),
             )
             .await?;
+        // A retry resumes past this chunk, so it won't write its rows again.
+        ctx.chunk_committed();
         cursor = Some(cur);
         emit_progress(&ctx.counters, &ctx.progress, ctx.started);
 
@@ -3772,6 +4744,108 @@ fn window_key(cfg: &TransferConfig, source_cols: &[ColumnType]) -> Option<(Strin
     Some((col, c.nullable))
 }
 
+/// Whether `MAX(watermark)` is probed on `source_table` itself rather than
+/// through `source_query`, when both are set.
+///
+/// Probed through the query, `MAX` inherits its filter: `MAX(id)` over
+/// `SELECT ... WHERE is_test = 0` can't come from the primary key, and was
+/// measured at 1.5 s and a planner cost of 308,743 where the table's own is
+/// "Select tables optimized away". The read itself, `WHERE id > x` pushed
+/// into the query, is a range scan either way. The table's MAX is a valid
+/// upper bound for the filtered read, but not a cursor: a row the filter
+/// excludes (a test row dated 2099, say) would carry the cursor past rows not
+/// read yet. So the read is bounded by it and the cursor saved is the largest
+/// watermark the read returned, folded by a [`WatermarkTracker`], which needs
+/// the watermark projected untransformed and of a type it can fold.
+/// `watermark_source_expr` is evaluated over the query's columns, not the
+/// table's, so it rules this out too. So does a first run seeded with
+/// `skip_to_max` (no `cursor` yet): its seed is the MAX itself, and would carry
+/// the cursor past every row the filter does return.
+///
+/// Used only when the query's own MAX would be a scan, so a transfer whose
+/// query MAX is affordable reads exactly as before; `probe_max_cost=0` keeps it
+/// that way always. A `source_query` that converts the watermark (a time-zone
+/// shift, say) is the case to watch: the table's MAX is then a bound in another
+/// value domain.
+fn table_max_eligible(
+    cfg: &TransferConfig,
+    source_cols: &[ColumnType],
+    watermark: &str,
+    cursor: Option<&str>,
+) -> bool {
+    cfg.source_table.is_some() && table_max_possible(cfg, source_cols, watermark, cursor)
+}
+
+/// [`table_max_eligible`] but for the `source_table` being set: whether
+/// setting one would have the MAX probed on it.
+///
+/// Not for a `chunk_rows` read either: its chunk markers keep the upper bound
+/// a resume reads to, and a table's MAX kept there would outlive the run that
+/// knew it was no cursor. And not for a watermark the transfer leaves out or
+/// overrides, which the tracker could not fold.
+fn table_max_possible(
+    cfg: &TransferConfig,
+    source_cols: &[ColumnType],
+    watermark: &str,
+    cursor: Option<&str>,
+) -> bool {
+    cfg.source_query.is_some()
+        && cfg.chunk_rows.is_none()
+        && cfg.watermark_source_expr.is_none()
+        && !cfg.column_transforms.contains_key(watermark)
+        && !cfg.type_overrides.contains_key(watermark)
+        && (cfg.include.is_empty() || cfg.include.iter().any(|c| c == watermark))
+        && !cfg.exclude.iter().any(|c| c == watermark)
+        && !(cfg.seed_watermark == WatermarkSeed::CurrentMax && cursor.is_none())
+        && source_cols
+            .iter()
+            .find(|c| c.name == watermark)
+            .is_some_and(|c| WatermarkUnit::of(&c.arrow, false).is_some())
+}
+
+/// Whether `value`, a MAX read off `source_table`, reads as the query's own
+/// `watermark` column: same unit, same offset form. An empty table's NULL
+/// does.
+fn watermark_value_parses(
+    source_cols: &[ColumnType],
+    watermark: &str,
+    value: Option<&str>,
+    utc_offset: bool,
+) -> bool {
+    let Some(value) = value else {
+        return true;
+    };
+    source_cols
+        .iter()
+        .find(|c| c.name == watermark)
+        .and_then(|c| WatermarkUnit::of(&c.arrow, utc_offset))
+        .is_some_and(|unit| unit.parse(value).is_some())
+}
+
+/// Whether the planner prices `source_table`'s MAX within `threshold`. An
+/// unknown cost never qualifies, whatever the threshold: the EXPLAIN may have
+/// failed because the table has no column by that name.
+fn table_max_affordable(cost: &ProbeCost, threshold: f64) -> bool {
+    !matches!(cost, ProbeCost::Unknown) && !cost.should_skip(threshold)
+}
+
+/// Whether the read needs no sweep because the watermark is the window key
+/// itself and there is a cursor: the read's own filter, `key > cursor`, is
+/// then the key range a window would have bounded, and covers only what is
+/// new. Through a filtered `source_query` its `MAX` can still price as a scan,
+/// which used to sweep the whole key space every run, with a full-scan
+/// `MIN`/`MAX` for the bounds on top.
+fn watermark_bounds_the_key(watermark: Option<&str>, key: &str, cursor: Option<&str>) -> bool {
+    let bounds = watermark == Some(key) && cursor.is_some();
+    if bounds {
+        tracing::info!(
+            "the watermark '{key}' is the window key, so the read's own filter is the key range \
+             above the cursor: reading it in one pass"
+        );
+    }
+    bounds
+}
+
 /// Decide whether the read must be swept in windows, and size the first one.
 ///
 /// Activation is decided by the caller from the planner-cost probe 0.18.0
@@ -3820,12 +4894,13 @@ fn plan_read_window(
 
 /// Read one partition, as one pass or as a sweep of bounded windows.
 ///
-/// The sweep reuses the single-pass path verbatim: a window is just an extra
-/// `key > lo AND key <= hi` conjunct on the partition predicate, so every
-/// downstream behaviour — decode, backpressure, archival, the watermark
-/// tracker that folds through `push_batch` — is unchanged.
+/// The sweep reuses the single-pass statement reader verbatim: a window is
+/// just an extra `key > lo AND key <= hi` conjunct on the partition
+/// predicate, so every downstream behaviour — decode, backpressure, archival,
+/// the watermark tracker that folds through `push_batch` — is unchanged. Its
+/// windows share one connection and one insert buffer: see [`ReadOut`].
 macro_rules! sweeping_partition {
-    ($name:ident, $inner:ident, $src:ty) => {
+    ($name:ident, $inner:ident, $stmt:ident, $src:ty) => {
         #[allow(clippy::too_many_arguments)]
         async fn $name(
             source: &$src,
@@ -3839,8 +4914,10 @@ macro_rules! sweeping_partition {
             chunk: Option<&ChunkPlan>,
             window: Option<&WindowPlan>,
         ) -> Result<()> {
-            let w = match window {
-                None => {
+            // Never a sweep of a chunked read: see `setup_postgres`.
+            let w = match (window, chunk) {
+                (Some(w), None) => w,
+                _ => {
                     return $inner(
                         source,
                         plan,
@@ -3854,8 +4931,11 @@ macro_rules! sweeping_partition {
                     )
                     .await
                 }
-                Some(w) => w,
             };
+            let mut out = ReadOut::new(cfg);
+            // Sent only between windows, so a window that fails and is read
+            // again has sent none of its rows: see `InsertBuffer::deferred`.
+            out.insert_buf.deferred = true;
             // Half-open (lo, hi]: start just below `min` so the first window
             // includes it, and every key is covered exactly once.
             let mut lo = w.min.saturating_sub(1);
@@ -3887,7 +4967,8 @@ macro_rules! sweeping_partition {
                     }),
                 };
                 let started = Instant::now();
-                let res = $inner(
+                let mark = out.insert_buf.mark();
+                let res = $stmt(
                     source,
                     plan,
                     cfg,
@@ -3896,12 +4977,13 @@ macro_rules! sweeping_partition {
                     base_query,
                     extra_filter,
                     part,
-                    None,
+                    &mut out,
                 )
                 .await;
                 match res {
                     Ok(()) => {
                         windows += 1;
+                        out.between_windows(ctx).await?;
                         let secs = started.elapsed().as_secs_f64();
                         let (n_lo, n_step) =
                             next_window(lo, hi, step, w, WindowOutcome::Done(secs));
@@ -3915,6 +4997,12 @@ macro_rules! sweeping_partition {
                         step = n_step;
                     }
                     Err(e) if e.is_transient_source() && step > w.floor => {
+                        // The window is read again from scratch: on a new
+                        // connection, since a statement that failed can leave
+                        // this one mid-result, and without the rows it had
+                        // buffered.
+                        out.conn = None;
+                        out.insert_buf.truncate(mark);
                         shrinks += 1;
                         let (n_lo, n_step) = next_window(lo, hi, step, w, WindowOutcome::Cancelled);
                         lo = n_lo;
@@ -3941,7 +5029,7 @@ macro_rules! sweeping_partition {
                         None => pred,
                     }),
                 };
-                $inner(
+                $stmt(
                     source,
                     plan,
                     cfg,
@@ -3950,13 +5038,13 @@ macro_rules! sweeping_partition {
                     base_query,
                     extra_filter,
                     part,
-                    None,
+                    &mut out,
                 )
                 .await?;
                 windows += 1;
             }
             tracing::info!("windowed read complete: {windows} window(s), {shrinks} shrink(s)");
-            Ok(())
+            out.finish(ctx).await
         }
     };
 }
@@ -3964,11 +5052,13 @@ macro_rules! sweeping_partition {
 sweeping_partition!(
     transfer_partition_postgres,
     read_one_partition_postgres,
+    read_statement_postgres,
     PgSource
 );
 sweeping_partition!(
     transfer_partition_mysql,
     read_one_partition_mysql,
+    read_statement_mysql,
     MySqlSource
 );
 
@@ -4100,8 +5190,48 @@ async fn read_one_partition_postgres(
         )
         .await;
     }
+    let mut out = ReadOut::new(cfg);
+    read_statement_postgres(
+        source,
+        plan,
+        cfg,
+        ctx,
+        base_table,
+        base_query,
+        extra_filter,
+        partition,
+        &mut out,
+    )
+    .await?;
+    out.finish(ctx).await
+}
+
+/// Read one statement, a partition or one window of a sweep, into `out`,
+/// connecting first if `out` has no connection. Leaves the last of its rows
+/// buffered: [`ReadOut::finish`] sends them.
+#[allow(clippy::too_many_arguments)]
+async fn read_statement_postgres(
+    source: &PgSource,
+    plan: &SelectPlan,
+    cfg: &TransferConfig,
+    ctx: &SendCtx,
+    base_table: Option<&str>,
+    base_query: Option<&str>,
+    extra_filter: Option<&str>,
+    partition: Partition,
+    out: &mut ReadOut<tokio_postgres::Client>,
+) -> Result<()> {
     tracing::info!("partition '{}' starting", partition.label);
-    let client = source.connect().await?;
+    let ReadOut {
+        conn,
+        sends,
+        insert_buf,
+        schema: out_schema,
+    } = out;
+    if conn.is_none() {
+        *conn = Some(source.connect().await?);
+    }
+    let client = conn.as_ref().expect("connected above");
     let copy_sql = source.copy_sql(
         &plan.source_columns,
         &plan.source_select_exprs,
@@ -4113,76 +5243,95 @@ async fn read_one_partition_postgres(
     );
     tracing::debug!("partition {}: {copy_sql}", partition.label);
 
-    let stream = source.copy_stream(&client, &copy_sql).await?;
+    let stream = source.copy_stream(client, &copy_sql).await?;
     futures::pin_mut!(stream);
     let mut chunks = CopyChunks::new(stream);
 
     let mut decoder =
         CopyDecoder::with_batch_bytes(&plan.dest_columns, cfg.batch_rows, cfg.batch_bytes)?;
     let schema = decoder.schema();
-    let mut sends: JoinSet<Result<()>> = JoinSet::new();
-    let mut insert_buf = InsertBuffer::new(cfg.insert_bytes);
+    *out_schema = Some(schema.clone());
     let mut archive_writer = match &ctx.archive {
         Some(info) => Some(info.writer_for(&partition.label, schema.clone())?),
         None => None,
     };
 
-    // Read/parse overlap: each chunk's parse runs on the blocking pool while
-    // the next chunk is pulled off the socket, so the COPY stream keeps draining
-    // instead of idling for the duration of every parse. A chunk is every row
-    // that has already arrived, not one `CopyData` message — see `CopyChunks`.
-    // The idle timer wraps the source await and nothing else: it is recorded
-    // *inside* `await_source`, at the moment the chunk arrives, so the
-    // concurrent decode below neither trips it nor inflates read_secs.
-    let idle = cfg.read_idle_timeout_secs;
-    let scope = format!("partition '{}'", partition.label);
-    let mut pending = await_source(chunks.next_chunk(), &ctx.counters, idle, &scope).await?;
-    while let Some(chunk) = pending {
-        let chunk = chunk?;
-        let decoding = feed_off_reactor(decoder, chunk);
-        let (next, joined) = tokio::join!(
-            await_source(chunks.next_chunk(), &ctx.counters, idle, &scope),
-            decoding
-        );
-        pending = next?;
-        let (returned, decoded) = joined.map_err(decode_task_failed)?;
-        decoder = returned;
-        for batch in decoded? {
+    // A failed read ends the run, or (a window of a sweep) is read again
+    // narrower; either way its file is aborted here, or a run that goes on
+    // to succeed would leave the upload's parts in the bucket.
+    let read = async {
+        // Read/parse overlap: each chunk's parse runs on the blocking pool while
+        // the next chunk is pulled off the socket, so the COPY stream keeps draining
+        // instead of idling for the duration of every parse. A chunk is every row
+        // that has already arrived, not one `CopyData` message — see `CopyChunks`.
+        // The idle timer wraps the source await and nothing else: it is recorded
+        // *inside* `await_source`, at the moment the chunk arrives, so the
+        // concurrent decode below neither trips it nor inflates read_secs.
+        let idle = cfg.read_idle_timeout_secs;
+        let scope = format!("partition '{}'", partition.label);
+        let mut pending = await_source(chunks.next_chunk(), &ctx.counters, idle, &scope).await?;
+        while let Some(chunk) = pending {
+            let chunk = chunk?;
+            let decoding = feed_off_reactor(decoder, chunk);
+            let (next, joined) = tokio::join!(
+                await_source(chunks.next_chunk(), &ctx.counters, idle, &scope),
+                decoding
+            );
+            pending = next?;
+            let (returned, decoded) = joined.map_err(decode_task_failed)?;
+            decoder = returned;
+            for batch in decoded? {
+                let rows = batch.num_rows() as u64;
+                if let Some(w) = archive_writer.as_mut() {
+                    w.write(&batch).await?;
+                }
+                ctx.push_batch(sends, insert_buf, schema.clone(), batch)
+                    .await;
+                // Pace the read: pausing here applies TCP backpressure to the COPY
+                // stream, slowing the server-side scan. One chunk is already in
+                // hand by this point (that's the overlap above), so the throttle
+                // now bites a chunk later than it used to — it still bounds the
+                // sustained rate, just with that much slack.
+                if let Some(t) = &ctx.throttle {
+                    t.acquire(rows).await;
+                }
+            }
+            reap(sends, false).await?; // surface any upload error promptly
+        }
+        if !decoder.saw_trailer() {
+            return Err(EtlError::decode(format!(
+                "COPY stream for partition {} ended without a trailer",
+                partition.label
+            )));
+        }
+        if let Some(batch) = decoder.finish()? {
             let rows = batch.num_rows() as u64;
             if let Some(w) = archive_writer.as_mut() {
                 w.write(&batch).await?;
             }
-            ctx.push_batch(&mut sends, &mut insert_buf, schema.clone(), batch)
+            ctx.push_batch(sends, insert_buf, schema.clone(), batch)
                 .await;
-            // Pace the read: pausing here applies TCP backpressure to the COPY
-            // stream, slowing the server-side scan. One chunk is already in
-            // hand by this point (that's the overlap above), so the throttle
-            // now bites a chunk later than it used to — it still bounds the
-            // sustained rate, just with that much slack.
+            // A statement's last batch counts toward the pace too: a window
+            // smaller than one batch is all last batch.
             if let Some(t) = &ctx.throttle {
                 t.acquire(rows).await;
             }
         }
-        reap(&mut sends, false).await?; // surface any upload error promptly
-    }
-    if !decoder.saw_trailer() {
-        return Err(EtlError::decode(format!(
-            "COPY stream for partition {} ended without a trailer",
-            partition.label
-        )));
-    }
-    if let Some(batch) = decoder.finish()? {
-        if let Some(w) = archive_writer.as_mut() {
-            w.write(&batch).await?;
+        if let Some(w) = archive_writer.take() {
+            w.close().await?;
         }
-        ctx.push_batch(&mut sends, &mut insert_buf, schema.clone(), batch)
-            .await;
+        Ok::<CopyDecoder, EtlError>(decoder)
     }
-    if let Some(w) = archive_writer.take() {
-        w.close().await?;
-    }
-    ctx.flush(&mut sends, &mut insert_buf, schema.clone()).await;
-    reap(&mut sends, true).await?; // wait for all uploads before returning
+    .await;
+    let decoder = match read {
+        Ok(decoder) => decoder,
+        Err(e) => {
+            if let Some(w) = archive_writer.take() {
+                w.abort().await;
+            }
+            return Err(e);
+        }
+    };
 
     ctx.counters
         .rows_read
@@ -4292,6 +5441,7 @@ async fn transfer_keyset_mysql(
             }
         }
         if let Some(batch) = batcher.finish()? {
+            let rows = batch.num_rows() as u64;
             if let Some(k) = last_int_key(&batch, chunk.keyset_idx)? {
                 cursor_candidate = Some(cursor_candidate.map_or(k, |c| c.max(k)));
             }
@@ -4299,6 +5449,9 @@ async fn transfer_keyset_mysql(
             chunk_ctx
                 .push_batch(&mut sends, &mut insert_buf, schema.clone(), batch)
                 .await;
+            if let Some(t) = &ctx.throttle {
+                t.acquire(rows).await;
+            }
         }
         chunk_ctx
             .flush(&mut sends, &mut insert_buf, schema.clone())
@@ -4313,6 +5466,7 @@ async fn transfer_keyset_mysql(
 
         // Land the chunk in the destination before its cursor is committed
         // below (a no-op where the flush above already did).
+        check_fatal(cfg, ctx.sink.as_ref(), &ctx.warnings, Before::Chunk)?;
         ctx.end_chunk(&chunk_ctx, rows_this_chunk).await?;
         if rows_this_chunk == 0 {
             break;
@@ -4332,10 +5486,12 @@ async fn transfer_keyset_mysql(
                 cfg,
                 chunk.committed.as_deref(),
                 &cur,
-                chunk.effective_upper.as_deref().unwrap_or(""),
+                &chunk.marker_upper(ctx.watermark_max.as_deref(), cfg.lookback_seconds),
                 ctx.counters.rows_written.load(Ordering::Relaxed),
             )
             .await?;
+        // A retry resumes past this chunk, so it won't write its rows again.
+        ctx.chunk_committed();
         cursor = Some(cur);
         emit_progress(&ctx.counters, &ctx.progress, ctx.started);
 
@@ -4375,8 +5531,46 @@ async fn read_one_partition_mysql(
         )
         .await;
     }
+    let mut out = ReadOut::new(cfg);
+    read_statement_mysql(
+        source,
+        plan,
+        cfg,
+        ctx,
+        base_table,
+        base_query,
+        extra_filter,
+        partition,
+        &mut out,
+    )
+    .await?;
+    out.finish(ctx).await
+}
+
+/// The MySQL [`read_statement_postgres`].
+#[allow(clippy::too_many_arguments)]
+async fn read_statement_mysql(
+    source: &MySqlSource,
+    plan: &SelectPlan,
+    cfg: &TransferConfig,
+    ctx: &SendCtx,
+    base_table: Option<&str>,
+    base_query: Option<&str>,
+    extra_filter: Option<&str>,
+    partition: Partition,
+    out: &mut ReadOut<mysql_async::Conn>,
+) -> Result<()> {
     tracing::info!("partition '{}' starting", partition.label);
-    let mut conn = source.connect().await?;
+    let ReadOut {
+        conn,
+        sends,
+        insert_buf,
+        schema: out_schema,
+    } = out;
+    if conn.is_none() {
+        *conn = Some(source.connect().await?);
+    }
+    let conn = conn.as_mut().expect("connected above");
     let select_sql = source.select_sql(
         &plan.source_columns,
         &plan.source_select_exprs,
@@ -4391,63 +5585,78 @@ async fn read_one_partition_mysql(
     let mut batcher =
         MySqlBatcher::with_batch_bytes(&plan.dest_columns, cfg.batch_rows, cfg.batch_bytes)?;
     let schema = batcher.schema();
-    let mut sends: JoinSet<Result<()>> = JoinSet::new();
-    let mut insert_buf = InsertBuffer::new(cfg.insert_bytes);
+    *out_schema = Some(schema.clone());
     let mut archive_writer = match &ctx.archive {
         Some(info) => Some(info.writer_for(&partition.label, schema.clone())?),
         None => None,
     };
 
-    // Use the binary protocol (prepared statement) for actual row fetching,
-    // not just for resolve_columns's schema probe: plain query_iter uses the
-    // text protocol, which returns every value as Bytes (ASCII text) even
-    // for integer/float columns, regardless of the column's real type.
-    let stmt = conn
-        .prep(select_sql)
-        .await
-        .map_err(|e| EtlError::from(e).context("preparing mysql statement"))?;
-    let mut result = conn
-        .exec_iter(stmt, ())
-        .await
-        .map_err(|e| EtlError::from(e).context("executing mysql query"))?;
-    let stream = result
-        .stream::<mysql_async::Row>()
-        .await
-        .map_err(|e| EtlError::from(e).context("streaming mysql result"))?
-        .ok_or_else(|| EtlError::other("mysql query returned no result set"))?;
-    futures::pin_mut!(stream);
+    // A failed read ends the run, or (a window of a sweep) is read again
+    // narrower; either way its file is aborted here, or a run that goes on
+    // to succeed would leave the upload's parts in the bucket.
+    let read = async {
+        // Use the binary protocol (prepared statement) for actual row fetching,
+        // not just for resolve_columns's schema probe: plain query_iter uses the
+        // text protocol, which returns every value as Bytes (ASCII text) even
+        // for integer/float columns, regardless of the column's real type.
+        let stmt = conn
+            .prep(select_sql)
+            .await
+            .map_err(|e| EtlError::from(e).context("preparing mysql statement"))?;
+        let mut result = conn
+            .exec_iter(stmt, ())
+            .await
+            .map_err(|e| EtlError::from(e).context("executing mysql query"))?;
+        let stream = result
+            .stream::<mysql_async::Row>()
+            .await
+            .map_err(|e| EtlError::from(e).context("streaming mysql result"))?
+            .ok_or_else(|| EtlError::other("mysql query returned no result set"))?;
+        futures::pin_mut!(stream);
 
-    let idle = cfg.read_idle_timeout_secs;
-    let scope = format!("partition '{}'", partition.label);
-    while let Some(row) = await_source(stream.next(), &ctx.counters, idle, &scope).await? {
-        let row = row.map_err(|e| EtlError::from(e).context("reading mysql row"))?;
-        if let Some(batch) = batcher.append_row(row)? {
+        let idle = cfg.read_idle_timeout_secs;
+        let scope = format!("partition '{}'", partition.label);
+        while let Some(row) = await_source(stream.next(), &ctx.counters, idle, &scope).await? {
+            let row = row.map_err(|e| EtlError::from(e).context("reading mysql row"))?;
+            if let Some(batch) = batcher.append_row(row)? {
+                let rows = batch.num_rows() as u64;
+                if let Some(w) = archive_writer.as_mut() {
+                    w.write(&batch).await?;
+                }
+                ctx.push_batch(sends, insert_buf, schema.clone(), batch)
+                    .await;
+                reap(sends, false).await?; // surface any upload error promptly
+                                           // Pace the read: pausing before fetching more rows applies
+                                           // backpressure to the streaming result set, slowing the scan.
+                if let Some(t) = &ctx.throttle {
+                    t.acquire(rows).await;
+                }
+            }
+        }
+        if let Some(batch) = batcher.finish()? {
             let rows = batch.num_rows() as u64;
             if let Some(w) = archive_writer.as_mut() {
                 w.write(&batch).await?;
             }
-            ctx.push_batch(&mut sends, &mut insert_buf, schema.clone(), batch)
+            ctx.push_batch(sends, insert_buf, schema.clone(), batch)
                 .await;
-            reap(&mut sends, false).await?; // surface any upload error promptly
-                                            // Pace the read: pausing before fetching more rows applies
-                                            // backpressure to the streaming result set, slowing the scan.
+            // See the equivalent pace in `read_statement_postgres`.
             if let Some(t) = &ctx.throttle {
                 t.acquire(rows).await;
             }
         }
-    }
-    if let Some(batch) = batcher.finish()? {
-        if let Some(w) = archive_writer.as_mut() {
-            w.write(&batch).await?;
+        if let Some(w) = archive_writer.take() {
+            w.close().await?;
         }
-        ctx.push_batch(&mut sends, &mut insert_buf, schema.clone(), batch)
-            .await;
+        Ok::<(), EtlError>(())
     }
-    if let Some(w) = archive_writer.take() {
-        w.close().await?;
+    .await;
+    if let Err(e) = read {
+        if let Some(w) = archive_writer.take() {
+            w.abort().await;
+        }
+        return Err(e);
     }
-    ctx.flush(&mut sends, &mut insert_buf, schema.clone()).await;
-    reap(&mut sends, true).await?; // wait for all uploads before returning
 
     ctx.counters
         .rows_read
@@ -4485,8 +5694,9 @@ async fn setup_clickhouse(
     };
     if base_table.is_some() && base_query.is_some() {
         tracing::warn!(
-            "both source_table and source_query are set; source_table is ignored — \
-             schema and data both come from source_query"
+            "both source_table and source_query are set; schema and data come from \
+             source_query. source_table is used only to check a cursor that is ahead of \
+             source_query's MAX(watermark), against the unfiltered table"
         );
     }
     let source_cols = s
@@ -4537,6 +5747,9 @@ async fn setup_clickhouse(
         // detect.
         stream_max_cursor: false,
         keyset_not_null: false,
+        max_from_table: false,
+        // Every ClickHouse query is its own HTTP request: nothing to keep.
+        control: None,
     })
 }
 
@@ -4683,6 +5896,7 @@ async fn transfer_keyset_clickhouse(
 
         // Land the chunk in the destination before its cursor is committed
         // below (a no-op where the flush above already did).
+        check_fatal(cfg, ctx.sink.as_ref(), &ctx.warnings, Before::Chunk)?;
         ctx.end_chunk(&chunk_ctx, rows_this_chunk).await?;
         if rows_this_chunk == 0 {
             break;
@@ -4702,10 +5916,12 @@ async fn transfer_keyset_clickhouse(
                 cfg,
                 chunk.committed.as_deref(),
                 &cur,
-                chunk.effective_upper.as_deref().unwrap_or(""),
+                &chunk.marker_upper(ctx.watermark_max.as_deref(), cfg.lookback_seconds),
                 ctx.counters.rows_written.load(Ordering::Relaxed),
             )
             .await?;
+        // A retry resumes past this chunk, so it won't write its rows again.
+        ctx.chunk_committed();
         cursor = Some(cur);
         emit_progress(&ctx.counters, &ctx.progress, ctx.started);
 
@@ -4858,7 +6074,11 @@ fn coercion_message(kind: WarningKind, column: &str, n: u64) -> String {
         | WarningKind::DecimalMappingMixed
         | WarningKind::WatermarkNotAdvanced
         | WarningKind::WatermarkAheadOfSource
-        | WarningKind::ShiftedTimestamp => {
+        | WarningKind::ShiftedTimestamp
+        | WarningKind::WindowBoundsUnavailable
+        | WarningKind::NullCheckSkipped
+        | WarningKind::RetriedAfterPartialWrite
+        | WarningKind::StorageWriteCountMismatch => {
             format!("column '{column}': {n} affected row(s)")
         }
     }
@@ -4973,8 +6193,14 @@ struct WatermarkProbePlan {
     /// Skip the `MAX(watermark)` bound and take the cursor from the read
     /// stream instead. Requires a lookback window — see [`plan_watermark_probes`].
     stream_max: bool,
-    /// At least one probe was too costly to run — emit `UnindexedWatermark`.
-    warn_costly: bool,
+    /// `MAX(watermark)` was too costly: no index serves the watermark, so the
+    /// read's `WHERE wm > x` scans the table. Emits `unindexed_watermark`, and
+    /// is what switches a windowed sweep on.
+    max_too_dear: bool,
+    /// The NULL count was too costly. Emits `null_check_skipped` and nothing
+    /// else: an indexed watermark with many NULLs prices the count high while
+    /// its MAX comes straight from the index and its read is a range scan.
+    count_too_dear: bool,
 }
 
 /// Decide the probe plan from the two planner estimates.
@@ -5015,70 +6241,193 @@ fn plan_watermark_probes(
         // run rather than implying it passed.
         count_nulls: !count_too_dear,
         stream_max: max_too_dear && lookback_seconds > 0,
-        warn_costly: count_too_dear || max_too_dear,
+        max_too_dear,
+        count_too_dear,
     }
 }
 
-/// Report a watermark column the planner says is expensive to probe, naming the
-/// evidence and everything that was skipped because of it.
+/// Attempts at the key-bounds probe before a windowed read falls back to one
+/// pass, counting the first.
+const KEY_BOUNDS_ATTEMPTS: u32 = 3;
+
+/// Settle the key bounds of a read that has to be windowed, given the first
+/// probe's outcome and a way to probe again on a fresh connection.
 ///
-/// Deliberately explicit when the NULL-watermark completeness check did not
-/// run: reporting a skipped check as a clean one is how the condition
-/// [`warn_on_null_watermark`] exists to catch goes unnoticed.
-fn warn_on_costly_watermark(
-    watermark: &str,
+/// A transient failure (a hot standby's recovery conflict, a statement
+/// timeout, a dropped connection) is retried with backoff: the probe is cheap
+/// to repeat, and the one-pass read that replaces the sweep without bounds
+/// is exactly the long scan the standby cancels. Never fails the run: when the
+/// bounds stay unavailable the read goes ahead in one pass, and says so with a
+/// `window_bounds_unavailable` warning an orchestrator can see. `None` is also
+/// an empty relation, which needs no sweep.
+async fn key_bounds_with_retry<F, Fut>(
+    col: &str,
+    first: Result<Option<(i64, i64)>>,
+    warnings: &Warnings,
+    mut probe: F,
+) -> Option<(i64, i64)>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Option<(i64, i64)>>>,
+{
+    let mut outcome = first;
+    let mut attempt = 1;
+    loop {
+        let e = match outcome {
+            Ok(bounds) => return bounds,
+            Err(e) => e,
+        };
+        if attempt >= KEY_BOUNDS_ATTEMPTS || !e.is_transient_source() {
+            warn_window_bounds_unavailable(col, attempt, &e, warnings);
+            return None;
+        }
+        let delay = crate::sink::backoff_delay(attempt);
+        tracing::warn!(
+            "probing the key bounds of '{col}' failed on attempt {attempt} ({e}); retrying in \
+             {delay:?}"
+        );
+        tokio::time::sleep(delay).await;
+        attempt += 1;
+        outcome = probe().await;
+    }
+}
+
+/// `window_bounds_unavailable`: the read needed a sweep, but the key bounds
+/// could not be probed, so it runs in one pass.
+fn warn_window_bounds_unavailable(col: &str, attempts: u32, e: &EtlError, warnings: &Warnings) {
+    let message = format!(
+        "the read plans as a sequential scan, but the key bounds of '{col}' could not be \
+         probed after {attempts} attempt(s) ({e}), so it cannot be windowed and will be read in \
+         one pass. On a hot standby that pass is likely to be cancelled. If source_query embeds \
+         its own unindexed filter, the probe inherits it: set source_table as well so the \
+         bounds come from the table, project the raw key and set partition_source_expr, or \
+         index the filtered column."
+    );
+    tracing::warn!("{message}");
+    warnings.push(TransferWarning {
+        kind: WarningKind::WindowBoundsUnavailable,
+        column: Some(col.to_string()),
+        count: 0,
+        sample: None,
+        message,
+    });
+}
+
+/// What the watermark probes skipped, and why, for [`Self::warn`].
+struct ProbeReport<'a> {
+    watermark: &'a str,
     plan: WatermarkProbePlan,
     count_cost: ProbeCost,
     max_cost: ProbeCost,
     nullable: bool,
     lookback_seconds: u64,
-    warnings: &Warnings,
-) {
-    if !plan.warn_costly {
-        return;
+    /// The read is swept in key windows.
+    swept: bool,
+    /// `MAX` went through a `source_query` with no `source_table`, and setting
+    /// one would have it probed on the table instead: a filter in the query
+    /// may be what made it costly.
+    suggest_source_table: bool,
+    /// The statement that adds the index, in the source's own dialect: see
+    /// [`pg_watermark_index_ddl`] and [`mysql_watermark_index_ddl`].
+    index_ddl: String,
+}
+
+impl ProbeReport<'_> {
+    /// Report each probe the planner priced out, naming its evidence and what
+    /// was skipped because of it: `unindexed_watermark` for the `MAX`, and
+    /// `null_check_skipped` for the NULL count. They used to be one warning,
+    /// raised by either, so a costly NULL count on an indexed watermark was
+    /// reported as a missing index, and it switched on a windowed sweep of a
+    /// read that was already a range scan.
+    ///
+    /// Deliberately explicit when the NULL-watermark completeness check did
+    /// not run: reporting a skipped check as a clean one is how the condition
+    /// [`warn_on_null_watermark`] exists to catch goes unnoticed.
+    fn warn(&self, warnings: &Warnings) {
+        let w = self.watermark;
+        if self.plan.max_too_dear {
+            let mut message = format!(
+                "watermark column '{w}' cannot be probed cheaply — {}. The incremental filter \
+                 `WHERE {w} > x` therefore scans the whole table on every run",
+                self.max_cost.describe()
+            );
+            if self.plan.stream_max {
+                message.push_str(
+                    ". quickhouse skipped the MAX(watermark) snapshot scan and took the cursor \
+                     from the rows it actually read instead",
+                );
+            } else if self.lookback_seconds == 0 {
+                message.push_str(
+                    ". The MAX(watermark) snapshot scan still ran: taking the cursor from the \
+                     read stream instead needs lookback_seconds > 0, so that a row written \
+                     mid-read is re-covered by the next run",
+                );
+            }
+            if self.suggest_source_table {
+                message.push_str(
+                    ". The MAX was taken through source_query, whose own filter can make it a \
+                     scan even when the column is indexed: set source_table as well, and the \
+                     MAX is probed on the table",
+                );
+            }
+            if self.swept {
+                message.push_str(&format!(
+                    ". The read itself is swept in bounded key windows so it still completes; \
+                     the durable fix that makes the whole sweep unnecessary is an index: {}.",
+                    self.index_ddl
+                ));
+            } else {
+                message.push_str(&format!(
+                    ". The durable fix is an index: {}.",
+                    self.index_ddl
+                ));
+            }
+            tracing::warn!("{message}");
+            warnings.push(TransferWarning {
+                kind: WarningKind::UnindexedWatermark,
+                column: Some(w.to_string()),
+                count: 0,
+                sample: None,
+                message,
+            });
+        }
+        if self.nullable && self.plan.count_too_dear {
+            let message = format!(
+                "the nullable-watermark completeness count on '{w}' cannot be run cheaply — {}, \
+                 so quickhouse SKIPPED the check behind the null_watermark warning: if any row \
+                 holds a NULL {w}, it is being silently excluded from this and every future \
+                 incremental run and this run cannot tell you. (A read that returns rows with \
+                 no {w} at all is still reported.) Set probe_max_cost=0 to pay for the count, \
+                 or make the column NOT NULL.",
+                self.count_cost.describe()
+            );
+            tracing::warn!("{message}");
+            warnings.push(TransferWarning {
+                kind: WarningKind::NullCheckSkipped,
+                column: Some(w.to_string()),
+                count: 0,
+                sample: None,
+                message,
+            });
+        }
     }
-    let evidence = if max_cost.should_skip(f64::MIN_POSITIVE) {
-        max_cost.describe()
-    } else {
-        count_cost.describe()
-    };
-    let mut message = format!(
-        "watermark column '{watermark}' cannot be probed cheaply — {evidence}. The incremental \
-         filter `WHERE {watermark} > x` therefore scans the whole table on every run"
-    );
-    if plan.stream_max {
-        message.push_str(
-            ". quickhouse skipped the MAX(watermark) snapshot scan and took the cursor from the \
-             rows it actually read instead",
-        );
-    } else if lookback_seconds == 0 {
-        message.push_str(
-            ". The MAX(watermark) snapshot scan still ran: taking the cursor from the read \
-             stream instead needs lookback_seconds > 0, so that a row written mid-read is \
-             re-covered by the next run",
-        );
-    }
-    if nullable && !plan.count_nulls {
-        message.push_str(&format!(
-            ". quickhouse also skipped the nullable-watermark completeness count, which is a \
-             full scan too. Note that SKIPPED the check behind the null_watermark warning: if \
-             any row holds a NULL {watermark}, it is being silently excluded from this and \
-             every future incremental run and this run cannot tell you"
-        ));
-    }
-    message.push_str(&format!(
-        ". The read itself is swept in bounded key windows so it still completes; the durable \
-         fix that makes the whole sweep unnecessary is an index: CREATE INDEX CONCURRENTLY ON \
-         <table> ({watermark})."
-    ));
-    tracing::warn!("{message}");
-    warnings.push(TransferWarning {
-        kind: WarningKind::UnindexedWatermark,
-        column: Some(watermark.to_string()),
-        count: 0,
-        sample: None,
-        message,
-    });
+}
+
+/// The PostgreSQL statement that indexes the watermark without blocking writes.
+fn pg_watermark_index_ddl(watermark: &str) -> String {
+    format!(
+        "CREATE INDEX CONCURRENTLY ON <table> ({})",
+        quote_pg(watermark)
+    )
+}
+
+/// The MySQL equivalent of [`pg_watermark_index_ddl`]: an online DDL, which
+/// MySQL spells as an `ALTER TABLE` (it has no `CREATE INDEX CONCURRENTLY`).
+fn mysql_watermark_index_ddl(watermark: &str) -> String {
+    format!(
+        "ALTER TABLE <table> ADD INDEX ({}), ALGORITHM=INPLACE, LOCK=NONE",
+        quote_my(watermark)
+    )
 }
 
 /// Report each MySQL `TIMESTAMP` column this run lands shifted by the
@@ -5457,6 +6806,7 @@ async fn compute_partitions_pg(
     client: &tokio_postgres::Client,
     cfg: &TransferConfig,
     source_cols: &[ColumnType],
+    cursor: Option<&str>,
 ) -> Result<Vec<Partition>> {
     let single = vec![Partition {
         label: "all".into(),
@@ -5509,8 +6859,32 @@ async fn compute_partitions_pg(
             type_id,
             cfg.parallelism,
             nullable,
+            partitions_above(cfg, &part_col, source_expr, cursor),
         )
         .await
+}
+
+/// Where range partitions start when the watermark is the partition key: just
+/// above the cursor. The read is `key > cursor` then, so splitting the whole
+/// table's `[MIN, MAX]` put every new row in the last partition, and with
+/// `parallelism=2` the other one opened a connection to read nothing. `None`
+/// (split the whole range) otherwise.
+fn partitions_above(
+    cfg: &TransferConfig,
+    part_col: &str,
+    source_expr: Option<&str>,
+    cursor: Option<&str>,
+) -> Option<i64> {
+    // With a watermark_source_expr the read compares that expression, not the
+    // key, to the cursor.
+    if cfg.mode != SyncMode::Incremental
+        || source_expr.is_some()
+        || cfg.watermark_source_expr.is_some()
+        || cfg.watermark.as_deref() != Some(part_col)
+    {
+        return None;
+    }
+    cursor?.trim().parse().ok()
 }
 
 /// Which relation the range-partition probe reads: `(Some(table), None)` for a
@@ -5586,6 +6960,7 @@ async fn compute_partitions_mysql(
     conn: &mut mysql_async::Conn,
     cfg: &TransferConfig,
     source_cols: &[ColumnType],
+    cursor: Option<&str>,
 ) -> Result<Vec<Partition>> {
     let single = vec![Partition {
         label: "all".into(),
@@ -5633,6 +7008,7 @@ async fn compute_partitions_mysql(
             type_id,
             cfg.parallelism,
             nullable,
+            partitions_above(cfg, &part_col, source_expr, cursor),
         )
         .await
 }
@@ -5852,6 +7228,33 @@ fn lower_bound_sql(
     }
 }
 
+/// `MAX(watermark)` through `source_query` (or on `source_table` when there is
+/// no query), on the setup connection when there is one.
+async fn query_max_watermark(
+    source: &Source,
+    control: Option<&mut ControlConn>,
+    cfg: &TransferConfig,
+) -> Result<Option<String>> {
+    let w = cfg.watermark.as_deref().unwrap_or_default();
+    let (t, q) = (cfg.source_table.as_deref(), cfg.source_query.as_deref());
+    let expr = cfg.watermark_source_expr.as_deref();
+    match (source, control) {
+        (Source::Postgres(s), Some(ControlConn::Postgres(c))) => {
+            s.max_watermark(c, t, q, w, expr).await
+        }
+        (Source::Postgres(s), _) => s.max_watermark(&s.connect().await?, t, q, w, expr).await,
+        (Source::MySql(s), Some(ControlConn::MySql(c))) => s.max_watermark(c, t, q, w, expr).await,
+        (Source::MySql(s), _) => {
+            s.max_watermark(&mut s.connect().await?, t, q, w, expr)
+                .await
+        }
+        (Source::ClickHouse(s), _) => Ok(s.max_watermark(t, q, w, expr).await?.0),
+        (Source::BigQuery(_), _) => {
+            unreachable!("BigQuery is handled via the early return in run_transfer")
+        }
+    }
+}
+
 /// Refuse to read when the lower bound evaluates to NULL on the source.
 ///
 /// `watermark > NULL` matches no row, so the run would read 0 rows and
@@ -5862,16 +7265,31 @@ fn lower_bound_sql(
 /// round trip that touches no table.
 async fn ensure_lower_bound_not_null(
     source: &Source,
+    control: Option<&mut ControlConn>,
     bound: &str,
     cfg: &TransferConfig,
     cursor: &str,
     from_state: bool,
 ) -> Result<()> {
-    let is_null = match source {
-        Source::Postgres(s) => s.is_null(bound).await?,
-        Source::MySql(s) => s.is_null(bound).await?,
-        Source::ClickHouse(s) => s.is_null(bound).await?,
-        Source::BigQuery(_) => {
+    // The setup connection can be gone by now: a key-bounds probe that failed
+    // on it may have been a dropped connection. Then a fresh one asks.
+    let is_null = match (source, control) {
+        (Source::Postgres(s), Some(ControlConn::Postgres(c))) => {
+            match PgSource::is_null_on(c, bound).await {
+                Err(e) if e.is_transient_source() => s.is_null(bound).await?,
+                other => other?,
+            }
+        }
+        (Source::MySql(s), Some(ControlConn::MySql(c))) => {
+            match MySqlSource::is_null_on(c, bound).await {
+                Err(e) if e.is_transient_source() => s.is_null(bound).await?,
+                other => other?,
+            }
+        }
+        (Source::Postgres(s), _) => s.is_null(bound).await?,
+        (Source::MySql(s), _) => s.is_null(bound).await?,
+        (Source::ClickHouse(s), _) => s.is_null(bound).await?,
+        (Source::BigQuery(_), _) => {
             unreachable!("BigQuery is handled via the early return in run_transfer")
         }
     };
@@ -5983,22 +7401,44 @@ fn parse_temporal_micros(v: &str) -> Option<(i64, bool)> {
 }
 
 impl CursorCheck {
-    /// `watermark_ahead_of_source`: raised before the read.
-    fn warn_if_cursor_ahead(&self, cfg: &TransferConfig, warnings: &Warnings) {
+    /// `watermark_ahead_of_source`: raised before the read. `filtered` is
+    /// `Some` when the MAX came through `source_query` and the unfiltered table
+    /// couldn't settle whether the filter explains it, with a sentence saying
+    /// why: see [`judge_cursor_ahead_of_query`].
+    fn warn_if_cursor_ahead(
+        &self,
+        cfg: &TransferConfig,
+        filtered: Option<&str>,
+        warnings: &Warnings,
+    ) {
         if !self.cursor_ahead {
             return;
         }
-        let message = format!(
+        let mut message = format!(
             "the incremental cursor for state_key '{key}' ({cursor}) is ahead of the source's \
-             MAX({w}) ({max}). Typical causes: a cursor converted into the wrong time zone, one \
-             seeded from another table, or the source's newest rows deleted. This run saves the \
-             source's MAX as the cursor. If the cursor had been shifted, rows between its true \
-             position and that MAX may never have been read; re-sync that range.",
+             MAX({w}) ({max}). ",
             key = cfg.effective_state_key(),
             cursor = self.cursor,
             w = self.watermark,
             max = self.max,
         );
+        if let Some(why) = filtered {
+            message.push_str(&format!(
+                "That MAX is computed through source_query, and a filter that excludes the \
+                 newest rows (a rolling time window on a quiet table, say) puts it below a \
+                 correct cursor. {why} This run saves that MAX as the cursor all the same: \
+                 moving it back costs a re-read at most, while keeping a cursor that really is \
+                 ahead would skip rows. Otherwise the typical causes are a cursor converted into \
+                 the wrong time zone, or one seeded from another table."
+            ));
+        } else {
+            message.push_str(
+                "Typical causes: a cursor converted into the wrong time zone, one seeded from \
+                 another table, or the source's newest rows deleted. This run saves the source's \
+                 MAX as the cursor. If the cursor had been shifted, rows between its true \
+                 position and that MAX may never have been read; re-sync that range.",
+            );
+        }
         tracing::warn!("{message}");
         warnings.push(TransferWarning {
             kind: WarningKind::WatermarkAheadOfSource,
@@ -6037,6 +7477,203 @@ impl CursorCheck {
             message,
         });
     }
+}
+
+/// What the incremental setup decided about the cursor, for after the read.
+#[derive(Debug, Default)]
+struct CursorPlan {
+    /// The cursor this run started from: the committed one, or the first run's
+    /// seed.
+    last: Option<String>,
+    /// `last` is a seed (or absent): no cursor was saved yet.
+    seeded: bool,
+    /// The cursor is ahead of the source for real: save the MAX, moving it
+    /// back.
+    rewind_to_max: bool,
+    /// What a cursor moved back is never moved below: see [`cursor_floor`].
+    floor: Option<String>,
+    /// The run resumes an interrupted chunked read past a marker that froze
+    /// an upper bound, which the read is held to and saves as the cursor:
+    /// see [`MarkerBound`].
+    pinned: bool,
+    /// The run resumes past a marker that froze none, so it can't account
+    /// for the chunks before it and keeps the committed cursor: see
+    /// [`MarkerBound::Unbounded`]. A first run, which has none to keep, takes
+    /// one from what it reads, as a fresh read would.
+    keep_committed: bool,
+}
+
+/// The cursor a cursor moved back is never moved below: the committed one,
+/// or on a first run a seed, but only when it parses in the tracker's own
+/// unit. PostgreSQL reads an offset-less seed of a `timestamptz` in the
+/// session's zone, so taking it as UTC could put the floor hours later than
+/// the read's own lower bound, and cancel the rewind it limits.
+fn cursor_floor(
+    committed: Option<&str>,
+    seed: Option<&str>,
+    tracker: Option<&WatermarkTracker>,
+) -> Option<String> {
+    match committed {
+        Some(c) => Some(c.to_string()),
+        None => seed
+            .filter(|s| tracker.is_some_and(|t| t.parse(s).is_some()))
+            .map(str::to_string),
+    }
+}
+
+/// What a cursor ahead of `source_query`'s MAX means. Whatever it is, the run
+/// saves that MAX as the cursor, as it always has: moving the cursor back costs
+/// a re-read, while keeping one that really is ahead (shifted by a time-zone
+/// conversion, say) would skip every row that arrives below it. What changes
+/// is only what is reported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CursorAhead {
+    /// Ahead of the source itself: the cursor is wrong. Warn.
+    Real,
+    /// Ahead of the filtered MAX but within the unfiltered table's: the
+    /// filter explains it. Say nothing.
+    WithinTable,
+    /// Ahead of the filtered MAX, with no unfiltered MAX to tell why. Warn,
+    /// with this sentence saying why the table didn't settle it.
+    Unexplained(String),
+}
+
+/// Judge a cursor that is ahead of the MAX probed through `source_query`.
+///
+/// A filter that excludes the newest rows puts that MAX below a correct
+/// cursor: a rolling `WHERE write_date >= now() - interval '3 days'` on a quiet
+/// table, once the rows age out of it. Moving the cursor back to that MAX
+/// only makes the next run re-read more, but the warning that came with it
+/// sent the operator after a time-zone bug that isn't there. So the cursor is
+/// compared against `source_table`'s own MAX when that is set, and the
+/// warning names the filter when nothing can tell.
+///
+/// A quiet table hits this on every run, so the table's MAX is held to
+/// `probe_max_cost` like the other probes: a full scan on each run to settle a
+/// warning is not worth it.
+async fn judge_cursor_ahead_of_query(
+    source: &Source,
+    control: Option<&mut ControlConn>,
+    cfg: &TransferConfig,
+    check: &CursorCheck,
+    source_cols: &[ColumnType],
+) -> CursorAhead {
+    let w = check.watermark.as_str();
+    let Some(table) = cfg.source_table.as_deref() else {
+        return CursorAhead::Unexplained(
+            "Set source_table as well to have the cursor checked against the unfiltered table \
+             instead."
+                .to_string(),
+        );
+    };
+    let expr = cfg.watermark_source_expr.as_deref();
+    let too_costly = |cost: ProbeCost| {
+        cost.should_skip(cfg.probe_max_cost).then(|| {
+            CursorAhead::Unexplained(format!(
+                "source_table's own MAX({w}) was not read to check it: {} (probe_max_cost={}).",
+                cost.describe(),
+                cfg.probe_max_cost
+            ))
+        })
+    };
+    let table_max = match (source, control) {
+        (Source::Postgres(s), Some(ControlConn::Postgres(c))) => {
+            let sql = PgSource::max_watermark_sql(Some(table), None, w, expr);
+            if let Some(v) = too_costly(s.explain_cost(c, &sql).await) {
+                return v;
+            }
+            s.max_watermark(c, Some(table), None, w, expr).await
+        }
+        (Source::MySql(s), Some(ControlConn::MySql(c))) => {
+            let sql = MySqlSource::max_watermark_sql(Some(table), None, w, expr);
+            if let Some(v) = too_costly(s.explain_cost(c, &sql).await) {
+                return v;
+            }
+            s.max_watermark(c, Some(table), None, w, expr).await
+        }
+        (Source::Postgres(_) | Source::MySql(_), _) => Err(EtlError::internal(
+            "the setup connection is gone before the cursor check",
+        )),
+        (Source::ClickHouse(s), _) => s
+            .max_watermark(Some(table), None, w, expr)
+            .await
+            .map(|(max, _)| max),
+        (Source::BigQuery(_), _) => {
+            unreachable!("BigQuery is handled via the early return in run_transfer")
+        }
+    };
+    let unexplained = || {
+        CursorAhead::Unexplained(format!(
+            "source_table's own MAX({w}) gave nothing to check it against."
+        ))
+    };
+    let table_max = match table_max {
+        Ok(Some(m)) => m,
+        Ok(None) => return unexplained(),
+        // source_query may rename or derive the column, so the table need not
+        // have one by that name.
+        Err(e) => {
+            return CursorAhead::Unexplained(format!(
+                "source_table's own MAX({w}) could not be read to check it ({e})."
+            ))
+        }
+    };
+    match check_cursor_against_max(
+        w,
+        &check.cursor,
+        &table_max,
+        cfg.lookback_seconds,
+        source_cols,
+    ) {
+        Some(c) if c.cursor_ahead => CursorAhead::Real,
+        Some(_) => CursorAhead::WithinTable,
+        None => unexplained(),
+    }
+}
+
+/// How far to move a stream-derived cursor back, in seconds, after a read of
+/// several statements that took `read_secs`.
+///
+/// Each window (or partition, or chunk) reads its own snapshot, one after
+/// another. A row in a window already read can be updated mid-read while a
+/// row in a later window is updated after it, and the cursor lands on the
+/// later update. The next run starts at `cursor - lookback`, which is past
+/// the first update once the read took longer than the lookback, so that
+/// row is never read again. Moving the cursor back by the excess keeps
+/// `cursor - lookback` at or before the read's start: the stream's maximum
+/// can't be later than the read's end, as long as the watermark follows the
+/// source's clock. 0 when the read fit inside the lookback.
+fn stream_cursor_rewind_secs(read_secs: f64, lookback_seconds: u64) -> u64 {
+    (read_secs.max(0.0).ceil() as u64).saturating_sub(lookback_seconds)
+}
+
+/// Report an incremental read that returned rows but no cursor: every row
+/// read had a NULL watermark. With no cursor saved, the next run has no lower
+/// bound and reads them all again, as does every run after it, while the
+/// NULL-count probe that raises `null_watermark` may have been skipped as too
+/// costly. Raised from the read itself so that can't hide it, unless that
+/// probe already reported the column.
+fn warn_on_unwatermarked_read(cfg: &TransferConfig, rows_read: u64, warnings: &Warnings) {
+    let w = cfg.watermark.as_deref().unwrap_or("?");
+    let message = format!(
+        "the incremental read for state_key '{key}' returned {rows_read} row(s), but none had \
+         a non-NULL '{w}', so there is no cursor to save (cursor unchanged). The next run has \
+         no lower bound either and reads every row again, as will each run after it. Populate \
+         '{w}', pick a watermark column that is set on every row, or load the table with \
+         mode=\"full\". Once a cursor exists, `WHERE {w} > x` never matches the NULL rows.",
+        key = cfg.effective_state_key(),
+    );
+    tracing::warn!("{message}");
+    if warnings.contains(WarningKind::NullWatermark, Some(w)) {
+        return;
+    }
+    warnings.push(TransferWarning {
+        kind: WarningKind::NullWatermark,
+        column: Some(w.to_string()),
+        count: rows_read,
+        sample: None,
+        message,
+    });
 }
 
 /// Resolve the first-run seed into the effective `last` watermark. Only ever
@@ -6896,7 +8533,7 @@ mod tests {
         let p = plan_watermark_probes(CHEAP, CHEAP, T, 86_400);
         assert!(p.count_nulls);
         assert!(!p.stream_max, "a cheap MAX must still be used as the bound");
-        assert!(!p.warn_costly);
+        assert!(!p.max_too_dear && !p.count_too_dear);
     }
 
     #[test]
@@ -6910,7 +8547,7 @@ mod tests {
             p.stream_max,
             "a full-scan MAX should give way to the stream"
         );
-        assert!(p.warn_costly);
+        assert!(p.max_too_dear && p.count_too_dear);
     }
 
     #[test]
@@ -6928,14 +8565,14 @@ mod tests {
         // a check.
         //
         // What protects the user instead is that the skip is *reported*:
-        // `warn_on_costly_watermark` states the check did not run rather than
+        // `null_check_skipped` states the check did not run rather than
         // implying it passed.
         let p = plan_watermark_probes(DEAR, DEAR, T, 86_400);
         assert!(
             !p.count_nulls,
             "an unaffordable check must not be attempted"
         );
-        assert!(p.warn_costly, "and the user must be told it was skipped");
+        assert!(p.count_too_dear, "and the user must be told it was skipped");
     }
 
     #[test]
@@ -6947,12 +8584,25 @@ mod tests {
     }
 
     #[test]
+    fn a_costly_null_count_alone_is_not_an_unindexed_watermark() {
+        // Issue #16, case 1: an indexed, nullable watermark with 1.9M NULLs.
+        // MAX comes straight from the index, while the planner prices the
+        // NULL count at 100,312. Only the count is skipped; the read is a
+        // range scan, so nothing may switch a sweep on.
+        let p = plan_watermark_probes(DEAR, CHEAP, T, 86_400);
+        assert!(!p.count_nulls);
+        assert!(!p.max_too_dear, "the MAX is what decides the sweep");
+        assert!(!p.stream_max);
+        assert!(p.count_too_dear);
+    }
+
+    #[test]
     fn stream_max_requires_a_lookback_window() {
         // Without a trailing re-scan nothing re-covers a row written mid-read
         // that the scan had already passed, so the MAX scan is paid for.
         let p = plan_watermark_probes(DEAR, DEAR, T, 0);
         assert!(!p.stream_max);
-        assert!(p.warn_costly);
+        assert!(p.max_too_dear);
     }
 
     #[test]
@@ -6962,7 +8612,7 @@ mod tests {
         let p = plan_watermark_probes(ProbeCost::Unknown, ProbeCost::Unknown, T, 86_400);
         assert!(!p.count_nulls);
         assert!(p.stream_max);
-        assert!(p.warn_costly);
+        assert!(p.max_too_dear && p.count_too_dear);
     }
 
     #[test]
@@ -6970,54 +8620,340 @@ mod tests {
         let p = plan_watermark_probes(DEAR, DEAR, 0.0, 86_400);
         assert!(p.count_nulls);
         assert!(!p.stream_max);
-        assert!(!p.warn_costly);
+        assert!(!p.max_too_dear && !p.count_too_dear);
+    }
+
+    fn report(
+        watermark: &'static str,
+        count: ProbeCost,
+        max: ProbeCost,
+        nullable: bool,
+        index_ddl: String,
+    ) -> Vec<TransferWarning> {
+        let warnings = Warnings::default();
+        ProbeReport {
+            watermark,
+            plan: plan_watermark_probes(count.clone(), max.clone(), T, 86_400),
+            count_cost: count,
+            max_cost: max,
+            nullable,
+            lookback_seconds: 86_400,
+            swept: true,
+            suggest_source_table: false,
+            index_ddl,
+        }
+        .warn(&warnings);
+        warnings.drain()
     }
 
     #[test]
-    fn the_warning_names_the_evidence_and_the_skipped_check() {
-        let warnings = Warnings::default();
-        let p = plan_watermark_probes(DEAR, DEAR, T, 86_400);
-        warn_on_costly_watermark("write_date", p, DEAR, DEAR, true, 86_400, &warnings);
-        let out = warnings.drain();
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].kind, WarningKind::UnindexedWatermark);
-        assert_eq!(out[0].column.as_deref(), Some("write_date"));
+    fn the_warnings_name_the_evidence_and_the_skipped_check() {
+        let out = report(
+            "write_date",
+            DEAR,
+            DEAR,
+            true,
+            pg_watermark_index_ddl("write_date"),
+        );
+        let kinds = out.iter().map(|w| w.kind).collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec![
+                WarningKind::UnindexedWatermark,
+                WarningKind::NullCheckSkipped
+            ]
+        );
+        let unindexed = &out[0];
+        assert_eq!(unindexed.column.as_deref(), Some("write_date"));
         // The planner estimate must be quoted, so an operator can act on it.
-        assert!(out[0].message.contains("3031034"), "{}", out[0].message);
-        assert!(out[0].message.contains("SKIPPED"), "{}", out[0].message);
-        assert!(out[0].message.contains("CREATE INDEX CONCURRENTLY"));
+        assert!(
+            unindexed.message.contains("3031034"),
+            "{}",
+            unindexed.message
+        );
+        assert!(unindexed.message.contains("CREATE INDEX CONCURRENTLY"));
+        assert!(
+            !unindexed.message.contains("SKIPPED"),
+            "{}",
+            unindexed.message
+        );
+        let skipped = &out[1];
+        assert_eq!(skipped.column.as_deref(), Some("write_date"));
+        assert!(skipped.message.contains("SKIPPED"), "{}", skipped.message);
+        assert!(skipped.message.contains("3031034"), "{}", skipped.message);
+    }
+
+    #[test]
+    fn an_indexed_watermark_with_many_nulls_reports_only_the_skipped_count() {
+        let out = report(
+            "updated_date",
+            DEAR,
+            CHEAP,
+            true,
+            mysql_watermark_index_ddl("x"),
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].kind, WarningKind::NullCheckSkipped);
+    }
+
+    #[test]
+    fn the_warning_gives_mysql_its_own_index_syntax() {
+        // `CREATE INDEX CONCURRENTLY` is PostgreSQL-only; MySQL rejects it.
+        let out = report(
+            "updated_date",
+            DEAR,
+            DEAR,
+            true,
+            mysql_watermark_index_ddl("updated_date"),
+        );
+        let msg = &out[0].message;
+        assert_eq!(out[0].kind, WarningKind::UnindexedWatermark);
+        assert!(
+            msg.contains(
+                "ALTER TABLE <table> ADD INDEX (`updated_date`), ALGORITHM=INPLACE, LOCK=NONE"
+            ),
+            "{msg}"
+        );
+        assert!(!msg.contains("CONCURRENTLY"), "{msg}");
     }
 
     #[test]
     fn no_warning_when_both_probes_are_cheap() {
-        let warnings = Warnings::default();
-        let p = plan_watermark_probes(CHEAP, CHEAP, T, 86_400);
-        warn_on_costly_watermark("write_date", p, CHEAP, CHEAP, true, 86_400, &warnings);
-        assert!(warnings.drain().is_empty());
+        let out = report(
+            "write_date",
+            CHEAP,
+            CHEAP,
+            true,
+            pg_watermark_index_ddl("x"),
+        );
+        assert!(out.is_empty());
     }
 
     #[test]
     fn the_warning_omits_the_skip_note_for_a_not_null_watermark() {
         // Nothing was skipped, because the count never runs on a NOT NULL
         // column — the warning must not claim a lost check.
-        let warnings = Warnings::default();
-        let p = plan_watermark_probes(ProbeCost::Known(0.0), DEAR, T, 86_400);
-        warn_on_costly_watermark(
+        let out = report(
             "write_date",
-            p,
             ProbeCost::Known(0.0),
             DEAR,
             false,
-            86_400,
-            &warnings,
+            pg_watermark_index_ddl("write_date"),
         );
-        let out = warnings.drain();
         assert_eq!(out.len(), 1);
+        assert_eq!(out[0].kind, WarningKind::UnindexedWatermark);
         assert!(
             !out[0].message.contains("SKIPPED the check"),
             "{}",
             out[0].message
         );
+    }
+
+    #[test]
+    fn a_table_max_is_probed_only_when_the_tracker_can_take_the_cursor() {
+        let mut cfg = crate::config::default_test_config();
+        cfg.source_table = Some("t".into());
+        cfg.source_query = Some("SELECT * FROM t WHERE is_test = 0".into());
+        let cols = [
+            col_typed("id", DataType::Int64),
+            col_typed(
+                "updated_date",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+            ),
+            col_typed("name", DataType::Utf8),
+        ];
+        assert!(table_max_eligible(&cfg, &cols, "id", None));
+        assert!(table_max_eligible(&cfg, &cols, "updated_date", None));
+        assert!(
+            !table_max_eligible(&cfg, &cols, "name", None),
+            "no tracker for text"
+        );
+
+        // The filter is evaluated over the query's columns, the table's MAX
+        // over the table's: a source expression can't be trusted on both.
+        cfg.watermark_source_expr = Some("updated_raw".into());
+        assert!(!table_max_eligible(&cfg, &cols, "updated_date", None));
+        cfg.watermark_source_expr = None;
+        cfg.column_transforms.insert(
+            "updated_date".into(),
+            "updated_date + INTERVAL 1 HOUR".into(),
+        );
+        assert!(!table_max_eligible(&cfg, &cols, "updated_date", None));
+        cfg.column_transforms.clear();
+
+        // Not for a chunked read, nor a watermark left out or overridden.
+        cfg.chunk_rows = Some(1000);
+        assert!(!table_max_eligible(&cfg, &cols, "id", None));
+        cfg.chunk_rows = None;
+        cfg.exclude = vec!["id".into()];
+        assert!(!table_max_eligible(&cfg, &cols, "id", None));
+        cfg.exclude.clear();
+        cfg.include = vec!["updated_date".into()];
+        assert!(!table_max_eligible(&cfg, &cols, "id", None));
+        cfg.include.clear();
+        cfg.type_overrides.insert("id".into(), "String".into());
+        assert!(!table_max_eligible(&cfg, &cols, "id", None));
+        cfg.type_overrides.clear();
+
+        // A skip_to_max first run seeds from the MAX: a filtered-out row past
+        // every real one would carry the cursor beyond them all.
+        cfg.seed_watermark = WatermarkSeed::CurrentMax;
+        assert!(!table_max_eligible(&cfg, &cols, "id", None));
+        assert!(
+            table_max_eligible(&cfg, &cols, "id", Some("41")),
+            "a later run has a cursor"
+        );
+        cfg.seed_watermark = WatermarkSeed::None;
+
+        cfg.source_table = None;
+        assert!(
+            !table_max_eligible(&cfg, &cols, "id", None),
+            "no table to probe"
+        );
+
+        // An EXPLAIN that failed (no such column on the table) never qualifies.
+        assert!(!table_max_affordable(&ProbeCost::Unknown, 0.0));
+        assert!(table_max_affordable(&CHEAP, T));
+        assert!(!table_max_affordable(&DEAR, T));
+        assert!(table_max_affordable(&DEAR, 0.0));
+    }
+
+    #[test]
+    fn a_cursor_under_a_table_max_advances_only_to_what_was_read() {
+        let t = WatermarkTracker {
+            idx: 0,
+            unit: WatermarkUnit::Int,
+            max: AtomicI64::new(i64::MIN),
+        };
+        assert!(!t.seen());
+        assert_eq!(t.advance_from(Some("100"), 0), None, "nothing read");
+        t.max.store(150, Ordering::Relaxed);
+        assert!(t.seen());
+        assert_eq!(t.advance_from(Some("100"), 0).as_deref(), Some("150"));
+        assert_eq!(t.advance_from(None, 0).as_deref(), Some("150"));
+        // Only the lookback band was read again: the cursor stays put.
+        assert_eq!(t.advance_from(Some("150"), 0), None);
+        assert_eq!(t.advance_from(Some("200"), 0), None);
+    }
+
+    #[test]
+    fn a_table_mode_cursor_takes_the_rewind_as_a_margin() {
+        let t = WatermarkTracker {
+            idx: 0,
+            unit: WatermarkUnit::NaiveMicros,
+            max: AtomicI64::new(i64::MIN),
+        };
+        t.max
+            .store(t.parse("2026-01-01 00:00:10").unwrap(), Ordering::Relaxed);
+        assert_eq!(
+            t.advance_from(Some("2026-01-01 00:00:00"), 4).as_deref(),
+            Some("2026-01-01 00:00:06.000000")
+        );
+        assert_eq!(
+            t.advance_from(Some("2026-01-01 00:00:08"), 4),
+            None,
+            "a rewind that lands at or below the starting cursor keeps it"
+        );
+    }
+
+    #[test]
+    fn a_timestamptz_cursor_keeps_its_offset_whatever_its_destination_type() {
+        // A PostgreSQL timestamptz overridden to a naive destination type still
+        // compares as an instant: a cursor without `+00` would be read in the
+        // session's TimeZone.
+        let plan = |arrow: DataType| SelectPlan {
+            source_columns: vec!["wm".into()],
+            source_select_exprs: vec![None],
+            dest_columns: vec![col_typed("wm", arrow)],
+        };
+        let naive = DataType::Timestamp(TimeUnit::Microsecond, None);
+        let zoned = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+        let unit = |arrow, utc| WatermarkTracker::new("wm", &plan(arrow), utc).unwrap().unit;
+        assert_eq!(unit(naive.clone(), true), WatermarkUnit::UtcMicros);
+        assert_eq!(unit(zoned.clone(), true), WatermarkUnit::UtcMicros);
+        assert_eq!(unit(naive, false), WatermarkUnit::NaiveMicros);
+        assert_eq!(unit(zoned, false), WatermarkUnit::NaiveMicros);
+    }
+
+    #[test]
+    fn integer_watermarks_fold_from_every_integer_width() {
+        let plan_cols = |arrow: DataType| SelectPlan {
+            source_columns: vec!["id".into()],
+            source_select_exprs: vec![None],
+            dest_columns: vec![col_typed("id", arrow)],
+        };
+        for arrow in [
+            DataType::Int32,
+            DataType::Int64,
+            DataType::UInt32,
+            DataType::Int16,
+        ] {
+            let t = WatermarkTracker::new("id", &plan_cols(arrow.clone()), false)
+                .unwrap_or_else(|| panic!("{arrow:?} should fold"));
+            assert_eq!(t.unit, WatermarkUnit::Int);
+        }
+        assert!(WatermarkTracker::new("id", &plan_cols(DataType::UInt64), false).is_none());
+        let t = WatermarkTracker::new("id", &plan_cols(DataType::Int32), false).unwrap();
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            DataType::Int32,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow_array::Int32Array::from(vec![
+                Some(7),
+                None,
+                Some(42),
+                Some(-3),
+            ]))],
+        )
+        .unwrap();
+        t.observe(&batch);
+        assert_eq!(t.advance_from(None, 0).as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn partitions_split_above_the_cursor_only_for_a_watermark_key() {
+        let mut cfg = crate::config::default_test_config();
+        cfg.mode = SyncMode::Incremental;
+        cfg.watermark = Some("id".into());
+        assert_eq!(partitions_above(&cfg, "id", None, Some("41")), Some(41));
+        assert_eq!(
+            partitions_above(&cfg, "id", None, None),
+            None,
+            "a first run"
+        );
+        assert_eq!(
+            partitions_above(&cfg, "id", Some("id_raw"), Some("41")),
+            None
+        );
+        assert_eq!(partitions_above(&cfg, "other", None, Some("41")), None);
+        assert_eq!(
+            partitions_above(&cfg, "id", None, Some("2026-01-01")),
+            None,
+            "not an integer cursor"
+        );
+        // The read compares watermark_source_expr, not the key, to the cursor.
+        cfg.watermark_source_expr = Some("COALESCE(id, legacy_id)".into());
+        assert_eq!(partitions_above(&cfg, "id", None, Some("41")), None);
+        cfg.watermark_source_expr = None;
+        cfg.mode = SyncMode::Full;
+        assert_eq!(partitions_above(&cfg, "id", None, Some("41")), None);
+    }
+
+    #[test]
+    fn a_watermark_key_with_a_cursor_needs_no_sweep() {
+        assert!(watermark_bounds_the_key(Some("id"), "id", Some("10")));
+        assert!(
+            !watermark_bounds_the_key(Some("id"), "id", None),
+            "a first run sweeps"
+        );
+        assert!(!watermark_bounds_the_key(
+            Some("updated_date"),
+            "id",
+            Some("x")
+        ));
     }
 
     #[test]
@@ -7187,6 +9123,7 @@ mod tests {
             warnings: Warnings::default(),
             next: AtomicU64::new(0),
             open: Mutex::new(None),
+            landed: None,
         })
     }
 
@@ -7203,6 +9140,7 @@ mod tests {
             warnings: Warnings::default(),
             watermark_max: None,
             chunk_stager,
+            landed: None,
         }
     }
 
@@ -7386,14 +9324,14 @@ mod tests {
 
         let due = check("1", "5", 0, DataType::Int64).unwrap();
         let w = Warnings::default();
-        due.warn_if_cursor_ahead(&cfg, &w);
+        due.warn_if_cursor_ahead(&cfg, None, &w);
         due.warn_if_not_advanced(&cfg, 4, &w);
         assert!(kinds(&w).is_empty(), "rows were read: nothing to report");
         due.warn_if_not_advanced(&cfg, 0, &w);
         assert_eq!(kinds(&w), vec![WarningKind::WatermarkNotAdvanced]);
 
         let quiet = check("5", "5", 0, DataType::Int64).unwrap();
-        quiet.warn_if_cursor_ahead(&cfg, &w);
+        quiet.warn_if_cursor_ahead(&cfg, None, &w);
         quiet.warn_if_not_advanced(&cfg, 0, &w);
         assert!(
             kinds(&w).is_empty(),
@@ -7401,13 +9339,436 @@ mod tests {
         );
 
         let ahead = check("9", "5", 0, DataType::Int64).unwrap();
-        ahead.warn_if_cursor_ahead(&cfg, &w);
+        ahead.warn_if_cursor_ahead(&cfg, None, &w);
         ahead.warn_if_not_advanced(&cfg, 0, &w);
         let out = w.drain();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].kind, WarningKind::WatermarkAheadOfSource);
         assert_eq!(out[0].column.as_deref(), Some("wm"));
         assert_eq!(out[0].sample.as_deref(), Some("9"));
+        assert!(out[0].message.contains("saves the source's MAX"));
+
+        // Through a filtered source_query the message names the filter as a
+        // cause, and still saves the MAX: moving back costs a re-read, while
+        // holding a cursor that really is ahead would skip rows.
+        ahead.warn_if_cursor_ahead(&cfg, Some("Set source_table as well."), &w);
+        let out = w.drain();
+        assert_eq!(out[0].kind, WarningKind::WatermarkAheadOfSource);
+        assert!(
+            out[0].message.contains("filter that excludes"),
+            "{}",
+            out[0].message
+        );
+        assert!(out[0].message.contains("Set source_table as well."));
+        assert!(
+            out[0].message.contains("saves that MAX"),
+            "{}",
+            out[0].message
+        );
+    }
+
+    #[tokio::test]
+    async fn key_bounds_probe_is_retried_after_a_transient_failure() {
+        let w = Warnings::default();
+        let calls = std::cell::Cell::new(0);
+        let transient = || EtlError::read_idle_timeout("probe", 1);
+        let bounds = key_bounds_with_retry("id", Err(transient()), &w, || {
+            calls.set(calls.get() + 1);
+            async { Ok(Some((1, 9))) }
+        })
+        .await;
+        assert_eq!(bounds, Some((1, 9)), "the retry's bounds window the read");
+        assert_eq!(calls.get(), 1);
+        assert!(w.drain().is_empty());
+    }
+
+    #[tokio::test]
+    async fn key_bounds_probe_that_keeps_failing_warns_and_reads_in_one_pass() {
+        let w = Warnings::default();
+        let calls = std::cell::Cell::new(0);
+        let bounds = key_bounds_with_retry(
+            "id",
+            Err(EtlError::read_idle_timeout("probe", 1)),
+            &w,
+            || {
+                calls.set(calls.get() + 1);
+                async { Err(EtlError::read_idle_timeout("probe", 1)) }
+            },
+        )
+        .await;
+        assert_eq!(bounds, None);
+        assert_eq!(calls.get(), KEY_BOUNDS_ATTEMPTS - 1);
+        let out = w.drain();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].kind, WarningKind::WindowBoundsUnavailable);
+        assert_eq!(out[0].column.as_deref(), Some("id"));
+        assert!(
+            out[0].message.contains("3 attempt(s)"),
+            "{}",
+            out[0].message
+        );
+
+        // A failure a retry can't fix (a syntax error, a missing column) is
+        // not retried at all.
+        let calls = std::cell::Cell::new(0);
+        let bounds =
+            key_bounds_with_retry("id", Err(EtlError::other("no such column")), &w, || {
+                calls.set(calls.get() + 1);
+                async { Ok(Some((1, 9))) }
+            })
+            .await;
+        assert_eq!(bounds, None);
+        assert_eq!(calls.get(), 0);
+        assert_eq!(w.drain()[0].kind, WarningKind::WindowBoundsUnavailable);
+    }
+
+    #[test]
+    fn a_sweep_buffer_is_sent_between_windows_only() {
+        let budget = MemoryBudget::new(1_000);
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = || {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(arrow_array::Int32Array::from(vec![1]))],
+            )
+            .unwrap()
+        };
+        let mut buf = InsertBuffer::new(10);
+        buf.deferred = true;
+        // Past the target, but a window's rows are never sent mid-window.
+        assert!(!buf.push(batch(), budget.try_reserve(8).unwrap(), 8));
+        assert!(!buf.push(batch(), budget.try_reserve(8).unwrap(), 8));
+        assert!(buf.full(), "sent once the window ends");
+        buf.deferred = false;
+        assert!(buf.push(batch(), budget.try_reserve(8).unwrap(), 8));
+    }
+
+    #[test]
+    fn a_failed_window_gives_back_only_its_own_buffered_rows() {
+        let budget = MemoryBudget::new(100);
+        let batch = || {
+            let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                "id",
+                DataType::Int32,
+                false,
+            )]));
+            RecordBatch::try_new(
+                schema,
+                vec![Arc::new(arrow_array::Int32Array::from(vec![1]))],
+            )
+            .unwrap()
+        };
+        let mut buf = InsertBuffer::new(usize::MAX);
+        let push = |buf: &mut InsertBuffer, size| {
+            buf.push(batch(), budget.try_reserve(size).unwrap(), size);
+        };
+        // An earlier window's rows, then a failing window's.
+        push(&mut buf, 10);
+        let mark = buf.mark();
+        push(&mut buf, 20);
+        push(&mut buf, 30);
+        buf.truncate(mark);
+        assert_eq!(buf.batches.len(), 1, "the earlier window's rows stay");
+        assert_eq!(buf.bytes, 10);
+        assert!(
+            budget.try_reserve(90).is_some(),
+            "and the failed window's memory is released"
+        );
+
+        // The buffer was sent mid-window: all it holds now is the failed
+        // window's.
+        let mark = buf.mark();
+        push(&mut buf, 5);
+        drop(buf.take());
+        push(&mut buf, 7);
+        buf.truncate(mark);
+        assert!(buf.is_empty());
+        assert_eq!(buf.bytes, 0);
+    }
+
+    #[test]
+    fn a_fatal_warning_stops_the_run_and_says_what_was_left_in_place() {
+        let mut cfg = crate::config::default_test_config();
+        let w = Warnings::default();
+        w.push(TransferWarning {
+            kind: WarningKind::CollapsedBool,
+            column: Some("x_state".into()),
+            count: 3,
+            sample: Some("7".into()),
+            message: "flattened".into(),
+        });
+        w.push(TransferWarning {
+            kind: WarningKind::CollapsedBool,
+            column: Some("x_state".into()),
+            count: 4,
+            sample: None,
+            message: "flattened".into(),
+        });
+        // Nothing is fatal by default.
+        assert!(check_fatal_warnings(&cfg, &w, Before::Cursor).is_ok());
+        cfg.fail_on_warnings = vec![WarningKind::NullWatermark];
+        assert!(check_fatal_warnings(&cfg, &w, Before::Cursor).is_ok());
+
+        cfg.fail_on_warnings = vec![WarningKind::NullWatermark, WarningKind::CollapsedBool];
+        let err = check_fatal_warnings(&cfg, &w, Before::Merge)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("fail_on_warnings: collapsed_bool"), "{err}");
+        assert!(err.contains("column 'x_state'"), "{err}");
+        assert!(err.contains("count 7"), "folded like drain: {err}");
+        assert!(err.contains("destination is untouched"), "{err}");
+        assert!(err.contains("cursor was not saved"), "{err}");
+        // Checking takes nothing: the result still reports it.
+        assert_eq!(w.drain().len(), 1);
+    }
+
+    #[test]
+    fn a_storage_write_mismatch_stops_a_merge_but_not_an_append() {
+        struct Mismatched(Mutex<Vec<TransferWarning>>);
+        #[async_trait::async_trait]
+        impl Sink for Mismatched {
+            fn take_write_warnings(&self) -> Vec<TransferWarning> {
+                std::mem::take(&mut *self.0.lock().unwrap())
+            }
+            async fn table_exists(&self, _: &str) -> Result<bool> {
+                unimplemented!()
+            }
+            async fn create_table(
+                &self,
+                _: &str,
+                _: &[ColumnType],
+                _: &TransferConfig,
+            ) -> Result<()> {
+                unimplemented!()
+            }
+            async fn clone_table_structure(&self, _: &str, _: &str) -> Result<()> {
+                unimplemented!()
+            }
+            async fn insert_batches(
+                &self,
+                _: &str,
+                _: SchemaRef,
+                _: &[RecordBatch],
+            ) -> Result<u64> {
+                unimplemented!()
+            }
+            async fn atomic_swap(&self, _: &str, _: &str, _: &[ColumnType]) -> Result<()> {
+                unimplemented!()
+            }
+            async fn current_row_count(&self, _: &str) -> Result<Option<u64>> {
+                unimplemented!()
+            }
+            async fn drop_table(&self, _: &str) -> Result<()> {
+                unimplemented!()
+            }
+            async fn ensure_state_table(&self, _: &str) -> Result<()> {
+                unimplemented!()
+            }
+            async fn read_last_watermark(&self, _: &TransferConfig) -> Result<Option<String>> {
+                unimplemented!()
+            }
+            async fn persist_watermark(&self, _: &TransferConfig, _: &str, _: u64) -> Result<()> {
+                unimplemented!()
+            }
+            async fn add_missing_columns(
+                &self,
+                _: &str,
+                _: &[ColumnType],
+                _: &TransferConfig,
+            ) -> Result<Vec<String>> {
+                unimplemented!()
+            }
+            fn dest_kind(&self) -> crate::config::DestKind {
+                crate::config::DestKind::BigQuery
+            }
+            fn namespace(&self) -> &str {
+                "ds"
+            }
+        }
+        let mismatch = || TransferWarning {
+            kind: WarningKind::StorageWriteCountMismatch,
+            column: None,
+            count: 3,
+            sample: Some("ds.stg".into()),
+            message: "finalized with 103 rows, 100 appended".into(),
+        };
+        let cfg = crate::config::default_test_config();
+        let sink = Mismatched(Mutex::new(vec![mismatch()]));
+        let w = Warnings::default();
+        let err = check_fatal(&cfg, &sink, &w, Before::Merge)
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with("storage_write_count_mismatch"), "{err}");
+        assert!(err.contains("destination is untouched"), "{err}");
+
+        // Written straight into the destination, it is reported, not fatal.
+        let sink = Mismatched(Mutex::new(vec![mismatch()]));
+        let w = Warnings::default();
+        assert!(check_fatal(&cfg, &sink, &w, Before::Done).is_ok());
+        assert_eq!(w.drain()[0].kind, WarningKind::StorageWriteCountMismatch);
+    }
+
+    #[test]
+    fn a_table_max_must_read_as_the_query_column() {
+        let cols = [
+            col_typed("id", DataType::Int64),
+            col_typed("updated", DataType::Timestamp(TimeUnit::Microsecond, None)),
+            col_typed("since", DataType::Int64),
+        ];
+        assert!(watermark_value_parses(&cols, "id", Some("42"), false));
+        assert!(
+            watermark_value_parses(&cols, "id", None, false),
+            "an empty table"
+        );
+        assert!(watermark_value_parses(
+            &cols,
+            "updated",
+            Some("2026-10-06 10:00:00"),
+            false
+        ));
+        // `UNIX_TIMESTAMP(updated_at) AS since` over a DATETIME column: the
+        // table's MAX would be a bound in another type.
+        assert!(!watermark_value_parses(
+            &cols,
+            "since",
+            Some("2026-10-06 10:00:00"),
+            false
+        ));
+        assert!(!watermark_value_parses(
+            &cols,
+            "updated",
+            Some("1759744800"),
+            false
+        ));
+        // A timestamptz MAX carries its offset; a naive one where one is due doesn't read.
+        assert!(watermark_value_parses(
+            &cols,
+            "updated",
+            Some("2026-10-06 10:00:00+00"),
+            true
+        ));
+        assert!(!watermark_value_parses(
+            &cols,
+            "updated",
+            Some("2026-10-06 10:00:00"),
+            true
+        ));
+    }
+
+    #[test]
+    fn a_retry_after_a_partial_write_is_a_warning_with_the_rows() {
+        let mut cfg = crate::config::default_test_config();
+        cfg.dest_table = "events".into();
+        let w = partial_write_warning(&cfg, 2, 130_000);
+        assert_eq!(w.kind, WarningKind::RetriedAfterPartialWrite);
+        assert_eq!(w.count, 130_000);
+        assert_eq!(w.column, None);
+        assert!(w.message.contains("attempt 2"), "{}", w.message);
+        assert!(w.message.contains("'events'"), "{}", w.message);
+    }
+
+    #[test]
+    fn stream_cursor_rewinds_only_by_what_the_read_took_beyond_the_lookback() {
+        assert_eq!(stream_cursor_rewind_secs(0.4, 1), 0);
+        assert_eq!(stream_cursor_rewind_secs(60.0, 3_600), 0);
+        assert_eq!(stream_cursor_rewind_secs(8.2, 1), 8);
+        assert_eq!(stream_cursor_rewind_secs(-1.0, 0), 0);
+    }
+
+    #[test]
+    fn rewound_stream_cursor_stays_between_the_floor_and_the_max() {
+        let t = WatermarkTracker {
+            idx: 0,
+            unit: WatermarkUnit::NaiveMicros,
+            max: AtomicI64::new(i64::MIN),
+        };
+        assert_eq!(t.render_rewound(10, Some("2026-01-01 00:00:00")), None);
+        let at = |s: &str| t.parse(s).unwrap();
+        t.max.store(at("2026-01-01 00:00:09"), Ordering::Relaxed);
+        assert_eq!(
+            t.render_rewound(0, Some("2026-01-01 00:00:05")).as_deref(),
+            Some("2026-01-01 00:00:09.000000")
+        );
+        // The issue's sweep: 8 s read, 1 s lookback, cursor from a late update.
+        assert_eq!(
+            t.render_rewound(8, None).as_deref(),
+            Some("2026-01-01 00:00:01.000000")
+        );
+        // Never below the cursor the run started from...
+        assert_eq!(
+            t.render_rewound(8, Some("2026-01-01 00:00:05")).as_deref(),
+            Some("2026-01-01 00:00:05.000000")
+        );
+        // ...and that floor never lifts it past what was read.
+        assert_eq!(
+            t.render_rewound(8, Some("2026-01-02 00:00:00")).as_deref(),
+            Some("2026-01-01 00:00:09.000000")
+        );
+        // A floor in another unit is ignored rather than guessed at.
+        assert_eq!(
+            t.render_rewound(8, Some("2026-01-01 00:00:05+00"))
+                .as_deref(),
+            Some("2026-01-01 00:00:01.000000")
+        );
+        // A timestamptz cursor saved without its offset (by 0.20.6, for one
+        // overridden to a naive type) still floors it, as UTC.
+        let z = WatermarkTracker {
+            idx: 0,
+            unit: WatermarkUnit::UtcMicros,
+            max: AtomicI64::new(i64::MIN),
+        };
+        z.max.store(
+            z.parse("2026-01-01 00:00:09+00").unwrap(),
+            Ordering::Relaxed,
+        );
+        assert_eq!(
+            z.render_rewound(8, Some("2026-01-01 00:00:05")).as_deref(),
+            Some("2026-01-01 00:00:05.000000+00")
+        );
+
+        let d = WatermarkTracker {
+            idx: 0,
+            unit: WatermarkUnit::Days,
+            max: AtomicI64::new(i64::MIN),
+        };
+        d.max
+            .store(d.parse("2026-01-10").unwrap(), Ordering::Relaxed);
+        // A DATE moves back in whole days, rounded up.
+        assert_eq!(d.render_rewound(1, None).as_deref(), Some("2026-01-09"));
+        assert_eq!(
+            d.render_rewound(86_401, None).as_deref(),
+            Some("2026-01-08")
+        );
+    }
+
+    #[test]
+    fn a_read_with_no_watermark_reports_null_watermark_once() {
+        let mut cfg = crate::config::default_test_config();
+        cfg.watermark = Some("updated_date".into());
+        let w = Warnings::default();
+        warn_on_unwatermarked_read(&cfg, 1_234, &w);
+        let out = w.drain();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].kind, WarningKind::NullWatermark);
+        assert_eq!(out[0].column.as_deref(), Some("updated_date"));
+        assert_eq!(out[0].count, 1_234);
+        assert!(
+            out[0].message.contains("no cursor to save"),
+            "{}",
+            out[0].message
+        );
+
+        // When the NULL-count probe already reported the column, its exact
+        // count stands and isn't added to.
+        warn_on_null_watermark("updated_date", 7, &w);
+        warn_on_unwatermarked_read(&cfg, 1_234, &w);
+        let out = w.drain();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].count, 7);
     }
 
     /// A `+00` cursor saved by 0.18 to 0.20.1 is read back without its zero
@@ -7737,10 +10098,22 @@ mod tests {
             archive: None,
         });
         let cb: StagedValidationCb = Arc::new(|_info: &StagedInfo| Ok(()));
-        let err = run_transfer_impl(src, dst, cfg, None, Some(cb), &ArchiveUploads::default())
-            .await
-            .expect_err("validate= together with chunk_rows must be rejected")
-            .to_string();
+        let err = run_transfer_impl(
+            src,
+            dst,
+            cfg,
+            None,
+            Some(cb),
+            &ArchiveUploads::default(),
+            Attempt {
+                landed: Arc::new(AtomicU64::new(0)),
+                carried: vec![],
+                first_started: Instant::now(),
+            },
+        )
+        .await
+        .expect_err("validate= together with chunk_rows must be rejected")
+        .to_string();
         assert!(err.contains("chunk_rows"), "got: {err}");
         assert!(err.contains("validate="), "got: {err}");
     }
@@ -8397,6 +10770,119 @@ mod tests {
         assert_eq!(cp.keyset_col, "id");
         assert_eq!(cp.keyset_idx, 0);
         assert_eq!(cp.limit, 1000);
+    }
+
+    #[test]
+    fn a_chunk_marker_records_the_cursor_a_resume_may_save() {
+        let (cfg, plan, src) = chunk_inputs("id", DataType::Int64, false);
+        let t = WatermarkTracker {
+            idx: 0,
+            unit: WatermarkUnit::NaiveMicros,
+            max: AtomicI64::new(i64::MIN),
+        };
+        let chunk = |upper: Option<&str>, marker: MarkerBound| {
+            let mut cp = build_chunk_plan(
+                &cfg,
+                &plan,
+                &src,
+                1000,
+                None,
+                upper.map(String::from),
+                None,
+                false,
+            )
+            .unwrap();
+            cp.marker = marker;
+            cp
+        };
+        let best = Arc::new(AtomicI64::new(i64::MIN));
+        let shared = |ago: u64, floor: Option<&str>, best: &Arc<AtomicI64>| MarkerBound::Stream {
+            started: Instant::now() - std::time::Duration::from_secs(ago),
+            floor: floor.map(String::from),
+            best: best.clone(),
+        };
+        let stream =
+            |ago: u64, floor: Option<&str>| shared(ago, floor, &Arc::new(AtomicI64::new(i64::MIN)));
+        // A frozen bound is the bound, whatever was read; without one, none.
+        let frozen = chunk(Some("2026-02-01 00:00:00"), MarkerBound::Frozen);
+        assert_eq!(frozen.marker_upper(Some(&t), 60), "2026-02-01 00:00:00");
+        assert_eq!(chunk(None, MarkerBound::Frozen).marker_upper(None, 60), "");
+        // A resume past a marker that recorded no bound records none either,
+        // even with a fresh MAX of its own to bound its read.
+        let unbounded = chunk(Some("2026-02-01 00:00:00"), MarkerBound::Unbounded);
+        assert_eq!(unbounded.marker_upper(Some(&t), 60), "");
+        // Taken from the rows read: nothing read yet, no bound.
+        let floor = Some("2026-01-01 00:00:00");
+        assert_eq!(chunk(None, stream(0, floor)).marker_upper(Some(&t), 60), "");
+        t.max
+            .store(t.parse("2026-01-01 02:00:00").unwrap(), Ordering::Relaxed);
+        // Within the lookback, the newest watermark read.
+        assert_eq!(
+            chunk(None, stream(0, floor)).marker_upper(Some(&t), 60),
+            "2026-01-01 02:00:00.000000"
+        );
+        // A read that has taken an hour longer than the lookback is moved back
+        // by that hour (its seconds rounded up)...
+        assert_eq!(
+            chunk(None, stream(3_659, floor)).marker_upper(Some(&t), 60),
+            "2026-01-01 01:00:00.000000"
+        );
+        // ...never below the cursor it started from...
+        assert_eq!(
+            chunk(None, stream(36_000, floor)).marker_upper(Some(&t), 60),
+            "2026-01-01 00:00:00.000000"
+        );
+        // ...unless everything read is, as an uninterrupted read would save:
+        // a cursor ahead of the source isn't kept past what was read.
+        let ahead = Some("2026-01-01 03:00:00");
+        assert_eq!(
+            chunk(None, stream(36_000, ahead)).marker_upper(Some(&t), 60),
+            "2026-01-01 02:00:00.000000"
+        );
+        // A later chunk never records less than an earlier one did: each was
+        // as safe a bound when recorded, and stays so.
+        assert_eq!(
+            chunk(None, shared(0, floor, &best)).marker_upper(Some(&t), 60),
+            "2026-01-01 02:00:00.000000"
+        );
+        assert_eq!(
+            chunk(None, shared(36_000, floor, &best)).marker_upper(Some(&t), 60),
+            "2026-01-01 02:00:00.000000"
+        );
+        // A first read has no floor.
+        assert_eq!(
+            chunk(None, stream(35_999, None)).marker_upper(Some(&t), 60),
+            "2025-12-31 16:01:00.000000"
+        );
+    }
+
+    #[test]
+    fn a_seed_floors_a_cursor_only_in_the_trackers_own_unit() {
+        let tz = WatermarkTracker {
+            idx: 0,
+            unit: WatermarkUnit::UtcMicros,
+            max: AtomicI64::new(i64::MIN),
+        };
+        // A committed cursor is quickhouse's own, offset or not.
+        assert_eq!(
+            cursor_floor(Some("2026-10-06 10:00:00"), None, Some(&tz)).as_deref(),
+            Some("2026-10-06 10:00:00")
+        );
+        // A seed with its offset floors it; one without is read in the
+        // session's zone, so it isn't guessed at.
+        assert_eq!(
+            cursor_floor(None, Some("2026-10-06 09:00:00+00"), Some(&tz)).as_deref(),
+            Some("2026-10-06 09:00:00+00")
+        );
+        assert_eq!(
+            cursor_floor(None, Some("2026-10-06 09:00:00"), Some(&tz)),
+            None
+        );
+        assert_eq!(
+            cursor_floor(None, Some("2026-10-06 09:00:00+00"), None),
+            None
+        );
+        assert_eq!(cursor_floor(None, None, Some(&tz)), None);
     }
 
     fn ct_source() -> SourceConfig {

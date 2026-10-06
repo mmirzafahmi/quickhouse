@@ -9,6 +9,193 @@ any breaking change is called out explicitly.
 
 ## [Unreleased]
 
+### Fixed
+- **A `chunk_rows` read into BigQuery no longer loses every row when its
+  watermark is too costly to probe.** When the `MAX(watermark)` probe priced
+  above `probe_max_cost`, the read was switched to a windowed sweep, and the
+  sweep bypassed the chunk loop: every row went into the template staging table
+  each chunk is cloned from, which was then dropped, while the cursor advanced
+  past them. Measured on 0.20.6: `rows_written=120`, 0 rows in BigQuery, no
+  error. Every such run since `chunk_rows` came to BigQuery in 0.20.2 lost its
+  rows; re-sync the range those runs covered. A chunked read is now never
+  swept (it is bounded per chunk already). Into ClickHouse the rows landed, but
+  without chunking or resume.
+- **`retry_max_attempts` no longer duplicates rows in a ClickHouse engine that
+  keeps them.** Each attempt started over and inserted again what the failed one
+  had written: a source connection killed part-way left 74,000 rows for 40,000
+  ids in a plain `MergeTree`, with `rows_written` saying 40,000. An incremental
+  run with retries into a `MergeTree` other than `ReplacingMergeTree` now stages
+  each attempt and moves it into the destination with one `INSERT ... SELECT`
+  at the end, so a failed attempt leaves nothing behind. A `Replicated*` engine
+  isn't staged (a staging clone could collide on its ZooKeeper path); there,
+  and in a `ReplacingMergeTree`, the retry is reported with the rows, and rows
+  in `chunk_rows` chunks committed before the failure, which a retry resumes
+  past, aren't counted. (#14)
+- **An incremental whose watermark is NULL on every row now says so, on every
+  run.** With no non-NULL watermark read there is no cursor to save, so each
+  run had no lower bound and re-read the whole table, while logging "no rows
+  read". The NULL-count probe that raises `null_watermark` is skipped as too
+  costly on a big table, so nothing else caught it: in production a 23.6M-row
+  table was re-read in full every day. The read now raises `null_watermark`
+  itself, before any `MERGE`, with the rows read as `count`, unless the probe
+  already reported the column. (#15)
+- **A windowed read that outlasts `lookback_seconds` no longer loses updates.**
+  With the `MAX` probe skipped as too costly, the cursor is the largest
+  watermark read. A sweep reads one window after another, so a row updated in a
+  window already read, followed by an update in a later window, left the
+  cursor on the later one. The next run started at `cursor - lookback`, past
+  the first update once the sweep took longer than the lookback, and that row
+  was never read again: reproduced on MySQL with an 8 s sweep and a 1 s
+  lookback. A read of several statements (windows, partitions, chunks) now
+  moves the stream cursor back by what it took beyond the lookback, never
+  below the cursor it started from. A `chunk_rows` read resumed past an
+  interrupted run's marker, by a retry or by a later sync, took its cursor
+  from the chunks after the marker alone, passing over rows in earlier chunks
+  that changed in between. Each marker now records a cursor the read could
+  safely have saved had it ended there, and the resume reads up to it and
+  saves it.
+  A resume past a marker that records none (one written by 0.20.6, say)
+  keeps the committed cursor; on a first run, which has none to keep, it
+  takes one from what it reads, as before. (#13)
+- **A `source_query` that filters out the newest rows no longer raises a false
+  `watermark_ahead_of_source`.** A rolling filter such as `write_date >= now() -
+  interval '3 days'` on a quiet table puts the query's MAX below a correct
+  cursor, and the warning blamed a time-zone shift (in production, a cursor at
+  10-01 against a MAX of 09-21). With `source_table` set as well, the cursor is
+  now checked against the unfiltered table, and nothing is raised unless it is
+  ahead of that too (that MAX is held to `probe_max_cost` like any probe).
+  Without it, the warning names the filter as a possible cause. The cursor
+  still goes back to the MAX either way, which costs a re-read at most: keeping
+  a cursor that really is ahead would skip every row that arrives below it.
+  (#23)
+- **A key-bounds probe that fails transiently is retried.** It was given up on
+  at the first error, and the read fell back to the single long scan windowing
+  exists to avoid, which a hot standby then cancelled. A recovery conflict, a
+  statement timeout or a dropped connection is now retried twice with backoff,
+  on a fresh connection. (#18)
+- **BigQuery retries a job that fails at the HTTP level.** Only a job that
+  finished with a rate limit was retried, so a `502` on submitting the state
+  `INSERT` failed a run whose data was already merged. Submitting and polling a
+  job are now retried on a 5xx, a 429 or a dropped connection with the same job
+  id: if an attempt that looked failed had reached BigQuery, the retry gets
+  `409 Already Exists` and polls that job, in the dataset's location, instead
+  of running the statement again. A job that fails with `backendError` or
+  `internalError` is retried like a rate-limited one, and opening a Storage
+  Write stream on a staging table BigQuery doesn't see yet is retried too.
+  (#19)
+- **MySQL errors 1317 and 3024 are transient.** A query killed on a replica
+  (1317) and one past `MAX_EXECUTION_TIME` (3024) now get the same treatment as
+  PostgreSQL's statement cancel: a windowed read retries the window narrower,
+  and `retry_max_attempts` re-runs the transfer. (#19)
+- **A Storage Write stream that finalizes with the wrong row count no longer
+  reaches the destination.** BigQuery reports how many rows a finalized stream
+  holds, and a count other than the rows appended means a retried append was
+  duplicated or one was lost. That was only logged, and the `MERGE` or swap
+  then promoted the suspect staging table. It is now the
+  `storage_write_count_mismatch` warning, and fails the run before any `MERGE`
+  or swap; an append, whose rows are in the destination already, reports it.
+  (#22)
+- **A windowed sweep opens one source connection and writes one insert.** Each
+  window opened its own connection (a TLS handshake against a remote source)
+  and flushed its own insert: 18 updated rows spread over a key range cost 20
+  MySQL connections and 18 ClickHouse parts, where a single pass took 4 and 2.
+  The windows now share a connection, replaced only after a window fails, and
+  an insert buffer sent between windows once it is full, so a window that fails
+  and is read again has sent none of its rows. A failed window also aborts its
+  archive upload, which a run that went on to succeed left in the bucket.
+  (#20)
+- **`read_max_rows_per_sec` paces each statement's last batch too.** It was
+  applied to full batches only, so a window or `chunk_rows` chunk smaller than
+  `batch_rows` was read unthrottled.
+- **The BigQuery state table is clustered by `(source_table, dest_table)`.**
+  Every cursor read filters on both, and unclustered it scanned the whole
+  table: 616 GiB billed over 24,880 reads in 14 days in production. New state
+  tables are created clustered and existing ones are patched once. (#21)
+- **Fewer round trips on every sync.** (#24)
+  - The lower-bound check runs on the connection setup already opened, rather
+    than a new one.
+  - With the watermark as the range-partition key, partitions split the keys
+    above the cursor rather than the whole table, where every new row landed in
+    the last partition and the rest opened connections to read nothing.
+  - ClickHouse's `CREATE TABLE IF NOT EXISTS` and column probe for the state
+    table run once per process, not per sync; a state table dropped by hand is
+    created again.
+  - BigQuery's clustering check behind `unclustered_merge_target` is read once
+    per table every ten minutes, not per `MERGE` (each was a billed query).
+  - A transient failure of the partition probe through `partition_source_expr`
+    stays retryable rather than becoming a config error.
+- **A PostgreSQL `timestamptz` watermark keeps its `+00` in a stream-derived
+  cursor whatever its destination type.** Overridden to a naive type, the
+  cursor was saved without an offset, and PostgreSQL read it back in the
+  session's own `TimeZone`, which quickhouse doesn't set.
+- **Log and error messages.** The `seed_watermark=skip_to_max` error no longer
+  carries runs of spaces. On MySQL the `unindexed_watermark` warning recommends
+  `ALTER TABLE … ADD INDEX …, ALGORITHM=INPLACE, LOCK=NONE` rather than
+  PostgreSQL's `CREATE INDEX CONCURRENTLY`. With both `source_table` and
+  `source_query` set, MySQL and ClickHouse no longer claim `source_table` is
+  ignored, and every source says what it is still used for. (#25)
+
+### Added
+- **`sync(fail_on_warnings={...})` fails a run on the warning kinds you name,
+  before anything they concern is made permanent.** The documented pattern,
+  raising on `result.warnings` after `sync()` returns, couldn't stop the
+  cursor: it was saved by then, so the orchestrator's retry started past the
+  rows the warning was about and went green. The check now runs inside the
+  transfer before a full refresh's swap, before an incremental `MERGE` or
+  insert-select, before the cursor is saved, and before each `chunk_rows` chunk
+  is committed. An append run saves its cursor first, since reading its rows
+  again would append them twice, and a DataFrame run is checked once it has
+  written. The error names the kind, the column, the count and what was left
+  in place. An unknown kind is an error. (#17)
+- **`quickhouse.compact_state(target)` and `quickhouse.state_keys(target)`.**
+  Every incremental run appends a row to `_quickhouse_state` and nothing
+  removed old ones; on BigQuery the table only grows (in production, 110k rows
+  of which 96% of the bytes belonged to keys no sync used any more).
+  `compact_state` keeps the newest row per cursor, leaving what every sync reads
+  unchanged, and is safe between syncs. `state_keys` lists the cursors with
+  their last write (UTC), and with `idle_days` only the idle ones. (#21)
+- **`TransferResult.rows_written_failed_attempts`** and
+  **`WarningKind::RetriedAfterPartialWrite`** (`"retried_after_partial_write"`):
+  what attempts that then failed had written into the destination before
+  `retry_max_attempts` ran the transfer again, which `rows_written` doesn't
+  count. (#14)
+- **`WarningKind::StorageWriteCountMismatch`**
+  (`"storage_write_count_mismatch"`): see the Storage Write fix above. (#22)
+- **`WarningKind::NullCheckSkipped`** (`"null_check_skipped"`) reports a
+  NULL-watermark completeness count too costly to run. It used to be part of
+  `unindexed_watermark`, which it isn't: see below. (#16)
+- **`WarningKind::WindowBoundsUnavailable`** (`"window_bounds_unavailable"`).
+  A read that should be swept in key windows but whose key-bounds probe
+  failed ran in one pass with only a log line, so an orchestrator couldn't see
+  why the run took several attempts. It is now a warning, with the window key
+  as `column`. (#18)
+
+### Changed
+- **A costly NULL count no longer reports a missing index or sweeps the read.**
+  An indexed, nullable watermark with many NULLs has its `MAX` from the index
+  but prices the NULL count high, and either costly probe raised
+  `unindexed_watermark` and switched the read to a windowed sweep. In
+  production three syncs swept 18 to 60 windows on every run of a read that was
+  a range scan. Windowing and `unindexed_watermark` now follow the `MAX` probe
+  alone, and a skipped count is `null_check_skipped`. Match on both if you
+  matched on `unindexed_watermark` for the skipped check. (#16)
+- **With both `source_table` and `source_query` set, a `MAX(watermark)` too
+  costly through the query is probed on the table.** Through a filter such as
+  `WHERE is_test = 0`, `MAX(id)` can't come from the primary key: measured at a
+  planner cost of 308,743 and 1.5 s, where the read itself is a range scan, and
+  it switched on an 18-window sweep. The table's MAX now bounds the read, and
+  the cursor saved is the largest watermark the read returned, so a row the
+  filter excludes can't carry the cursor past rows not read yet. Only when that
+  MAX reads as the query column's own type, and not for a `chunk_rows` read, a
+  watermark the transfer leaves out or overrides, or a `skip_to_max` first run.
+  A query whose own MAX is affordable reads exactly as before, as does every
+  run with `probe_max_cost=0`, the way to opt out for a `source_query` that
+  converts its watermark. (#16)
+- **A primary-key watermark through a filtered `source_query` is no longer
+  swept once it has a cursor.** The read's own `id > cursor` is the range a
+  window bounds; the sweep added a full-scan `MIN`/`MAX` for its bounds on top
+  of the `MAX`. (#16)
+
 ## [0.20.6] — 2026-10-06
 
 ### Fixed

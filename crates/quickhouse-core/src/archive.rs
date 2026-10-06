@@ -218,6 +218,20 @@ impl ArchiveUploads {
         UploadWriter(upload)
     }
 
+    /// Abort one upload now, best effort, as [`Self::abort_unfinished`] does.
+    async fn abort(key: &str, upload: &SharedUpload) {
+        let state = std::mem::replace(&mut *upload.lock().await, Upload::Closed);
+        if let Upload::Open(mut w) = state {
+            match w.abort().await {
+                Ok(()) => tracing::debug!("archive: aborted the unfinished upload of '{key}'"),
+                Err(e) => tracing::warn!(
+                    "archive: could not abort the unfinished upload of '{key}' ({e}); its \
+                     parts stay in the bucket until a lifecycle rule removes them"
+                ),
+            }
+        }
+    }
+
     /// Abort every upload not yet completed. Best effort: a failure is logged,
     /// never returned, so it can't mask the error that failed the transfer. An
     /// upload still inside `BufWriter`'s buffer has sent nothing, and aborting
@@ -225,16 +239,7 @@ impl ArchiveUploads {
     pub(crate) async fn abort_unfinished(&self) {
         let started = std::mem::take(&mut *self.started.lock().unwrap());
         for (key, upload) in started {
-            let state = std::mem::replace(&mut *upload.lock().await, Upload::Closed);
-            if let Upload::Open(mut w) = state {
-                match w.abort().await {
-                    Ok(()) => tracing::debug!("archive: aborted the unfinished upload of '{key}'"),
-                    Err(e) => tracing::warn!(
-                        "archive: could not abort the unfinished upload of '{key}' ({e}); its \
-                         parts stay in the bucket until a lifecycle rule removes them"
-                    ),
-                }
-            }
+            Self::abort(&key, &upload).await;
         }
     }
 }
@@ -282,6 +287,8 @@ impl AsyncFileWriter for UploadWriter {
 /// [`Self::close`] finalizes the footer and completes the underlying upload.
 pub(crate) struct ArchiveWriter {
     inner: AsyncArrowWriter<UploadWriter>,
+    /// The upload `inner` writes to, so [`Self::abort`] can reach it.
+    upload: SharedUpload,
     key: String,
     /// `ArchiveConfig::kind()` — carried purely so an error names the store it
     /// failed against; by this point the config itself is long gone.
@@ -300,6 +307,7 @@ impl ArchiveWriter {
         uploads: &ArchiveUploads,
     ) -> Result<Self> {
         let writer = uploads.start(store, &key);
+        let upload = writer.0.clone();
         let props = WriterProperties::builder()
             .set_compression(parquet_compression(compression))
             .build();
@@ -308,7 +316,20 @@ impl ArchiveWriter {
                 "{kind} archive: failed to open parquet writer for '{key}': {e}"
             ))
         })?;
-        Ok(Self { inner, key, kind })
+        Ok(Self {
+            inner,
+            upload,
+            key,
+            kind,
+        })
+    }
+
+    /// Give up on this file: abort its upload now rather than leave it to the
+    /// transfer's own failure, for a read that fails but is tried again in
+    /// the same run (a window of a sweep). A run that then succeeds would
+    /// otherwise leave the upload's parts in the bucket.
+    pub(crate) async fn abort(self) {
+        ArchiveUploads::abort(&self.key, &self.upload).await;
     }
 
     pub(crate) async fn write(&mut self, batch: &RecordBatch) -> Result<()> {

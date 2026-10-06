@@ -682,7 +682,12 @@ pub enum WatermarkSeed {
 /// One table transfer.
 #[derive(Debug, Clone)]
 pub struct TransferConfig {
-    /// Source table (schema-qualified allowed). Ignored if `source_query` is set.
+    /// Source table (schema-qualified allowed). When `source_query` is set too,
+    /// schema and data come from the query, and the table is used only for the
+    /// probes a filter would distort: a windowed read's key bounds, the check
+    /// of a cursor that is ahead of the query's `MAX(watermark)`, and that
+    /// `MAX` itself when it is too costly through the query, which then bounds
+    /// the read while the cursor is the largest watermark read.
     pub source_table: Option<String>,
     /// Custom SELECT to read from instead of a whole table.
     pub source_query: Option<String>,
@@ -1101,10 +1106,34 @@ pub struct TransferConfig {
     pub keyset_not_null: bool,
     /// Max total attempts for the whole transfer when it fails with a
     /// *transient source* error (PostgreSQL hot-standby recovery conflict /
-    /// statement cancel; MySQL server-gone-away / lock-wait / deadlock).
-    /// `1` (default) = no retry, byte-identical to before. Sink/write-side
-    /// retries are separate and always on (see `sink::backoff_delay`).
+    /// statement cancel; MySQL server-gone-away / lock-wait / deadlock /
+    /// interrupted query / `MAX_EXECUTION_TIME`). `1` (default) = no retry,
+    /// byte-identical to before. Sink/write-side retries are separate and
+    /// always on (see `sink::backoff_delay`).
+    ///
+    /// Each attempt starts over, so rows a failed attempt already inserted
+    /// are inserted again. Into a ClickHouse table whose engine keeps
+    /// duplicates (a `MergeTree` other than `ReplacingMergeTree`), an
+    /// incremental run with retries therefore writes each attempt to its own
+    /// staging table and moves it into the destination with one
+    /// `INSERT ... SELECT` at the end, so a failed attempt leaves nothing
+    /// behind. Elsewhere a retry that follows a partial write raises
+    /// [`WarningKind::RetriedAfterPartialWrite`] and counts the rows in
+    /// [`TransferResult::rows_written_failed_attempts`].
     pub retry_max_attempts: u32,
+    /// Warning kinds that fail the run instead of being returned on
+    /// [`TransferResult::warnings`]. Checked inside the transfer, before each
+    /// step that makes anything permanent: before a full refresh's swap,
+    /// before an incremental run's `MERGE` or insert-select, before its cursor
+    /// is saved, and before each `chunk_rows` chunk is committed. A run stopped
+    /// before its `MERGE` or swap leaves the destination untouched; one that
+    /// inserts straight into the destination (ClickHouse incremental) has
+    /// written its rows, but doesn't save the cursor, so the next run reads the
+    /// same range again once the cause is fixed. Raising on a kind after
+    /// `sync()` returns can't do that: the cursor is saved by then, and a
+    /// retry starts past the rows the warning was about. Empty (default):
+    /// nothing is fatal.
+    pub fail_on_warnings: Vec<WarningKind>,
     /// Skip a setup-phase watermark probe when the planner estimates it will
     /// cost more than this. `0` disables the gate, running every probe
     /// unconditionally as before.
@@ -1687,11 +1716,11 @@ pub enum WarningKind {
     FullRefreshShrink,
     /// The incremental watermark column has no btree index leading with it, so
     /// `WHERE watermark > x` cannot use one and every incremental run scans the
-    /// whole table. quickhouse drops the probes it can (the `MAX(watermark)`
-    /// snapshot bound, the nullable-watermark completeness count) to avoid
-    /// paying for that scan two extra times, which is what this warning
-    /// reports. Not a data problem on its own — a cost one, plus the
-    /// completeness check it had to skip.
+    /// whole table. Raised when the `MAX(watermark)` probe is too costly to run
+    /// (see `probe_max_cost`); quickhouse then skips it, takes the cursor from
+    /// the read when it can, and sweeps the read in key windows. Not a data
+    /// problem on its own — a cost one. A skipped NULL-watermark count is
+    /// reported separately, as [`WarningKind::NullCheckSkipped`].
     UnindexedWatermark,
     /// A BigQuery `MERGE` ran against a destination that is not clustered by
     /// the merge key, so the key-range prune had nothing to prune with and the
@@ -1744,6 +1773,37 @@ pub enum WarningKind {
     /// type, which asks for that wall-clock time. See
     /// [`MySqlConfig::utc_session`].
     ShiftedTimestamp,
+    /// The read plans as a sequential scan and should have been swept in
+    /// bounded key windows, but the key-bounds probe that windowing needs kept
+    /// failing (a hot standby's recovery conflict, a statement timeout), so
+    /// the read ran in one pass: the long scan windowing exists to avoid,
+    /// which a standby is likely to cancel. Not a data problem on its own.
+    /// `column` is the window key.
+    WindowBoundsUnavailable,
+    /// The nullable watermark's completeness count (`count(*) WHERE watermark
+    /// IS NULL`) was too costly to run (see `probe_max_cost`), so this run
+    /// cannot say whether rows hold a NULL watermark, which an incremental
+    /// filter excludes for good. Its own warning since 0.20.7: a watermark
+    /// served by an index can still price this count high when many rows are
+    /// NULL, and that says nothing about the read, which `unindexed_watermark`
+    /// is about. `column` is the watermark.
+    NullCheckSkipped,
+    /// `retry_max_attempts` re-ran the transfer after an attempt that had
+    /// already written rows into the destination, and the retry writes them
+    /// again. A `ReplacingMergeTree` collapses the copies at its next merge
+    /// (`count()` runs high until then); an engine that keeps duplicates
+    /// keeps them. `count` is the rows the failed attempts wrote, also on
+    /// [`TransferResult::rows_written_failed_attempts`]. Table-level: `column`
+    /// is `None`.
+    RetriedAfterPartialWrite,
+    /// A BigQuery Storage Write stream finalized with a different number of
+    /// rows than were appended to it: an offset failed to deduplicate a
+    /// retried append (more rows), or an append was lost (fewer). `count` is
+    /// the difference and `sample` the table. Into a staging table it fails
+    /// the run before the `MERGE` or swap, so the destination is untouched; it
+    /// is only reported when the rows went straight into the destination
+    /// (append), where failing would take nothing back.
+    StorageWriteCountMismatch,
 }
 
 impl WarningKind {
@@ -1766,8 +1826,39 @@ impl WarningKind {
             WarningKind::WatermarkNotAdvanced => "watermark_not_advanced",
             WarningKind::WatermarkAheadOfSource => "watermark_ahead_of_source",
             WarningKind::ShiftedTimestamp => "shifted_timestamp",
+            WarningKind::WindowBoundsUnavailable => "window_bounds_unavailable",
+            WarningKind::NullCheckSkipped => "null_check_skipped",
+            WarningKind::RetriedAfterPartialWrite => "retried_after_partial_write",
+            WarningKind::StorageWriteCountMismatch => "storage_write_count_mismatch",
         }
     }
+
+    /// The kind named `name` (as [`Self::as_str`] spells it), if any.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|k| k.as_str() == name)
+    }
+
+    /// Every kind, in declaration order.
+    pub const ALL: [WarningKind; 18] = [
+        WarningKind::CollapsedBool,
+        WarningKind::CoercedDate,
+        WarningKind::CoercedDecimal,
+        WarningKind::CoercedScalar,
+        WarningKind::NullWatermark,
+        WarningKind::FullRefreshShrink,
+        WarningKind::UnindexedWatermark,
+        WarningKind::UnclusteredMergeTarget,
+        WarningKind::IgnoredSourceArchive,
+        WarningKind::IncompleteExport,
+        WarningKind::DecimalMappingMixed,
+        WarningKind::WatermarkNotAdvanced,
+        WarningKind::WatermarkAheadOfSource,
+        WarningKind::ShiftedTimestamp,
+        WarningKind::WindowBoundsUnavailable,
+        WarningKind::NullCheckSkipped,
+        WarningKind::RetriedAfterPartialWrite,
+        WarningKind::StorageWriteCountMismatch,
+    ];
 }
 
 /// One structured warning from a transfer — the data form of what also goes to
@@ -1840,6 +1931,11 @@ pub struct TransferResult {
     /// Structured warnings, aggregated per `(kind, column)`. Empty on a clean
     /// run. See [`TransferWarning`].
     pub warnings: Vec<TransferWarning>,
+    /// Rows that attempts which then failed had already written into the
+    /// destination, before `retry_max_attempts` ran the transfer again.
+    /// [`rows_written`](Self::rows_written) counts the successful attempt only.
+    /// `0` when no retry followed a partial write.
+    pub rows_written_failed_attempts: u64,
 }
 
 /// A default `TransferConfig` for tests in other modules (e.g. `sync`), which
@@ -1883,6 +1979,7 @@ pub(crate) fn default_test_config() -> TransferConfig {
         chunk_rows: None,
         keyset_not_null: false,
         retry_max_attempts: 1,
+        fail_on_warnings: Vec::new(),
         probe_max_cost: crate::source::DEFAULT_PROBE_MAX_COST,
         read_window_rows: None,
         window_target_secs: None,
@@ -2000,6 +2097,7 @@ mod tests {
             chunk_rows: None,
             keyset_not_null: false,
             retry_max_attempts: 1,
+            fail_on_warnings: Vec::new(),
             probe_max_cost: crate::source::DEFAULT_PROBE_MAX_COST,
             read_window_rows: None,
             window_target_secs: None,
@@ -2134,6 +2232,40 @@ mod tests {
         c.seed_watermark = WatermarkSeed::CurrentMax;
         c.normalize();
         assert_eq!(c.seed_watermark, WatermarkSeed::None);
+    }
+
+    #[test]
+    fn every_warning_kind_is_listed_and_named_once() {
+        let names: Vec<&str> = WarningKind::ALL.iter().map(|k| k.as_str()).collect();
+        let unique: std::collections::BTreeSet<&str> = names.iter().copied().collect();
+        assert_eq!(unique.len(), names.len(), "a kind listed twice");
+        for k in WarningKind::ALL {
+            assert_eq!(WarningKind::from_name(k.as_str()), Some(k));
+        }
+        assert_eq!(WarningKind::from_name("collapsed_boolean"), None);
+        // A kind left out of ALL can't be named in fail_on_warnings. This match
+        // fails to compile when a kind is added, as a reminder to list it.
+        let listed = |k: WarningKind| match k {
+            WarningKind::CollapsedBool
+            | WarningKind::CoercedDate
+            | WarningKind::CoercedDecimal
+            | WarningKind::CoercedScalar
+            | WarningKind::NullWatermark
+            | WarningKind::FullRefreshShrink
+            | WarningKind::UnindexedWatermark
+            | WarningKind::UnclusteredMergeTarget
+            | WarningKind::IgnoredSourceArchive
+            | WarningKind::IncompleteExport
+            | WarningKind::DecimalMappingMixed
+            | WarningKind::WatermarkNotAdvanced
+            | WarningKind::WatermarkAheadOfSource
+            | WarningKind::ShiftedTimestamp
+            | WarningKind::WindowBoundsUnavailable
+            | WarningKind::NullCheckSkipped
+            | WarningKind::RetriedAfterPartialWrite
+            | WarningKind::StorageWriteCountMismatch => WarningKind::ALL.contains(&k),
+        };
+        assert!(WarningKind::ALL.into_iter().all(listed));
     }
 
     /// A config shaped the way `from_pandas` builds one: no source table, and

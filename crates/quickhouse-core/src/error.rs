@@ -164,7 +164,11 @@ fn mysql_error_is_transient(e: &mysql_async::Error) -> bool {
     use mysql_async::Error;
     match e {
         // 1205 = lock wait timeout; 1213 = deadlock (both retryable).
-        Error::Server(se) => matches!(se.code, 1205 | 1213),
+        // 1317 = query execution was interrupted (a KILL QUERY, as on a
+        // replica). 3024 = MAX_EXECUTION_TIME exceeded, MySQL's statement
+        // timeout: transient on the same terms as PostgreSQL's 57014, so a
+        // windowed read retries the window narrower.
+        Error::Server(se) => matches!(se.code, 1205 | 1213 | 1317 | 3024),
         // Transport failure (server gone away / reset / broken pipe).
         Error::Io(_) => true,
         Error::Driver(mysql_async::DriverError::ConnectionClosed) => true,
@@ -323,6 +327,22 @@ mod tests {
             "undefined table is permanent"
         );
         assert!(!sqlstate_is_transient(""), "empty is not transient");
+    }
+
+    #[test]
+    fn mysql_interrupted_and_timed_out_queries_are_transient() {
+        let server = |code| {
+            EtlError::MySql(mysql_async::Error::Server(mysql_async::ServerError {
+                code,
+                message: String::new(),
+                state: String::new(),
+            }))
+        };
+        for code in [1205, 1213, 1317, 3024] {
+            assert!(server(code).is_transient_source(), "{code}");
+        }
+        // 1146 = no such table: retrying can't fix it.
+        assert!(!server(1146).is_transient_source());
     }
 
     #[test]

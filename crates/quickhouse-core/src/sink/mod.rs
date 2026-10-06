@@ -58,6 +58,22 @@ pub(crate) fn missing_columns<'a>(
         .collect()
 }
 
+/// One `(state_key, dest_table)` cursor in a state table, as
+/// [`Sink::state_keys`] lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateKey {
+    /// The state key: `state_key=`, or else the `source_table` (or
+    /// `source_query` text) it defaults to. Stored as `source_table`.
+    pub state_key: String,
+    pub dest_table: String,
+    /// The cursor a run would read: the newest row's.
+    pub last_watermark: String,
+    /// When the newest row was written, as the destination renders it (UTC).
+    pub last_run: String,
+    /// How many rows the key holds. Compaction leaves one.
+    pub state_rows: u64,
+}
+
 /// Outcome of a single send attempt, telling the caller whether to retry.
 /// Shared classification: transport failures and 5xx/429 are transient
 /// (worth retrying with backoff); deterministic errors (4xx: bad request,
@@ -236,6 +252,50 @@ pub trait Sink: Send + Sync {
         Err(EtlError::internal(
             "merge_into: this destination does not use staged-merge incremental writes",
         ))
+    }
+
+    /// Warnings the writes themselves raised since the last call, taken off
+    /// the sink: see [`crate::config::WarningKind::StorageWriteCountMismatch`].
+    /// Default: none.
+    fn take_write_warnings(&self) -> Vec<crate::config::TransferWarning> {
+        Vec::new()
+    }
+
+    // ---- state-table maintenance (0.20.7) ----
+
+    /// Delete every state row that isn't the newest for its `(source_table,
+    /// dest_table)` key, so each cursor read stays one row's work. A cursor
+    /// read takes the newest row, so it returns the same values afterwards,
+    /// and a write racing the delete only adds a newer row, so it is safe to
+    /// run between syncs. Returns the rows deleted.
+    async fn compact_state(&self, _state_table: &str) -> Result<u64> {
+        Err(EtlError::config(
+            "compact_state is not supported for this destination",
+        ))
+    }
+
+    /// Every key in the state table with its newest cursor and when it was
+    /// written, oldest first; with `idle_days`, only keys with no write in
+    /// that many days, which no sync uses any more if their pipelines are all
+    /// running. A cleanup aid: renamed state keys leave their old rows behind.
+    async fn state_keys(
+        &self,
+        _state_table: &str,
+        _idle_days: Option<u32>,
+    ) -> Result<Vec<StateKey>> {
+        Err(EtlError::config(
+            "state_keys is not supported for this destination",
+        ))
+    }
+
+    /// Whether an incremental run with `retry_max_attempts > 1` should stage
+    /// each attempt rather than insert into `table` directly: true for a
+    /// destination that keeps a duplicate row, where a retry would duplicate
+    /// what a failed attempt wrote. Only consulted for a destination that
+    /// doesn't stage incremental loads anyway; such a one needs
+    /// [`Self::insert_select`]. Default `false`.
+    async fn stage_for_retries(&self, _table: &str, _cfg: &TransferConfig) -> Result<bool> {
+        Ok(false)
     }
 
     /// Append all of `staging`'s rows into `dest` by column name

@@ -407,6 +407,8 @@ impl PgSource {
         column_oid: u32,
         n: usize,
         column_nullable: bool,
+        // Split only the keys above this one: see `sync::partitions_above`.
+        above: Option<i64>,
     ) -> Result<Vec<Partition>> {
         let single = || {
             vec![Partition {
@@ -425,23 +427,30 @@ impl PgSource {
         let key = source_expr
             .map(str::to_string)
             .unwrap_or_else(|| quote_pg(column));
+        let above_pred = above
+            .map(|c| format!(" WHERE {key} > {c}"))
+            .unwrap_or_default();
         let sql = match base_query {
-            Some(q) => format!("SELECT min({key})::bigint, max({key})::bigint FROM ({q}) AS _src"),
+            Some(q) => format!(
+                "SELECT min({key})::bigint, max({key})::bigint FROM ({q}) AS _src{above_pred}"
+            ),
             None => format!(
-                "SELECT min({key})::bigint, max({key})::bigint FROM {t}",
+                "SELECT min({key})::bigint, max({key})::bigint FROM {t}{above_pred}",
                 t = quote_pg_table(from_table.expect("table or query required")),
             ),
         };
         let row = client.query_one(&sql, &[]).await.map_err(|e| {
+            let e = EtlError::from(e);
             // A bad `partition_source_expr` surfaces here as an opaque SQL
-            // error; name the knob so the fix is obvious.
+            // error; name the knob so the fix is obvious. A transient failure
+            // stays one, so a retry can still help.
             match source_expr {
-                Some(expr) => EtlError::config(format!(
+                Some(expr) if !e.is_transient_source() => EtlError::config(format!(
                     "partition_source_expr='{expr}' could not be probed for a MIN/MAX range: {e}. \
                      It must be a raw SQL expression over a column source_query projects, and it \
                      must resolve to an integer type."
                 )),
-                None => e.into(),
+                _ => e,
             }
         })?;
         let lo: Option<i64> = row.get(0);
@@ -450,10 +459,14 @@ impl PgSource {
             (Some(lo), Some(hi)) if hi >= lo => (lo, hi),
             _ => return Ok(single()),
         };
+        // From just past the cursor rather than the lowest key found above it,
+        // so a key committed into that gap after the probe is still covered.
+        let lo = above.map_or(lo as i128, |c| i128::from(c) + 1);
 
-        let mut parts = super::range_partitions(lo as i128, hi as i128, n, &key);
+        let mut parts = super::range_partitions(lo, hi as i128, n, &key);
         // Rows whose partition key is NULL would be skipped by range predicates.
-        if column_nullable {
+        // Above a cursor the read is `key > cursor`, which no NULL key matches.
+        if column_nullable && above.is_none() {
             parts.push(Partition {
                 label: "null-key".into(),
                 predicate: Some(format!("{key} IS NULL")),
@@ -562,7 +575,11 @@ impl PgSource {
     /// lower-bound check (`sync::ensure_lower_bound_not_null`) runs after
     /// setup's connection is gone.
     pub async fn is_null(&self, expr: &str) -> Result<bool> {
-        let client = self.connect().await?;
+        Self::is_null_on(&self.connect().await?, expr).await
+    }
+
+    /// [`Self::is_null`] on a connection already open.
+    pub async fn is_null_on(client: &Client, expr: &str) -> Result<bool> {
         let row = client
             .query_one(&format!("SELECT ({expr}) IS NULL"), &[])
             .await?;

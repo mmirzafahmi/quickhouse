@@ -193,3 +193,28 @@ def test_source_table_supplies_bounds_alongside_source_query(
         assert total == sum(range(1, 401)), "windowed sweep lost or duplicated rows"
     finally:
         _drop_ch(ch_client, table)
+
+
+def test_a_chunked_read_is_never_swept(
+    pg_conn, ch_client, pg_source, ch_target, unique_name, capfd
+):
+    """A sweep bypassed the keyset loop of a chunk_rows read whose MAX probe
+    priced too high: no chunk markers, and on a staged destination (BigQuery)
+    every row went into the template table each chunk is cloned from, which
+    is then dropped. A chunked read is bounded per chunk already."""
+    table = unique_name
+    _seed(pg_conn, table, rows=300)
+    _drop_ch(ch_client, table)
+    try:
+        capfd.readouterr()
+        r = _sync(
+            pg_source, ch_target, table, probe_max_cost=1.0, read_window_rows=50,
+            lookback_seconds=86_400, chunk_rows=100,
+        )
+        err = capfd.readouterr().err
+        assert r.rows_written == 300
+        assert "keyset chunked read starting" in err
+        assert "windowed read on" not in err
+        assert _rows(ch_client, table)[:2] == (300, 300)
+    finally:
+        _drop_ch(ch_client, table)

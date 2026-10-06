@@ -246,7 +246,11 @@ impl CoercionTally {
             | WarningKind::DecimalMappingMixed
             | WarningKind::WatermarkNotAdvanced
             | WarningKind::WatermarkAheadOfSource
-            | WarningKind::ShiftedTimestamp => None,
+            | WarningKind::ShiftedTimestamp
+            | WarningKind::WindowBoundsUnavailable
+            | WarningKind::NullCheckSkipped
+            | WarningKind::RetriedAfterPartialWrite
+            | WarningKind::StorageWriteCountMismatch => None,
         }
     }
 

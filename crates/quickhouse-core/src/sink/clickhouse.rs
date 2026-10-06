@@ -82,7 +82,8 @@ impl ClickHouseSink {
         format!("quickhouse-state-{}-{n}", self.run_token)
     }
 
-    /// Append one row to the state table.
+    /// Append one row to the state table, creating the table again if it was
+    /// dropped since this process last saw it.
     async fn insert_state_row(&self, cfg: &TransferConfig, row: StateRow<'_>) -> Result<()> {
         let sql = state_row_insert_sql(
             &self.cfg.database,
@@ -90,7 +91,14 @@ impl ClickHouseSink {
             &self.state_dedup_token(),
             &row,
         );
-        self.execute(&sql).await
+        match self.execute(&sql).await {
+            Err(e) if is_unknown_table(&e) => {
+                self.forget_state_table(&cfg.state_table_name);
+                self.ensure_state_table(&cfg.state_table_name).await?;
+                self.execute(&sql).await
+            }
+            other => other,
+        }
     }
 
     pub fn database(&self) -> &str {
@@ -161,6 +169,91 @@ impl ClickHouseSink {
                 Some((name.to_string(), ty.to_string()))
             })
             .collect())
+    }
+
+    /// Whether an incremental run with retries should stage each attempt:
+    /// see [`Sink::stage_for_retries`]. True for a `MergeTree`-family engine
+    /// other than a `ReplacingMergeTree`: a plain `MergeTree` keeps every copy
+    /// a retry inserts, and a `SummingMergeTree` adds them up. The engine is
+    /// the existing table's, or the one this run would create. Other engines
+    /// (`Distributed`, `Null`, `Buffer`, ...) aren't staged: `CREATE TABLE ...
+    /// AS` a `Distributed` table points at the same shards, so it would be no
+    /// staging at all.
+    pub async fn stage_for_retries(&self, table: &str, cfg: &TransferConfig) -> Result<bool> {
+        let sql = format!(
+            "SELECT engine FROM system.tables WHERE database = '{}' AND name = '{}'",
+            escape_sql_string(&self.cfg.database),
+            escape_sql_string(table),
+        );
+        let engine = match self.query_scalar(&sql).await? {
+            Some(engine) => engine,
+            None => cfg.effective_engine(),
+        };
+        Ok(engine_keeps_duplicates(&engine))
+    }
+
+    /// See [`Sink::compact_state`]. The state table is a `ReplacingMergeTree`
+    /// keyed by `(source_table, dest_table)` with `run_ts` as its version, so a
+    /// final merge keeps exactly the newest row per key; until one runs, the
+    /// cursor reads' `FINAL` does that work on every read.
+    pub async fn compact_state(&self, state_table: &str) -> Result<u64> {
+        let before = match self.current_row_count(state_table).await? {
+            Some(n) => n,
+            None => return Ok(0),
+        };
+        self.execute(&format!(
+            "OPTIMIZE TABLE {}.{} FINAL",
+            ident(&self.cfg.database),
+            ident(state_table)
+        ))
+        .await?;
+        let after = self.current_row_count(state_table).await?.unwrap_or(0);
+        Ok(before.saturating_sub(after))
+    }
+
+    /// See [`Sink::state_keys`].
+    pub async fn state_keys(
+        &self,
+        state_table: &str,
+        idle_days: Option<u32>,
+    ) -> Result<Vec<crate::sink::StateKey>> {
+        if !self.table_exists(state_table).await? {
+            return Ok(Vec::new());
+        }
+        let idle = idle_days
+            .map(|d| format!(" HAVING max(run_ts) < now64(3) - INTERVAL {d} DAY"))
+            .unwrap_or_default();
+        let sql = format!(
+            "SELECT source_table, dest_table, argMax(last_watermark, run_ts), \
+             toString(max(run_ts), 'UTC'), count() FROM {}.{} \
+             GROUP BY source_table, dest_table{idle} \
+             ORDER BY max(run_ts), source_table, dest_table \
+             FORMAT TabSeparated",
+            ident(&self.cfg.database),
+            ident(state_table)
+        );
+        self.query_column(&sql)
+            .await?
+            .iter()
+            .map(|line| {
+                let f: Vec<String> = line
+                    .split('\t')
+                    .map(|v| crate::source::clickhouse::tsv_field(v).unwrap_or_default())
+                    .collect();
+                match f.as_slice() {
+                    [key, dest, wm, run, n] => Ok(crate::sink::StateKey {
+                        state_key: key.clone(),
+                        dest_table: dest.clone(),
+                        last_watermark: wm.clone(),
+                        last_run: run.clone(),
+                        state_rows: n.parse().unwrap_or(0),
+                    }),
+                    _ => Err(EtlError::clickhouse(format!(
+                        "unexpected state_keys row: {line:?}"
+                    ))),
+                }
+            })
+            .collect()
     }
 
     /// Current row count of `table`, or `None` if it doesn't exist. Diagnostic.
@@ -262,6 +355,10 @@ impl ClickHouseSink {
     /// uses) means the `ALTER` fires at most once per table, and never for a
     /// 0.5+ table — `create_state_table` already declares both columns.
     pub async fn ensure_state_table(&self, state_table: &str) -> Result<()> {
+        let key = self.state_table_key(state_table);
+        if ready_state_tables().lock().unwrap().contains(&key) {
+            return Ok(());
+        }
         self.execute(&crate::ddl::create_state_table(
             &self.cfg.database,
             state_table,
@@ -280,13 +377,39 @@ impl ClickHouseSink {
             ))
             .await?;
         }
+        ready_state_tables().lock().unwrap().insert(key);
         Ok(())
+    }
+
+    /// Identifies a state table in [`ready_state_tables`].
+    fn state_table_key(&self, state_table: &str) -> String {
+        format!("{}\n{}\n{state_table}", self.cfg.url, self.cfg.database)
+    }
+
+    /// Whether this process already created or checked `state_table`.
+    fn state_table_ready(&self, state_table: &str) -> bool {
+        ready_state_tables()
+            .lock()
+            .unwrap()
+            .contains(&self.state_table_key(state_table))
+    }
+
+    /// Forget `state_table` after a statement found it missing (dropped by
+    /// hand), so the next write creates it again.
+    fn forget_state_table(&self, state_table: &str) {
+        ready_state_tables()
+            .lock()
+            .unwrap()
+            .remove(&self.state_table_key(state_table));
     }
 
     /// Read the last persisted watermark for this `(state_key, dest_table)` pair.
     pub async fn read_last_watermark(&self, cfg: &TransferConfig) -> Result<Option<String>> {
         // The state table may not exist yet on the very first incremental run.
-        if !self.table_exists(&cfg.state_table_name).await? {
+        // One this process has seen needs no round trip to say so.
+        if !self.state_table_ready(&cfg.state_table_name)
+            && !self.table_exists(&cfg.state_table_name).await?
+        {
             return Ok(None);
         }
         let source_id = cfg.effective_state_key();
@@ -299,7 +422,13 @@ impl ClickHouseSink {
             escape_sql_string(&source_id),
             escape_sql_string(&cfg.dest_table),
         );
-        self.query_scalar(&sql).await
+        match self.query_scalar(&sql).await {
+            Err(e) if is_unknown_table(&e) => {
+                self.forget_state_table(&cfg.state_table_name);
+                Ok(None)
+            }
+            other => other,
+        }
     }
 
     /// Persist a new watermark after a successful incremental run. Writes empty
@@ -332,7 +461,9 @@ impl ClickHouseSink {
     /// `upper` is the frozen snapshot-max the interrupted run was reading up to,
     /// so resumption reads the same window rather than re-snapshotting.
     pub async fn read_chunk_state(&self, cfg: &TransferConfig) -> Result<Option<(String, String)>> {
-        if !self.table_exists(&cfg.state_table_name).await? {
+        if !self.state_table_ready(&cfg.state_table_name)
+            && !self.table_exists(&cfg.state_table_name).await?
+        {
             return Ok(None);
         }
         let source_id = cfg.effective_state_key();
@@ -345,7 +476,13 @@ impl ClickHouseSink {
             escape_sql_string(&source_id),
             escape_sql_string(&cfg.dest_table),
         );
-        let rows = self.query_column(&sql).await?;
+        let rows = match self.query_column(&sql).await {
+            Err(e) if is_unknown_table(&e) => {
+                self.forget_state_table(&cfg.state_table_name);
+                return Ok(None);
+            }
+            other => other?,
+        };
         // One TSV line: "<cursor>\t<upper>". Empty cursor = no resume marker.
         match rows.first() {
             Some(line) => {
@@ -805,6 +942,35 @@ impl ClickHouseSink {
     }
 }
 
+/// State tables this process has created or checked, keyed by URL, database
+/// and name, so [`ClickHouseSink::ensure_state_table`]'s `CREATE TABLE IF NOT
+/// EXISTS` and column probe run once per process rather than on every sync,
+/// and the cursor read skips its existence check. A statement that finds the
+/// table gone forgets it, so a table dropped by hand is created again.
+fn ready_state_tables() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static READY: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    READY.get_or_init(Default::default)
+}
+
+/// Whether a ClickHouse engine (as `system.tables` names it, or as an
+/// `engine=` clause spells it) is a `MergeTree` that keeps a re-inserted row
+/// as a second copy. See [`ClickHouseSink::stage_for_retries`].
+///
+/// A `Replicated*` engine is left out: `CREATE TABLE ... AS` copies its engine
+/// arguments, and with an explicit ZooKeeper path the staging table would
+/// register as a replica of the destination and fail.
+fn engine_keeps_duplicates(engine: &str) -> bool {
+    let name = engine.split('(').next().unwrap_or(engine).trim();
+    name.ends_with("MergeTree") && !name.contains("Replacing") && !name.starts_with("Replicated")
+}
+
+/// ClickHouse's `UNKNOWN_TABLE` (code 60).
+fn is_unknown_table(e: &EtlError) -> bool {
+    let msg = e.to_string();
+    msg.contains("UNKNOWN_TABLE") || msg.contains("Code: 60.")
+}
+
 /// Thin delegation to the inherent methods above. ClickHouse keeps the default
 /// `merge_into` (unsupported) — it dedups via `ReplacingMergeTree` rather than a
 /// staged MERGE, so `requires_staging_for_incremental` stays `false`. It does
@@ -814,6 +980,19 @@ impl ClickHouseSink {
 impl Sink for ClickHouseSink {
     async fn table_exists(&self, table: &str) -> Result<bool> {
         ClickHouseSink::table_exists(self, table).await
+    }
+    async fn stage_for_retries(&self, table: &str, cfg: &TransferConfig) -> Result<bool> {
+        ClickHouseSink::stage_for_retries(self, table, cfg).await
+    }
+    async fn compact_state(&self, state_table: &str) -> Result<u64> {
+        ClickHouseSink::compact_state(self, state_table).await
+    }
+    async fn state_keys(
+        &self,
+        state_table: &str,
+        idle_days: Option<u32>,
+    ) -> Result<Vec<crate::sink::StateKey>> {
+        ClickHouseSink::state_keys(self, state_table, idle_days).await
     }
     async fn column_types(
         &self,
@@ -1150,6 +1329,32 @@ fn state_row_insert_sql(database: &str, state_table: &str, token: &str, row: &St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_mergetree_that_keeps_copies_is_staged_for_retries() {
+        for keeps in [
+            "MergeTree",
+            "SharedMergeTree",
+            "SummingMergeTree",
+            "AggregatingMergeTree",
+            "MergeTree()",
+        ] {
+            assert!(engine_keeps_duplicates(keeps), "{keeps}");
+        }
+        for collapses in [
+            // Not staged: a staging clone could collide on its ZooKeeper path.
+            "ReplicatedMergeTree",
+            "ReplacingMergeTree",
+            "ReplicatedReplacingMergeTree",
+            "SharedReplacingMergeTree",
+            "ReplacingMergeTree(version)",
+            "Distributed",
+            "Null",
+            "Buffer",
+        ] {
+            assert!(!engine_keeps_duplicates(collapses), "{collapses}");
+        }
+    }
 
     #[test]
     fn bare_type_peels_every_wrapper_layer() {

@@ -15,11 +15,21 @@ from __future__ import annotations
 
 import contextlib
 import datetime as dt
+import threading
+import time
 
 import pytest
 
 import quickhouse
-from conftest import MYSQL_DSN, MYSQL_HOST, MYSQL_PORT, MYSQL_ROOT_PASSWORD
+from conftest import (
+    MYSQL_DB,
+    MYSQL_DSN,
+    MYSQL_HOST,
+    MYSQL_PASSWORD,
+    MYSQL_PORT,
+    MYSQL_ROOT_PASSWORD,
+    MYSQL_USER,
+)
 
 
 def _seed_table(mysql_conn, table: str, rows: int, base_ts: str = "2024-01-01 00:00:00"):
@@ -1117,6 +1127,607 @@ def test_a_timestamp_lands_shifted_unless_the_session_is_utc(
                 "2026-09-30 01:00:00.000000",
             )]
             assert shifted == set()
+    finally:
+        _drop_ch(ch_client, table)
+        with mysql_conn.cursor() as cur:
+            cur.execute(f"DROP TABLE IF EXISTS `{table}`")
+
+
+def test_an_all_null_watermark_is_reported_on_every_run(
+    mysql_conn, ch_client, mysql_source, ch_target, unique_name
+):
+    """Issue #15: when every row's watermark is NULL there is no cursor to
+    save, so each run re-reads the whole table. The NULL-count probe that
+    raises null_watermark is skipped as too costly on a big table
+    (``probe_max_cost=1.0`` stands in for that here), so the read itself has
+    to say so, on every run."""
+    table = unique_name
+    with mysql_conn.cursor() as cur:
+        cur.execute(f"DROP TABLE IF EXISTS `{table}`")
+        cur.execute(
+            f"CREATE TABLE `{table}` (id BIGINT PRIMARY KEY, updated_date DATETIME NULL)"
+        )
+        cur.executemany(
+            f"INSERT INTO `{table}` (id) VALUES (%s)", [(i,) for i in range(1, 201)]
+        )
+    _drop_ch(ch_client, table)
+    kw = dict(
+        dest_table=table, source_table=table, mode="incremental", watermark="updated_date",
+        # No version column: ReplacingMergeTree(updated_date) can't hold a NULL.
+        key=["id"], create_if_missing=True, engine="ReplacingMergeTree()", order_by=["id"],
+    )
+
+    def nulls(result):
+        return [(w.column, w.count) for w in result.warnings if w.kind == "null_watermark"]
+
+    try:
+        for _ in range(2):
+            r = quickhouse.sync(
+                mysql_source, ch_target, lookback_seconds=60, probe_max_cost=1.0, **kw
+            )
+            assert r.rows_read == 200, "no cursor, so every run reads it all"
+            assert r.new_watermark is None
+            assert nulls(r) == [("updated_date", 200)], r.warnings
+
+        # With the probe affordable it reports the column itself, and the
+        # read doesn't add a second count on top of it.
+        r = quickhouse.sync(mysql_source, ch_target, probe_max_cost=0.0, **kw)
+        assert r.rows_read == 200
+        assert nulls(r) == [("updated_date", 200)], r.warnings
+    finally:
+        _drop_ch(ch_client, table)
+        with mysql_conn.cursor() as cur:
+            cur.execute(f"DROP TABLE IF EXISTS `{table}`")
+
+
+def test_a_source_query_that_filters_out_the_newest_rows_raises_no_false_warning(
+    mysql_conn, ch_client, mysql_source, ch_target, unique_name
+):
+    """Issue #23: a source_query that filters out the newest rows has a MAX
+    below a correct cursor. That is no reason to warn about a shifted cursor
+    when source_table shows the cursor is within the table. The cursor still
+    goes back to that MAX, as it always has: a re-read at most, where keeping
+    a cursor that really is ahead would skip rows."""
+    table = unique_name
+    _seed_table(mysql_conn, table, 100, base_ts="2024-01-01 00:00:00")
+    with mysql_conn.cursor() as cur:
+        cur.executemany(
+            f"INSERT INTO `{table}` (id, name, write_date) VALUES (%s, %s, %s)",
+            [(i, f"row-{i}", "2024-03-01 00:00:00") for i in range(101, 111)],
+        )
+    _drop_ch(ch_client, table)
+    query = f"SELECT id, name, write_date FROM `{table}` WHERE id <= 100"
+    kw = dict(
+        dest_table=table, source_query=query, mode="incremental", watermark="write_date",
+        key=["id"], create_if_missing=True, engine="ReplacingMergeTree", order_by=["id"],
+        probe_max_cost=0.0, state_key=f"{table}:filtered",
+    )
+    try:
+        assert quickhouse.sync(mysql_source, ch_target, source_table=table, **kw).rows_written == 100
+
+        # Past the filtered MAX (01-01), within the table's (03-01).
+        _insert_state(ch_client, table, "2024-02-01 00:00:00")
+        r = quickhouse.sync(mysql_source, ch_target, source_table=table, **kw)
+        assert _cursor_warnings(r) == [], r.warnings
+        assert _latest_cursor(ch_client, table) == "2024-01-01 00:00:00"
+
+        # Without source_table nothing tells the filter from a shifted cursor:
+        # the warning names the filter as a possible cause.
+        _insert_state(ch_client, table, "2024-02-01 00:00:00")
+        r = quickhouse.sync(mysql_source, ch_target, **kw)
+        (ahead,) = _cursor_warnings(r)
+        assert ahead.kind == "watermark_ahead_of_source"
+        assert "source_query" in ahead.message and "set source_table" in ahead.message.lower()
+        assert _latest_cursor(ch_client, table) == "2024-01-01 00:00:00"
+
+        # Past the table's own MAX: a real cursor problem, handled as before.
+        _insert_state(ch_client, table, "2024-04-01 00:00:00")
+        r = quickhouse.sync(mysql_source, ch_target, source_table=table, **kw)
+        (ahead,) = _cursor_warnings(r)
+        assert ahead.kind == "watermark_ahead_of_source"
+        assert "saves the source's MAX" in ahead.message
+        assert _latest_cursor(ch_client, table) == "2024-01-01 00:00:00"
+    finally:
+        _drop_ch(ch_client, table)
+        with mysql_conn.cursor() as cur:
+            cur.execute(f"DROP TABLE IF EXISTS `{table}`")
+
+
+def test_a_sweep_longer_than_the_lookback_rereads_rows_updated_mid_sweep(
+    mysql_conn, ch_client, mysql_source, ch_target, unique_name
+):
+    """Issue #13: a windowed sweep reads one window after another. A row in a
+    window already read is updated mid-sweep, then a row in a later window,
+    and the stream cursor lands on the later update. Once the sweep outlasts
+    lookback_seconds, the next run's lower bound is past the first update and
+    that row was never read again. The cursor now moves back by what the sweep
+    took beyond the lookback, so the next run reads it."""
+    pymysql = pytest.importorskip("pymysql")
+    table = unique_name
+    rows = 6_000
+    with mysql_conn.cursor() as cur:
+        cur.execute(f"DROP TABLE IF EXISTS `{table}`")
+        cur.execute(
+            f"CREATE TABLE `{table}` (id BIGINT PRIMARY KEY, "
+            "updated_date DATETIME(6) NOT NULL, payload VARCHAR(32) NOT NULL)"
+        )
+        cur.executemany(
+            f"INSERT INTO `{table}` VALUES (%s, '2026-01-01 00:00:00', 'v0')",
+            [(i,) for i in range(1, rows + 1)],
+        )
+    _drop_ch(ch_client, table)
+    kw = dict(
+        dest_table=table, source_table=table, mode="incremental", watermark="updated_date",
+        key=["id"], create_if_missing=True, engine="ReplacingMergeTree()", order_by=["id"],
+        lookback_seconds=1, state_key=f"{table}:updated_date", parallelism=1,
+        # Stands in for a MAX(updated_date) too costly to probe: the read is
+        # swept, and the cursor comes from the rows read.
+        probe_max_cost=1.0,
+        read_window_rows=300,
+    )
+    # 20 windows of 300 keys at 1,000 rows/s: a ~6 s sweep. The pace is kept
+    # per full batch, so batches have to be smaller than a window.
+    slow = dict(read_max_rows_per_sec=1_000, batch_rows=50)
+
+    def payload(i):
+        return ch_client.command(f"SELECT payload FROM `{table}` FINAL WHERE id = {i}")
+
+    def update(i, value):
+        # Its own connection: the fixture's is not safe to share across threads.
+        conn = pymysql.connect(
+            host=MYSQL_HOST, port=MYSQL_PORT, user=MYSQL_USER, password=MYSQL_PASSWORD,
+            database=MYSQL_DB, autocommit=True,
+        )
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE `{table}` SET updated_date = NOW(6), payload = %s WHERE id = %s",
+                (value, i),
+            )
+        conn.close()
+
+    try:
+        quickhouse.sync(mysql_source, ch_target, **kw)
+        result = {}
+        sweep = threading.Thread(
+            target=lambda: result.update(r=quickhouse.sync(mysql_source, ch_target, **kw, **slow))
+        )
+        sweep.start()
+        time.sleep(1.5)
+        update(100, "v1-early")  # its window was read in the first half second
+        time.sleep(1.5)
+        update(rows - 10, "v1-late")  # its window is read last
+        sweep.join()
+        assert payload(rows - 10) == "v1-late", "the sweep should have read the late update"
+        assert result["r"].stage_secs > 3, result["r"].stage_secs
+
+        quickhouse.sync(mysql_source, ch_target, **kw)
+        assert payload(100) == "v1-early"
+    finally:
+        _drop_ch(ch_client, table)
+        with mysql_conn.cursor() as cur:
+            cur.execute(f"DROP TABLE IF EXISTS `{table}`")
+
+
+def _connections(mysql_conn) -> int:
+    """MySQL's count of connection attempts since start: the difference across
+    a sync is how many connections it opened."""
+    with mysql_conn.cursor() as cur:
+        cur.execute("SHOW GLOBAL STATUS LIKE 'Connections'")
+        return int(cur.fetchone()[1])
+
+
+def _new_parts(ch_client, table) -> int:
+    ch_client.command("SYSTEM FLUSH LOGS")
+    return ch_client.command(
+        "SELECT count() FROM system.part_log WHERE database = currentDatabase() "
+        f"AND table = '{table}' AND event_type = 'NewPart'"
+    )
+
+
+def test_an_indexed_watermark_with_many_nulls_is_read_in_one_pass(
+    mysql_conn, ch_client, mysql_source, ch_target, unique_name, capfd
+):
+    """Issue #16, case 1: on an indexed, nullable watermark with mostly NULLs,
+    MAX comes from the index while the NULL count prices above the gate. The
+    costly count used to report unindexed_watermark and sweep a read that was a
+    range scan. Now only the skipped count is reported."""
+    table = unique_name
+    with mysql_conn.cursor() as cur:
+        cur.execute(f"DROP TABLE IF EXISTS `{table}`")
+        cur.execute(
+            f"CREATE TABLE `{table}` (id BIGINT PRIMARY KEY, updated_date DATETIME NULL, "
+            "KEY (updated_date))"
+        )
+        cur.executemany(
+            f"INSERT INTO `{table}` VALUES (%s, %s)",
+            [(i, "2026-01-01 00:00:00" if i <= 100 else None) for i in range(1, 2001)],
+        )
+    _drop_ch(ch_client, table)
+    try:
+        capfd.readouterr()
+        r = quickhouse.sync(
+            mysql_source, ch_target, dest_table=table, source_table=table,
+            mode="incremental", watermark="updated_date", key=["id"],
+            create_if_missing=True, engine="ReplacingMergeTree()", order_by=["id"],
+            probe_max_cost=1.0, read_window_rows=100, parallelism=1,
+        )
+        kinds = {w.kind for w in r.warnings}
+        assert "unindexed_watermark" not in kinds, r.warnings
+        assert "null_check_skipped" in kinds, r.warnings
+        assert "windowed read on" not in capfd.readouterr().err
+        # `WHERE updated_date <= MAX` matches no NULL, as ever.
+        assert r.rows_written == 100
+    finally:
+        _drop_ch(ch_client, table)
+        with mysql_conn.cursor() as cur:
+            cur.execute(f"DROP TABLE IF EXISTS `{table}`")
+
+
+def _seed_filtered(mysql_conn, table, ids):
+    with mysql_conn.cursor() as cur:
+        cur.execute(f"DROP TABLE IF EXISTS `{table}`")
+        cur.execute(
+            f"CREATE TABLE `{table}` (id BIGINT PRIMARY KEY, updated_date DATETIME NOT NULL, "
+            "is_test TINYINT NOT NULL, payload VARCHAR(32) NOT NULL, KEY (updated_date))"
+        )
+        _add_filtered(mysql_conn, table, ids)
+
+
+def _add_filtered(mysql_conn, table, ids, is_test=0):
+    with mysql_conn.cursor() as cur:
+        cur.executemany(
+            f"INSERT INTO `{table}` VALUES (%s, "
+            "TIMESTAMPADD(SECOND, %s, '2026-01-01 00:00:00'), %s, 'p')",
+            [(i, i % 100_000, is_test) for i in ids],
+        )
+
+
+def test_a_filtered_source_query_probes_max_on_the_table(
+    mysql_conn, ch_client, mysql_source, ch_target, unique_name, capfd
+):
+    """Issue #16, case 2 with both set: MAX(id) through `WHERE is_test = 0`
+    can't come from the primary key, so it priced as a scan and switched on a
+    sweep of a read that is a range scan. With source_table set the MAX is the
+    table's own. It only bounds the read, though: the cursor is the largest id
+    actually read, so a test row the filter excludes (id 1,000,000,000) can't
+    carry the cursor past rows not read yet."""
+    table = unique_name
+    _seed_filtered(mysql_conn, table, range(1, 3001))
+    _add_filtered(mysql_conn, table, [1_000_000_000], is_test=1)
+    _drop_ch(ch_client, table)
+    kw = dict(
+        dest_table=table, source_table=table,
+        source_query=f"SELECT id, updated_date, payload FROM `{table}` WHERE is_test = 0",
+        mode="incremental", watermark="id", key=["id"], create_if_missing=True,
+        engine="ReplacingMergeTree()", order_by=["id"], probe_max_cost=1.0,
+        read_window_rows=100, parallelism=1, state_key=f"{table}:pk",
+    )
+    try:
+        capfd.readouterr()
+        r = quickhouse.sync(mysql_source, ch_target, **kw)
+        assert r.rows_written == 3000
+        assert r.new_watermark == "3000", "the cursor is what was read, not the table's MAX"
+        assert "unindexed_watermark" not in {w.kind for w in r.warnings}, r.warnings
+        assert "windowed read on" not in capfd.readouterr().err
+
+        _add_filtered(mysql_conn, table, range(3001, 3011))
+        r = quickhouse.sync(mysql_source, ch_target, **kw)
+        assert r.rows_written == 10, "rows past the cursor but below the junk row still land"
+        assert r.new_watermark == "3010"
+        assert ch_client.command(f"SELECT count() FROM `{table}` FINAL") == 3010
+    finally:
+        _drop_ch(ch_client, table)
+        with mysql_conn.cursor() as cur:
+            cur.execute(f"DROP TABLE IF EXISTS `{table}`")
+
+
+def test_a_key_watermark_through_a_filtered_query_is_not_swept_once_it_has_a_cursor(
+    mysql_conn, ch_client, mysql_source, ch_target, unique_name, capfd
+):
+    """Issue #16, case 2 with a primary-key watermark and only source_query:
+    MAX(id) through the filter is a scan, and with lookback_seconds=0 it runs
+    anyway. The sweep added a second full scan for its key bounds, every run.
+    With a cursor the read is `id > cursor`, the very range a window bounds,
+    so a run pays for the MAX at most."""
+    table = unique_name
+    _seed_filtered(mysql_conn, table, range(1, 2001))
+    _drop_ch(ch_client, table)
+    kw = dict(
+        dest_table=table,
+        source_query=f"SELECT id, updated_date, payload FROM `{table}` WHERE is_test = 0",
+        mode="incremental", watermark="id", key=["id"], create_if_missing=True,
+        engine="ReplacingMergeTree()", order_by=["id"], probe_max_cost=1.0,
+        read_window_rows=100, parallelism=1, state_key=f"{table}:pk",
+    )
+    try:
+        assert quickhouse.sync(mysql_source, ch_target, **kw).rows_written == 2000
+        _add_filtered(mysql_conn, table, range(2001, 2021))
+        capfd.readouterr()
+        r = quickhouse.sync(mysql_source, ch_target, **kw)
+        assert r.rows_written == 20
+        assert "windowed read on" not in capfd.readouterr().err
+        unindexed = next(w for w in r.warnings if w.kind == "unindexed_watermark")
+        assert "set source_table as well" in unindexed.message, unindexed.message
+    finally:
+        _drop_ch(ch_client, table)
+        with mysql_conn.cursor() as cur:
+            cur.execute(f"DROP TABLE IF EXISTS `{table}`")
+
+
+def test_key_watermark_partitions_split_the_rows_above_the_cursor(
+    mysql_conn, ch_client, mysql_source, ch_target, unique_name, capfd
+):
+    """Issue #24: with the watermark as the partition key, the partitions split
+    the table's whole [MIN, MAX], so every new row landed in the last one and
+    the others opened a connection to read nothing. They now split what is
+    above the cursor. A steady-state run also opens no connection beyond the
+    setup one and the read: the lower-bound check runs on the setup's."""
+    table = unique_name
+    _seed_table(mysql_conn, table, 100)
+    _drop_ch(ch_client, table)
+    kw = dict(
+        dest_table=table, source_table=table, mode="incremental", watermark="id",
+        key=["id"], create_if_missing=True, engine="ReplacingMergeTree", order_by=["id"],
+    )
+    try:
+        quickhouse.sync(mysql_source, ch_target, parallelism=2, **kw)
+        _add_newer_rows(mysql_conn, table)  # ids 101..150
+        capfd.readouterr()
+        r = quickhouse.sync(mysql_source, ch_target, parallelism=2, **kw)
+        assert r.rows_written == 50
+        err = capfd.readouterr().err
+        assert "partition 'range-0' complete: 25 rows" in err, err
+        assert "partition 'range-1' complete: 25 rows" in err, err
+
+        before = _connections(mysql_conn)
+        r = quickhouse.sync(mysql_source, ch_target, parallelism=1, **kw)
+        assert r.rows_written == 0
+        assert _connections(mysql_conn) - before == 2, "setup + read, nothing else"
+    finally:
+        _drop_ch(ch_client, table)
+
+
+def test_a_windowed_sweep_shares_one_connection_and_one_insert(
+    mysql_conn, ch_client, mysql_source, ch_target, unique_name
+):
+    """Issue #20: each window of a sweep opened its own connection and flushed
+    its own insert, so 18 updated rows spread over the key range cost 20
+    MySQL connections and 18 ClickHouse parts where a single pass took 4 and
+    2. The windows now share one connection and one insert buffer."""
+    table = unique_name
+    with mysql_conn.cursor() as cur:
+        cur.execute(f"DROP TABLE IF EXISTS `{table}`")
+        cur.execute(
+            f"CREATE TABLE `{table}` (id BIGINT PRIMARY KEY, updated_date DATETIME(6) NOT NULL)"
+        )
+        cur.executemany(
+            f"INSERT INTO `{table}` VALUES (%s, TIMESTAMPADD(SECOND, %s, '2026-01-01'))",
+            [(i, i) for i in range(1, 2001)],
+        )
+    _drop_ch(ch_client, table)
+    kw = dict(
+        dest_table=table, source_table=table, mode="incremental", watermark="updated_date",
+        key=["id"], create_if_missing=True, engine="ReplacingMergeTree()", order_by=["id"],
+        lookback_seconds=1, probe_max_cost=1.0, read_window_rows=100, parallelism=1,
+    )
+    try:
+        quickhouse.sync(mysql_source, ch_target, **kw)
+        with mysql_conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE `{table}` SET updated_date = NOW(6) WHERE id IN "
+                f"({', '.join(str(i) for i in range(50, 2000, 110))})"
+            )
+        parts, conns = _new_parts(ch_client, table), _connections(mysql_conn)
+        r = quickhouse.sync(mysql_source, ch_target, **kw)
+        assert r.rows_written >= 18
+        assert _connections(mysql_conn) - conns == 2, "setup + one for the whole sweep"
+        assert _new_parts(ch_client, table) - parts == 1, "one insert for the whole sweep"
+    finally:
+        _drop_ch(ch_client, table)
+        with mysql_conn.cursor() as cur:
+            cur.execute(f"DROP TABLE IF EXISTS `{table}`")
+
+
+def test_fail_on_warnings_stops_the_cursor_and_the_swap(
+    mysql_conn, ch_client, mysql_source, ch_target, unique_name
+):
+    """Issue #17: raising on a warning after sync() returns can't stop the
+    cursor, which is saved by then, so a retry starts past the rows the
+    warning was about. fail_on_warnings stops the run before that."""
+    table = unique_name
+    _seed_table(mysql_conn, table, 10)
+    _drop_ch(ch_client, table)
+    kw = dict(
+        dest_table=table, source_table=table, mode="incremental", watermark="write_date",
+        key=["id"], create_if_missing=True, engine="ReplacingMergeTree", order_by=["id"],
+        probe_max_cost=0.0, state_key=f"{table}:wd",
+    )
+
+    def cursor():
+        return ch_client.command(
+            "SELECT last_watermark FROM _quickhouse_state FINAL "
+            f"WHERE source_table = '{table}:wd' ORDER BY run_ts DESC LIMIT 1"
+        )
+
+    try:
+        quickhouse.sync(mysql_source, ch_target, **kw)
+        before = cursor()
+        with mysql_conn.cursor() as cur:
+            cur.execute(
+                f"INSERT INTO `{table}` (id, name, is_active, write_date) "
+                "VALUES (11, 'row-11', 2, '2024-03-01 00:00:00')"
+            )
+        with pytest.raises(RuntimeError, match="fail_on_warnings: collapsed_bool") as err:
+            quickhouse.sync(mysql_source, ch_target, fail_on_warnings={"collapsed_bool"}, **kw)
+        assert "column 'is_active'" in str(err.value)
+        assert "cursor was not saved" in str(err.value)
+        assert cursor() == before, "the cursor did not move"
+        # Once the cause is accepted, the next run reads the same range again.
+        r = quickhouse.sync(mysql_source, ch_target, **kw)
+        assert r.rows_written == 1
+        assert {w.kind for w in r.warnings} == {"collapsed_bool"}
+
+        # A full refresh stops before its swap: the destination is untouched.
+        with mysql_conn.cursor() as cur:
+            cur.execute(f"UPDATE `{table}` SET name = 'changed' WHERE id = 1")
+        # The incremental runs left an unmerged copy of row 11, which the
+        # shrink guard counts.
+        full = dict(kw, mode="full", allow_full_refresh_shrink=True)
+        with pytest.raises(RuntimeError, match="untouched"):
+            quickhouse.sync(mysql_source, ch_target, fail_on_warnings=["collapsed_bool"], **full)
+        assert ch_client.command(f"SELECT name FROM `{table}` FINAL WHERE id = 1") == "row-1"
+
+        with pytest.raises(RuntimeError, match="unknown warning kind"):
+            quickhouse.sync(mysql_source, ch_target, fail_on_warnings={"collapsed"}, **kw)
+    finally:
+        _drop_ch(ch_client, table)
+
+
+def _seed_wide(mysql_conn, table, rows):
+    """`rows` rows of 1 KB each: wide enough that MySQL is still sending the
+    result while a throttled read drains it, so killing the connection
+    breaks the read rather than the idle socket after it."""
+    with mysql_conn.cursor() as cur:
+        cur.execute(f"DROP TABLE IF EXISTS `{table}`")
+        cur.execute(
+            f"CREATE TABLE `{table}` (id BIGINT PRIMARY KEY, payload VARCHAR(1024) NOT NULL)"
+        )
+        cur.execute("SET SESSION cte_max_recursion_depth = 1000000")
+        cur.execute(
+            f"INSERT INTO `{table}` WITH RECURSIVE seq (n) AS "
+            f"(SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < {rows}) "
+            "SELECT n, REPEAT('x', 1000) FROM seq"
+        )
+
+
+def _kill_reader_after(mysql_conn, delay):
+    """Kill quickhouse's read connection after `delay` seconds, as a replica
+    restart would, from a thread of its own: every connection of the test
+    user but this test's own."""
+    pymysql = pytest.importorskip("pymysql")
+    with mysql_conn.cursor() as cur:
+        cur.execute("SELECT CONNECTION_ID()")
+        (fixture,) = cur.fetchone()
+
+    def kill():
+        time.sleep(delay)
+        conn = pymysql.connect(
+            host=MYSQL_HOST, port=MYSQL_PORT, user=MYSQL_USER, password=MYSQL_PASSWORD,
+            database=MYSQL_DB, autocommit=True,
+        )
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id FROM information_schema.processlist "
+                "WHERE user = %s AND id NOT IN (%s, CONNECTION_ID())",
+                (MYSQL_USER, fixture),
+            )
+            killed.extend(thread for (thread,) in cur.fetchall())
+            for thread in killed:
+                cur.execute(f"KILL CONNECTION {thread}")
+        conn.close()
+
+    killed = []
+    t = threading.Thread(target=kill)
+    t.start()
+    return t, killed
+
+
+def test_a_retry_into_a_plain_mergetree_writes_each_row_once(
+    mysql_conn, ch_client, mysql_source, ch_target, unique_name
+):
+    """Issue #14: a retried attempt re-inserts what the failed one wrote, and a
+    plain MergeTree keeps every copy: 280,000 rows for 150,000 ids, with
+    rows_written saying 150,000. Retries now stage each attempt for such an
+    engine, so the failed one leaves nothing behind."""
+    table = unique_name
+    rows = 40_000
+    _seed_wide(mysql_conn, table, rows)
+    _drop_ch(ch_client, table)
+    ch_client.command(
+        f"CREATE TABLE `{table}` (id Int64, payload String) ENGINE = MergeTree ORDER BY id"
+    )
+    kw = dict(
+        dest_table=table, source_table=table, mode="incremental", watermark="id",
+        key=["id"], create_if_missing=True, parallelism=1, batch_rows=1000, insert_bytes=0,
+        read_max_rows_per_sec=10_000, retry_max_attempts=3, state_key=f"{table}:pk",
+    )
+    try:
+        killer, killed = _kill_reader_after(mysql_conn, 1.5)
+        r = quickhouse.sync(mysql_source, ch_target, **kw)
+        killer.join()
+        assert killed, "the read should have been cut off part-way"
+        got = ch_client.query(f"SELECT count(), uniqExact(id) FROM `{table}`").result_rows[0]
+        assert got == (rows, rows), got
+        assert r.rows_written == rows
+        assert r.rows_written_failed_attempts == 0
+        assert "retried_after_partial_write" not in {w.kind for w in r.warnings}
+    finally:
+        _drop_ch(ch_client, table)
+        with mysql_conn.cursor() as cur:
+            cur.execute(f"DROP TABLE IF EXISTS `{table}`")
+
+
+def test_a_retry_after_a_partial_write_says_so(
+    mysql_conn, ch_client, mysql_source, ch_target, unique_name
+):
+    """Issue #14, ReplacingMergeTree: the copies a retry writes collapse at the
+    next merge, but count() runs high until then and rows_written covered the
+    last attempt only. The retry is now reported, with the rows."""
+    table = unique_name
+    rows = 40_000
+    _seed_wide(mysql_conn, table, rows)
+    _drop_ch(ch_client, table)
+    kw = dict(
+        dest_table=table, source_table=table, mode="incremental", watermark="id",
+        key=["id"], create_if_missing=True, engine="ReplacingMergeTree", order_by=["id"],
+        parallelism=1, batch_rows=1000, insert_bytes=0, read_max_rows_per_sec=10_000,
+        retry_max_attempts=3, state_key=f"{table}:pk",
+    )
+    try:
+        killer, killed = _kill_reader_after(mysql_conn, 1.5)
+        r = quickhouse.sync(mysql_source, ch_target, **kw)
+        killer.join()
+        assert killed, "the read should have been cut off part-way"
+        (retried,) = [w for w in r.warnings if w.kind == "retried_after_partial_write"]
+        assert r.rows_written == rows
+        assert 0 < r.rows_written_failed_attempts < rows
+        assert retried.count == r.rows_written_failed_attempts
+        assert ch_client.command(f"SELECT uniqExact(id) FROM `{table}` FINAL") == rows
+    finally:
+        _drop_ch(ch_client, table)
+        with mysql_conn.cursor() as cur:
+            cur.execute(f"DROP TABLE IF EXISTS `{table}`")
+
+
+def test_a_table_max_never_becomes_the_cursor_of_an_excluded_watermark(
+    mysql_conn, ch_client, mysql_source, ch_target, unique_name
+):
+    """Review of #16: with the watermark left out of the transfer there is no
+    read to take the cursor from, and source_table's unfiltered MAX is no
+    cursor: a test row the filter excludes, dated 2099, would carry it past
+    every real row. source_query's own MAX is probed instead."""
+    table = unique_name
+    _seed_filtered(mysql_conn, table, range(1, 101))
+    with mysql_conn.cursor() as cur:
+        cur.execute(
+            f"INSERT INTO `{table}` VALUES (1000000, '2099-01-01 00:00:00', 1, 'junk')"
+        )
+    _drop_ch(ch_client, table)
+    kw = dict(
+        dest_table=table, source_table=table,
+        source_query=f"SELECT id, updated_date, payload FROM `{table}` WHERE is_test = 0",
+        mode="incremental", watermark="updated_date", key=["id"], create_if_missing=True,
+        engine="ReplacingMergeTree()", order_by=["id"], probe_max_cost=1.0,
+        exclude=["updated_date"], state_key=f"{table}:ud", parallelism=1,
+    )
+    try:
+        r = quickhouse.sync(mysql_source, ch_target, **kw)
+        assert r.rows_written == 100
+        assert r.new_watermark is not None and not r.new_watermark.startswith("2099"), (
+            r.new_watermark
+        )
+        _add_filtered(mysql_conn, table, range(101, 111))
+        assert quickhouse.sync(mysql_source, ch_target, **kw).rows_written >= 10
     finally:
         _drop_ch(ch_client, table)
         with mysql_conn.cursor() as cur:
