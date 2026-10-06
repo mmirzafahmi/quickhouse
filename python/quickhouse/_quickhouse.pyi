@@ -178,8 +178,9 @@ class S3Archive:
     to a :class:`ClickHouse` destination via its ``archive=`` parameter.
 
     Every batch synced into ClickHouse is also written as Parquet — one
-    streamed file per parallel partition, never fully buffered in memory —
-    to ``s3://{bucket}/{prefix}/{dest_table}/dt=<date>/run=<id>/
+    streamed file per parallel partition (per chunk, with ``chunk_rows``),
+    never fully buffered in memory — to
+    ``s3://{bucket}/{prefix}/{dest_table}/dt=<date>/run=<id>/
     part-<partition>.parquet``. A secondary, best-effort-free backup/
     historical side channel: omitting ``archive`` entirely disables this and
     has zero effect on the ClickHouse write path. A persistent S3 failure
@@ -229,8 +230,8 @@ class GcsArchive:
     parameter — the GCS counterpart of :class:`S3Archive`.
 
     Every batch synced is also written as Parquet — one streamed file per
-    parallel partition, never fully buffered in memory — to
-    ``gs://{bucket}/{prefix}/{dest_table}/dt=<date>/run=<id>/
+    parallel partition (per chunk, with ``chunk_rows``), never fully buffered
+    in memory — to ``gs://{bucket}/{prefix}/{dest_table}/dt=<date>/run=<id>/
     part-<partition>.parquet``, the same Hive-style layout the S3 archive
     writes, directly queryable by BigQuery external tables, Spark or DuckDB.
     A persistent GCS failure fails the whole ``sync()`` call, matching how

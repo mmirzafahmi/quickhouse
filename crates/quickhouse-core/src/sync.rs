@@ -17,7 +17,7 @@ use mysql_async::prelude::*;
 use object_store::ObjectStore;
 use tokio::task::JoinSet;
 
-use crate::archive::{archive_object_key, build_store, ArchiveWriter};
+use crate::archive::{archive_object_key, build_store, ArchiveUploads, ArchiveWriter};
 use crate::config::{
     ApiColumn, ArchiveConfig, DestinationConfig, ParquetCompression, SourceConfig, SourceShape,
     SyncMode, TransferConfig, TransferResult, TransferWarning, WarningKind, WatermarkSeed,
@@ -815,6 +815,8 @@ struct ArchiveRunInfo {
     /// Backend label ("s3"/"gcs") for error messages only — the store itself
     /// is a `dyn ObjectStore` and no longer says which cloud it talks to.
     kind: &'static str,
+    /// Every upload this attempt starts; see [`run_transfer_attempt`].
+    uploads: ArchiveUploads,
 }
 
 impl ArchiveRunInfo {
@@ -826,7 +828,74 @@ impl ArchiveRunInfo {
             &self.run_id,
             partition_label,
         );
-        ArchiveWriter::new(self.store.clone(), key, schema, self.compression, self.kind)
+        ArchiveWriter::new(
+            self.store.clone(),
+            key,
+            schema,
+            self.compression,
+            self.kind,
+            &self.uploads,
+        )
+    }
+}
+
+/// The archive side of a keyset-chunked (`chunk_rows`) read: one Parquet file
+/// per chunk, finished before that chunk's cursor is committed.
+///
+/// A chunked read commits its cursor after every chunk, and a run that fails
+/// part-way resumes at the next one. With one file for the whole run, that
+/// lost rows: the file was finished only after the last chunk, so a failed
+/// run left no object, and the run that resumed archived only the chunks it
+/// read itself. The destination held every row and the archive silently did
+/// not — measured on GCS, a run killed after 4 of 20 chunks and resumed left
+/// 2,000,000 of 10,000,000 rows out of the backup. A file per chunk keeps the
+/// archive whole across a resume: every committed chunk is already an object.
+struct ChunkArchive {
+    info: Option<Arc<ArchiveRunInfo>>,
+    schema: SchemaRef,
+    /// Index of the current chunk within this run, which names its file.
+    chunk: usize,
+    writer: Option<ArchiveWriter>,
+}
+
+impl ChunkArchive {
+    fn new(info: Option<Arc<ArchiveRunInfo>>, schema: SchemaRef) -> Self {
+        Self {
+            info,
+            schema,
+            chunk: 0,
+            writer: None,
+        }
+    }
+
+    /// Append `batch` to the current chunk's file, opening the file on the
+    /// chunk's first row, so a chunk that reads nothing writes nothing.
+    async fn write(&mut self, batch: &RecordBatch) -> Result<()> {
+        let Some(info) = &self.info else {
+            return Ok(());
+        };
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+        let writer = match self.writer.take() {
+            Some(w) => w,
+            None => {
+                let label = format!("keyset-{:05}", self.chunk);
+                info.writer_for(&label, self.schema.clone())?
+            }
+        };
+        self.writer.insert(writer).write(batch).await
+    }
+
+    /// Finish the current chunk's file. Call once the chunk has landed in the
+    /// destination and before its cursor is committed, so a chunk the cursor
+    /// counts as done is always in the archive too.
+    async fn finish_chunk(&mut self) -> Result<()> {
+        if let Some(w) = self.writer.take() {
+            w.close().await?;
+        }
+        self.chunk += 1;
+        Ok(())
     }
 }
 
@@ -838,6 +907,7 @@ impl ArchiveRunInfo {
 fn build_archive_run_info(
     archive: Option<ArchiveConfig>,
     dest_table: &str,
+    uploads: &ArchiveUploads,
 ) -> Result<Option<Arc<ArchiveRunInfo>>> {
     let Some(cfg) = archive else {
         return Ok(None);
@@ -860,6 +930,7 @@ fn build_archive_run_info(
         run_id: new_run_id(),
         compression: cfg.compression(),
         kind: cfg.kind(),
+        uploads: uploads.clone(),
     })))
 }
 
@@ -934,7 +1005,7 @@ pub async fn run_transfer(
     if max_attempts <= 1 {
         // Fast path: byte-identical to the pre-retry behavior — one call, one
         // context wrap, no clones.
-        return run_transfer_impl(source_cfg, dest, cfg, progress, on_staged)
+        return run_transfer_attempt(source_cfg, dest, cfg, progress, on_staged)
             .await
             .map_err(|e| e.context(table_context));
     }
@@ -945,7 +1016,7 @@ pub async fn run_transfer(
     // separately at the insert layer, so those never re-read the source here.
     let mut attempt = 1u32;
     loop {
-        let result = run_transfer_impl(
+        let result = run_transfer_attempt(
             source_cfg.clone(),
             dest.clone(),
             cfg.clone(),
@@ -969,12 +1040,32 @@ pub async fn run_transfer(
     }
 }
 
+/// One attempt at a transfer. When it fails, every archive upload it started
+/// and never finished is aborted before the error is returned, so a failed run
+/// leaves no incomplete multipart upload behind in the bucket. See
+/// [`ArchiveUploads`] for why this is awaited here rather than left to a `Drop`.
+async fn run_transfer_attempt(
+    source_cfg: SourceConfig,
+    dest: DestinationConfig,
+    cfg: TransferConfig,
+    progress: Option<ProgressCb>,
+    on_staged: Option<StagedValidationCb>,
+) -> Result<TransferResult> {
+    let uploads = ArchiveUploads::default();
+    let result = run_transfer_impl(source_cfg, dest, cfg, progress, on_staged, &uploads).await;
+    if result.is_err() {
+        uploads.abort_unfinished().await;
+    }
+    result
+}
+
 async fn run_transfer_impl(
     source_cfg: SourceConfig,
     dest: DestinationConfig,
     cfg: TransferConfig,
     progress: Option<ProgressCb>,
     on_staged: Option<StagedValidationCb>,
+    uploads: &ArchiveUploads,
 ) -> Result<TransferResult> {
     // Every source (Postgres, MySQL, BigQuery — directly or via reqwest/tonic's
     // own rustls-based transport) eventually needs a process-wide rustls
@@ -1059,7 +1150,7 @@ async fn run_transfer_impl(
     // in either branch — and built once here so a bad archive config (e.g. a
     // missing bucket) fails fast rather than being discovered mid-transfer.
     let archive_cfg = dest.archive().cloned();
-    let archive_info = build_archive_run_info(archive_cfg, &cfg.dest_table)?;
+    let archive_info = build_archive_run_info(archive_cfg, &cfg.dest_table, uploads)?;
 
     // Per-run-unique staging table name (see `staging_name`), computed once
     // and reused at every create/swap/merge/drop site this run.
@@ -3505,10 +3596,7 @@ async fn transfer_keyset_postgres(
     let schema =
         CopyDecoder::with_batch_bytes(&plan.dest_columns, cfg.batch_rows, cfg.batch_bytes)?
             .schema();
-    let mut archive_writer = match &ctx.archive {
-        Some(info) => Some(info.writer_for("keyset", schema.clone())?),
-        None => None,
-    };
+    let mut archive = ChunkArchive::new(ctx.archive.clone(), schema.clone());
     tracing::info!(
         "keyset chunked read starting on '{}' (chunk_rows={}, resume_cursor={:?})",
         chunk.keyset_col,
@@ -3566,9 +3654,7 @@ async fn transfer_keyset_postgres(
                 if let Some(k) = last_int_key(&batch, chunk.keyset_idx)? {
                     cursor_candidate = Some(cursor_candidate.map_or(k, |c| c.max(k)));
                 }
-                if let Some(w) = archive_writer.as_mut() {
-                    w.write(&batch).await?;
-                }
+                archive.write(&batch).await?;
                 chunk_ctx
                     .push_batch(&mut sends, &mut insert_buf, schema.clone(), batch)
                     .await;
@@ -3587,9 +3673,7 @@ async fn transfer_keyset_postgres(
             if let Some(k) = last_int_key(&batch, chunk.keyset_idx)? {
                 cursor_candidate = Some(cursor_candidate.map_or(k, |c| c.max(k)));
             }
-            if let Some(w) = archive_writer.as_mut() {
-                w.write(&batch).await?;
-            }
+            archive.write(&batch).await?;
             chunk_ctx
                 .push_batch(&mut sends, &mut insert_buf, schema.clone(), batch)
                 .await;
@@ -3622,6 +3706,8 @@ async fn transfer_keyset_postgres(
                 chunk.keyset_col
             ))
         })?;
+        // The chunk's archive file is durable before its cursor, like its rows.
+        archive.finish_chunk().await?;
         let cur = next.to_string();
         ctx.sink
             .persist_chunk_cursor(
@@ -3638,9 +3724,6 @@ async fn transfer_keyset_postgres(
         if (rows_this_chunk as usize) < chunk.limit {
             break; // short chunk — the window is exhausted
         }
-    }
-    if let Some(w) = archive_writer.take() {
-        w.close().await?;
     }
     tracing::info!(
         "keyset chunked read complete: {} rows read",
@@ -4143,10 +4226,7 @@ async fn transfer_keyset_mysql(
     let schema =
         MySqlBatcher::with_batch_bytes(&plan.dest_columns, cfg.batch_rows, cfg.batch_bytes)?
             .schema();
-    let mut archive_writer = match &ctx.archive {
-        Some(info) => Some(info.writer_for("keyset", schema.clone())?),
-        None => None,
-    };
+    let mut archive = ChunkArchive::new(ctx.archive.clone(), schema.clone());
     tracing::info!(
         "keyset chunked read starting on '{}' (chunk_rows={}, resume_cursor={:?})",
         chunk.keyset_col,
@@ -4201,9 +4281,7 @@ async fn transfer_keyset_mysql(
                 if let Some(k) = last_int_key(&batch, chunk.keyset_idx)? {
                     cursor_candidate = Some(cursor_candidate.map_or(k, |c| c.max(k)));
                 }
-                if let Some(w) = archive_writer.as_mut() {
-                    w.write(&batch).await?;
-                }
+                archive.write(&batch).await?;
                 chunk_ctx
                     .push_batch(&mut sends, &mut insert_buf, schema.clone(), batch)
                     .await;
@@ -4217,9 +4295,7 @@ async fn transfer_keyset_mysql(
             if let Some(k) = last_int_key(&batch, chunk.keyset_idx)? {
                 cursor_candidate = Some(cursor_candidate.map_or(k, |c| c.max(k)));
             }
-            if let Some(w) = archive_writer.as_mut() {
-                w.write(&batch).await?;
-            }
+            archive.write(&batch).await?;
             chunk_ctx
                 .push_batch(&mut sends, &mut insert_buf, schema.clone(), batch)
                 .await;
@@ -4248,6 +4324,8 @@ async fn transfer_keyset_mysql(
                 chunk.keyset_col
             ))
         })?;
+        // The chunk's archive file is durable before its cursor, like its rows.
+        archive.finish_chunk().await?;
         let cur = next.to_string();
         ctx.sink
             .persist_chunk_cursor(
@@ -4264,9 +4342,6 @@ async fn transfer_keyset_mysql(
         if (rows_this_chunk as usize) < chunk.limit {
             break;
         }
-    }
-    if let Some(w) = archive_writer.take() {
-        w.close().await?;
     }
     tracing::info!(
         "keyset chunked read complete: {} rows read",
@@ -4541,10 +4616,7 @@ async fn transfer_keyset_clickhouse(
         predicate: None,
     };
     let schema = ChArrowDecoder::new(&plan.dest_columns, cfg.batch_bytes).schema();
-    let mut archive_writer = match &ctx.archive {
-        Some(info) => Some(info.writer_for("keyset", schema.clone())?),
-        None => None,
-    };
+    let mut archive = ChunkArchive::new(ctx.archive.clone(), schema.clone());
     tracing::info!(
         "keyset chunked read starting on '{}' (chunk_rows={}, resume_cursor={:?})",
         chunk.keyset_col,
@@ -4588,9 +4660,7 @@ async fn transfer_keyset_clickhouse(
                 if let Some(k) = last_int_key(&batch, chunk.keyset_idx)? {
                     cursor_candidate = Some(cursor_candidate.map_or(k, |c| c.max(k)));
                 }
-                if let Some(w) = archive_writer.as_mut() {
-                    w.write(&batch).await?;
-                }
+                archive.write(&batch).await?;
                 chunk_ctx
                     .push_batch(&mut sends, &mut insert_buf, schema.clone(), batch)
                     .await;
@@ -4624,6 +4694,8 @@ async fn transfer_keyset_clickhouse(
                 chunk.keyset_col
             ))
         })?;
+        // The chunk's archive file is durable before its cursor, like its rows.
+        archive.finish_chunk().await?;
         let cur = next.to_string();
         ctx.sink
             .persist_chunk_cursor(
@@ -4640,9 +4712,6 @@ async fn transfer_keyset_clickhouse(
         if (rows_this_chunk as usize) < chunk.limit {
             break;
         }
-    }
-    if let Some(w) = archive_writer.take() {
-        w.close().await?;
     }
     tracing::info!(
         "keyset chunked read complete: {} rows read",
@@ -7668,7 +7737,7 @@ mod tests {
             archive: None,
         });
         let cb: StagedValidationCb = Arc::new(|_info: &StagedInfo| Ok(()));
-        let err = run_transfer_impl(src, dst, cfg, None, Some(cb))
+        let err = run_transfer_impl(src, dst, cfg, None, Some(cb), &ArchiveUploads::default())
             .await
             .expect_err("validate= together with chunk_rows must be rejected")
             .to_string();
@@ -8299,9 +8368,10 @@ mod tests {
         });
         let mut ids = std::collections::HashSet::new();
         for _ in 0..20 {
-            let info = build_archive_run_info(Some(cfg.clone()), "orders")
-                .unwrap()
-                .unwrap();
+            let info =
+                build_archive_run_info(Some(cfg.clone()), "orders", &ArchiveUploads::default())
+                    .unwrap()
+                    .unwrap();
             assert!(
                 ids.insert(info.run_id.clone()),
                 "duplicate run_id: {}",

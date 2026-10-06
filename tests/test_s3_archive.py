@@ -53,6 +53,9 @@ def minio_bucket(s3_client, unique_bucket_name):
     objs = s3_client.list_objects_v2(Bucket=bucket).get("Contents", [])
     for o in objs:
         s3_client.delete_object(Bucket=bucket, Key=o["Key"])
+    # Only a failing test leaves one, but it would block the bucket's delete.
+    for u in s3_client.list_multipart_uploads(Bucket=bucket).get("Uploads", []):
+        s3_client.abort_multipart_upload(Bucket=bucket, Key=u["Key"], UploadId=u["UploadId"])
     s3_client.delete_bucket(Bucket=bucket)
 
 
@@ -101,6 +104,17 @@ def _read_parquet_objects(s3_client, bucket: str, prefix: str):
 def _drop_ch(ch_client, table: str):
     ch_client.command(f"DROP TABLE IF EXISTS `{table}`")
     ch_client.command(f"DROP TABLE IF EXISTS `{table}_quickhouse_tmp`")
+
+
+def _dest_that_stops_after(ch_client, table: str, max_id: int):
+    """A destination that rejects any row past `max_id`, so a transfer into it
+    fails part-way at a known row, and accepts everything once
+    `stop_here` is dropped."""
+    _drop_ch(ch_client, table)
+    ch_client.command(
+        f"CREATE TABLE `{table}` (id Int64, name Nullable(String), amount Nullable(Float64), "
+        f"CONSTRAINT stop_here CHECK id <= {max_id}) ENGINE = ReplacingMergeTree ORDER BY id"
+    )
 
 
 def test_archive_parquet_matches_clickhouse_single_partition(pg_conn, ch_client, pg_source, s3_client, minio_bucket, unique_name):
@@ -204,3 +218,77 @@ def test_archive_fires_for_a_dataframe_source(ch_client, s3_client, minio_bucket
     finally:
         _drop_ch(ch_client, table)
 
+
+def test_a_resumed_chunked_run_archives_every_row(
+    pg_conn, ch_client, pg_source, s3_client, minio_bucket, unique_name
+):
+    """Regression: a `chunk_rows` read commits its cursor after every chunk, but
+    archived the whole run to one file, finished only after the last chunk. A
+    run that failed part-way left no object, the run that resumed archived only
+    the chunks it read itself, and the backup silently lacked every row the
+    failed attempt had committed. Each chunk now gets its own file, finished
+    before its cursor commits."""
+    table = unique_name
+    n, chunk = 1000, 100
+    _seed_table(pg_conn, table, n)
+    _dest_that_stops_after(ch_client, table, max_id=450)  # chunk 5 of 10 fails
+    dst = _archive_target(minio_bucket)
+    kw = dict(
+        dest_table=table, source_table=table, mode="incremental", watermark="id",
+        key=["id"], chunk_rows=chunk, advance_watermark=False, create_if_missing=False,
+    )
+    try:
+        with pytest.raises(RuntimeError, match="stop_here"):
+            quickhouse.sync(pg_source, dst, **kw)
+        ch_client.command(f"ALTER TABLE `{table}` DROP CONSTRAINT stop_here")
+        resumed = quickhouse.sync(pg_source, dst, **kw)
+        assert resumed.rows_read == n - 400, "the retry must resume after the 4 committed chunks"
+
+        keys, archived = _read_parquet_objects(s3_client, minio_bucket, f"lake/{table}/")
+        assert sorted(archived.column("id").to_pylist()) == list(range(1, n + 1))
+        # One file per chunk across both runs; the failed chunk's never finished.
+        assert len(keys) == n // chunk, keys
+        assert all(k.rsplit("/", 1)[1].startswith("part-keyset-") for k in keys), keys
+    finally:
+        _drop_ch(ch_client, table)
+
+
+def test_a_failed_run_leaves_no_multipart_upload_behind(
+    pg_conn, ch_client, pg_source, s3_client, minio_bucket, unique_name
+):
+    """Regression: a file bigger than the 10 MiB upload buffer goes up as a
+    multipart upload, which becomes an object only once completed. A run that
+    failed after its archive had sent parts neither completed nor aborted the
+    upload, so the parts stayed in the bucket, invisible and billed, until a
+    lifecycle rule removed them, if there was one. A failed run now aborts every
+    upload it didn't finish.
+
+    One chunk, past the first Parquet row group (1,048,576 rows) and so past
+    10 MiB: its file is already uploading when the destination rejects a later
+    row, and a chunk's file is finished only after the chunk has landed."""
+    table = unique_name
+    n = 1_100_000
+    with pg_conn.cursor() as cur:
+        cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+        cur.execute(
+            f'CREATE TABLE "{table}" (id bigint PRIMARY KEY, name text, amount double precision)'
+        )
+        cur.execute(
+            f'INSERT INTO "{table}" SELECT g, md5(g::text), g * 1.5 '
+            f"FROM generate_series(1, {n}) g"
+        )
+    _dest_that_stops_after(ch_client, table, max_id=1_090_000)
+    try:
+        with pytest.raises(RuntimeError, match="stop_here"):
+            quickhouse.sync(
+                pg_source, _archive_target(minio_bucket), dest_table=table, source_table=table,
+                mode="incremental", watermark="id", key=["id"], chunk_rows=n,
+                create_if_missing=False,
+            )
+        uploads = s3_client.list_multipart_uploads(Bucket=minio_bucket).get("Uploads", [])
+        assert uploads == [], f"the failed run left {len(uploads)} multipart upload(s) open"
+        assert not s3_client.list_objects_v2(Bucket=minio_bucket).get("Contents")
+    finally:
+        _drop_ch(ch_client, table)
+        with pg_conn.cursor() as cur:
+            cur.execute(f'DROP TABLE IF EXISTS "{table}"')

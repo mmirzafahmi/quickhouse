@@ -33,6 +33,8 @@ pub struct ClickHouseSink {
     /// reuses the value it already took, which is what makes the retry
     /// idempotent rather than merely distinct.
     insert_epoch: Arc<std::sync::atomic::AtomicU64>,
+    /// Numbers this run's state-table writes; see [`Self::state_dedup_token`].
+    state_epoch: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ClickHouseSink {
@@ -52,6 +54,7 @@ impl ClickHouseSink {
                 .unix_timestamp_nanos()
                 .to_string(),
             insert_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            state_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
@@ -67,6 +70,27 @@ impl ClickHouseSink {
             .insert_epoch
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Some(format!("{}-{epoch}", self.run_token))
+    }
+
+    /// A dedup token no other state-table write has used: this run's token
+    /// and a counter. Unlike [`Self::next_dedup_token`] it is always on and a
+    /// caller's setting never replaces it; see [`state_row_insert_sql`].
+    fn state_dedup_token(&self) -> String {
+        let n = self
+            .state_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!("quickhouse-state-{}-{n}", self.run_token)
+    }
+
+    /// Append one row to the state table.
+    async fn insert_state_row(&self, cfg: &TransferConfig, row: StateRow<'_>) -> Result<()> {
+        let sql = state_row_insert_sql(
+            &self.cfg.database,
+            &cfg.state_table_name,
+            &self.state_dedup_token(),
+            &row,
+        );
+        self.execute(&sql).await
     }
 
     pub fn database(&self) -> &str {
@@ -288,18 +312,18 @@ impl ClickHouseSink {
         rows: u64,
     ) -> Result<()> {
         let source_id = cfg.effective_state_key();
-        let sql = format!(
-            "INSERT INTO {}.{} \
-             (source_table, dest_table, last_watermark, rows, chunk_cursor, chunk_upper) \
-             VALUES ('{}', '{}', '{}', {}, '', '')",
-            crate::ddl::quote_ident(&self.cfg.database),
-            crate::ddl::quote_ident(&cfg.state_table_name),
-            escape_sql_string(&source_id),
-            escape_sql_string(&cfg.dest_table),
-            escape_sql_string(watermark),
-            rows,
-        );
-        self.execute(&sql).await
+        self.insert_state_row(
+            cfg,
+            StateRow {
+                source_id: &source_id,
+                dest_table: &cfg.dest_table,
+                watermark,
+                rows,
+                chunk_cursor: "",
+                chunk_upper: "",
+            },
+        )
+        .await
     }
 
     /// Read an in-progress chunk-resume marker `(cursor, upper)` for this
@@ -352,20 +376,18 @@ impl ClickHouseSink {
         rows: u64,
     ) -> Result<()> {
         let source_id = cfg.effective_state_key();
-        let sql = format!(
-            "INSERT INTO {}.{} \
-             (source_table, dest_table, last_watermark, rows, chunk_cursor, chunk_upper) \
-             VALUES ('{}', '{}', '{}', {}, '{}', '{}')",
-            crate::ddl::quote_ident(&self.cfg.database),
-            crate::ddl::quote_ident(&cfg.state_table_name),
-            escape_sql_string(&source_id),
-            escape_sql_string(&cfg.dest_table),
-            escape_sql_string(committed.unwrap_or("")),
-            rows,
-            escape_sql_string(cursor),
-            escape_sql_string(upper),
-        );
-        self.execute(&sql).await
+        self.insert_state_row(
+            cfg,
+            StateRow {
+                source_id: &source_id,
+                dest_table: &cfg.dest_table,
+                watermark: committed.unwrap_or(""),
+                rows,
+                chunk_cursor: cursor,
+                chunk_upper: upper,
+            },
+        )
+        .await
     }
 
     /// Insert a group of Arrow batches into `table` via `FORMAT ArrowStream`.
@@ -1081,6 +1103,50 @@ impl std::io::Write for ChunkWriter {
     }
 }
 
+/// One state-table row: the committed watermark, and the chunk-resume marker
+/// (empty once a run finishes).
+struct StateRow<'a> {
+    source_id: &'a str,
+    dest_table: &'a str,
+    watermark: &'a str,
+    rows: u64,
+    chunk_cursor: &'a str,
+    chunk_upper: &'a str,
+}
+
+/// The `INSERT` for one state row, carrying a dedup token of its own.
+///
+/// A replicated table drops an insert whose block it has seen before, and a
+/// state row can repeat an earlier one byte for byte: a chunk's marker when the
+/// same window is read again, or the cleared marker a run ends on. Dropped, it
+/// leaves an older row as the latest, so a resume restarts from scratch, or a
+/// marker the run believes it cleared is still there. `run_ts` doesn't tell
+/// two writes apart: it is a column default, which ClickHouse Cloud (26.6)
+/// leaves out of the hash. Nor does `insert_deduplicate = 0`: on 26.6 the
+/// newer `deduplicate_insert` overrides it, and a server that predates that
+/// setting rejects its name. A unique `insert_deduplication_token` is the one
+/// switch every version honours. It goes in the statement's own `SETTINGS`,
+/// which outranks a caller's `settings=` (sent as URL parameters): a fixed
+/// token there would otherwise make every state write after the first a
+/// duplicate.
+fn state_row_insert_sql(database: &str, state_table: &str, token: &str, row: &StateRow) -> String {
+    format!(
+        "INSERT INTO {}.{} \
+         (source_table, dest_table, last_watermark, rows, chunk_cursor, chunk_upper) \
+         SETTINGS {DEDUP_TOKEN_SETTING} = '{}' \
+         VALUES ('{}', '{}', '{}', {}, '{}', '{}')",
+        crate::ddl::quote_ident(database),
+        crate::ddl::quote_ident(state_table),
+        escape_sql_string(token),
+        escape_sql_string(row.source_id),
+        escape_sql_string(row.dest_table),
+        escape_sql_string(row.watermark),
+        row.rows,
+        escape_sql_string(row.chunk_cursor),
+        escape_sql_string(row.chunk_upper),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1360,5 +1426,46 @@ mod tests {
             escape_sql_string(r"ends_with_backslash\"),
             r"ends_with_backslash\\"
         );
+    }
+
+    #[test]
+    fn a_state_row_carries_its_own_dedup_token() {
+        let sql = state_row_insert_sql(
+            "analytics",
+            "_quickhouse_state",
+            "quickhouse-state-1-0",
+            &StateRow {
+                source_id: "o'k",
+                dest_table: "orders",
+                watermark: "",
+                rows: 5,
+                chunk_cursor: "42",
+                chunk_upper: "99",
+            },
+        );
+        assert!(
+            sql.contains(" SETTINGS insert_deduplication_token = 'quickhouse-state-1-0' VALUES ("),
+            "{sql}"
+        );
+        assert!(
+            sql.ends_with("VALUES ('o''k', 'orders', '', 5, '42', '99')"),
+            "{sql}"
+        );
+    }
+
+    // Regression: a state row identical to an earlier one was dropped as a
+    // duplicate on ClickHouse Cloud, so the chunk markers of a window read a
+    // second time never landed and the resume after a failure started over
+    // from the first chunk.
+    #[test]
+    fn state_rows_never_share_a_dedup_token() {
+        let sink = sink_with_settings(&[]);
+        let a = sink.state_dedup_token();
+        let b = sink.state_dedup_token();
+        assert_ne!(a, b);
+        // A later run's sink starts its counter over; its run token keeps the
+        // two apart.
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        assert_ne!(sink_with_settings(&[]).state_dedup_token(), a);
     }
 }

@@ -60,6 +60,13 @@ gs://{bucket}/{prefix}/{dest_table}/dt=<date>/run=<id>/part-<partition>.parquet
 s3://{bucket}/{prefix}/{dest_table}/dt=<date>/run=<id>/part-<partition>.parquet
 ```
 
+A `chunk_rows` read writes one file per chunk instead —
+`part-keyset-00000.parquet`, `part-keyset-00001.parquet`, … — and finishes each
+before that chunk's cursor is committed. A run that fails part-way and resumes
+keeps every chunk it committed in the archive, under the failed attempt's
+`run=` directory, and the resumed run writes the rest under its own. Read the
+table's whole prefix, not a single `run=` directory.
+
 GCS credentials fall back to Application Default Credentials and the standard
 `SERVICE_ACCOUNT` / `GOOGLE_SERVICE_ACCOUNT` environment, exactly as for the
 `BigQuery` descriptor; pass `credentials_file=` or `credentials_json=` to
@@ -69,3 +76,13 @@ role); pass `endpoint=` for an S3-compatible service like MinIO.
 A persistent upload failure fails the whole `sync()` call, same as a ClickHouse
 insert failure — the archive never silently falls behind. Storage and request
 costs are billed by Google/AWS as usual (free on a self-hosted MinIO).
+
+A failed run aborts every upload it hadn't finished, so it leaves no partial
+file and no multipart upload behind. It can leave finished files: a
+partition's file is complete once its rows are read, and a chunk's once its
+rows have landed, so a run that fails after that — on its last insert, or
+while promoting a staging table — has archived those rows already, and its
+retry archives them again under a new `run=`. Deduplicate on the key when you
+read the archive back. A process that is killed outright can't abort
+anything, so give the bucket a lifecycle rule that aborts incomplete multipart
+uploads after a day (`AbortIncompleteMultipartUpload` on both GCS and S3).

@@ -281,8 +281,9 @@ qh.sync(src, dst, dest_table="orders", source_table="orders", mode="full", key=[
 directly — `qh.GcsArchive(bucket=...)` and `qh.S3Archive(bucket=...)`. Parquet
 is the only supported `format`; any other value is rejected at the call.
 
-This streams Parquet — one file per parallel partition, never fully buffered
-in memory — to `gs://` or `s3://{bucket}/{prefix}/{dest_table}/dt=<date>/
+This streams Parquet — one file per parallel partition (per chunk, with
+`chunk_rows`), never fully buffered in memory — to `gs://` or
+`s3://{bucket}/{prefix}/{dest_table}/dt=<date>/
 run=<id>/part-<partition>.parquet`, a Hive-style layout directly queryable by
 BigQuery external tables, Athena, Spark, or DuckDB. It works for **every**
 source and **both** destinations, so a CleverTap pull or a `from_pandas()`

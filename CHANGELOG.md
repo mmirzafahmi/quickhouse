@@ -9,6 +9,42 @@ any breaking change is called out explicitly.
 
 ## [Unreleased]
 
+### Fixed
+- **A `chunk_rows` read that fails and resumes no longer leaves rows out of its
+  archive.** A chunked read commits its cursor after every chunk, but archived
+  the whole run as one file, finished only after the last chunk. A run that
+  failed part-way left no object, the run that resumed archived only the chunks
+  it read itself, and nothing said so. On GCS, a ClickHouse → ClickHouse run
+  killed after 4 of 20 chunks and resumed left 2,000,000 of 10,000,000 rows out
+  of the backup; one that hit an insert error and was retried in the same
+  process, the way a retry wrapper does it, left 1,200,000 out. Each chunk now
+  gets its own file, `part-keyset-<n>.parquet`, finished after the chunk lands
+  and before its cursor commits, so every committed chunk survives a resume. A
+  chunk that reads nothing writes no file. Read the table's whole prefix: a
+  resumed run's chunks sit under two `run=` directories. Finishing a file per
+  chunk costs a little: a 10M-row Postgres read in 500,000-row chunks wrote 20
+  files, 5% more bytes than one, and its run without retries took 119.0 s
+  against 112.1–115.3 s with no archive.
+- **A failed run no longer leaves multipart uploads in the bucket.** A file
+  bigger than 10 MiB goes up as a multipart upload, which becomes an object only
+  when it is completed. A run that failed with one open neither completed nor
+  aborted it, so its parts stayed in the bucket, invisible and billed, with
+  nothing to remove them but a lifecycle rule; on GCS, each failed 10M-row
+  chunked run in testing left one. A failed run now aborts every upload it hadn't finished before it
+  returns its error. A process killed outright still can't, so the ClickHouse
+  destination guide now recommends that lifecycle rule.
+- **State rows are no longer dropped as duplicates on ClickHouse Cloud.** A
+  replicated table drops an insert whose block it has seen before (on ClickHouse
+  Cloud, within a week for an async insert), and a `_quickhouse_state` row can
+  repeat an earlier one byte for byte: a chunk's marker when a window is read
+  again, or the cleared marker a run ends on. Dropped, it left an older row as
+  the latest, so a retry after a failure started over from the first chunk
+  instead of resuming. `run_ts` didn't tell the rows apart, because ClickHouse
+  Cloud leaves a column default out of the hash, and `insert_deduplicate = 0`
+  doesn't help on 26.6, where `deduplicate_insert` overrides it. Every state
+  write now carries its own `insert_deduplication_token`, in the statement's own
+  `SETTINGS`, where it also outranks a fixed token passed in `settings=`.
+
 ## [0.20.5] — 2026-10-01
 
 ### Added

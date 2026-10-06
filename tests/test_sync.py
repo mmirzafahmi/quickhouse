@@ -1013,3 +1013,54 @@ def test_an_engine_version_column_from_a_source_query_is_created_non_nullable(
             _drop_ch(ch_client, f"{table}_{i}")
         with pg_conn.cursor() as cur:
             cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+
+
+def test_a_chunk_marker_repeated_from_an_earlier_read_still_lands(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """Regression: a replicated ClickHouse table drops an insert whose block it
+    has seen before. A chunk marker written while re-reading a window repeats,
+    byte for byte, the marker an earlier read of that window wrote, so it was
+    dropped: the latest state row stayed the earlier run's cleared marker, and
+    the retry after a failure started over from the first chunk. Every state
+    write now carries a dedup token of its own.
+
+    ClickHouse Cloud leaves a column default out of the block's hash; a local
+    MergeTree doesn't, so `run_ts` (a default) would keep every row distinct
+    here. This state table pins `run_ts` to a constant and turns on a dedup
+    window, which makes the local server drop a repeated row the way Cloud does.
+    """
+    table = unique_name
+    state = f"{table}_state"
+    n, chunk = 1000, 100
+    _seed_table(pg_conn, table, n)
+    _drop_ch(ch_client, table)
+    ch_client.command(f"DROP TABLE IF EXISTS `{state}`")
+    ch_client.command(
+        f"CREATE TABLE `{state}` (source_table String, dest_table String, "
+        f"last_watermark String, rows UInt64, chunk_cursor String DEFAULT '', "
+        f"chunk_upper String DEFAULT '', "
+        f"run_ts DateTime64(3) DEFAULT toDateTime64('2000-01-01 00:00:00', 3)) "
+        f"ENGINE = ReplacingMergeTree(run_ts) ORDER BY (source_table, dest_table) "
+        f"SETTINGS non_replicated_deduplication_window = 1000"
+    )
+    kw = dict(
+        dest_table=table, source_table=table, mode="incremental", watermark="id",
+        key=["id"], chunk_rows=chunk, advance_watermark=False, create_if_missing=True,
+        engine="ReplacingMergeTree", order_by=["id"], state_table_name=state,
+    )
+    try:
+        # A full read of the window, then a second one that fails in chunk 5 of
+        # 10, after committing the same 4 markers the first read did.
+        assert quickhouse.sync(pg_source, ch_target, **kw).rows_read == n
+        ch_client.command(f"ALTER TABLE `{table}` ADD CONSTRAINT stop_here CHECK id <= 450")
+        with pytest.raises(RuntimeError, match="stop_here"):
+            quickhouse.sync(pg_source, ch_target, **kw)
+        ch_client.command(f"ALTER TABLE `{table}` DROP CONSTRAINT stop_here")
+
+        assert quickhouse.sync(pg_source, ch_target, **kw).rows_read == n - 400, (
+            "the retry must resume after the 4 committed chunks, not start over"
+        )
+    finally:
+        _drop_ch(ch_client, table)
+        ch_client.command(f"DROP TABLE IF EXISTS `{state}`")

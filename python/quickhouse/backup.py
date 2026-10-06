@@ -32,7 +32,7 @@ def backup(
 
     Pass the result as a destination's ``archive=``; every batch written to
     that destination is also streamed to cloud object storage as Parquet, one
-    file per parallel partition::
+    file per parallel partition (per chunk, with ``chunk_rows``)::
 
         dst = quickhouse.ClickHouse(
             "http://host:8123", database="analytics",

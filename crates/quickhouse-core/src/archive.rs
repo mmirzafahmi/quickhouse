@@ -3,35 +3,42 @@
 //! [`crate::config::ArchiveConfig`].
 //!
 //! Every batch synced to the destination is also streamed to object storage
-//! as Parquet, one file per parallel partition, via [`ArchiveWriter`] — never
-//! fully buffered in memory (the same bounded-memory guarantee as the rest of
-//! this crate). This is a secondary, best-effort-free side channel: it has no
-//! effect on the destination write path, and is entirely absent when
-//! `archive` is `None`.
+//! as Parquet, one file per parallel partition (one per chunk for a
+//! `chunk_rows` read), via [`ArchiveWriter`] — never fully buffered in memory
+//! (the same bounded-memory guarantee as the rest of this crate). This is a
+//! secondary, best-effort-free side channel: it has no effect on the
+//! destination write path, and is entirely absent when `archive` is `None`.
 //!
 //! Deliberately built on the same Apache Arrow ecosystem already in this
 //! crate's dependency tree (`arrow`/`arrow-array`) rather than a vendor SDK:
 //! `parquet` is pinned to the exact `arrow` 53.x release line so
 //! `RecordBatch`es already flowing through the decoders pass straight into
-//! the Parquet writer with zero conversion, and `parquet`'s own
-//! `object_store` integration (`ParquetObjectWriter`) needs no hand-rolled
-//! `AsyncWrite`-over-multipart glue. `object_store`'s builders also have
-//! their own request-level retry (`RetryConfig`), so unlike the
-//! ClickHouse/BigQuery sinks this path doesn't need to reuse
-//! `sink::{SendError, backoff_delay}` — the crate already solves that.
+//! the Parquet writer with zero conversion, and `object_store`'s `BufWriter`
+//! does the multipart upload, so there is no hand-rolled multipart glue — only
+//! [`UploadWriter`], which feeds it exactly as `parquet`'s own
+//! `ParquetObjectWriter` does while keeping a handle that can abort it.
+//! `object_store`'s builders also have their own request-level retry
+//! (`RetryConfig`), so unlike the ClickHouse/BigQuery sinks this path doesn't
+//! need to reuse `sink::{SendError, backoff_delay}` — the crate already solves
+//! that.
 
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
+use bytes::Bytes;
+use futures::future::BoxFuture;
 use object_store::aws::AmazonS3Builder;
+use object_store::buffered::BufWriter;
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::path::Path;
 use object_store::ObjectStore;
-use parquet::arrow::async_writer::ParquetObjectWriter;
+use parquet::arrow::async_writer::AsyncFileWriter;
 use parquet::arrow::AsyncArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
+use parquet::errors::ParquetError;
 use parquet::file::properties::WriterProperties;
+use tokio::io::AsyncWriteExt;
 
 use crate::config::{ArchiveConfig, GcsArchiveConfig, ParquetCompression, S3ArchiveConfig};
 use crate::error::{EtlError, Result};
@@ -172,12 +179,109 @@ fn parquet_compression(c: ParquetCompression) -> Compression {
     }
 }
 
+/// Every upload one transfer attempt opens, so the attempt can abort the ones
+/// it never finished.
+///
+/// A file bigger than `BufWriter`'s 10 MiB buffer goes up as a multipart
+/// upload and becomes an object only when the upload is completed. One that
+/// never is — its transfer failed — is invisible but not gone: the store keeps
+/// its parts, and bills for them, until the upload is aborted, and
+/// `object_store` has no `Drop` that aborts one. A `Drop` here couldn't do it
+/// reliably either: aborting is async, and `run_transfer_blocking` drops its
+/// runtime as soon as the transfer returns, cancelling any task spawned to do
+/// it. So the attempt awaits [`Self::abort_unfinished`] itself when it fails.
+#[derive(Clone, Default)]
+pub(crate) struct ArchiveUploads {
+    started: Arc<std::sync::Mutex<Vec<(String, SharedUpload)>>>,
+}
+
+type SharedUpload = Arc<tokio::sync::Mutex<Upload>>;
+
+/// One upload, shared by the [`UploadWriter`] feeding it and the
+/// [`ArchiveUploads`] that may have to abort it.
+enum Upload {
+    Open(Box<BufWriter>),
+    /// Completed, aborted, or past the point where it can still be aborted:
+    /// `BufWriter::abort` panics once a shutdown has begun.
+    Closed,
+}
+
+impl ArchiveUploads {
+    /// Start an upload to `key`, keeping a handle on it.
+    fn start(&self, store: Arc<dyn ObjectStore>, key: &str) -> UploadWriter {
+        let writer = BufWriter::new(store, Path::from(key));
+        let upload = Arc::new(tokio::sync::Mutex::new(Upload::Open(Box::new(writer))));
+        self.started
+            .lock()
+            .unwrap()
+            .push((key.to_string(), upload.clone()));
+        UploadWriter(upload)
+    }
+
+    /// Abort every upload not yet completed. Best effort: a failure is logged,
+    /// never returned, so it can't mask the error that failed the transfer. An
+    /// upload still inside `BufWriter`'s buffer has sent nothing, and aborting
+    /// it is a no-op.
+    pub(crate) async fn abort_unfinished(&self) {
+        let started = std::mem::take(&mut *self.started.lock().unwrap());
+        for (key, upload) in started {
+            let state = std::mem::replace(&mut *upload.lock().await, Upload::Closed);
+            if let Upload::Open(mut w) = state {
+                match w.abort().await {
+                    Ok(()) => tracing::debug!("archive: aborted the unfinished upload of '{key}'"),
+                    Err(e) => tracing::warn!(
+                        "archive: could not abort the unfinished upload of '{key}' ({e}); its \
+                         parts stay in the bucket until a lifecycle rule removes them"
+                    ),
+                }
+            }
+        }
+    }
+}
+
+/// `parquet`'s `ParquetObjectWriter`, except that the upload is shared with
+/// the [`ArchiveUploads`] that started it, so a failed transfer can abort it.
+struct UploadWriter(SharedUpload);
+
+impl AsyncFileWriter for UploadWriter {
+    fn write(&mut self, bs: Bytes) -> BoxFuture<'_, parquet::errors::Result<()>> {
+        Box::pin(async move {
+            match &mut *self.0.lock().await {
+                Upload::Open(w) => w
+                    .put(bs)
+                    .await
+                    .map_err(|e| ParquetError::External(Box::new(e))),
+                Upload::Closed => Err(ParquetError::General(
+                    "archive upload is already closed".to_string(),
+                )),
+            }
+        })
+    }
+
+    fn complete(&mut self) -> BoxFuture<'_, parquet::errors::Result<()>> {
+        Box::pin(async move {
+            // Out of the shared slot before the shutdown starts, since from
+            // then on the upload can't be aborted.
+            let state = std::mem::replace(&mut *self.0.lock().await, Upload::Closed);
+            match state {
+                Upload::Open(mut w) => w
+                    .shutdown()
+                    .await
+                    .map_err(|e| ParquetError::External(Box::new(e))),
+                Upload::Closed => Err(ParquetError::General(
+                    "archive upload is already closed".to_string(),
+                )),
+            }
+        })
+    }
+}
+
 /// Streams one Parquet file to object storage for the lifetime of one
-/// partition: each call to [`Self::write`] appends a new row group without
-/// buffering prior ones, and [`Self::close`] finalizes the footer and
-/// completes the underlying multipart upload.
+/// partition, or of one chunk of a `chunk_rows` read: each call to
+/// [`Self::write`] appends a new row group without buffering prior ones, and
+/// [`Self::close`] finalizes the footer and completes the underlying upload.
 pub(crate) struct ArchiveWriter {
-    inner: AsyncArrowWriter<ParquetObjectWriter>,
+    inner: AsyncArrowWriter<UploadWriter>,
     key: String,
     /// `ArchiveConfig::kind()` — carried purely so an error names the store it
     /// failed against; by this point the config itself is long gone.
@@ -185,14 +289,17 @@ pub(crate) struct ArchiveWriter {
 }
 
 impl ArchiveWriter {
+    /// Open a file at `key`. Its upload is registered with `uploads`, so a
+    /// transfer that fails before [`Self::close`] can abort it.
     pub(crate) fn new(
         store: Arc<dyn ObjectStore>,
         key: String,
         schema: SchemaRef,
         compression: ParquetCompression,
         kind: &'static str,
+        uploads: &ArchiveUploads,
     ) -> Result<Self> {
-        let writer = ParquetObjectWriter::new(store, Path::from(key.as_str()));
+        let writer = uploads.start(store, &key);
         let props = WriterProperties::builder()
             .set_compression(parquet_compression(compression))
             .build();
@@ -369,6 +476,7 @@ mod tests {
             schema.clone(),
             ParquetCompression::Zstd,
             "s3",
+            &ArchiveUploads::default(),
         )
         .expect("open writer");
         // Two writes, so the read-back also proves multiple row groups are
@@ -433,6 +541,7 @@ mod tests {
                 schema.clone(),
                 ParquetCompression::Snappy,
                 "gcs",
+                &ArchiveUploads::default(),
             )
             .unwrap();
             let batch = RecordBatch::try_new(
@@ -444,6 +553,178 @@ mod tests {
             // dropped here, deliberately without close()
         }
         assert!(store.get(&Path::from(key.as_str())).await.is_err());
+    }
+
+    /// `InMemory`, counting what becomes of its multipart uploads — the one
+    /// thing `InMemory` can't tell a test, because an aborted upload and one
+    /// left open alike just never become an object.
+    #[derive(Debug)]
+    struct CountingStore {
+        inner: object_store::memory::InMemory,
+        started: Arc<std::sync::atomic::AtomicUsize>,
+        completed: Arc<std::sync::atomic::AtomicUsize>,
+        aborted: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl CountingStore {
+        fn new() -> Self {
+            Self {
+                inner: object_store::memory::InMemory::new(),
+                started: Arc::default(),
+                completed: Arc::default(),
+                aborted: Arc::default(),
+            }
+        }
+
+        fn count(n: &std::sync::atomic::AtomicUsize) -> usize {
+            n.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl std::fmt::Display for CountingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "CountingStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for CountingStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: object_store::PutMultipartOpts,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.started
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Box::new(CountingUpload {
+                inner: self.inner.put_multipart_opts(location, opts).await?,
+                completed: self.completed.clone(),
+                aborted: self.aborted.clone(),
+            }))
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn delete(&self, location: &Path) -> object_store::Result<()> {
+            self.inner.delete(location).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> futures::stream::BoxStream<'_, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    #[derive(Debug)]
+    struct CountingUpload {
+        inner: Box<dyn object_store::MultipartUpload>,
+        completed: Arc<std::sync::atomic::AtomicUsize>,
+        aborted: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::MultipartUpload for CountingUpload {
+        fn put_part(&mut self, data: object_store::PutPayload) -> object_store::UploadPart {
+            self.inner.put_part(data)
+        }
+
+        async fn complete(&mut self) -> object_store::Result<object_store::PutResult> {
+            self.completed
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.complete().await
+        }
+
+        async fn abort(&mut self) -> object_store::Result<()> {
+            self.aborted
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.abort().await
+        }
+    }
+
+    /// Past `BufWriter`'s 10 MiB buffer, so an upload holding this much is a
+    /// real multipart one with parts already sent.
+    fn eleven_mib() -> Bytes {
+        Bytes::from(vec![0_u8; 11 * 1024 * 1024])
+    }
+
+    // Regression: a transfer that failed after its archive began sending parts
+    // left the multipart upload open in the bucket. It never became an object
+    // and nothing ever aborted it, so its parts stayed, billed. A failed run on
+    // GCS left one behind for every file it had open.
+    #[tokio::test]
+    async fn abort_unfinished_aborts_an_upload_that_sent_parts() {
+        let store = Arc::new(CountingStore::new());
+        let uploads = ArchiveUploads::default();
+        let key = "lake/orders/dt=2026-10-06/run=1/part-keyset-00003.parquet";
+        let mut w = uploads.start(store.clone(), key);
+        w.write(eleven_mib()).await.unwrap();
+        assert_eq!(
+            CountingStore::count(&store.started),
+            1,
+            "expected a multipart upload"
+        );
+
+        uploads.abort_unfinished().await;
+
+        assert_eq!(CountingStore::count(&store.aborted), 1);
+        assert_eq!(CountingStore::count(&store.completed), 0);
+        assert!(store.inner.get(&Path::from(key)).await.is_err());
+        // An aborted upload takes no more bytes, and can't be completed.
+        assert!(w.write(Bytes::from_static(b"late")).await.is_err());
+        assert!(w.complete().await.is_err());
+    }
+
+    // The other half: a file the run finished is never touched, even though
+    // the attempt failed later on — e.g. the chunks of a `chunk_rows` read that
+    // committed before the chunk that failed.
+    #[tokio::test]
+    async fn abort_unfinished_leaves_a_completed_upload_alone() {
+        let store = Arc::new(CountingStore::new());
+        let uploads = ArchiveUploads::default();
+        let key = "lake/orders/dt=2026-10-06/run=1/part-keyset-00000.parquet";
+        let mut w = uploads.start(store.clone(), key);
+        w.write(eleven_mib()).await.unwrap();
+        w.complete().await.unwrap();
+
+        uploads.abort_unfinished().await;
+
+        assert_eq!(CountingStore::count(&store.completed), 1);
+        assert_eq!(CountingStore::count(&store.aborted), 0);
+        let got = store.inner.get(&Path::from(key)).await.unwrap();
+        assert_eq!(got.bytes().await.unwrap().len(), 11 * 1024 * 1024);
     }
 
     /// Live GCS round trip, skipped unless `QUICKHOUSE_GCS_BUCKET` names a
@@ -499,6 +780,7 @@ mod tests {
             schema.clone(),
             cfg.compression,
             "gcs",
+            &ArchiveUploads::default(),
         )
         .expect("open writer");
         let batch = RecordBatch::try_new(
