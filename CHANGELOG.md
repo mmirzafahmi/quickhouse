@@ -45,6 +45,18 @@ any breaking change is called out explicitly.
   write now carries its own `insert_deduplication_token`, in the statement's own
   `SETTINGS`, where it also outranks a fixed token passed in `settings=`.
 
+### Documentation
+- **The benchmark measures the GCS archive.** Each source moved the same 10M
+  rows into a ClickHouse `Null` table, with and without
+  `archive=qh.backup(destination="gcs")`, so the archived arm is effectively
+  source → GCS: MySQL 33–40 s against 24–30 s without the archive, ClickHouse
+  19–31 s against 17–32 s, and Postgres ~111 s either way, its replica read
+  being the bottleneck. The archive cost 8–10 s of CPU per 10M rows and
+  150–350 MB of extra peak memory, and every archived file was checked against
+  the source. The page also notes that re-sending the same window into a warm
+  ClickHouse Cloud table gets every insert after the first deduplicated, which
+  likely flattered the ClickHouse timings this page reports.
+
 ## [0.20.5] — 2026-10-01
 
 ### Added

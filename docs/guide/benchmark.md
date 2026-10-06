@@ -1,13 +1,14 @@
 # Benchmark
 
-*Last updated: 2026-09-29*
+*Last updated: 2026-10-06 (GCS archive section; the comparison ran 2026-09-29)*
 
 This page reports a head-to-head benchmark of quickhouse against two widely used
 Python/Go EL tools — [dlt](https://dlthub.com/) and [Sling](https://slingdata.io/) —
 moving the same data, under the same constraints, into both BigQuery and
 ClickHouse. It also includes an [ADBC](https://arrow.apache.org/adbc/)-based
 measurement that isolates how much of the total time is spent reading the
-source versus writing the destination.
+source versus writing the destination, and a section on what quickhouse's
+Parquet backup to Google Cloud Storage costs on the same data.
 
 This benchmark was run against production-shaped tables and queries from a
 real deployment (not a synthetic schema), and the raw scripts are linked at
@@ -330,6 +331,83 @@ never promise a single part. Queries need `FINAL` (or
 `OPTIMIZE TABLE ... FINAL` forces the collapse at the cost of rewriting the
 table.
 
+## Archiving to GCS
+
+quickhouse can also back every synced batch up to Google Cloud Storage as
+Parquet, with `archive=qh.backup(destination="gcs", ...)` on the destination
+(see [Cloud backup](destinations/clickhouse.md#cloud-backup-parquet-archive)).
+GCS is not a destination of its own: the archive rides along on a ClickHouse or
+BigQuery destination. So this section measures it two ways, on 2026-10-06 with
+quickhouse 0.20.5 on the same VM:
+
+- **Source → GCS.** Each source synced into a ClickHouse `ENGINE = Null` table
+  on the VM itself, which parses rows and discards them, once without the
+  archive and once with it. With nothing kept at the destination, the archived
+  run is close to the cost of moving the rows from the source into GCS.
+- **Added to a real sync.** The same pair, into the ClickHouse Cloud
+  destination used above.
+
+Three sources, 10,000,000 rows each: MySQL `user_order` (the window above, 21
+columns), PostgreSQL `sale_order_line` (29 columns, read in 500,000-row chunks
+as above), and ClickHouse: production's own copy of `user_order`, the same 10M
+keys and 21 columns, read with `FINAL`. The bucket is in `asia-southeast2`, the
+VM in `asia-southeast1`, and the Parquet is zstd-compressed (the default). Each
+arm ran once untimed, then 3 timed runs, the two arms alternating which went
+first. Every archived file was read back from GCS and checked against the
+source: 10,000,000 rows, 10,000,000 distinct keys, and the sum of a money
+column (exact for MySQL and PostgreSQL; within float rounding for ClickHouse's
+`Float64`).
+
+| Source → GCS | Without archive | With GCS archive | Archive cost, same round | Parquet | Peak RSS, without → with |
+|---|---:|---:|---:|---:|---:|
+| MySQL `user_order` | 24.2 – 29.8 s | 33.4 – 40.2 s | +8.6 – +10.3 s | 229 MiB | 130–162 → 467–506 MB |
+| PostgreSQL `sale_order_line` | 110.2 – 115.4 s | 110.5 – 113.8 s | −1.6 – +0.8 s | 134 MiB | 171–248 → 301–373 MB |
+| ClickHouse `user_order` | 16.7 – 32.3 s | 19.2 – 31.2 s | −1.2 – +6.1 s | 235 MiB | 102–118 → 260–263 MB |
+
+1. **The archive costs CPU, and shows in wall clock only when the source is
+   fast.** Encoding 10M rows of Parquet took 7.6–10.3 s of CPU. MySQL paid it in
+   every round. PostgreSQL paid nothing: its chunked read is the bottleneck, and
+   the encoding fit into the time spent waiting on it. ClickHouse sits between
+   the two, and its own read swung by 15 s from run to run (`FINAL`, on a busy
+   production service).
+2. **The network is not the limit.** An upload of 256 MiB straight to the
+   bucket from the same VM ran at ~71 MiB/s, so the largest file needs ~3 s of
+   transfer, and it overlaps the read. The encoding does not: it runs inline
+   with the read and the destination insert, so both MySQL arms used about one
+   of the two cores.
+3. **Memory goes up by 150–350 MB.** Parquet holds a whole row group (1,048,576
+   rows) in memory before uploading it, plus up to 80 MiB of upload parts in
+   flight, and that buffer sits outside `max_memory_bytes`. Size the machine
+   for it.
+
+Into the ClickHouse Cloud destination:
+
+| Into ClickHouse Cloud | Without archive | With GCS archive | Peak RSS, without → with |
+|---|---:|---:|---:|
+| MySQL | 26.7 – 47.6 s | 35.3 – 37.4 s | 229–242 → 697–716 MB |
+| PostgreSQL | 114.0 – 115.9 s | 113.5 – 126.2 s | 172–219 → 302–500 MB |
+| ClickHouse | 17.3 – 27.4 s | 24.3 – 29.0 s | 178–202 → 336–372 MB |
+
+The MySQL and PostgreSQL rows understate a real load. Every run re-sent the
+same window into the same table, and ClickHouse Cloud drops an insert block it
+has already stored: from the second run on it parsed each block, recognized
+it, and wrote nothing (`system.part_log` error 389). Both arms were treated
+alike, so the gap between them holds; the absolute times do not. The
+ClickHouse-source runs escaped it because `FINAL` returns rows in a different
+order every time.
+
+The PostgreSQL runs read in chunks, and checking them exposed a gap in the
+archive, fixed since: a chunked read archived the whole run as one file,
+finished only after the last chunk, so a run that failed part-way and resumed
+left the chunks it had committed out of the backup. Chunked reads now write one
+file per chunk, finished before the chunk's cursor is committed. Re-run on the
+fix, each archived run wrote 20 files, 140 MiB (5% more than one file). The
+replica cancelled reads in two of the three timed runs; both resumed, one after
+19 of its 20 chunks, and both ended with all 20 chunk files, and the one checked
+against the source held all 10,000,000 rows. The archived run that needed no
+retry took 119.0 s, against 112.1–115.3 s without the archive: each chunk's
+file is now finished before the next chunk is read.
+
 ## Limitations
 
 Publishing your own benchmark without stating where it's weak isn't a fair
@@ -356,6 +434,15 @@ benchmark, so:
   quickhouse's time goes, did not.
 - **A small machine.** 2 vCPU. quickhouse's stage and dlt's normalize step are
   both CPU-bound here, and both would likely be faster on more cores.
+- **ClickHouse Cloud may have deduplicated the timed ClickHouse runs.** Every
+  timed run merged the same window into a warm table, and ClickHouse Cloud
+  drops an insert block identical to one it has already stored. Measuring the
+  [GCS archive](#archiving-to-gcs) the same way showed every MySQL insert after
+  the first run deduplicated, so the ClickHouse timings above may reflect
+  parsing rather than writing, for any tool whose blocks repeat exactly. The
+  service keeps `system.part_log` for only about 5.5 hours, so this edition's
+  runs can no longer be checked. A rerun should write each run into a fresh
+  table.
 - **Destinations were not interleaved.** All ClickHouse runs happened before
   all BigQuery runs (a harness bug discarded the first BigQuery attempt).
   Within each destination the tool order rotated every round.
