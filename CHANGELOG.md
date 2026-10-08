@@ -9,6 +9,8 @@ any breaking change is called out explicitly.
 
 ## [Unreleased]
 
+## [0.20.8] — 2026-10-08
+
 ### Fixed
 - **A `DATE` watermark's cursor no longer skips same-day updates after a read
   that crossed midnight.** With the `MAX(watermark)` probe skipped as too
