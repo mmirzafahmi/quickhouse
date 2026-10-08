@@ -592,7 +592,11 @@ class TransferWarning:
       read, when an incremental read returns rows of which none has a
       watermark: there is no cursor to save, so every run reads them all
       again. That is caught from the read itself, even when the NULL-count
-      probe was skipped as too costly (0.20.7).
+      probe was skipped as too costly (0.20.7), except into a destination
+      that can't hold a NULL watermark, such as a ClickHouse
+      ``ReplacingMergeTree`` whose version column is the watermark: a first
+      read leaves those rows out unread, so only the count reports them
+      (0.20.8).
     - ``"full_refresh_shrink"`` — a full refresh left the destination smaller,
       permitted by ``allow_full_refresh_shrink``.
     - ``"unclustered_merge_target"`` — a BigQuery ``MERGE`` ran against a
@@ -953,7 +957,10 @@ def sync(
     timestamp column. For a BigQuery source, ``DATE``-typed watermarks have
     no sub-day granularity, so a sub-day ``lookback_seconds`` rounds *up* to
     a whole day. Default ``0`` disables lookback entirely (byte-identical to
-    the plain watermark filter).
+    the plain watermark filter). When the cursor is taken from the rows read
+    (see ``probe_max_cost``), a read of several statements that outlasts the
+    lookback moves it back by the difference; for a ``DATE`` watermark, the
+    day of a change, the lookback counts a day less (0.20.8).
 
     Incremental cursor control (all incremental-mode only):
 

@@ -136,7 +136,10 @@ Where the nullable-watermark completeness count is skipped, quickhouse can no
 longer tell you whether rows hold a NULL watermark — and such rows are excluded
 from this and every future incremental run. The `null_check_skipped` warning
 says so, and quotes the estimate that caused it. (A read that returns rows with
-no watermark at all is still reported, as `null_watermark`.) Treat the warning
+no watermark at all is still reported, as `null_watermark`, except into a
+destination that can't hold a NULL watermark, such as a ClickHouse
+`ReplacingMergeTree` whose version column is the watermark: a first read leaves
+those rows out unread, so only the count can report them.) Treat the warning
 as a prompt to add the index:
 
     CREATE INDEX CONCURRENTLY ON your_table (your_watermark_column);  -- PostgreSQL
@@ -154,7 +157,10 @@ lookback exceeding the read's own duration re-covers it on the next run. With
 risk. A read of several statements (a sweep of windows, range partitions,
 `chunk_rows`) can take longer than the lookback, so its cursor is moved back by
 the difference: a row updated in a window already read is then read on the next
-run.
+run. A `DATE` is the day of a change, up to a day earlier than the change, so
+for a `DATE` watermark the lookback counts a day less: with a lookback of a day
+or less, such a read moves its cursor back at least a day, in case it crossed
+midnight.
 ```
 
 The filter itself still scans — nothing but an index fixes that. On a hot

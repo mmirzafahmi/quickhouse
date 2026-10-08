@@ -303,6 +303,34 @@ def test_a_bigquery_source_with_no_watermark_reports_it(
         ch_client.command(f"DROP TABLE IF EXISTS `{dest}`")
 
 
+def test_a_bigquery_source_with_no_watermark_into_a_replacing_merge_tree_says_so(
+    bq, bq_source, ch_client, ch_target, dest
+):
+    """Issue #27 on the BigQuery-source flow: into a ReplacingMergeTree
+    versioned by the watermark, which can't hold a NULL, the rows with no
+    watermark are left out rather than failing the insert, and counted (the
+    MAX is NULL only when every watermark is, and BigQuery counts for free)."""
+    _bq_table(
+        bq,
+        dest,
+        ", ".join(f"STRUCT({i} AS id, CAST(NULL AS DATETIME) AS updated_at)" for i in range(1, 6)),
+    )
+    ch_client.command(f"DROP TABLE IF EXISTS `{dest}`")
+    kw = dict(
+        dest_table=dest, source_table=f"{BQ_DATASET}.{dest}", mode="incremental",
+        watermark="updated_at", key=["id"], create_if_missing=True, state_key=f"{dest}:bq",
+    )
+    try:
+        for _ in range(2):
+            r = quickhouse.sync(bq_source, ch_target, **kw)
+            assert r.rows_written == 0
+            assert [(w.kind, w.count) for w in r.warnings if w.kind == "null_watermark"] == [
+                ("null_watermark", 5)
+            ], r.warnings
+    finally:
+        ch_client.command(f"DROP TABLE IF EXISTS `{dest}`")
+
+
 def test_a_bigquery_source_query_below_the_cursor_names_the_filter(
     bq, bq_source, ch_client, ch_target, dest
 ):

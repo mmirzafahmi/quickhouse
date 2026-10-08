@@ -266,6 +266,34 @@ impl BigQuerySource {
             Ok(None)
         }
     }
+
+    /// `COUNT(*)` of a table, which BigQuery answers from metadata, billing no
+    /// bytes.
+    pub async fn count_rows(
+        &self,
+        client: &Client,
+        project_id: &str,
+        table_sql: &str,
+    ) -> Result<i64> {
+        let request = QueryRequest {
+            query: format!("SELECT COUNT(*) AS n FROM {table_sql}"),
+            ..Default::default()
+        };
+        let mut iter = client
+            .query::<google_cloud_bigquery::query::row::Row>(project_id, request)
+            .await
+            .map_err(|e| EtlError::other(format!("bigquery query error: {e}")))?;
+        match iter
+            .next()
+            .await
+            .map_err(|e| EtlError::other(format!("bigquery row error: {e}")))?
+        {
+            Some(row) => row
+                .column::<i64>(0)
+                .map_err(|e| EtlError::other(format!("bigquery column error: {e}"))),
+            None => Ok(0),
+        }
+    }
 }
 
 /// The BigQuery-SQL table expression for a resolved [`TableReference`], for

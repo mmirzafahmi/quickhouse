@@ -1352,3 +1352,119 @@ def test_a_resume_that_reads_only_rows_with_no_watermark_saves_its_bound(
         assert _latest_state(ch_client, state_key) == (upper, "", "")
     finally:
         _drop_ch(ch_client, table)
+
+
+
+def test_a_date_cursor_from_a_chunked_read_across_midnight_keeps_that_day(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """Issue #26: a DATE is the day of a change, up to a day before it. A
+    chunked read whose cursor comes from the rows read, crossing midnight,
+    saw a row changed after midnight (id 200, dated 01-02), so the newest
+    DATE read is 01-02. A row read before midnight and changed again that
+    day is dated 01-01, below `'01-02' - lookback` for a lookback of a day or
+    less, and was never read again. The cursor now goes back a day."""
+    table = unique_name
+    with pg_conn.cursor() as cur:
+        cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+        cur.execute(f'CREATE TABLE "{table}" (id bigint PRIMARY KEY, v int, d date NOT NULL)')
+        cur.execute(
+            f"INSERT INTO \"{table}\" SELECT g, 0, "
+            "CASE WHEN g = 200 THEN date '2024-01-02' ELSE date '2024-01-01' END "
+            "FROM generate_series(1, 200) g"
+        )
+    _drop_ch(ch_client, table)
+    kw = dict(
+        dest_table=table, source_table=table, mode="incremental", watermark="d",
+        key=["id"], create_if_missing=True, engine="ReplacingMergeTree", order_by=["id"],
+        chunk_rows=50, probe_max_cost=1.0, lookback_seconds=3600, state_key=f"{table}:date",
+    )
+    try:
+        r = quickhouse.sync(pg_source, ch_target, **kw)
+        assert r.rows_written == 200
+        assert r.new_watermark == "2024-01-01", "moved back a day from 01-02"
+
+        with pg_conn.cursor() as cur:
+            cur.execute(f"UPDATE \"{table}\" SET v = 1 WHERE id = 10")
+        quickhouse.sync(pg_source, ch_target, **kw)
+        assert ch_client.command(f"SELECT v FROM `{table}` FINAL WHERE id = 10") == 1
+    finally:
+        _drop_ch(ch_client, table)
+
+
+def _null_watermark_table(pg_conn, ch_client, table):
+    """200 rows with no index on `write_date`, NULL on ids 150-160."""
+    with pg_conn.cursor() as cur:
+        cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+        cur.execute(f'CREATE TABLE "{table}" (id bigint PRIMARY KEY, v int, write_date timestamp)')
+        cur.execute(
+            f"INSERT INTO \"{table}\" SELECT g, 0, "
+            "CASE WHEN g BETWEEN 150 AND 160 THEN NULL ELSE timestamp '2024-01-01' END "
+            "FROM generate_series(1, 200) g"
+        )
+    _drop_ch(ch_client, table)
+
+
+def test_a_first_read_into_a_replacing_merge_tree_leaves_out_null_watermarks(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """Issue #27: a ReplacingMergeTree's version column is the watermark, so
+    it can't be NULL. A first read bounded by the MAX leaves rows with a NULL
+    watermark out; one whose MAX probe was skipped had no bound at all, read
+    them, and failed the insert with an Arrow error. It leaves them out too
+    now, and says so."""
+    table = unique_name
+    _null_watermark_table(pg_conn, ch_client, table)
+    kw = dict(
+        dest_table=table, source_table=table, mode="incremental", watermark="write_date",
+        key=["id"], create_if_missing=True, lookback_seconds=60, state_key=table,
+    )
+    try:
+        r = quickhouse.sync(pg_source, ch_target, probe_max_cost=1.0, **kw)
+        assert r.rows_written == 189
+        kinds = {w.kind for w in r.warnings}
+        assert kinds & {"null_watermark", "null_check_skipped"}, r.warnings
+        # As a read bounded by the MAX lands.
+        _drop_ch(ch_client, table)
+        r = quickhouse.sync(
+            pg_source, ch_target, probe_max_cost=0.0, **{**kw, "state_key": f"{table}:max"}
+        )
+        assert r.rows_written == 189
+    finally:
+        _drop_ch(ch_client, table)
+
+
+def test_a_resumed_first_read_into_a_replacing_merge_tree_leaves_out_null_watermarks(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """Issue #27, resumed: the read it finishes left NULL watermarks out, so
+    the resume does too, rather than read them and fail the insert."""
+    table = unique_name
+    with pg_conn.cursor() as cur:
+        cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+        cur.execute(f'CREATE TABLE "{table}" (id bigint PRIMARY KEY, v int, write_date timestamp)')
+    _drop_ch(ch_client, table)
+    state_key = f"{table}:chunked"
+    kw = dict(
+        dest_table=table, source_table=table, mode="incremental", watermark="write_date",
+        key=["id"], create_if_missing=True, engine="ReplacingMergeTree", order_by=["id"],
+        chunk_rows=50, probe_max_cost=1.0, lookback_seconds=60, state_key=state_key,
+    )
+    try:
+        assert quickhouse.sync(pg_source, ch_target, **kw).new_watermark is None
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                f"INSERT INTO \"{table}\" SELECT g, 0, "
+                "CASE WHEN g BETWEEN 150 AND 160 THEN NULL ELSE timestamp '2024-01-01' END "
+                "FROM generate_series(1, 200) g"
+            )
+        ch_client.command(f"ALTER TABLE `{table}` ADD CONSTRAINT stop_here CHECK id <= 100")
+        with pytest.raises(RuntimeError, match="stop_here"):
+            quickhouse.sync(pg_source, ch_target, **kw)
+        ch_client.command(f"ALTER TABLE `{table}` DROP CONSTRAINT stop_here")
+
+        r = quickhouse.sync(pg_source, ch_target, **kw)
+        assert r.rows_read == 89
+        assert ch_client.command(f"SELECT count() FROM `{table}` FINAL") == 189
+    finally:
+        _drop_ch(ch_client, table)

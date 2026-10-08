@@ -9,6 +9,32 @@ any breaking change is called out explicitly.
 
 ## [Unreleased]
 
+### Fixed
+- **A `DATE` watermark's cursor no longer skips same-day updates after a read
+  that crossed midnight.** With the `MAX(watermark)` probe skipped as too
+  costly, the cursor is the newest watermark read. A `DATE` is the day of a
+  change, up to a day earlier than the change itself, so a read of several
+  statements (`chunk_rows` chunks, key windows, range partitions) that crossed
+  midnight could save the next day as the cursor. A row read before midnight
+  and changed again that day was then dated below the next run's
+  `cursor - lookback_seconds`, for any lookback of a day or less, and was never
+  read again. Such a read now moves a `DATE` cursor back as though the lookback
+  were a day shorter: with a lookback of a day or less, by at least a day. A
+  lookback longer than the read by a day or more changes nothing. (#26)
+- **A first read into a ClickHouse `ReplacingMergeTree` no longer fails on a
+  NULL watermark.** The watermark is the engine's version column, which can't
+  be NULL. A first read bounded by the `MAX` leaves rows with a NULL watermark
+  out and reports them. One whose `MAX` probe was skipped as too costly had no
+  bound at all: it read them, and the insert failed with `arrow error: ...
+  declared as non-nullable but contains null values`. It leaves them out as
+  well now, and the NULL-count probe reports them: `null_watermark`, or
+  `null_check_skipped` when the count costs too much. From a BigQuery source,
+  whose MAX is NULL only when every watermark is, they are counted for free
+  and reported as `null_watermark`. A resumed first read leaves them out
+  too. Into a destination that can hold a NULL watermark (a
+  `ReplacingMergeTree()` with no version column, say), a first read still
+  lands them. (#27)
+
 ## [0.20.7] — 2026-10-06
 
 ### Fixed

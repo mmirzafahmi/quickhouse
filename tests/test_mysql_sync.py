@@ -1180,6 +1180,38 @@ def test_an_all_null_watermark_is_reported_on_every_run(
             cur.execute(f"DROP TABLE IF EXISTS `{table}`")
 
 
+def test_a_first_read_into_a_replacing_merge_tree_leaves_out_null_watermarks(
+    mysql_conn, ch_client, mysql_source, ch_target, unique_name
+):
+    """Issue #27, MySQL: with the MAX probe skipped, a first read has no bound
+    and read rows whose watermark is NULL, which a ReplacingMergeTree's
+    version column can't hold: the insert failed. It leaves them out now, as
+    a read bounded by the MAX does."""
+    table = unique_name
+    with mysql_conn.cursor() as cur:
+        cur.execute(f"DROP TABLE IF EXISTS `{table}`")
+        cur.execute(
+            f"CREATE TABLE `{table}` (id BIGINT PRIMARY KEY, updated_date DATETIME NULL)"
+        )
+        cur.executemany(
+            f"INSERT INTO `{table}` (id, updated_date) VALUES (%s, %s)",
+            [(i, None if 150 <= i <= 160 else "2024-01-01 00:00:00") for i in range(1, 201)],
+        )
+    _drop_ch(ch_client, table)
+    try:
+        r = quickhouse.sync(
+            mysql_source, ch_target, dest_table=table, source_table=table,
+            mode="incremental", watermark="updated_date", key=["id"], create_if_missing=True,
+            lookback_seconds=60, probe_max_cost=1.0,
+        )
+        assert r.rows_written == 189
+        assert {w.kind for w in r.warnings} & {"null_watermark", "null_check_skipped"}
+    finally:
+        _drop_ch(ch_client, table)
+        with mysql_conn.cursor() as cur:
+            cur.execute(f"DROP TABLE IF EXISTS `{table}`")
+
+
 def test_a_source_query_that_filters_out_the_newest_rows_raises_no_false_warning(
     mysql_conn, ch_client, mysql_source, ch_target, unique_name
 ):

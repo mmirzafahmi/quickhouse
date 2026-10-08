@@ -599,6 +599,21 @@ impl WatermarkTracker {
             .and_then(|v| self.render_value(v))
     }
 
+    /// [`stream_cursor_rewind_secs`] for a cursor in this tracker's unit. A
+    /// `DATE` is the day of a change, up to a day before the change itself,
+    /// so the lookback covers a day less of the read: with a lookback of a
+    /// day or less, a read that crossed midnight is moved back a day (see
+    /// [`Self::rewind_step`]). Otherwise a row read before midnight and
+    /// changed again that day would sit below the next run's lower bound
+    /// once a row changed after midnight set the cursor to the next day.
+    fn stream_rewind_secs(&self, read_secs: f64, lookback_seconds: u64) -> u64 {
+        let covered = match self.unit {
+            WatermarkUnit::Days => lookback_seconds.saturating_sub(86_400),
+            _ => lookback_seconds,
+        };
+        stream_cursor_rewind_secs(read_secs, covered)
+    }
+
     /// [`Self::render_rewound`] before it is rendered.
     fn rewound(&self, rewind_secs: u64, floor: Option<&str>) -> Option<i64> {
         let max = self.max.load(Ordering::Relaxed);
@@ -2130,17 +2145,32 @@ async fn run_transfer_impl(
             }
         };
         // A first read whose cursor comes from the rows read has no bound
-        // at all, so it reads rows whose watermark is NULL too. Resumed,
-        // it is held to its marker's bound, which no NULL is under: read
-        // them all the same, as the read it finishes would have.
+        // at all, so it reads rows whose watermark is NULL too. Resumed, it
+        // is held to its marker's bound, which no NULL is under: read them
+        // all the same, as the read it finishes would have. Unless the
+        // destination can't hold them: a ClickHouse ReplacingMergeTree's
+        // version column is the watermark, never NULL, and the first such
+        // row would fail the insert. Such a read leaves them out, as a read
+        // bounded by the MAX does, and the NULL-count probe reports them
+        // (`null_watermark`, or `null_check_skipped` when it costs too much).
+        let null_watermark_lands = null_watermark_lands(&plan, watermark);
+        let col = watermark_column_sql(source.as_ref(), watermark, source_expr);
         let filter = match filter {
-            Some(f) if last.is_none() && cursor_plan.pinned && stream_max_cursor => {
-                let col = match (source_expr, source.as_ref()) {
-                    (Some(e), _) => e.to_string(),
-                    (None, Source::MySql(_)) => quote_my(watermark),
-                    (None, _) => format!("\"{}\"", watermark.replace('"', "\"\"")),
-                };
+            Some(f)
+                if last.is_none()
+                    && cursor_plan.pinned
+                    && stream_max_cursor
+                    && null_watermark_lands =>
+            {
                 Some(format!("({f} OR {col} IS NULL)"))
+            }
+            None if !null_watermark_lands => {
+                tracing::info!(
+                    "the destination's '{watermark}' can't be NULL (a ReplacingMergeTree's \
+                     version column, or a key), so this unbounded read leaves out rows whose \
+                     '{watermark}' is NULL, as every bounded one does"
+                );
+                Some(format!("{col} IS NOT NULL"))
             }
             other => other,
         };
@@ -2465,7 +2495,9 @@ async fn run_transfer_impl(
             // binding, not shadowed, so `TransferResult::new_watermark` reports
             // the value that was actually persisted.
             // A read of several statements can outlast the lookback: see
-            // `stream_cursor_rewind_secs`.
+            // `stream_cursor_rewind_secs`. Under source_table's MAX, a DATE
+            // needs no extra day: that bound keeps out rows changed after
+            // the read began, a later day's included.
             let rewind = if read_spans_statements {
                 stream_cursor_rewind_secs(stage_secs, cfg.lookback_seconds)
             } else {
@@ -2508,9 +2540,21 @@ async fn run_transfer_impl(
                     );
                 }
             } else if let Some(t) = &watermark_tracker {
+                let rewind = if read_spans_statements {
+                    t.stream_rewind_secs(stage_secs, cfg.lookback_seconds)
+                } else {
+                    0
+                };
                 new_watermark = t.render_rewound(rewind, cursor_plan.floor.as_deref());
                 if let Some(w) = &new_watermark {
-                    if rewind > 0 {
+                    if rewind > 0 && t.unit == WatermarkUnit::Days {
+                        tracing::info!(
+                            "watermark taken from the read stream: {w}, moved back a day or \
+                             more: a DATE is the day of a change, so a read of several \
+                             statements that crossed midnight would otherwise leave a row read \
+                             and changed again that day below the next run's lower bound"
+                        );
+                    } else if rewind > 0 {
                         tracing::info!(
                             "watermark taken from the read stream: {w}, moved back {rewind}s \
                              because the read took {stage_secs:.0}s, longer than \
@@ -2702,6 +2746,19 @@ async fn run_transfer_bigquery(
             cfg.lookback_seconds,
             &source_cols,
         );
+        // Unbounded only on a first run whose MAX is NULL: leave out the rows
+        // with no watermark where the destination can't hold them, as any
+        // bound does (see `null_watermark_lands`). With the MAX NULL, that is
+        // every row the table has, which BigQuery counts for nothing, so
+        // leaving them out is never silent.
+        let filter = match filter {
+            None if !null_watermark_lands(&plan, watermark) => {
+                let rows = source.count_rows(&client, &project_id, &table_sql).await?;
+                warn_on_null_watermark(watermark, rows, &warnings);
+                Some(format!("{} IS NOT NULL", quote_my(watermark)))
+            }
+            other => other,
+        };
         // No lower-bound NULL check here: every BigQuery bound is a typed
         // literal (`CAST('...' AS DATETIME)`, `TIMESTAMP '...'`), which fails
         // the query outright on a value it can't parse rather than yielding
@@ -4421,10 +4478,8 @@ impl ChunkPlan {
                 best,
             } => tracker
                 .and_then(|t| {
-                    let rewind = stream_cursor_rewind_secs(
-                        started.elapsed().as_secs_f64(),
-                        lookback_seconds,
-                    );
+                    let rewind =
+                        t.stream_rewind_secs(started.elapsed().as_secs_f64(), lookback_seconds);
                     let v = t.rewound(rewind, floor.as_deref())?;
                     t.render_value(best.fetch_max(v, Ordering::Relaxed).max(v))
                 })
@@ -6397,8 +6452,10 @@ impl ProbeReport<'_> {
                  so quickhouse SKIPPED the check behind the null_watermark warning: if any row \
                  holds a NULL {w}, it is being silently excluded from this and every future \
                  incremental run and this run cannot tell you. (A read that returns rows with \
-                 no {w} at all is still reported.) Set probe_max_cost=0 to pay for the count, \
-                 or make the column NOT NULL.",
+                 no {w} at all is still reported, except into a destination that can't hold a \
+                 NULL {w}, such as a ReplacingMergeTree versioned by it: a first read leaves \
+                 those rows out unread.) Set probe_max_cost=0 to pay for the count, or make the \
+                 column NOT NULL.",
                 self.count_cost.describe()
             );
             tracing::warn!("{message}");
@@ -8026,6 +8083,29 @@ fn lookback_lower_bound_bigquery(
             "ensure_lookback_compatible only allows Date32/Timestamp Arrow types, which map to \
              BigQuery Date/Datetime/Timestamp — got {other:?}"
         ),
+    }
+}
+
+/// Whether a row whose watermark is NULL can be written: not where the
+/// destination column can't be NULL, a ClickHouse ReplacingMergeTree's
+/// version column (the watermark) or a key, and the insert would fail on
+/// the first one. A watermark the transfer leaves out has no column to fail.
+fn null_watermark_lands(plan: &SelectPlan, watermark: &str) -> bool {
+    plan.source_columns
+        .iter()
+        .position(|c| c == watermark)
+        .and_then(|i| plan.dest_columns.get(i))
+        .map_or(true, |c| c.nullable)
+}
+
+/// The watermark as a read's filter names it: `watermark_source_expr` when
+/// set, else the column, quoted for the source's dialect.
+fn watermark_column_sql(source: &Source, watermark: &str, source_expr: Option<&str>) -> String {
+    match (source_expr, source) {
+        (Some(e), _) => e.to_string(),
+        (None, Source::Postgres(_)) => format!("\"{}\"", watermark.replace('"', "\"\"")),
+        (None, Source::ClickHouse(_)) => crate::ddl::quote_ident(watermark),
+        (None, Source::MySql(_) | Source::BigQuery(_)) => quote_my(watermark),
     }
 }
 
@@ -10707,6 +10787,33 @@ mod tests {
     }
 
     #[test]
+    fn a_null_watermark_lands_only_where_the_destination_holds_one() {
+        // Issue #27: a ReplacingMergeTree's version column is the watermark.
+        let (mut cfg, _, src) = chunk_inputs("id", DataType::Int64, false);
+        cfg.chunk_rows = None;
+        let mut nullable = src.clone();
+        nullable[1].nullable = true;
+        let lands = |cfg: &TransferConfig, dest| {
+            let plan = crate::transform::plan(&nullable, cfg, dest).unwrap();
+            null_watermark_lands(&plan, "wm")
+        };
+        assert!(!lands(&cfg, crate::config::DestKind::ClickHouse));
+        assert!(lands(&cfg, crate::config::DestKind::BigQuery));
+        cfg.engine = Some("ReplacingMergeTree()".into());
+        assert!(
+            lands(&cfg, crate::config::DestKind::ClickHouse),
+            "no version column"
+        );
+        cfg.engine = Some("MergeTree".into());
+        assert!(lands(&cfg, crate::config::DestKind::ClickHouse));
+        // Left out of the transfer, it has no column to fail.
+        cfg.engine = None;
+        cfg.exclude = vec!["wm".into()];
+        let plan = crate::transform::plan(&nullable, &cfg, crate::config::DestKind::ClickHouse);
+        assert!(plan.map_or(true, |p| null_watermark_lands(&p, "wm")));
+    }
+
+    #[test]
     fn resume_marker_with_empty_upper_pins_nothing() {
         let with_upper = ("41".to_string(), "2024-06-10 00:00:00".to_string());
         assert_eq!(
@@ -10854,6 +10961,58 @@ mod tests {
             chunk(None, stream(35_999, None)).marker_upper(Some(&t), 60),
             "2025-12-31 16:01:00.000000"
         );
+    }
+
+    #[test]
+    fn a_date_cursor_from_a_read_across_midnight_goes_back_a_day() {
+        // Issue #26: a 50-minute chunked read from 23:30 on 01-01 saw a row
+        // changed at 00:05, so the newest DATE read is 01-02. A row read at
+        // 23:31 and changed at 23:45 is dated 01-01, below the next run's
+        // `> '01-02' - 3600s` unless the cursor goes back to 01-01.
+        let d = WatermarkTracker {
+            idx: 0,
+            unit: WatermarkUnit::Days,
+            max: AtomicI64::new(i64::MIN),
+        };
+        d.max
+            .store(d.parse("2026-01-02").unwrap(), Ordering::Relaxed);
+        let rewound = |lookback| d.render_rewound(d.stream_rewind_secs(3_000.0, lookback), None);
+        assert_eq!(rewound(3_600).as_deref(), Some("2026-01-01"));
+        assert_eq!(rewound(86_400).as_deref(), Some("2026-01-01"));
+        // A day longer than the read, the lookback covers the change's own
+        // day already.
+        assert_eq!(rewound(129_600).as_deref(), Some("2026-01-02"));
+        assert_eq!(rewound(172_800).as_deref(), Some("2026-01-02"));
+        // A read longer than what the lookback leaves goes back further.
+        assert_eq!(
+            d.render_rewound(d.stream_rewind_secs(90_000.0, 3_600), None)
+                .as_deref(),
+            Some("2025-12-31")
+        );
+        // Never below the cursor the read started from.
+        assert_eq!(
+            d.render_rewound(d.stream_rewind_secs(3_000.0, 3_600), Some("2026-01-02"))
+                .as_deref(),
+            Some("2026-01-02")
+        );
+        // A timestamp watermark keeps the whole lookback.
+        let t = WatermarkTracker {
+            idx: 0,
+            unit: WatermarkUnit::NaiveMicros,
+            max: AtomicI64::new(i64::MIN),
+        };
+        assert_eq!(t.stream_rewind_secs(3_000.0, 3_600), 0);
+        assert_eq!(t.stream_rewind_secs(3_000.0, 600), 2_400);
+
+        // A chunk's resume marker records the same day.
+        let (cfg, plan, src) = chunk_inputs("id", DataType::Int64, false);
+        let mut cp = build_chunk_plan(&cfg, &plan, &src, 1000, None, None, None, false).unwrap();
+        cp.marker = MarkerBound::Stream {
+            started: Instant::now() - std::time::Duration::from_secs(3_000),
+            floor: None,
+            best: Arc::new(AtomicI64::new(i64::MIN)),
+        };
+        assert_eq!(cp.marker_upper(Some(&d), 3_600), "2026-01-01");
     }
 
     #[test]
