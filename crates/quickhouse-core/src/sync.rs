@@ -1438,7 +1438,8 @@ struct SourceSetup {
     /// [`plan_watermark_probes`].
     stream_max_cursor: bool,
     /// `Some` when the read's own filter plans as a sequential scan, so it must
-    /// be swept in bounded key windows to survive a standby's conflict window.
+    /// be swept in bounded key windows to survive a standby's conflict window,
+    /// or when the transfer asks for a sweep (`TransferConfig::windowed`).
     window: Option<WindowPlan>,
     /// ClickHouse only: the watermark's ClickHouse type, which types the
     /// filter's cursor literals (see `build_watermark_filter_clickhouse`).
@@ -2720,6 +2721,12 @@ async fn run_transfer_bigquery(
             "partition_source_expr is not supported for a BigQuery source (it reads through one \
              Storage Read session whose own stream count is the parallelism — there are no \
              discrete range partitions for an expression to bound)",
+        ));
+    }
+    if cfg.windowed_read() {
+        return Err(EtlError::config(
+            "windowed=True and window_bounds are not supported for a BigQuery source (it reads \
+             through one Storage Read session, with no statement for a key window to bound)",
         ));
     }
     let (client, project_id) = source.connect().await?;
@@ -4152,11 +4159,24 @@ async fn setup_postgres(
     // keyset loop, which a sweep would bypass: on a staged destination the
     // rows would land in the template table every chunk is cloned from, and
     // be dropped with it.
-    let window = if window_activated && cfg.chunk_rows.is_none() {
-        match window_key(cfg, &source_cols) {
-            Some((col, _)) if watermark_bounds_the_key(watermark, &col, cursor) => {
+    // A sweep asked for (`windowed`, `window_bounds`) doesn't wait on the
+    // probes: a read with a cheap MAX can be long all the same.
+    let forced = cfg.windowed_read();
+    let window = if (window_activated || forced) && cfg.chunk_rows.is_none() {
+        let key = if forced {
+            Some(forced_window_key(cfg, &source_cols)?)
+        } else {
+            window_key(cfg, &source_cols)
+        };
+        match key {
+            Some((col, _)) if !forced && watermark_bounds_the_key(watermark, &col, cursor) => {
                 key_bounded = true;
                 None
+            }
+            // The caller's range: nothing to probe, and nothing outside it is
+            // read, a NULL key included.
+            Some((col, _)) if cfg.window_bounds.is_some() => {
+                plan_read_window(cfg, cfg.window_bounds, quote_pg(&col), false)
             }
             Some((col, nullable_key)) => {
                 let first = s
@@ -4365,11 +4385,20 @@ async fn setup_mysql(
     // keyset loop, which a sweep would bypass: on a staged destination the
     // rows would land in the template table every chunk is cloned from, and
     // be dropped with it.
-    let window = if window_activated && cfg.chunk_rows.is_none() {
-        match window_key(cfg, &source_cols) {
-            Some((col, _)) if watermark_bounds_the_key(watermark, &col, cursor) => {
+    let forced = cfg.windowed_read();
+    let window = if (window_activated || forced) && cfg.chunk_rows.is_none() {
+        let key = if forced {
+            Some(forced_window_key(cfg, &source_cols)?)
+        } else {
+            window_key(cfg, &source_cols)
+        };
+        match key {
+            Some((col, _)) if !forced && watermark_bounds_the_key(watermark, &col, cursor) => {
                 key_bounded = true;
                 None
+            }
+            Some((col, _)) if cfg.window_bounds.is_some() => {
+                plan_read_window(cfg, cfg.window_bounds, quote_my(&col), false)
             }
             Some((col, nullable_key)) => {
                 let first = s
@@ -4827,6 +4856,32 @@ fn window_key(cfg: &TransferConfig, source_cols: &[ColumnType]) -> Option<(Strin
     Some((col, c.nullable))
 }
 
+/// [`window_key`] for a read that asked to be swept (`windowed`,
+/// `window_bounds`). There a key the sweep can't bound is a config error, not
+/// `None`: `None` reads in one pass, the very read the caller set out to avoid.
+fn forced_window_key(cfg: &TransferConfig, source_cols: &[ColumnType]) -> Result<(String, bool)> {
+    if let Some(key) = window_key(cfg, source_cols) {
+        return Ok(key);
+    }
+    // `validate` already refused a run with no key column at all.
+    let col = cfg.keyset_column().unwrap_or_default();
+    let why = if cfg.column_transforms.contains_key(&col) {
+        "is in column_transforms: a window would bound the transformed value, which no index on \
+         the column serves"
+            .to_string()
+    } else {
+        match source_cols.iter().find(|c| c.name == col) {
+            Some(c) => format!("must be an integer, and is {:?}", c.arrow),
+            None => "isn't a column the source returns".to_string(),
+        }
+    };
+    Err(EtlError::config(format!(
+        "windowed=True and window_bounds sweep the read in windows of '{col}' (partition_column, \
+         else the first key column), which {why}. Set partition_column to an integer column an \
+         index serves, such as the primary key"
+    )))
+}
+
 /// Whether `MAX(watermark)` is probed on `source_table` itself rather than
 /// through `source_query`, when both are set.
 ///
@@ -4933,8 +4988,9 @@ fn watermark_bounds_the_key(watermark: Option<&str>, key: &str, cursor: Option<&
 ///
 /// Activation is decided by the caller from the planner-cost probe 0.18.0
 /// already runs against the watermark column: if that column cannot be served
-/// by an index, the read's `WHERE wm > x` is a sequential scan. This function
-/// only sizes the sweep.
+/// by an index, the read's `WHERE wm > x` is a sequential scan. Or the
+/// transfer asks for a sweep (`TransferConfig::windowed`), and `bounds` may be
+/// its own. This function only sizes the sweep.
 ///
 /// Returns `None` (read in one pass, exactly as before) when the relation is
 /// empty or windowing is disabled.
@@ -5146,7 +5202,8 @@ sweeping_partition!(
 );
 
 /// A sweep of bounded key-range windows, used when the read's own filter is a
-/// sequential scan.
+/// sequential scan, or when the transfer asks for one (a bounded backfill on
+/// an indexed key is long too: see `TransferConfig::windowed`).
 ///
 /// **Why this exists.** On a hot standby, a read longer than
 /// `max_standby_streaming_delay` is cancelled with `SQLSTATE 40001`. Retrying
@@ -5766,6 +5823,12 @@ async fn setup_clickhouse(
     watermark: Option<&str>,
     warnings: &Warnings,
 ) -> Result<SourceSetup> {
+    if cfg.windowed_read() {
+        return Err(EtlError::config(
+            "windowed=True and window_bounds are supported for PostgreSQL and MySQL sources \
+             only: a ClickHouse source's reads are never swept in key windows",
+        ));
+    }
     tracing::info!("resolving clickhouse source schema...");
     // `source_query` wins, matching `ClickHouseSource::select_sql` and
     // `source_table`'s documented contract — see the equivalent comment in
@@ -10271,6 +10334,39 @@ mod tests {
         // the stored column, so no index can serve it.
         cfg.column_transforms.insert("id".into(), "id + 1".into());
         assert!(window_key(&cfg, &[int_col("id", false)]).is_none());
+    }
+
+    #[test]
+    fn a_sweep_asked_for_refuses_a_key_it_cannot_window() {
+        let mut cfg = crate::config::default_test_config();
+        cfg.key = vec!["id".to_string()];
+        cfg.windowed = true;
+        let col = |name: &str, arrow: DataType, nullable: bool| ColumnType {
+            name: name.to_string(),
+            type_id: 0,
+            nullable,
+            arrow,
+            clickhouse_inner: String::new(),
+            arbitrary_precision_decimal: false,
+            declared_decimal: None,
+        };
+        // An integer key is swept, a nullable one with its `IS NULL` window.
+        assert_eq!(
+            forced_window_key(&cfg, &[col("id", DataType::Int32, true)]).unwrap(),
+            ("id".to_string(), true)
+        );
+        // Anything else is refused, saying why, where an automatic sweep
+        // would read in one pass: the read the caller set out to avoid.
+        let refused = |cfg: &TransferConfig, key: ColumnType, why: &str| {
+            let cols = [key];
+            assert!(window_key(cfg, &cols).is_none());
+            let msg = forced_window_key(cfg, &cols).unwrap_err().to_string();
+            assert!(msg.contains(why) && msg.contains("'id'"), "{why}: {msg}");
+        };
+        refused(&cfg, col("id", DataType::Utf8, false), "must be an integer");
+        refused(&cfg, col("other", DataType::Int64, false), "isn't a column");
+        cfg.column_transforms.insert("id".into(), "id + 1".into());
+        refused(&cfg, col("id", DataType::Int64, false), "column_transforms");
     }
 
     #[test]

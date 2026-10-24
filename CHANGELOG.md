@@ -42,6 +42,24 @@ any breaking change is called out explicitly.
   default, which leaves the session as it was. PostgreSQL already does this
   through the DSN, `?options=-c%20default_transaction_read_only%3Don`, and the
   `Postgres` docs now say so. (#31)
+- **`windowed=True` and `window_bounds=(lo, hi)` sweep a read in key windows
+  whatever the probes cost.** The sweep switched on by itself only when the
+  `MAX(watermark)` probe priced too high, so a read long for another reason
+  couldn't ask for it. The main case is a bounded backfill on an indexed
+  primary key (`watermark="id"`, `advance_watermark=False`): its probe is
+  cheap, so it was read in one pass, and on a hot standby that pass was
+  cancelled with `SQLSTATE 40001` once it outlived
+  `max_standby_streaming_delay`, on every retry, since each restarted the same
+  scan. Healing 487M ids took about 974 calls of 500k ids, and a call of 5M ids
+  was cancelled on all 10 of its attempts. `window_bounds` gives the key range
+  to sweep instead of a `MIN`/`MAX` probe, and is the range read: a row whose
+  key is outside it isn't read, so it needs `advance_watermark=False`.
+  `windowed=True` alone probes the bounds. A window the source cancels is read
+  again at half the width, so one call can work through a large range.
+  Incremental mode, PostgreSQL and MySQL sources. A combination the sweep can't
+  serve is a config error: a key that isn't an untransformed integer,
+  `mode="full"`, `chunk_rows`, `parallelism` above 1, `partition_source_expr`,
+  and, with `window_bounds`, `delete_stale_in_window`. (#29)
 
 ### Fixed
 - **A `collapsed_bool` warning's message now gives the same number as its

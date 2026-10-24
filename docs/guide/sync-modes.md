@@ -134,7 +134,7 @@ incremental-mode only):
       <div class="qh-params__name">advance_watermark</div>
       <div class="qh-params__type">bool = True</div>
     </div>
-    <p class="qh-params__desc">Set to <code>False</code> to read and merge a window <em>without</em> moving the cursor &mdash; for loading a historical backfill without rewinding your regular schedule. The computed watermark is still returned in <code>TransferResult.new_watermark</code>.</p>
+    <p class="qh-params__desc">Set to <code>False</code> to read and merge a window <em>without</em> moving the cursor &mdash; for loading a historical backfill without rewinding your regular schedule. The computed watermark is still returned in <code>TransferResult.new_watermark</code>. To read a long backfill from a hot standby, sweep it in key windows with <code>window_bounds</code> (see <em>Performance &amp; safety</em>).</p>
   </div>
   <div>
     <div>

@@ -171,6 +171,65 @@ attempt restarts from zero against the same ceiling and re-pays the same scan,
 and the backoff schedule is far shorter than the conflict window. Remove the
 scan, or raise the standby's tolerance.
 
+## A long read with a cheap probe: bounded backfills
+
+The sweep above switches on by itself only when the `MAX(watermark)` probe is
+too costly. A read can be long for other reasons, and the commonest is a
+bounded backfill on an indexed primary key: its probe is cheap, so it is read in
+one pass, and on a hot standby that pass is cancelled with `SQLSTATE 40001` once
+it outlives `max_standby_streaming_delay`. Retrying doesn't help, since every
+attempt restarts the same scan. `window_bounds` sweeps it anyway:
+
+```python
+qh.sync(
+    qh.Postgres("postgresql://user@replica:5432/db"),
+    dst,
+    dest_table="orders", source_table="orders",
+    mode="incremental", watermark="id", key=["id"],
+    advance_watermark=False,                  # the schedule's cursor stays put,
+    state_key="orders:backfill",              # and isn't this run's lower bound
+    window_bounds=(1, 50_000_000),            # the ids to read, in windows
+)
+```
+
+The bounds stand in for a `MIN`/`MAX` probe of the key, and they are the range
+the run reads: a row whose key is outside them, or `NULL`, isn't read, whatever
+`source_query` selects. A `source_query` that bounds the same range, as a
+hand-written backfill does, reads the same rows. Each window is sized by
+`window_target_secs` and capped by `read_window_rows`, and one the standby
+cancels is read again at half the width, so one call works through the whole
+range instead of failing on its first long statement.
+
+`windowed=True` forces the same sweep with the bounds probed instead, on
+`source_table` when it is set: for a long read of the whole key range, a first
+pull of a large table whose watermark is indexed, say.
+
+The window key is `partition_column`, else the first `key` column: an integer
+column, read untransformed, that an index serves. Both settings are for
+incremental runs from PostgreSQL or MySQL, and the sweep reads single-stream.
+So a key that can't bound a window is a config error, as are `mode="full"`,
+`chunk_rows`, `parallelism` above 1 and `partition_source_expr`. So are
+`window_bounds` without `advance_watermark=False`, or with
+`delete_stale_in_window`: the cursor a run computes, and the window that delete
+scopes, both reach rows outside the bounds that the run never read.
+
+```{admonition} Windows or chunks?
+:class: note
+`chunk_rows` reads in bounded statements too, and works for a backfill: with
+`advance_watermark=False` and a `state_key` of its own, each chunk records a
+resume marker under that key, a run retried after a failure resumes after the
+last chunk it committed, and a finished run clears the marker, so the next run
+reads the whole range again. Use one `state_key` per range: a run resumes from
+whatever marker its key holds, and a marker another range left behind holds the
+read to that range's bound, so it can read nothing and still succeed. What
+decides between them is a cancellation. A chunk has a fixed size, so one the
+standby cancels is read again, after a whole-transfer retry, at the same size,
+and each cancellation spends one of `retry_max_attempts`. A window shrinks on
+the spot, with no retry. But a sweep doesn't resume: a run that fails reads its
+range again from the start, so keep each call's range to what you are willing
+to read twice.
+```
+
 ## Two timeouts, and which one you actually want
 
 ```{admonition} `statement_timeout_secs` bounds the whole transfer, not the query

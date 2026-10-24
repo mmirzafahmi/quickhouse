@@ -1332,6 +1332,8 @@ fn parse_parquet_compression(c: &str) -> PyResult<core::ParquetCompression> {
     probe_max_cost=core::source::DEFAULT_PROBE_MAX_COST,
     read_window_rows=None,
     window_target_secs=None,
+    windowed=false,
+    window_bounds=None,
     column_transforms=None,
     column_transform_types=None,
     evolve_schema=false,
@@ -1392,6 +1394,8 @@ fn sync(
     probe_max_cost: f64,
     read_window_rows: Option<u64>,
     window_target_secs: Option<f64>,
+    windowed: bool,
+    window_bounds: Option<Vec<i64>>,
     column_transforms: Option<HashMap<String, String>>,
     column_transform_types: Option<HashMap<String, String>>,
     evolve_schema: bool,
@@ -1427,6 +1431,17 @@ fn sync(
     let fail_on_warnings = match fail_on_warnings {
         Some(kinds) => parse_warning_kinds(&kinds)?,
         None => Vec::new(),
+    };
+    // A pair, as a tuple or as the list a TOML job file writes.
+    let window_bounds = match window_bounds.as_deref() {
+        None => None,
+        Some(&[lo, hi]) => Some((lo, hi)),
+        Some(other) => {
+            return Err(PyRuntimeError::new_err(format!(
+                "window_bounds must be a pair (lo, hi), got {} value(s)",
+                other.len()
+            )))
+        }
     };
     let cfg = core::TransferConfig {
         source_archive_ignored,
@@ -1468,6 +1483,8 @@ fn sync(
         probe_max_cost,
         read_window_rows,
         window_target_secs,
+        windowed,
+        window_bounds,
         column_transforms: column_transforms.unwrap_or_default(),
         column_transform_types: column_transform_types.unwrap_or_default(),
         evolve_schema,

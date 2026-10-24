@@ -16,6 +16,10 @@ Run against docker-compose.yml -- see test_sync.py's module docstring.
 
 from __future__ import annotations
 
+import re
+
+import pytest
+
 import quickhouse
 
 
@@ -53,6 +57,32 @@ def _rows(ch_client, table):
     return ch_client.query(
         f"SELECT count(), uniqExact(id), sum(id) FROM `{table}` FINAL"
     ).result_rows[0]
+
+
+def _sweep(err):
+    """`(windows, shrinks)` from the log line a finished sweep writes."""
+    m = re.search(r"windowed read complete: (\d+) window\(s\), (\d+) shrink\(s\)", err)
+    assert m, f"the read was not swept:\n{err}"
+    return int(m.group(1)), int(m.group(2))
+
+
+def _backfill(table, lo, hi, **kw):
+    """A bounded backfill as a caller runs one: a primary-key range, a cursor
+    that stays where it is, and a state key of its own."""
+    return dict(
+        dest_table=table, mode="incremental", watermark="id", key=["id"],
+        advance_watermark=False, state_key=f"{table}:backfill:{lo}-{hi}",
+        create_if_missing=True, engine="ReplacingMergeTree", order_by=["id"], **kw,
+    )
+
+
+def _state_rows(ch_client, state_key):
+    """The rows a run saved under `state_key`: cursors and resume markers."""
+    if not ch_client.command("EXISTS TABLE _quickhouse_state"):
+        return 0
+    return ch_client.command(
+        f"SELECT count() FROM _quickhouse_state WHERE source_table = '{state_key}'"
+    )
 
 
 def test_windowed_read_matches_a_single_pass_read(
@@ -216,5 +246,153 @@ def test_a_chunked_read_is_never_swept(
         assert "keyset chunked read starting" in err
         assert "windowed read on" not in err
         assert _rows(ch_client, table)[:2] == (300, 300)
+    finally:
+        _drop_ch(ch_client, table)
+
+
+def test_a_primary_key_backfill_can_force_the_sweep(
+    pg_conn, ch_client, pg_source, ch_target, unique_name, capfd
+):
+    """Issue #29: a backfill on the primary key has a cheap MAX probe, so it
+    was always read in one pass, which a hot standby cancels once it outlives
+    max_standby_streaming_delay -- on every retry, since each one restarts the
+    same scan. window_bounds sweeps it in windows whatever the probe costs."""
+    table = unique_name
+    _seed(pg_conn, table, rows=1000)
+    _drop_ch(ch_client, table)
+    q = (f'SELECT "id", "name", "write_date" FROM "{table}" '
+         f'WHERE "id" >= 201 AND "id" <= 800')
+    kw = _backfill(table, 201, 800, source_query=q, read_window_rows=100)
+    try:
+        capfd.readouterr()
+        r = quickhouse.sync(pg_source, ch_target, **kw)
+        assert "windowed read on" not in capfd.readouterr().err, "a cheap probe: one pass"
+        assert r.rows_written == 600
+        _drop_ch(ch_client, table)
+
+        r = quickhouse.sync(pg_source, ch_target, window_bounds=(201, 800), **kw)
+        err = capfd.readouterr().err
+        # (200, 300], (300, 400], ..., (700, 800]
+        assert _sweep(err)[0] == 6, err
+        assert r.rows_written == 600
+        assert _rows(ch_client, table) == (600, 600, sum(range(201, 801)))
+        assert r.new_watermark == "800"
+        assert _state_rows(ch_client, kw["state_key"]) == 0, "the cursor stays unsaved"
+    finally:
+        _drop_ch(ch_client, table)
+
+
+def test_window_bounds_are_the_range_the_sweep_reads(
+    pg_conn, ch_client, pg_source, ch_target, unique_name, capfd
+):
+    """The bounds stand in for the MIN/MAX probe, and they are the range read:
+    from source_table alone, a backfill of ids 201..800 reads those rows and no
+    others, in windows over [201, 800] rather than the table's [1, 1000]."""
+    table = unique_name
+    _seed(pg_conn, table, rows=1000)
+    _drop_ch(ch_client, table)
+    kw = _backfill(table, 201, 800, source_table=table, read_window_rows=100)
+    try:
+        capfd.readouterr()
+        r = quickhouse.sync(pg_source, ch_target, window_bounds=(201, 800), **kw)
+        err = capfd.readouterr().err
+        assert 'windowed read on "id" over [201, 800]' in err, err
+        assert _sweep(err)[0] == 6
+        assert r.rows_written == 600
+        assert _rows(ch_client, table) == (600, 600, sum(range(201, 801)))
+    finally:
+        _drop_ch(ch_client, table)
+
+
+def test_windowed_without_bounds_sweeps_the_whole_key_range(
+    pg_conn, ch_client, pg_source, ch_target, unique_name, capfd
+):
+    """windowed=True alone probes the key's MIN/MAX for its bounds, so the sweep
+    reads exactly what one pass would, and the cursor moves as usual."""
+    table = unique_name
+    _seed(pg_conn, table, rows=500)
+    _drop_ch(ch_client, table)
+    try:
+        capfd.readouterr()
+        r = quickhouse.sync(
+            pg_source, ch_target, dest_table=table, source_table=table,
+            mode="incremental", watermark="id", key=["id"], create_if_missing=True,
+            engine="ReplacingMergeTree", order_by=["id"], state_key=f"{table}:pk",
+            windowed=True, read_window_rows=100,
+        )
+        err = capfd.readouterr().err
+        assert 'windowed read on "id" over [1, 500]' in err, err
+        assert _sweep(err)[0] == 5
+        assert _rows(ch_client, table) == (500, 500, sum(range(1, 501)))
+        assert r.new_watermark == "500"
+    finally:
+        _drop_ch(ch_client, table)
+
+
+def test_a_cancelled_window_of_a_backfill_is_read_again_narrower(
+    pg_conn, ch_client, pg_source, ch_target, unique_name, capfd
+):
+    """Why a backfill wants the sweep on a hot standby: a statement the source
+    cancels is read again at half the width until one fits. A function in
+    source_query raises SQLSTATE 40001 once one statement has read more than
+    140 rows, as a standby cancels any statement that outlives
+    max_standby_streaming_delay. One pass fails on every retry; the sweep
+    shrinks, finishes, and lands every row once."""
+    table = unique_name
+    guard = f"{table}_cancel_past"
+    _seed(pg_conn, table, rows=600, start_id=10, gap=10)  # ids 10, 20, ..., 6000
+    with pg_conn.cursor() as cur:
+        # Counted per statement: every read is a transaction of its own.
+        cur.execute(f"""
+            CREATE FUNCTION "{guard}"(n int) RETURNS boolean
+            LANGUAGE plpgsql VOLATILE AS $$
+            DECLARE
+              seen int := coalesce(nullif(current_setting('qh.seen', true), ''), '0')::int + 1;
+            BEGIN
+              PERFORM set_config('qh.seen', seen::text, true);
+              IF seen > n THEN
+                RAISE EXCEPTION 'canceling statement due to conflict with recovery'
+                  USING ERRCODE = '40001';
+              END IF;
+              RETURN true;
+            END $$""")
+    _drop_ch(ch_client, table)
+    q = f'SELECT "id", "name", "write_date" FROM "{table}" WHERE "{guard}"(140)'
+    kw = _backfill(table, 10, 6000, source_query=q, retry_max_attempts=2)
+    try:
+        with pytest.raises(RuntimeError, match="conflict with recovery"):
+            quickhouse.sync(pg_source, ch_target, **kw)
+
+        capfd.readouterr()
+        # Windows of 1,000 keys (100 rows) at the narrowest, 4,000 at the widest.
+        r = quickhouse.sync(
+            pg_source, ch_target, window_bounds=(10, 6000), read_window_rows=4000, **kw
+        )
+        windows, shrinks = _sweep(capfd.readouterr().err)
+        assert shrinks > 0 and windows > 1, (windows, shrinks)
+        assert r.rows_written == 600
+        assert _rows(ch_client, table) == (600, 600, sum(range(10, 6001, 10)))
+    finally:
+        _drop_ch(ch_client, table)
+        with pg_conn.cursor() as cur:
+            cur.execute(f'DROP FUNCTION IF EXISTS "{guard}"(int)')
+
+
+def test_a_forced_sweep_refuses_a_key_it_cannot_window(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """Asked for a sweep, a key that can't bound one is an error before
+    anything is written, not the one-pass read the caller set out to avoid."""
+    table = unique_name
+    _seed(pg_conn, table, rows=10)
+    _drop_ch(ch_client, table)
+    try:
+        with pytest.raises(RuntimeError, match="must be an integer"):
+            quickhouse.sync(
+                pg_source, ch_target, dest_table=table, source_table=table,
+                mode="incremental", watermark="id", key=["name"], windowed=True,
+                create_if_missing=True, engine="ReplacingMergeTree", order_by=["name"],
+            )
+        assert not ch_client.command(f"EXISTS TABLE `{table}`")
     finally:
         _drop_ch(ch_client, table)

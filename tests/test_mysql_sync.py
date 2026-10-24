@@ -1777,6 +1777,40 @@ def test_a_windowed_sweep_shares_one_connection_and_one_insert(
             cur.execute(f"DROP TABLE IF EXISTS `{table}`")
 
 
+def test_a_primary_key_backfill_can_force_the_sweep(
+    mysql_conn, ch_client, mysql_source, ch_target, unique_name, capfd
+):
+    """Issue #29: a backfill on the primary key has a cheap MAX probe, so it
+    was always read in one pass. window_bounds sweeps it in windows over the
+    range given, whatever the probe costs, and every row lands once."""
+    table = unique_name
+    _seed_filtered(mysql_conn, table, range(1, 1001))
+    _drop_ch(ch_client, table)
+    kw = dict(
+        dest_table=table,
+        source_query=f"SELECT id, updated_date, payload FROM `{table}` "
+        "WHERE id >= 201 AND id <= 800",
+        mode="incremental", watermark="id", key=["id"], advance_watermark=False,
+        state_key=f"{table}:backfill", create_if_missing=True,
+        engine="ReplacingMergeTree()", order_by=["id"], read_window_rows=100,
+    )
+    try:
+        capfd.readouterr()
+        r = quickhouse.sync(mysql_source, ch_target, window_bounds=(201, 800), **kw)
+        err = capfd.readouterr().err
+        assert "windowed read on `id` over [201, 800]" in err, err
+        assert "windowed read complete: 6 window(s), 0 shrink(s)" in err, err
+        assert r.rows_written == 600
+        got = ch_client.query(
+            f"SELECT count(), uniqExact(id), sum(id) FROM `{table}` FINAL"
+        ).result_rows[0]
+        assert got == (600, 600, sum(range(201, 801))), got
+    finally:
+        _drop_ch(ch_client, table)
+        with mysql_conn.cursor() as cur:
+            cur.execute(f"DROP TABLE IF EXISTS `{table}`")
+
+
 def test_fail_on_warnings_stops_the_cursor_and_the_swap(
     mysql_conn, ch_client, mysql_source, ch_target, unique_name
 ):

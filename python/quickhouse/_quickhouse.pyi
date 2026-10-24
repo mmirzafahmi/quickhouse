@@ -886,6 +886,8 @@ def sync(
     probe_max_cost: float = 50_000.0,
     read_window_rows: Optional[int] = None,
     window_target_secs: Optional[float] = None,
+    windowed: bool = False,
+    window_bounds: Optional[Tuple[int, int]] = None,
     column_transforms: Optional[Mapping[str, str]] = None,
     column_transform_types: Optional[Mapping[str, str]] = None,
     evolve_schema: bool = False,
@@ -1110,9 +1112,10 @@ def sync(
       not the rows returned, so with an index on the key its duration is
       predictable whatever the rest of the WHERE selects; a window cancelled
       anyway is retried at half the width. This activates automatically from
-      the same planner-cost probe as ``probe_max_cost``; the setting only sizes
-      it. Note the whole key space is still swept, so the total work is
-      unchanged \u2014 the gain is that the run *completes*.
+      the same planner-cost probe as ``probe_max_cost``, or on request (see
+      ``windowed``); the setting only sizes it. Note the whole key space is
+      still swept, so the total work is unchanged \u2014 the gain is that the
+      run *completes*.
     - ``window_target_secs`` (default ``5.0``) is what one window should take;
       the sweep re-sizes itself after every window to converge on it. Keep it
       well under the standby's ``max_standby_streaming_delay``. Raising it buys
@@ -1121,6 +1124,37 @@ def sync(
       time is a cancelled window, whose work is thrown away and redone:
       measured, 21 cancellations accounted for ~420s of a 2603s sweep. Measured on one table: p50 3.2s, p90 9.6s,
       max 82s, all at the same target.
+    - ``windowed=True`` sweeps the read in key windows whatever the probes
+      cost. On its own the sweep switches on only when ``MAX(watermark)`` is
+      too costly, and a read can be long for other reasons: a bounded backfill
+      on an indexed primary key (``watermark="id"``,
+      ``advance_watermark=False``) has a cheap probe, so it was read in one
+      pass, which a hot standby cancels on every retry once it outlives
+      ``max_standby_streaming_delay``. The window key is ``partition_column``,
+      else the first ``key``: an integer column the transfer reads
+      untransformed, or the run is refused rather than read in one pass. Its
+      ``MIN``/``MAX`` are probed, on ``source_table`` when it is set, unless
+      ``window_bounds`` gives them. Incremental mode, PostgreSQL and MySQL
+      sources only. The sweep is single-stream, so ``chunk_rows``,
+      ``partition_source_expr`` and a ``parallelism`` above 1 are refused. A
+      sweep doesn't resume: a run that fails reads its range again from the
+      start, where ``chunk_rows`` resumes after its last chunk (but reads every
+      chunk at the same size, and each cancelled one costs a whole-transfer
+      retry out of ``retry_max_attempts``). New in 0.20.9.
+    - ``window_bounds=(lo, hi)`` sweeps the keys from ``lo`` to ``hi``,
+      inclusive, instead of probing for them, and implies ``windowed=True``.
+      New in 0.20.9.
+      They are the range the run reads: a row whose key is outside them, or
+      ``NULL``, isn't read. So they need ``advance_watermark=False`` (the
+      cursor a run computes is the source's ``MAX(watermark)``, past rows
+      outside the range it never read) and can't be combined with
+      ``delete_stale_in_window``. A bounded backfill, with a ``state_key`` of
+      its own so the schedule's cursor isn't its lower bound::
+
+          quickhouse.sync(src, dst, dest_table="orders", source_table="orders",
+                          mode="incremental", watermark="id", key=["id"],
+                          advance_watermark=False, state_key="orders:backfill",
+                          window_bounds=(1, 50_000_000))
     - ``retry_max_attempts`` (default ``1`` = no retry) re-runs the whole
       transfer on a *transient source* error — PostgreSQL hot-standby recovery
       conflict / statement cancel, MySQL server-gone-away / lock-wait / deadlock /
