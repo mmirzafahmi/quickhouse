@@ -346,6 +346,7 @@ async fn read_source_keys(source_cfg: &SourceConfig, cfg: &ReconcileConfig) -> R
                 my.client_cert_file.clone(),
                 my.client_key_file.clone(),
                 my.utc_session,
+                my.read_only,
             );
             let mut conn = source.connect().await?;
             source

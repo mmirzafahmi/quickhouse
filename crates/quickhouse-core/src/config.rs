@@ -83,6 +83,15 @@ pub struct MySqlConfig {
     /// `NOW()` and `CURDATE()` return in a `source_query`. `DATETIME` columns
     /// carry no zone and read the same either way.
     pub utc_session: bool,
+    /// Make every connection's session read-only (`SET SESSION
+    /// transaction_read_only = ON`, in the same statement as the settings
+    /// above). MySQL then refuses any statement that would write — a
+    /// `source_query` that calls a function which inserts, a `SELECT ... FOR
+    /// UPDATE` — with error 1792, whatever the user's grants allow. A second
+    /// guard on top of a read-only user, not a replacement for one. Needs
+    /// MySQL 5.7.20 or later: a server that doesn't know the variable fails
+    /// the connection rather than reading without it.
+    pub read_only: bool,
 }
 
 /// Where to read from, when the source is Google BigQuery.
@@ -1189,9 +1198,10 @@ pub struct TransferConfig {
     /// other predicates are selective and unindexed.
     ///
     /// Windowing activates automatically from the planner-cost probe (see
-    /// [`Self::probe_max_cost`]); this only sizes it. The whole key space is
-    /// still swept, so the total work is unchanged — the gain is that the run
-    /// completes rather than being cancelled.
+    /// [`Self::probe_max_cost`]), or on request (see [`Self::windowed`]); this
+    /// only sizes it. The whole key space is still swept, so the total work is
+    /// unchanged — the gain is that the run completes rather than being
+    /// cancelled.
     pub read_window_rows: Option<u64>,
 
     /// What one **windowed read** should take, in seconds. `None` uses
@@ -1212,6 +1222,39 @@ pub struct TransferConfig {
     /// thrown away and redone. Measured, 21 cancellations accounted for ~420s
     /// of a 2603s sweep.
     pub window_target_secs: Option<f64>,
+    /// Sweep the read in **bounded key windows** whatever the probes cost.
+    /// `false` (default) leaves it to the probes: the sweep switches on by
+    /// itself only when `MAX(watermark)` is too costly (see
+    /// [`Self::read_window_rows`]).
+    ///
+    /// **Why this exists.** A read can be long for another reason than an
+    /// unindexed watermark. A bounded backfill on an indexed primary key
+    /// (`watermark="id"`, `advance_watermark=false`) has a cheap probe, so it
+    /// was read in one pass, and on a hot standby a pass that outlives
+    /// `max_standby_streaming_delay` is cancelled on every retry, since each
+    /// one restarts the same scan. Healing 487M ids of a 924M-row table took
+    /// about 974 calls of 500k ids each, and a call of 5M ids was cancelled on
+    /// all 10 of its attempts.
+    ///
+    /// The window key is [`Self::keyset_column`]'s, and it has to be an
+    /// integer column the transfer reads untransformed: the run is refused
+    /// rather than read in the one pass it asked to avoid. Its bounds are
+    /// probed (`MIN`/`MAX`, on `source_table` when it is set) unless
+    /// [`Self::window_bounds`] gives them. Incremental mode, PostgreSQL and
+    /// MySQL sources only. The sweep is single-stream, so `chunk_rows`,
+    /// `partition_source_expr` and an explicit `parallelism` above 1 are
+    /// refused rather than silently ignored.
+    pub windowed: bool,
+    /// The inclusive key range `(lo, hi)` a windowed read sweeps, instead of
+    /// probing the window key's `MIN`/`MAX`. Implies [`Self::windowed`].
+    ///
+    /// The bounds are the range the run reads: a row whose key is outside
+    /// them, or NULL, is not read, whatever `source_query` selects. So they
+    /// need `advance_watermark=false`, since the cursor a run computes is the
+    /// source's `MAX(watermark)`, past rows outside the bounds it never read.
+    /// For the same reason they rule out [`Self::delete_stale_in_window`],
+    /// whose delete reaches every row in its window the run didn't stage.
+    pub window_bounds: Option<(i64, i64)>,
     /// Per-column SQL value transforms applied in the source `SELECT`
     /// (source-column name -> expression, e.g. `"CAST(x AS TEXT)"`,
     /// `"col AT TIME ZONE 'UTC'"`, `"ROUND(amt, 9)"`). Applied over
@@ -1435,6 +1478,50 @@ impl TransferConfig {
             .or_else(|| self.key.first().cloned())
     }
 
+    /// Whether the read is swept in key windows whatever the probes cost:
+    /// [`Self::windowed`], or [`Self::window_bounds`], which implies it.
+    pub fn windowed_read(&self) -> bool {
+        self.windowed || self.window_bounds.is_some()
+    }
+
+    /// Which read a `chunk_rows` resume marker belongs to, recorded with it so
+    /// that only the same read resumes it. The state key alone can't say:
+    /// `state_key` is meant to stay put across query edits, and without one,
+    /// reads that set the same `source_table` share theirs. A stable hash
+    /// (64-bit FNV-1a, as hex) of what decides the rows a keyset cursor
+    /// walks: `source_table`, `source_query`, the keyset column, `watermark`
+    /// and `watermark_source_expr`.
+    pub fn chunk_read_id(&self) -> String {
+        let keyset = self.keyset_column();
+        let parts = [
+            self.source_table.as_deref(),
+            self.source_query.as_deref(),
+            keyset.as_deref(),
+            self.watermark.as_deref(),
+            self.watermark_source_expr.as_deref(),
+        ];
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut feed = |bytes: &[u8]| {
+            for &b in bytes {
+                hash ^= u64::from(b);
+                hash = hash.wrapping_mul(0x0100_0000_01b3);
+            }
+        };
+        // Each part is tagged and length-prefixed, so no two different
+        // tuples feed the same bytes.
+        for part in parts {
+            match part {
+                None => feed(&[0]),
+                Some(s) => {
+                    feed(&[1]);
+                    feed(&(s.len() as u64).to_le_bytes());
+                    feed(s.as_bytes());
+                }
+            }
+        }
+        format!("{hash:016x}")
+    }
+
     /// Validation for a DB source (Postgres/MySQL/BigQuery/ClickHouse) —
     /// byte-identical to the original `validate`.
     pub fn validate(&self) -> crate::error::Result<()> {
@@ -1488,6 +1575,12 @@ impl TransferConfig {
             if self.lookback_seconds > 0 {
                 return Err(EtlError::config(format!(
                     "lookback_seconds is not supported for {noun}"
+                )));
+            }
+            if self.windowed_read() {
+                return Err(EtlError::config(format!(
+                    "windowed=True and window_bounds (a sweep of key windows) are not supported \
+                     for {noun}"
                 )));
             }
         }
@@ -1597,6 +1690,77 @@ impl TransferConfig {
                 "chunk_rows requires a keyset ordering column: set partition_column or key \
                  (it must be a UNIQUE, NOT NULL integer column, or ties silently skip rows)",
             ));
+        }
+        // A sweep asked for is single-stream, over an integer key, and part of
+        // the incremental read: each knob that can't hold is refused here
+        // rather than quietly ignored. The key's type is checked once the
+        // source's columns are known (`sync::forced_window_key`).
+        if self.windowed_read() {
+            if self.mode != SyncMode::Incremental {
+                return Err(EtlError::config(
+                    "windowed=True and window_bounds only apply to incremental mode: the sweep \
+                     is part of the incremental read, and a full refresh replaces the whole \
+                     destination with what it reads, which window_bounds would cut down to \
+                     its range",
+                ));
+            }
+            if self.chunk_rows.is_some() {
+                return Err(EtlError::config(
+                    "windowed=True and window_bounds are not supported together with \
+                     chunk_rows: a chunked read already bounds each statement through its own \
+                     keyset loop, which a sweep would bypass. Pick one: chunk_rows resumes \
+                     after its last chunk when a run fails, and a sweep halves a window the \
+                     source cancels",
+                ));
+            }
+            if self.parallelism > 1 {
+                return Err(EtlError::config(format!(
+                    "windowed=True and window_bounds read single-stream, one key window after \
+                     another, so parallelism={} can't apply: leave it at 0 or set it to 1",
+                    self.parallelism
+                )));
+            }
+            if self.partition_source_expr.is_some() {
+                return Err(EtlError::config(
+                    "windowed=True and window_bounds read single-stream, so \
+                     partition_source_expr, which splits a source_query into parallel range \
+                     partitions, can't apply: drop it",
+                ));
+            }
+            if self.keyset_column().is_none() {
+                return Err(EtlError::config(
+                    "windowed=True and window_bounds sweep windows of a key: set \
+                     partition_column, or key (an integer column an index serves, such as the \
+                     primary key)",
+                ));
+            }
+            if self.read_window_rows == Some(0) {
+                return Err(EtlError::config(
+                    "read_window_rows=0 turns the windowed read off, so it can't be combined \
+                     with windowed=True or window_bounds",
+                ));
+            }
+        }
+        if let Some((lo, hi)) = self.window_bounds {
+            if lo > hi {
+                return Err(EtlError::config(format!(
+                    "window_bounds=({lo}, {hi}) is empty: lo can't be greater than hi"
+                )));
+            }
+            if self.advance_watermark {
+                return Err(EtlError::config(
+                    "window_bounds needs advance_watermark=False: the bounds are the range the \
+                     run reads, and the cursor it computes is the source's MAX(watermark), past \
+                     every row outside them, which it never read",
+                ));
+            }
+            if self.delete_stale_in_window {
+                return Err(EtlError::config(
+                    "window_bounds is not supported together with delete_stale_in_window: the \
+                     delete removes the destination rows in its window that the run didn't \
+                     stage, and a run reads only the rows inside the bounds",
+                ));
+            }
         }
         if self.delete_stale_in_window {
             if self.mode != SyncMode::Incremental {
@@ -1804,6 +1968,28 @@ pub enum WarningKind {
     /// is only reported when the rows went straight into the destination
     /// (append), where failing would take nothing back.
     StorageWriteCountMismatch,
+    /// The existing destination has a column that no source column feeds
+    /// (after `rename` / `include` / `exclude`) and that it doesn't fill
+    /// itself: no `DEFAULT`, nor on ClickHouse a `MATERIALIZED`, `ALIAS` or
+    /// `EPHEMERAL` expression. Every row the run writes lands without a value
+    /// there. On ClickHouse that is the type's default (NULL when
+    /// `Nullable`), and in a `ReplacingMergeTree` the row replaces the stored
+    /// one, value and all. On BigQuery a `MERGE` leaves the column alone on
+    /// rows it updates and NULL on rows it inserts. A full refresh rebuilds
+    /// every row without it. Raised at setup, before anything is written,
+    /// once per column with `count` `0`; `column` is the destination column.
+    UnsourcedDestinationColumn,
+    /// The state key held the resume marker of an unfinished `chunk_rows`
+    /// read of a different query (see [`TransferConfig::chunk_read_id`]), so
+    /// the run didn't resume it: a marker's keyset cursor and frozen upper
+    /// bound mean nothing to another query, whose resume would read only
+    /// their overlap and report success. It read from the committed cursor
+    /// instead, so nothing it selects is skipped. The other query's rows past
+    /// its marker stay unread until it runs again, which matters when nothing
+    /// else reads them (`advance_watermark=false`). `sample` is the marker's
+    /// cursor. Raised at setup, before anything is written. Table-level:
+    /// `column` is `None`.
+    AbandonedResumeMarker,
 }
 
 impl WarningKind {
@@ -1830,6 +2016,8 @@ impl WarningKind {
             WarningKind::NullCheckSkipped => "null_check_skipped",
             WarningKind::RetriedAfterPartialWrite => "retried_after_partial_write",
             WarningKind::StorageWriteCountMismatch => "storage_write_count_mismatch",
+            WarningKind::UnsourcedDestinationColumn => "unsourced_destination_column",
+            WarningKind::AbandonedResumeMarker => "abandoned_resume_marker",
         }
     }
 
@@ -1839,7 +2027,7 @@ impl WarningKind {
     }
 
     /// Every kind, in declaration order.
-    pub const ALL: [WarningKind; 18] = [
+    pub const ALL: [WarningKind; 20] = [
         WarningKind::CollapsedBool,
         WarningKind::CoercedDate,
         WarningKind::CoercedDecimal,
@@ -1858,6 +2046,8 @@ impl WarningKind {
         WarningKind::NullCheckSkipped,
         WarningKind::RetriedAfterPartialWrite,
         WarningKind::StorageWriteCountMismatch,
+        WarningKind::UnsourcedDestinationColumn,
+        WarningKind::AbandonedResumeMarker,
     ];
 }
 
@@ -1872,8 +2062,9 @@ impl WarningKind {
 pub struct TransferWarning {
     pub kind: WarningKind,
     /// The source column responsible, when the condition is attributable to
-    /// one. `None` for table-level conditions (a full-refresh shrink, an
-    /// unclustered merge target).
+    /// one: for [`WarningKind::UnsourcedDestinationColumn`], the destination
+    /// column no source column feeds. `None` for table-level conditions (a
+    /// full-refresh shrink, an unclustered merge target).
     pub column: Option<String>,
     /// How many values/rows tripped this condition. Table-level warnings use
     /// the count that makes the condition concrete (rows lost to a shrink,
@@ -1983,6 +2174,8 @@ pub(crate) fn default_test_config() -> TransferConfig {
         probe_max_cost: crate::source::DEFAULT_PROBE_MAX_COST,
         read_window_rows: None,
         window_target_secs: None,
+        windowed: false,
+        window_bounds: None,
         column_transforms: HashMap::new(),
         column_transform_types: HashMap::new(),
         evolve_schema: false,
@@ -2101,6 +2294,8 @@ mod tests {
             probe_max_cost: crate::source::DEFAULT_PROBE_MAX_COST,
             read_window_rows: None,
             window_target_secs: None,
+            windowed: false,
+            window_bounds: None,
             column_transforms: HashMap::new(),
             column_transform_types: HashMap::new(),
             evolve_schema: false,
@@ -2201,6 +2396,44 @@ mod tests {
     }
 
     #[test]
+    fn a_chunk_read_id_names_the_read_not_the_state_key() {
+        let c = cfg(SyncMode::Incremental, Some("write_date"));
+        // Persisted with every resume marker, so it can never change between
+        // releases: an unfinished read would no longer recognise its marker.
+        assert_eq!(c.chunk_read_id(), "72e7c1b8e7a66aec");
+        let id = |f: &dyn Fn(&mut TransferConfig)| {
+            let mut c = cfg(SyncMode::Incremental, Some("write_date"));
+            f(&mut c);
+            c.chunk_read_id()
+        };
+        // The state key and the projection don't decide which rows a keyset
+        // cursor walks.
+        assert_eq!(id(&|c| c.state_key = Some("k".into())), c.chunk_read_id());
+        assert_eq!(id(&|c| c.exclude = vec!["note".into()]), c.chunk_read_id());
+        // What does, does.
+        for changed in [
+            id(&|c| c.source_query = Some("SELECT * FROM t WHERE id > 5".into())),
+            id(&|c| c.partition_column = Some("seq".into())),
+            id(&|c| c.watermark = Some("id".into())),
+            id(&|c| c.watermark_source_expr = Some("write_date + 1".into())),
+        ] {
+            assert_ne!(changed, c.chunk_read_id());
+        }
+        // Fields are kept apart: the same text split differently is a
+        // different read.
+        assert_ne!(
+            id(&|c| {
+                c.source_table = Some("ab".into());
+                c.source_query = None;
+            }),
+            id(&|c| {
+                c.source_table = Some("a".into());
+                c.source_query = Some("b".into());
+            })
+        );
+    }
+
+    #[test]
     fn validate_rejects_seed_and_freeze_outside_incremental() {
         let mut c = cfg(SyncMode::Full, None);
         c.seed_watermark = WatermarkSeed::CurrentMax;
@@ -2263,7 +2496,9 @@ mod tests {
             | WarningKind::WindowBoundsUnavailable
             | WarningKind::NullCheckSkipped
             | WarningKind::RetriedAfterPartialWrite
-            | WarningKind::StorageWriteCountMismatch => WarningKind::ALL.contains(&k),
+            | WarningKind::StorageWriteCountMismatch
+            | WarningKind::UnsourcedDestinationColumn
+            | WarningKind::AbandonedResumeMarker => WarningKind::ALL.contains(&k),
         };
         assert!(WarningKind::ALL.into_iter().all(listed));
     }
@@ -2366,6 +2601,14 @@ mod tests {
             (
                 "lookback_seconds",
                 Box::new(|c: &mut TransferConfig| c.lookback_seconds = 60),
+            ),
+            (
+                "windowed",
+                Box::new(|c: &mut TransferConfig| c.windowed = true),
+            ),
+            (
+                "window_bounds",
+                Box::new(|c: &mut TransferConfig| c.window_bounds = Some((1, 100))),
             ),
             (
                 "column_transforms",
@@ -2521,5 +2764,95 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("incremental"));
+    }
+
+    fn refused(c: &TransferConfig, needle: &str) {
+        let msg = c.validate().unwrap_err().to_string();
+        assert!(msg.contains(needle), "{needle}: {msg}");
+    }
+
+    #[test]
+    fn a_sweep_asked_for_is_refused_where_it_cannot_run() {
+        let windowed = || {
+            let mut c = cfg(SyncMode::Incremental, Some("id"));
+            c.windowed = true;
+            c
+        };
+        assert!(windowed().windowed_read());
+        windowed().validate().unwrap();
+        // Part of the incremental read.
+        let mut c = windowed();
+        c.mode = SyncMode::Full;
+        c.watermark = None;
+        refused(&c, "incremental");
+        // A chunked read bounds its statements through its own keyset loop.
+        let mut c = windowed();
+        c.chunk_rows = Some(1000);
+        refused(&c, "chunk_rows");
+        // Single-stream: an explicit fan-out can't happen. 0 (from the host)
+        // and 1 ask for none.
+        let mut c = windowed();
+        c.parallelism = 4;
+        refused(&c, "parallelism=4");
+        for p in [0, 1] {
+            let mut c = windowed();
+            c.parallelism = p;
+            c.validate().unwrap();
+        }
+        let mut c = windowed();
+        c.partition_source_expr = Some("id_raw".into());
+        refused(&c, "partition_source_expr");
+        // No key to sweep.
+        let mut c = windowed();
+        c.key = vec![];
+        refused(&c, "partition_column");
+        let mut c = windowed();
+        c.read_window_rows = Some(0);
+        refused(&c, "read_window_rows=0");
+        // Not for a source with no SQL statement to bound.
+        let mut c = windowed();
+        c.source_table = None;
+        let msg = c.validate_api().unwrap_err().to_string();
+        assert!(
+            msg.contains("windowed=True") && msg.contains("an API source"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn window_bounds_imply_a_sweep_of_a_backfill_range() {
+        let backfill = || {
+            let mut c = cfg(SyncMode::Incremental, Some("id"));
+            c.advance_watermark = false;
+            c.window_bounds = Some((201, 800));
+            c
+        };
+        assert!(backfill().windowed_read(), "the bounds ask for a sweep");
+        backfill().validate().unwrap();
+        // So everything a sweep can't do is refused for them too.
+        let mut c = backfill();
+        c.chunk_rows = Some(1000);
+        refused(&c, "chunk_rows");
+        // One key is a range; an inverted pair is empty.
+        let mut c = backfill();
+        c.window_bounds = Some((5, 5));
+        c.validate().unwrap();
+        c.window_bounds = Some((800, 201));
+        refused(&c, "window_bounds=(800, 201)");
+        // The rows outside the bounds aren't read: the cursor the run computes
+        // would pass them, and the window-scoped delete would remove them.
+        let mut c = backfill();
+        c.advance_watermark = true;
+        refused(&c, "advance_watermark=False");
+        let mut c = backfill();
+        c.delete_stale_in_window = true;
+        c.merge_prune_partition_by = Some("create_date".into());
+        refused(&c, "delete_stale_in_window");
+        // A sweep of the whole key range reads what one pass would, so both
+        // stay open to it.
+        c.window_bounds = None;
+        c.windowed = true;
+        c.advance_watermark = true;
+        c.validate().unwrap();
     }
 }

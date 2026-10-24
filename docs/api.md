@@ -26,6 +26,17 @@ hard-deletes stays in the destination forever; this is what converges the two.
 .. autofunction:: reconcile_keys
 ```
 
+## reconcile_values
+
+Measure value drift: keys on both sides whose columns differ, which every
+count-based check misses. Compares each column over a key window and counts the
+mismatches and the NULLs on one side only. See the
+[data-quality guide](guide/data-quality.md#checking-values-after-the-fact).
+
+```{eval-rst}
+.. autofunction:: reconcile_values
+```
+
 ## compact_state and state_keys
 
 Maintain the cursor state table: every incremental run appends a row to it and
@@ -91,6 +102,12 @@ Connection descriptors accepted as ``sync()``'s ``target`` argument. ``BigQuery`
    :members:
 
 .. autoclass:: ReconcileResult
+   :members:
+
+.. autoclass:: ValueReconcileResult
+   :members:
+
+.. autoclass:: ColumnDrift
    :members:
 
 .. autoclass:: StateKey

@@ -1,5 +1,5 @@
-"""Integration tests for the 0.15 delete/reconcile paths and the structured
-``TransferResult``.
+"""Integration tests for the 0.15 delete/reconcile paths, the structured
+``TransferResult``, and ``reconcile_values``' per-column comparison.
 
 These need a live PostgreSQL and ClickHouse (``docker compose up -d``); the
 fixtures in ``conftest.py`` skip the module if either is unreachable.
@@ -321,3 +321,264 @@ def test_reconcile_keeps_keys_that_differ_only_in_case(
     assert result.orphan_keys == 0
     assert result.rows_deleted == 0
     assert int(ch_client.command(f"SELECT count() FROM {CH_DB}.{unique_name}")) == 2
+
+
+def _drift(result):
+    """`reconcile_values` columns by name, as (mismatched, null_in_dest_only,
+    null_in_source_only, sorted sample)."""
+    return {
+        c.column: (c.mismatched, c.null_in_dest_only, c.null_in_source_only, sorted(c.sample))
+        for c in result.columns
+    }
+
+
+def test_reconcile_values_finds_value_drift_and_nulls_a_sync_wrote_from_postgres(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """#28 end to end: a source_query that has lost a column makes an
+    incremental run write it as NULL over values the source still holds. Key
+    counts match throughout; only a per-column comparison sees it."""
+    src = f"{unique_name}_src"
+    pg_conn.execute(f"DROP TABLE IF EXISTS {src}")
+    pg_conn.execute(
+        f"""
+        CREATE TABLE {src} (
+            id          bigint PRIMARY KEY,
+            amount      numeric(15, 2) NOT NULL,
+            state       text,
+            qty         integer NOT NULL,
+            updated_at  timestamp NOT NULL
+        )
+        """
+    )
+    pg_conn.execute(
+        f"""
+        INSERT INTO {src} VALUES
+            (1, 10.10, 'posted', 1, '2026-07-01 00:00:00.123456'),
+            (2, 20.20, 'posted', 2, '2026-07-01 01:00:00'),
+            (3, 30.30, 'draft',  3, '2026-07-01 02:00:00'),
+            (4, 40.40, 'posted', 4, '2026-07-01 03:00:00'),
+            (5, 50.50, NULL,     5, '2026-07-01 04:00:00'),
+            (6, 60.60, 'posted', 6, '2026-08-01 00:00:00')
+        """
+    )
+    common = dict(
+        dest_table=unique_name,
+        mode="incremental",
+        watermark="updated_at",
+        key=["id"],
+        state_key=src,
+        create_if_missing=True,
+    )
+    qh.sync(pg_source, ch_target, source_table=src, **common)
+
+    def reconcile():
+        return qh.reconcile_values(
+            pg_source, ch_target, unique_name, key="id", source_table=src, window="id <= 5"
+        )
+
+    clean = reconcile()
+    assert clean.compared_keys == 5
+    assert [c.column for c in clean.columns] == ["amount", "state", "qty", "updated_at"]
+    assert all(c.mismatched == 0 for c in clean.columns), clean.columns
+    assert clean.skipped_columns == []
+
+    # Hold the ReplacingMergeTree's parts apart, so each rewritten row sits
+    # beside its original: the comparison has to read the newest through FINAL.
+    ch_client.command(f"SYSTEM STOP MERGES {CH_DB}.{unique_name}")
+    try:
+        pg_conn.execute(f"UPDATE {src} SET updated_at = now() WHERE id IN (2, 3)")
+        # The #28 run: the query no longer carries `state`.
+        qh.sync(
+            pg_source,
+            ch_target,
+            source_query=f"SELECT id, amount, qty, updated_at FROM {src}",
+            **common,
+        )
+        # A source edit no watermark saw: plain value drift.
+        pg_conn.execute(f"UPDATE {src} SET qty = 999 WHERE id = 4")
+        assert int(ch_client.command(f"SELECT count() FROM {CH_DB}.{unique_name}")) == 8
+
+        drifted = reconcile()
+    finally:
+        ch_client.command(f"SYSTEM START MERGES {CH_DB}.{unique_name}")
+
+    assert drifted.source_rows == 5
+    assert drifted.dest_rows == 5, "FINAL collapses the rewritten rows"
+    assert drifted.compared_keys == 5
+    assert (drifted.missing_keys, drifted.orphan_keys, drifted.duplicate_keys) == (0, 0, 0)
+    assert _drift(drifted) == {
+        "amount": (0, 0, 0, []),
+        "state": (2, 2, 0, ["2", "3"]),
+        "qty": (1, 0, 0, ["4"]),
+        "updated_at": (0, 0, 0, []),
+    }
+
+
+def test_reconcile_values_reports_a_float_truncated_into_a_decimal_unless_tolerated(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """ClickHouse truncates a Float64 written into a Decimal column, so 0.29
+    lands in Decimal(15, 2) as 0.28. A float8 column overridden to a Decimal
+    goes down exactly that path."""
+    src = f"{unique_name}_src"
+    pg_conn.execute(f"DROP TABLE IF EXISTS {src}")
+    pg_conn.execute(f"CREATE TABLE {src} (id bigint PRIMARY KEY, price float8 NOT NULL)")
+    pg_conn.execute(f"INSERT INTO {src} VALUES (1, 0.29), (2, 0.57), (3, 0.5), (4, 32.9)")
+    qh.sync(
+        pg_source,
+        ch_target,
+        source_table=src,
+        dest_table=unique_name,
+        mode="full",
+        order_by=["id"],
+        create_if_missing=True,
+        type_overrides={"price": "Decimal(15, 2)"},
+    )
+    stored = ch_client.query(
+        f"SELECT toString(price) FROM {CH_DB}.{unique_name} ORDER BY id"
+    ).result_rows
+    assert [r[0] for r in stored] == ["0.28", "0.56", "0.5", "32.9"]
+
+    def price(**kwargs):
+        r = qh.reconcile_values(
+            pg_source, ch_target, unique_name, key="id", source_table=src, window="id > 0", **kwargs
+        )
+        (column,) = r.columns
+        return column
+
+    exact = price()
+    assert exact.mismatched == 2
+    assert sorted(exact.sample) == ["1", "2"]
+    assert exact.null_in_dest_only == 0
+    # One step of the column's scale covers every truncation, named per column
+    # or given once for every numeric column.
+    assert price(tolerance={"price": 0.01}).mismatched == 0
+    assert price(tolerance=0.01).mismatched == 0
+
+
+def test_reconcile_values_from_mysql_into_a_table_another_loader_created(
+    mysql_conn, ch_client, mysql_source, ch_target, unique_name
+):
+    """#28's setting: the ClickHouse table predates the sync, with every column
+    and its own types. `tinyint(1)` went into a Bool and a UInt8, text into
+    non-Nullable columns (where a NULL is stored as ''), and a DATETIME(6) into
+    a second-precision DateTime. None of that is drift; values a sync wrote
+    over, or never wrote, are."""
+    src = f"{unique_name}_src"
+    with mysql_conn.cursor() as cur:
+        cur.execute(f"DROP TABLE IF EXISTS `{src}`")
+        cur.execute(
+            f"""
+            CREATE TABLE `{src}` (
+                id          BIGINT PRIMARY KEY,
+                is_active   TINYINT(1) NOT NULL,
+                is_open     TINYINT(1) NOT NULL,
+                state       VARCHAR(20) NOT NULL,
+                note        VARCHAR(50) NULL,
+                qty         INT NOT NULL,
+                updated_at  DATETIME(6) NOT NULL
+            )
+            """
+        )
+        cur.execute(
+            f"""
+            INSERT INTO `{src}` VALUES
+                (1, 1, 1, 'posted', NULL, 10, '2026-07-01 00:00:00.123456'),
+                (2, 2, 2, 'posted', 'n2', 20, '2026-07-01 01:00:00.500000'),
+                (3, 0, 0, 'draft',  'n3', 30, '2026-07-01 02:00:00'),
+                (4, 1, 1, 'posted', NULL, 40, '2026-07-01 03:00:00'),
+                (5, 1, 0, 'cancel', 'n5', 50, '2026-07-01 04:00:00')
+            """
+        )
+    mysql_conn.commit()
+    ch_client.command(
+        f"""
+        CREATE TABLE {CH_DB}.{unique_name} (
+            id          Int64,
+            is_active   Bool,
+            is_open     UInt8,
+            state       LowCardinality(String),
+            note        String,
+            qty         Int32,
+            updated_at  DateTime('UTC')
+        ) ENGINE = ReplacingMergeTree(updated_at) ORDER BY id
+        """
+    )
+    common = dict(
+        dest_table=unique_name,
+        mode="incremental",
+        watermark="updated_at",
+        key=["id"],
+        state_key=src,
+        tinyint1_as_bool=False,
+    )
+    qh.sync(mysql_source, ch_target, source_table=src, **common)
+
+    def reconcile():
+        return qh.reconcile_values(
+            mysql_source, ch_target, unique_name, key="id", source_table=src, window="id > 0"
+        )
+
+    clean = reconcile()
+    assert clean.compared_keys == 5
+    assert [c.column for c in clean.columns] == [
+        "is_active",
+        "is_open",
+        "state",
+        "note",
+        "qty",
+        "updated_at",
+    ]
+    assert all(c.mismatched == 0 for c in clean.columns), clean.columns
+
+    ch_client.command(f"SYSTEM STOP MERGES {CH_DB}.{unique_name}")
+    try:
+        with mysql_conn.cursor() as cur:
+            cur.execute(f"UPDATE `{src}` SET updated_at = '2026-09-01 00:00:00' WHERE id IN (3, 5)")
+        mysql_conn.commit()
+        # The #28 run: `state` has dropped out of the query, so the column,
+        # which can't hold NULL, is reset to ''.
+        qh.sync(
+            mysql_source,
+            ch_target,
+            source_query=f"SELECT id, is_active, is_open, note, qty, updated_at FROM `{src}`",
+            **common,
+        )
+        with mysql_conn.cursor() as cur:
+            cur.execute(f"UPDATE `{src}` SET qty = 999 WHERE id = 2")
+        mysql_conn.commit()
+        assert int(ch_client.command(f"SELECT count() FROM {CH_DB}.{unique_name}")) == 7
+
+        drifted = reconcile()
+    finally:
+        ch_client.command(f"SYSTEM START MERGES {CH_DB}.{unique_name}")
+
+    assert drifted.dest_rows == 5
+    assert drifted.compared_keys == 5
+    assert (drifted.missing_keys, drifted.orphan_keys, drifted.duplicate_keys) == (0, 0, 0)
+    assert _drift(drifted) == {
+        "is_active": (0, 0, 0, []),
+        "is_open": (0, 0, 0, []),
+        "state": (2, 2, 0, ["3", "5"]),
+        "note": (0, 0, 0, []),
+        "qty": (1, 0, 0, ["2"]),
+        "updated_at": (0, 0, 0, []),
+    }
+
+
+def test_reconcile_values_refuses_a_bigquery_destination(pg_source, unique_name):
+    """Not supported yet, and said so before anything is read."""
+    try:
+        qh.reconcile_values(
+            pg_source,
+            qh.BigQuery("some-project", dataset_id="analytics"),
+            unique_name,
+            key="id",
+            source_table="whatever",
+            window="id > 0",
+        )
+    except RuntimeError as e:
+        assert "BigQuery destination" in str(e), e
+    else:
+        raise AssertionError("a BigQuery destination must be refused")

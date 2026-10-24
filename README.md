@@ -398,6 +398,8 @@ errors are surfaced verbatim rather than wrapped in something generic.
 | `probe_max_cost` | Skip a setup-phase watermark probe when the planner estimates it above this cost. Without an index, `MAX(watermark)` and the nullable-watermark `count(*)` are full scans on every run (measured 57s each on a 14.9 GB table). Asked via `EXPLAIN`, never `ANALYZE`. `0` = always probe (default `50000`) |
 | `read_window_rows` | Sweep an unindexed read in bounded key ranges so each piece finishes inside a hot standby's conflict window, instead of being cancelled with `40001`. Activates automatically; this only sizes it (default `None`) |
 | `window_target_secs` | What one windowed read should take; the sweep re-sizes itself to converge on it (default `5.0`) |
+| `windowed` | Sweep the read in key windows even when the watermark probe is cheap, e.g. a long backfill on the primary key. Incremental, Postgres/MySQL, single-stream; the key must be an integer (default `False`) |
+| `window_bounds` | `(lo, hi)`: the key range a windowed read sweeps, instead of probing `MIN`/`MAX`. Rows outside it aren't read, so it needs `advance_watermark=False`. Implies `windowed` (default `None`) |
 | `retry_max_attempts` | Re-run the whole transfer on a transient *source* error (PG recovery-conflict/cancel; MySQL gone-away/lock-wait/deadlock). `1` = no retry (default) |
 | `column_transforms` | Per-column SQL value transforms over `source_table=` (e.g. `{"ts":"ts AT TIME ZONE 'UTC'"}`), preserving range partitioning. Postgres/MySQL/ClickHouse only |
 | `evolve_schema` | Auto-`ADD COLUMN` (Nullable) when the source has a column the destination lacks, instead of erroring. ADD-only. Default `False` |

@@ -386,6 +386,8 @@ def test_knobs_that_cannot_apply_to_a_frame_are_refused(ch_target, unique_name):
         ({"chunk_rows": 1000}, "chunk_rows"),
         ({"read_max_rows_per_sec": 100}, "read_max_rows_per_sec"),
         ({"retry_max_attempts": 3}, "retry_max_attempts"),
+        ({"windowed": True}, "windowed"),
+        ({"window_bounds": (1, 100)}, "window_bounds"),
     ]:
         with pytest.raises(RuntimeError, match=needle):
             quickhouse.from_pandas(

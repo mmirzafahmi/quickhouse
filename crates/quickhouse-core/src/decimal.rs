@@ -250,7 +250,9 @@ impl CoercionTally {
             | WarningKind::WindowBoundsUnavailable
             | WarningKind::NullCheckSkipped
             | WarningKind::RetriedAfterPartialWrite
-            | WarningKind::StorageWriteCountMismatch => None,
+            | WarningKind::StorageWriteCountMismatch
+            | WarningKind::UnsourcedDestinationColumn
+            | WarningKind::AbandonedResumeMarker => None,
         }
     }
 

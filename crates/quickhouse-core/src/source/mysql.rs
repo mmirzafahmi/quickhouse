@@ -75,10 +75,15 @@ fn build_opts(
     Ok(builder.into())
 }
 
-/// The `SET` a new connection runs, if any: the statement timeout and, with
-/// `utc_session`, a UTC session time zone. One statement, so setup costs one
-/// round trip however many are set.
-fn session_setup_sql(statement_timeout_secs: u64, utc_session: bool) -> Option<String> {
+/// The `SET` a new connection runs, if any: the statement timeout, with
+/// `utc_session` a UTC session time zone, and with `read_only` a read-only
+/// session. One statement, so setup costs one round trip however many are
+/// set, and a server that refuses any of them fails the connection.
+fn session_setup_sql(
+    statement_timeout_secs: u64,
+    utc_session: bool,
+    read_only: bool,
+) -> Option<String> {
     let mut vars = Vec::new();
     if statement_timeout_secs > 0 {
         vars.push(format!(
@@ -88,6 +93,11 @@ fn session_setup_sql(statement_timeout_secs: u64, utc_session: bool) -> Option<S
     }
     if utc_session {
         vars.push("time_zone = '+00:00'".to_string());
+    }
+    // `transaction_read_only`, not `tx_read_only`: MySQL 8.0 removed the old
+    // name, and 5.7.20 added this one.
+    if read_only {
+        vars.push("transaction_read_only = ON".to_string());
     }
     (!vars.is_empty()).then(|| format!("SET SESSION {}", vars.join(", ")))
 }
@@ -100,6 +110,7 @@ pub struct MySqlSource {
     client_cert_file: Option<String>,
     client_key_file: Option<String>,
     utc_session: bool,
+    read_only: bool,
 }
 
 /// Decode a MySQL wire `Value` as an `i128`, whichever protocol produced it.
@@ -131,6 +142,7 @@ impl MySqlSource {
         client_cert_file: Option<String>,
         client_key_file: Option<String>,
         utc_session: bool,
+        read_only: bool,
     ) -> Self {
         Self {
             dsn: dsn.into(),
@@ -140,6 +152,7 @@ impl MySqlSource {
             client_cert_file,
             client_key_file,
             utc_session,
+            read_only,
         }
     }
 
@@ -150,6 +163,11 @@ impl MySqlSource {
     }
 
     /// Open a fresh connection. Each parallel query stream should use its own.
+    ///
+    /// This is the only place quickhouse opens a MySQL connection: the setup
+    /// one, each partition's, a chunked or windowed read's, a retried
+    /// attempt's and `reconcile_keys`' all come through here, so the session
+    /// setup below holds on every one of them.
     pub async fn connect(&self) -> Result<Conn> {
         let opts = build_opts(
             &self.dsn,
@@ -161,7 +179,11 @@ impl MySqlSource {
         let mut conn = Conn::new(opts)
             .await
             .map_err(|e| EtlError::from(e).context("connecting to mysql"))?;
-        if let Some(sql) = session_setup_sql(self.statement_timeout_secs, self.utc_session) {
+        if let Some(sql) = session_setup_sql(
+            self.statement_timeout_secs,
+            self.utc_session,
+            self.read_only,
+        ) {
             conn.query_drop(sql)
                 .await
                 .map_err(|e| EtlError::from(e).context("setting mysql session variables"))?;
@@ -719,24 +741,39 @@ mod tests {
 
     #[test]
     fn session_setup_is_one_statement_or_none() {
-        assert_eq!(session_setup_sql(0, false), None);
+        assert_eq!(session_setup_sql(0, false, false), None);
         assert_eq!(
-            session_setup_sql(30, false).as_deref(),
+            session_setup_sql(30, false, false).as_deref(),
             Some("SET SESSION MAX_EXECUTION_TIME = 30000")
         );
         assert_eq!(
-            session_setup_sql(0, true).as_deref(),
+            session_setup_sql(0, true, false).as_deref(),
             Some("SET SESSION time_zone = '+00:00'")
         );
         assert_eq!(
-            session_setup_sql(30, true).as_deref(),
+            session_setup_sql(30, true, false).as_deref(),
             Some("SET SESSION MAX_EXECUTION_TIME = 30000, time_zone = '+00:00'")
         );
     }
 
     #[test]
+    fn a_read_only_session_joins_the_same_one_statement() {
+        assert_eq!(
+            session_setup_sql(0, false, true).as_deref(),
+            Some("SET SESSION transaction_read_only = ON")
+        );
+        assert_eq!(
+            session_setup_sql(30, true, true).as_deref(),
+            Some(
+                "SET SESSION MAX_EXECUTION_TIME = 30000, time_zone = '+00:00', \
+                 transaction_read_only = ON"
+            )
+        );
+    }
+
+    #[test]
     fn select_sql_with_table_and_filters() {
-        let src = MySqlSource::new("mysql://x", 0, None, false, None, None, false);
+        let src = MySqlSource::new("mysql://x", 0, None, false, None, None, false, false);
         let part = Partition {
             label: "r0".into(),
             predicate: Some("`id` >= 1 AND `id` <= 100".into()),
@@ -759,7 +796,7 @@ mod tests {
 
     #[test]
     fn select_sql_with_query() {
-        let src = MySqlSource::new("mysql://x", 0, None, false, None, None, false);
+        let src = MySqlSource::new("mysql://x", 0, None, false, None, None, false, false);
         let part = Partition {
             label: "all".into(),
             predicate: None,
@@ -778,7 +815,7 @@ mod tests {
 
     #[test]
     fn select_sql_transform_and_keyset() {
-        let src = MySqlSource::new("mysql://x", 0, None, false, None, None, false);
+        let src = MySqlSource::new("mysql://x", 0, None, false, None, None, false, false);
         let part = Partition {
             label: "all".into(),
             predicate: None,

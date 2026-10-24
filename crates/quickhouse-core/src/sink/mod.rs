@@ -35,27 +35,64 @@ pub(crate) fn backoff_delay(attempt: u32) -> std::time::Duration {
     std::time::Duration::from_millis(BACKOFF_BASE_MS.saturating_mul(mult))
 }
 
+/// `name` as two column names are compared: lowercased when
+/// `case_insensitive` (BigQuery treats column names case-insensitively;
+/// ClickHouse is case-sensitive).
+fn column_key(name: &str, case_insensitive: bool) -> String {
+    if case_insensitive {
+        name.to_ascii_lowercase()
+    } else {
+        name.to_string()
+    }
+}
+
 /// The columns in `desired` whose names aren't already present in `existing`
-/// — the set schema-evolution must `ADD COLUMN`. `case_insensitive` compares
-/// lowercased (BigQuery treats column names case-insensitively; ClickHouse is
-/// case-sensitive). Preserves `desired` order.
+/// — the set schema-evolution must `ADD COLUMN`. `case_insensitive` as in
+/// [`column_key`]. Preserves `desired` order.
 pub(crate) fn missing_columns<'a>(
     existing: &[String],
     desired: &'a [ColumnType],
     case_insensitive: bool,
 ) -> Vec<&'a ColumnType> {
-    let norm = |s: &str| {
-        if case_insensitive {
-            s.to_ascii_lowercase()
-        } else {
-            s.to_string()
-        }
-    };
-    let have: std::collections::HashSet<String> = existing.iter().map(|s| norm(s)).collect();
+    let have: std::collections::HashSet<String> = existing
+        .iter()
+        .map(|s| column_key(s, case_insensitive))
+        .collect();
     desired
         .iter()
-        .filter(|c| !have.contains(&norm(&c.name)))
+        .filter(|c| !have.contains(&column_key(&c.name, case_insensitive)))
         .collect()
+}
+
+/// The names in `existing` that no column of `written` feeds — the other
+/// direction from [`missing_columns`]: destination columns a write leaves
+/// without a value. `case_insensitive` as in [`column_key`]. Preserves
+/// `existing` order.
+pub(crate) fn unsourced_columns(
+    existing: Vec<String>,
+    written: &[ColumnType],
+    case_insensitive: bool,
+) -> Vec<String> {
+    let fed: std::collections::HashSet<String> = written
+        .iter()
+        .map(|c| column_key(&c.name, case_insensitive))
+        .collect();
+    existing
+        .into_iter()
+        .filter(|name| !fed.contains(&column_key(name, case_insensitive)))
+        .collect()
+}
+
+/// An in-progress chunk-resume marker, as [`Sink::read_chunk_state`] reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkMarker {
+    /// The keyset cursor the interrupted run had durably read past.
+    pub cursor: String,
+    /// The bound it froze (see `sync::MarkerBound`); empty for none.
+    pub upper: String,
+    /// The [`TransferConfig::chunk_read_id`] of the read that wrote it; empty
+    /// for a marker written before 0.20.9, which can't say.
+    pub read: String,
 }
 
 /// One `(state_key, dest_table)` cursor in a state table, as
@@ -180,6 +217,22 @@ pub trait Sink: Send + Sync {
         cfg: &TransferConfig,
     ) -> Result<Vec<String>>;
 
+    /// The other direction from [`Self::add_missing_columns`]: the columns of
+    /// the existing `table` that no entry of `columns` feeds and that the
+    /// destination doesn't fill itself (a `DEFAULT`, or on ClickHouse a
+    /// `MATERIALIZED`, `ALIAS` or `EPHEMERAL` expression), so a row written
+    /// with `columns` leaves them without a value. Empty when the table
+    /// doesn't exist. See
+    /// [`crate::config::WarningKind::UnsourcedDestinationColumn`]. Default:
+    /// none, for a destination that can't list its columns.
+    async fn unsourced_columns(
+        &self,
+        _table: &str,
+        _columns: &[ColumnType],
+    ) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
     /// Which destination engine this writes to — threaded into `transform::plan`
     /// for destination-aware type promotion. Pure/no I/O.
     fn dest_kind(&self) -> crate::config::DestKind;
@@ -207,13 +260,14 @@ pub trait Sink: Send + Sync {
         false
     }
 
-    /// In-progress chunk-resume marker `(cursor, upper)`, or `None`. Default
-    /// `None` — a destination without chunked-read support has nothing to resume.
-    async fn read_chunk_state(&self, _cfg: &TransferConfig) -> Result<Option<(String, String)>> {
+    /// In-progress chunk-resume marker, or `None`. Default `None` — a
+    /// destination without chunked-read support has nothing to resume.
+    async fn read_chunk_state(&self, _cfg: &TransferConfig) -> Result<Option<ChunkMarker>> {
         Ok(None)
     }
 
-    /// Persist a per-chunk resume marker. Default: unsupported — only a
+    /// Persist a per-chunk resume marker, recording `cfg`'s
+    /// [`TransferConfig::chunk_read_id`] with it. Default: unsupported — only a
     /// destination that actually supports chunked resumable reads is ever asked.
     async fn persist_chunk_cursor(
         &self,
@@ -457,6 +511,24 @@ mod tests {
             .map(|c| c.name.as_str())
             .collect();
         assert_eq!(ci, vec!["amount"]);
+    }
+
+    #[test]
+    fn unsourced_columns_are_the_destination_columns_nothing_writes() {
+        let existing = || vec!["id".to_string(), "Name".to_string(), "legacy".to_string()];
+        let written = vec![col("id"), col("name")];
+        // Case-sensitive (ClickHouse): "name" doesn't feed "Name", in
+        // `existing` order.
+        assert_eq!(
+            unsourced_columns(existing(), &written, false),
+            vec!["Name", "legacy"]
+        );
+        // Case-insensitive (BigQuery): it does.
+        assert_eq!(
+            unsourced_columns(existing(), &written, true),
+            vec!["legacy"]
+        );
+        assert!(unsourced_columns(Vec::new(), &written, false).is_empty());
     }
 
     #[test]

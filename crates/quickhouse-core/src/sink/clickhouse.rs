@@ -308,6 +308,30 @@ impl ClickHouseSink {
         Ok(added)
     }
 
+    /// See [`crate::sink::Sink::unsourced_columns`]. A column with a
+    /// `default_kind` (`DEFAULT`, `MATERIALIZED`, `ALIAS`, `EPHEMERAL`) is the
+    /// table's own to fill, so it is never one. Case-sensitive, as
+    /// ClickHouse column names are.
+    pub async fn unsourced_columns(
+        &self,
+        table: &str,
+        columns: &[ColumnType],
+    ) -> Result<Vec<String>> {
+        let sql = format!(
+            "SELECT name FROM system.columns WHERE database = '{}' AND table = '{}' \
+             AND default_kind = '' ORDER BY position",
+            escape_sql_string(&self.cfg.database),
+            escape_sql_string(table),
+        );
+        let existing = self
+            .query_column(&sql)
+            .await?
+            .iter()
+            .filter_map(|name| crate::source::clickhouse::tsv_field(name))
+            .collect();
+        Ok(crate::sink::unsourced_columns(existing, columns, false))
+    }
+
     /// Generate and run this destination's own `CREATE TABLE` DDL for `table`.
     pub async fn create_table(
         &self,
@@ -450,25 +474,32 @@ impl ClickHouseSink {
                 rows,
                 chunk_cursor: "",
                 chunk_upper: "",
+                chunk_read: "",
             },
         )
         .await
     }
 
-    /// Read an in-progress chunk-resume marker `(cursor, upper)` for this
-    /// `(state_key, dest_table)`, or `None` if there's nothing to resume (no
-    /// state row, or `chunk_cursor` empty — the marker a clean run clears).
-    /// `upper` is the frozen snapshot-max the interrupted run was reading up to,
-    /// so resumption reads the same window rather than re-snapshotting.
-    pub async fn read_chunk_state(&self, cfg: &TransferConfig) -> Result<Option<(String, String)>> {
-        if !self.state_table_ready(&cfg.state_table_name)
-            && !self.table_exists(&cfg.state_table_name).await?
-        {
-            return Ok(None);
+    /// Read an in-progress chunk-resume marker for this `(state_key,
+    /// dest_table)`, or `None` if there's nothing to resume (no state row, or
+    /// `chunk_cursor` empty — the marker a clean run clears). Its `upper` is
+    /// the frozen snapshot-max the interrupted run was reading up to, so
+    /// resumption reads the same window rather than re-snapshotting.
+    pub async fn read_chunk_state(
+        &self,
+        cfg: &TransferConfig,
+    ) -> Result<Option<crate::sink::ChunkMarker>> {
+        if !self.state_table_ready(&cfg.state_table_name) {
+            if !self.table_exists(&cfg.state_table_name).await? {
+                return Ok(None);
+            }
+            // Migrated before it is read: a table from before 0.20.9 has no
+            // `chunk_read` to select. A no-op once this process has checked it.
+            self.ensure_state_table(&cfg.state_table_name).await?;
         }
         let source_id = cfg.effective_state_key();
         let sql = format!(
-            "SELECT chunk_cursor, chunk_upper FROM {}.{} FINAL \
+            "SELECT chunk_cursor, chunk_upper, chunk_read FROM {}.{} FINAL \
              WHERE source_table = '{}' AND dest_table = '{}' \
              ORDER BY run_ts DESC LIMIT 1 FORMAT TabSeparated",
             crate::ddl::quote_ident(&self.cfg.database),
@@ -483,16 +514,21 @@ impl ClickHouseSink {
             }
             other => other?,
         };
-        // One TSV line: "<cursor>\t<upper>". Empty cursor = no resume marker.
+        // One TSV line: "<cursor>\t<upper>\t<read>". Empty cursor = no
+        // resume marker.
         match rows.first() {
             Some(line) => {
-                let mut it = line.splitn(2, '\t');
-                let cursor = it.next().unwrap_or("").to_string();
-                let upper = it.next().unwrap_or("").to_string();
+                let mut it = line.splitn(3, '\t');
+                let mut next = || it.next().unwrap_or("").to_string();
+                let (cursor, upper, read) = (next(), next(), next());
                 if cursor.is_empty() {
                     Ok(None)
                 } else {
-                    Ok(Some((cursor, upper)))
+                    Ok(Some(crate::sink::ChunkMarker {
+                        cursor,
+                        upper,
+                        read,
+                    }))
                 }
             }
             None => Ok(None),
@@ -513,6 +549,7 @@ impl ClickHouseSink {
         rows: u64,
     ) -> Result<()> {
         let source_id = cfg.effective_state_key();
+        let read = cfg.chunk_read_id();
         self.insert_state_row(
             cfg,
             StateRow {
@@ -522,6 +559,7 @@ impl ClickHouseSink {
                 rows,
                 chunk_cursor: cursor,
                 chunk_upper: upper,
+                chunk_read: &read,
             },
         )
         .await
@@ -1053,13 +1091,19 @@ impl Sink for ClickHouseSink {
     ) -> Result<Vec<String>> {
         ClickHouseSink::add_missing_columns(self, table, columns, cfg).await
     }
+    async fn unsourced_columns(&self, table: &str, columns: &[ColumnType]) -> Result<Vec<String>> {
+        ClickHouseSink::unsourced_columns(self, table, columns).await
+    }
     fn dest_kind(&self) -> crate::config::DestKind {
         crate::config::DestKind::ClickHouse
     }
     fn namespace(&self) -> &str {
         self.database()
     }
-    async fn read_chunk_state(&self, cfg: &TransferConfig) -> Result<Option<(String, String)>> {
+    async fn read_chunk_state(
+        &self,
+        cfg: &TransferConfig,
+    ) -> Result<Option<crate::sink::ChunkMarker>> {
         ClickHouseSink::read_chunk_state(self, cfg).await
     }
     async fn persist_chunk_cursor(
@@ -1117,7 +1161,7 @@ fn ident(name: &str) -> String {
 /// query built from it (independently verified against a real ClickHouse
 /// server: `SELECT 'ends_with_backslash\'` fails with "Code: 62. Single
 /// quoted string is not closed").
-fn escape_sql_string(s: &str) -> String {
+pub(crate) fn escape_sql_string(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\'', "''")
 }
 
@@ -1291,6 +1335,8 @@ struct StateRow<'a> {
     rows: u64,
     chunk_cursor: &'a str,
     chunk_upper: &'a str,
+    /// The read the marker belongs to: see `TransferConfig::chunk_read_id`.
+    chunk_read: &'a str,
 }
 
 /// The `INSERT` for one state row, carrying a dedup token of its own.
@@ -1311,9 +1357,10 @@ struct StateRow<'a> {
 fn state_row_insert_sql(database: &str, state_table: &str, token: &str, row: &StateRow) -> String {
     format!(
         "INSERT INTO {}.{} \
-         (source_table, dest_table, last_watermark, rows, chunk_cursor, chunk_upper) \
+         (source_table, dest_table, last_watermark, rows, chunk_cursor, chunk_upper, \
+         chunk_read) \
          SETTINGS {DEDUP_TOKEN_SETTING} = '{}' \
-         VALUES ('{}', '{}', '{}', {}, '{}', '{}')",
+         VALUES ('{}', '{}', '{}', {}, '{}', '{}', '{}')",
         crate::ddl::quote_ident(database),
         crate::ddl::quote_ident(state_table),
         escape_sql_string(token),
@@ -1323,6 +1370,7 @@ fn state_row_insert_sql(database: &str, state_table: &str, token: &str, row: &St
         row.rows,
         escape_sql_string(row.chunk_cursor),
         escape_sql_string(row.chunk_upper),
+        escape_sql_string(row.chunk_read),
     )
 }
 
@@ -1646,6 +1694,7 @@ mod tests {
                 rows: 5,
                 chunk_cursor: "42",
                 chunk_upper: "99",
+                chunk_read: "72e7c1b8e7a66aec",
             },
         );
         assert!(
@@ -1653,7 +1702,7 @@ mod tests {
             "{sql}"
         );
         assert!(
-            sql.ends_with("VALUES ('o''k', 'orders', '', 5, '42', '99')"),
+            sql.ends_with("VALUES ('o''k', 'orders', '', 5, '42', '99', '72e7c1b8e7a66aec')"),
             "{sql}"
         );
     }

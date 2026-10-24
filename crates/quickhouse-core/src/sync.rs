@@ -29,7 +29,7 @@ use crate::decode_clickhouse::ChArrowDecoder;
 use crate::decode_mysql::MySqlBatcher;
 use crate::error::{EtlError, Result};
 use crate::memory::{MemoryBudget, Reservation};
-use crate::sink::{build_sink, Sink};
+use crate::sink::{build_sink, ChunkMarker, Sink};
 use crate::source::appsflyer::AppsFlyerSource;
 use crate::source::clevertap::CleverTapSource;
 use crate::source::clickhouse::quote_ch_table;
@@ -687,6 +687,7 @@ impl Warnings {
             .filter(|w| w.kind == first.kind && w.column == first.column)
             .map(|w| w.count)
             .sum();
+        restate_folded_coercion(&mut folded);
         Some(folded)
     }
 
@@ -714,6 +715,7 @@ impl Warnings {
                     if f.sample.is_none() {
                         f.sample = w.sample;
                     }
+                    restate_folded_coercion(f);
                 }
                 None => folded.push(w),
             }
@@ -725,6 +727,26 @@ impl Warnings {
                 .then_with(|| a.column.cmp(&b.column))
         });
         folded
+    }
+}
+
+/// Restate a folded coercion's message for its folded `count`.
+///
+/// Every read that met a coercion reports it — each partition, each chunk,
+/// each window of a sweep — and each wrote the message from its own rows, so
+/// the fold kept the first read's number under the run's total: 2 partitions
+/// that flattened one value each said "1 tinyint(1) value(s)" with `count` 2.
+/// A table-level warning's message is its call site's, and is kept.
+fn restate_folded_coercion(w: &mut TransferWarning) {
+    let coercion = matches!(
+        w.kind,
+        WarningKind::CollapsedBool
+            | WarningKind::CoercedDate
+            | WarningKind::CoercedDecimal
+            | WarningKind::CoercedScalar
+    );
+    if let (true, Some(column)) = (coercion, w.column.as_deref()) {
+        w.message = coercion_message(w.kind, column, w.count);
     }
 }
 
@@ -1416,7 +1438,8 @@ struct SourceSetup {
     /// [`plan_watermark_probes`].
     stream_max_cursor: bool,
     /// `Some` when the read's own filter plans as a sequential scan, so it must
-    /// be swept in bounded key windows to survive a standby's conflict window.
+    /// be swept in bounded key windows to survive a standby's conflict window,
+    /// or when the transfer asks for a sweep (`TransferConfig::windowed`).
     window: Option<WindowPlan>,
     /// ClickHouse only: the watermark's ClickHouse type, which types the
     /// filter's cursor literals (see `build_watermark_filter_clickhouse`).
@@ -1778,6 +1801,7 @@ async fn run_transfer_impl(
             my.client_cert_file.clone(),
             my.client_key_file.clone(),
             my.utc_session,
+            my.read_only,
         )),
         SourceConfig::ClickHouse(ch) => Source::ClickHouse(ClickHouseSource::new(ch)?),
         SourceConfig::BigQuery(_) => unreachable!("handled via early return above"),
@@ -1845,13 +1869,14 @@ async fn run_transfer_impl(
 
     // The committed cursor from the last fully-successful run (None on a first
     // run), and an in-progress chunk-resume marker (frozen upper + last durable
-    // cursor; chunked reads only, and only if a prior run was cut short). Read
-    // before the source is probed, because the probes can use the cursor: see
-    // `partitions_above` and `watermark_bounds_the_key`.
+    // cursor; chunked reads only, and only if a prior run of this read was cut
+    // short). Read before the source is probed, because the probes can use the
+    // cursor: see `partitions_above` and `watermark_bounds_the_key`.
     let (committed, resume) = if cfg.mode == SyncMode::Incremental {
         let committed = sink.read_last_watermark(&cfg).await?;
         let resume = if cfg.chunk_rows.is_some() {
-            sink.read_chunk_state(&cfg).await?
+            let marker = sink.read_chunk_state(&cfg).await?;
+            resumable_marker(marker, &cfg, committed.as_deref(), &warnings)
         } else {
             None
         };
@@ -2264,8 +2289,10 @@ async fn run_transfer_impl(
     // snapshot, so a stream-derived cursor has to allow for how long it took.
     let read_spans_statements =
         window_plan.is_some() || partitions.len() > 1 || chunk_plan.is_some();
-    // Setup raised its warnings already: one that is fatal stops the run here,
-    // before any table is created or written.
+    // Setup raised its warnings already, and the destination's columns raise
+    // theirs here: one that is fatal stops the run before any table is
+    // created or written.
+    warn_on_unsourced_columns(sink.as_ref(), &cfg, &plan.dest_columns, &warnings).await?;
     check_fatal(&cfg, sink.as_ref(), &warnings, Before::Write)?;
 
     // --- Ensure destination / staging tables exist. ---
@@ -2697,6 +2724,12 @@ async fn run_transfer_bigquery(
              discrete range partitions for an expression to bound)",
         ));
     }
+    if cfg.windowed_read() {
+        return Err(EtlError::config(
+            "windowed=True and window_bounds are not supported for a BigQuery source (it reads \
+             through one Storage Read session, with no statement for a key window to bound)",
+        ));
+    }
     let (client, project_id) = source.connect().await?;
     tracing::info!("authenticated with bigquery, project_id={project_id}");
 
@@ -2807,6 +2840,7 @@ async fn run_transfer_bigquery(
         ));
     }
 
+    warn_on_unsourced_columns(sink.as_ref(), &cfg, &plan.dest_columns, &warnings).await?;
     check_fatal(&cfg, sink.as_ref(), &warnings, Before::Write)?;
     let target_table = prepare_target(
         &sink,
@@ -3297,6 +3331,7 @@ async fn run_transfer_api(
         ));
     }
 
+    warn_on_unsourced_columns(sink.as_ref(), &cfg, &plan.dest_columns, &warnings).await?;
     check_fatal(&cfg, sink.as_ref(), &warnings, Before::Write)?;
     let target_table = prepare_target(
         &sink,
@@ -3752,6 +3787,7 @@ async fn run_transfer_frame(
         ));
     }
 
+    warn_on_unsourced_columns(sink.as_ref(), &cfg, &plan.dest_columns, &warnings).await?;
     check_fatal(&cfg, sink.as_ref(), &warnings, Before::Write)?;
     let target_table = prepare_target(
         &sink,
@@ -4124,11 +4160,24 @@ async fn setup_postgres(
     // keyset loop, which a sweep would bypass: on a staged destination the
     // rows would land in the template table every chunk is cloned from, and
     // be dropped with it.
-    let window = if window_activated && cfg.chunk_rows.is_none() {
-        match window_key(cfg, &source_cols) {
-            Some((col, _)) if watermark_bounds_the_key(watermark, &col, cursor) => {
+    // A sweep asked for (`windowed`, `window_bounds`) doesn't wait on the
+    // probes: a read with a cheap MAX can be long all the same.
+    let forced = cfg.windowed_read();
+    let window = if (window_activated || forced) && cfg.chunk_rows.is_none() {
+        let key = if forced {
+            Some(forced_window_key(cfg, &source_cols)?)
+        } else {
+            window_key(cfg, &source_cols)
+        };
+        match key {
+            Some((col, _)) if !forced && watermark_bounds_the_key(watermark, &col, cursor) => {
                 key_bounded = true;
                 None
+            }
+            // The caller's range: nothing to probe, and nothing outside it is
+            // read, a NULL key included.
+            Some((col, _)) if cfg.window_bounds.is_some() => {
+                plan_read_window(cfg, cfg.window_bounds, quote_pg(&col), false)
             }
             Some((col, nullable_key)) => {
                 let first = s
@@ -4337,11 +4386,20 @@ async fn setup_mysql(
     // keyset loop, which a sweep would bypass: on a staged destination the
     // rows would land in the template table every chunk is cloned from, and
     // be dropped with it.
-    let window = if window_activated && cfg.chunk_rows.is_none() {
-        match window_key(cfg, &source_cols) {
-            Some((col, _)) if watermark_bounds_the_key(watermark, &col, cursor) => {
+    let forced = cfg.windowed_read();
+    let window = if (window_activated || forced) && cfg.chunk_rows.is_none() {
+        let key = if forced {
+            Some(forced_window_key(cfg, &source_cols)?)
+        } else {
+            window_key(cfg, &source_cols)
+        };
+        match key {
+            Some((col, _)) if !forced && watermark_bounds_the_key(watermark, &col, cursor) => {
                 key_bounded = true;
                 None
+            }
+            Some((col, _)) if cfg.window_bounds.is_some() => {
+                plan_read_window(cfg, cfg.window_bounds, quote_my(&col), false)
             }
             Some((col, nullable_key)) => {
                 let first = s
@@ -4398,6 +4456,52 @@ async fn setup_mysql(
         keyset_not_null: false,
         control: Some(ControlConn::MySql(control)),
     })
+}
+
+/// The `(cursor, upper)` of a chunk-resume marker this run may resume: one its
+/// own read wrote, or one from before 0.20.9, which can't say whose it is.
+/// Another read's marker, under a shared state key, is left alone and
+/// reported as [`WarningKind::AbandonedResumeMarker`]: its cursor and frozen
+/// bound belong to that read's range, so resuming it would read only where
+/// the two ranges overlap, often nothing, and report success.
+fn resumable_marker(
+    marker: Option<ChunkMarker>,
+    cfg: &TransferConfig,
+    committed: Option<&str>,
+    warnings: &Warnings,
+) -> Option<(String, String)> {
+    let marker = marker?;
+    if marker.read.is_empty() || marker.read == cfg.chunk_read_id() {
+        return Some((marker.cursor, marker.upper));
+    }
+    let keyset = cfg.keyset_column().unwrap_or_default();
+    let from = match committed {
+        Some(c) => format!("the saved cursor, {c}"),
+        None => "the start".to_string(),
+    };
+    let unread = if cfg.advance_watermark {
+        ""
+    } else {
+        " With advance_watermark=False nothing else reads the rest of that query's range: run \
+         it again to read it, under a state_key of its own so no other read replaces its marker."
+    };
+    let message = format!(
+        "state_key '{}' into '{}' holds the resume marker of an unfinished chunk_rows read of a \
+         different query, stopped past {keyset} {}. This run doesn't resume it, and reads from \
+         {from} instead.{unread}",
+        cfg.effective_state_key(),
+        cfg.dest_table,
+        marker.cursor,
+    );
+    tracing::warn!("{message}");
+    warnings.push(TransferWarning {
+        kind: WarningKind::AbandonedResumeMarker,
+        column: None,
+        count: 0,
+        sample: Some(marker.cursor),
+        message,
+    });
+    None
 }
 
 /// Resolved plan for a keyset-chunked resumable read (see
@@ -4799,6 +4903,32 @@ fn window_key(cfg: &TransferConfig, source_cols: &[ColumnType]) -> Option<(Strin
     Some((col, c.nullable))
 }
 
+/// [`window_key`] for a read that asked to be swept (`windowed`,
+/// `window_bounds`). There a key the sweep can't bound is a config error, not
+/// `None`: `None` reads in one pass, the very read the caller set out to avoid.
+fn forced_window_key(cfg: &TransferConfig, source_cols: &[ColumnType]) -> Result<(String, bool)> {
+    if let Some(key) = window_key(cfg, source_cols) {
+        return Ok(key);
+    }
+    // `validate` already refused a run with no key column at all.
+    let col = cfg.keyset_column().unwrap_or_default();
+    let why = if cfg.column_transforms.contains_key(&col) {
+        "is in column_transforms: a window would bound the transformed value, which no index on \
+         the column serves"
+            .to_string()
+    } else {
+        match source_cols.iter().find(|c| c.name == col) {
+            Some(c) => format!("must be an integer, and is {:?}", c.arrow),
+            None => "isn't a column the source returns".to_string(),
+        }
+    };
+    Err(EtlError::config(format!(
+        "windowed=True and window_bounds sweep the read in windows of '{col}' (partition_column, \
+         else the first key column), which {why}. Set partition_column to an integer column an \
+         index serves, such as the primary key"
+    )))
+}
+
 /// Whether `MAX(watermark)` is probed on `source_table` itself rather than
 /// through `source_query`, when both are set.
 ///
@@ -4905,8 +5035,9 @@ fn watermark_bounds_the_key(watermark: Option<&str>, key: &str, cursor: Option<&
 ///
 /// Activation is decided by the caller from the planner-cost probe 0.18.0
 /// already runs against the watermark column: if that column cannot be served
-/// by an index, the read's `WHERE wm > x` is a sequential scan. This function
-/// only sizes the sweep.
+/// by an index, the read's `WHERE wm > x` is a sequential scan. Or the
+/// transfer asks for a sweep (`TransferConfig::windowed`), and `bounds` may be
+/// its own. This function only sizes the sweep.
 ///
 /// Returns `None` (read in one pass, exactly as before) when the relation is
 /// empty or windowing is disabled.
@@ -5118,7 +5249,8 @@ sweeping_partition!(
 );
 
 /// A sweep of bounded key-range windows, used when the read's own filter is a
-/// sequential scan.
+/// sequential scan, or when the transfer asks for one (a bounded backfill on
+/// an indexed key is long too: see `TransferConfig::windowed`).
 ///
 /// **Why this exists.** On a hot standby, a read longer than
 /// `max_standby_streaming_delay` is cancelled with `SQLSTATE 40001`. Retrying
@@ -5738,6 +5870,12 @@ async fn setup_clickhouse(
     watermark: Option<&str>,
     warnings: &Warnings,
 ) -> Result<SourceSetup> {
+    if cfg.windowed_read() {
+        return Err(EtlError::config(
+            "windowed=True and window_bounds are supported for PostgreSQL and MySQL sources \
+             only: a ClickHouse source's reads are never swept in key windows",
+        ));
+    }
     tracing::info!("resolving clickhouse source schema...");
     // `source_query` wins, matching `ClickHouseSource::select_sql` and
     // `source_table`'s documented contract — see the equivalent comment in
@@ -6133,7 +6271,9 @@ fn coercion_message(kind: WarningKind, column: &str, n: u64) -> String {
         | WarningKind::WindowBoundsUnavailable
         | WarningKind::NullCheckSkipped
         | WarningKind::RetriedAfterPartialWrite
-        | WarningKind::StorageWriteCountMismatch => {
+        | WarningKind::StorageWriteCountMismatch
+        | WarningKind::UnsourcedDestinationColumn
+        | WarningKind::AbandonedResumeMarker => {
             format!("column '{column}': {n} affected row(s)")
         }
     }
@@ -7200,6 +7340,67 @@ fn warn_mixed_decimals(table: &str, decimal: &[String], float: &[String], warnin
         sample: None,
         message,
     });
+}
+
+/// Raise [`WarningKind::UnsourcedDestinationColumn`] for each column of the
+/// existing destination that the rows this run writes leave without a value.
+/// Checked before anything is written, so a `fail_on_warnings` that names it
+/// stops the run with the destination untouched.
+async fn warn_on_unsourced_columns(
+    sink: &dyn Sink,
+    cfg: &TransferConfig,
+    dest_columns: &[ColumnType],
+    warnings: &Warnings,
+) -> Result<()> {
+    let unsourced = sink
+        .unsourced_columns(&cfg.dest_table, dest_columns)
+        .await?;
+    let effect = unsourced_effect(sink.dest_kind(), cfg.mode);
+    for column in unsourced {
+        let message = format!(
+            "destination column '{column}' of '{}' gets no value from this run: no source column \
+             feeds it (after rename/include/exclude) and it has no DEFAULT. {effect}. Select it \
+             in the source, or drop it from the destination if nothing needs it.",
+            cfg.dest_table,
+        );
+        tracing::warn!("{message}");
+        warnings.push(TransferWarning {
+            kind: WarningKind::UnsourcedDestinationColumn,
+            column: Some(column),
+            count: 0,
+            sample: None,
+            message,
+        });
+    }
+    Ok(())
+}
+
+/// What a run in `mode` does to a destination column it has no value for. The
+/// destinations differ: a ClickHouse row replaces the stored one whole, while
+/// a BigQuery `MERGE` sets only the columns it names.
+fn unsourced_effect(kind: crate::config::DestKind, mode: SyncMode) -> &'static str {
+    use crate::config::DestKind;
+    match (kind, mode) {
+        (DestKind::ClickHouse, SyncMode::Incremental) => {
+            "Every row this run writes sets it to the type's default (NULL when Nullable), and in \
+             a ReplacingMergeTree that row replaces the stored one, so a value already there is \
+             lost"
+        }
+        (DestKind::BigQuery, SyncMode::Incremental) => {
+            "The MERGE keeps it on rows this run updates and sets it NULL on rows it inserts"
+        }
+        (DestKind::ClickHouse, SyncMode::Full) => {
+            "The refresh rebuilds every row without it, so every row ends up with the type's \
+             default (NULL when Nullable)"
+        }
+        (DestKind::BigQuery, SyncMode::Full) => {
+            "The refresh rebuilds every row without it, so every row ends up NULL there"
+        }
+        (DestKind::ClickHouse, SyncMode::Append) => {
+            "Every row this run appends gets the type's default there (NULL when Nullable)"
+        }
+        (DestKind::BigQuery, SyncMode::Append) => "Every row this run appends gets NULL there",
+    }
 }
 
 /// What the destination table already holds, for
@@ -8453,6 +8654,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_folded_coercion_states_the_runs_total_not_one_partitions() {
+        // Two partitions each flattened one value of the same column.
+        let w = Warnings::default();
+        for part in ["range-0", "range-1"] {
+            report_coercions(
+                &format!("partition '{part}'"),
+                vec![(WarningKind::CollapsedBool, "x_state".to_string(), 1)],
+                &w,
+            );
+        }
+        // A table-level warning's message is its call site's, folded or not.
+        for _ in 0..2 {
+            w.push(TransferWarning {
+                kind: WarningKind::NullWatermark,
+                column: Some("updated_at".into()),
+                count: 3,
+                sample: None,
+                message: "as written".into(),
+            });
+        }
+        // The fail_on_warnings check reads the same fold.
+        let fatal = w.first_of(&[WarningKind::CollapsedBool]).unwrap();
+        assert_eq!(fatal.count, 2);
+        assert!(
+            fatal.message.contains("'x_state': 2 tinyint(1) value(s)"),
+            "{}",
+            fatal.message
+        );
+        let out = w.drain();
+        let collapsed = out
+            .iter()
+            .find(|x| x.kind == WarningKind::CollapsedBool)
+            .unwrap();
+        assert_eq!(collapsed.count, 2);
+        assert_eq!(collapsed.message, fatal.message);
+        let null = out
+            .iter()
+            .find(|x| x.kind == WarningKind::NullWatermark)
+            .unwrap();
+        assert_eq!((null.count, null.message.as_str()), (6, "as written"));
+    }
+
     /// One step of a scripted `COPY` byte stream for exercising `CopyChunks`.
     enum Step {
         Item(std::result::Result<Bytes, &'static str>),
@@ -9571,6 +9815,60 @@ mod tests {
     }
 
     #[test]
+    fn only_the_read_that_wrote_a_resume_marker_resumes_it() {
+        let mut cfg = crate::config::default_test_config();
+        cfg.mode = SyncMode::Incremental;
+        cfg.watermark = Some("id".into());
+        cfg.key = vec!["id".into()];
+        cfg.state_key = Some("orders:backfill".into());
+        cfg.source_query = Some("SELECT * FROM t WHERE id <= 500".into());
+        let marker = |read: &str| ChunkMarker {
+            cursor: "200".into(),
+            upper: "500".into(),
+            read: read.into(),
+        };
+        let w = Warnings::default();
+        let own = cfg.chunk_read_id();
+        let resumed = Some(("200".to_string(), "500".to_string()));
+        assert_eq!(
+            resumable_marker(Some(marker(&own)), &cfg, None, &w),
+            resumed
+        );
+        // Written before 0.20.9: it can't say whose it is, so it resumes as before.
+        assert_eq!(resumable_marker(Some(marker("")), &cfg, None, &w), resumed);
+        assert_eq!(resumable_marker(None, &cfg, None, &w), None);
+        assert!(w.drain().is_empty());
+
+        // Another range's marker under the same state key.
+        cfg.source_query = Some("SELECT * FROM t WHERE id > 500".into());
+        cfg.advance_watermark = false;
+        assert_eq!(resumable_marker(Some(marker(&own)), &cfg, None, &w), None);
+        let raised = w.drain();
+        assert_eq!(raised.len(), 1);
+        assert_eq!(raised[0].kind, WarningKind::AbandonedResumeMarker);
+        assert_eq!(raised[0].sample.as_deref(), Some("200"));
+        let msg = &raised[0].message;
+        assert!(
+            msg.contains("stopped past id 200") && msg.contains("from the start"),
+            "{msg}"
+        );
+        assert!(msg.contains("run it again"), "{msg}");
+
+        // A query edited between a failed run and the next: that one goes on
+        // from the saved cursor, which nothing has moved, so all is read.
+        cfg.advance_watermark = true;
+        assert_eq!(
+            resumable_marker(Some(marker(&own)), &cfg, Some("100"), &w),
+            None
+        );
+        let msg = &w.drain()[0].message;
+        assert!(
+            msg.contains("the saved cursor, 100") && !msg.contains("run it again"),
+            "{msg}"
+        );
+    }
+
+    #[test]
     fn a_fatal_warning_stops_the_run_and_says_what_was_left_in_place() {
         let mut cfg = crate::config::default_test_config();
         let w = Warnings::default();
@@ -10138,6 +10436,39 @@ mod tests {
         // the stored column, so no index can serve it.
         cfg.column_transforms.insert("id".into(), "id + 1".into());
         assert!(window_key(&cfg, &[int_col("id", false)]).is_none());
+    }
+
+    #[test]
+    fn a_sweep_asked_for_refuses_a_key_it_cannot_window() {
+        let mut cfg = crate::config::default_test_config();
+        cfg.key = vec!["id".to_string()];
+        cfg.windowed = true;
+        let col = |name: &str, arrow: DataType, nullable: bool| ColumnType {
+            name: name.to_string(),
+            type_id: 0,
+            nullable,
+            arrow,
+            clickhouse_inner: String::new(),
+            arbitrary_precision_decimal: false,
+            declared_decimal: None,
+        };
+        // An integer key is swept, a nullable one with its `IS NULL` window.
+        assert_eq!(
+            forced_window_key(&cfg, &[col("id", DataType::Int32, true)]).unwrap(),
+            ("id".to_string(), true)
+        );
+        // Anything else is refused, saying why, where an automatic sweep
+        // would read in one pass: the read the caller set out to avoid.
+        let refused = |cfg: &TransferConfig, key: ColumnType, why: &str| {
+            let cols = [key];
+            assert!(window_key(cfg, &cols).is_none());
+            let msg = forced_window_key(cfg, &cols).unwrap_err().to_string();
+            assert!(msg.contains(why) && msg.contains("'id'"), "{why}: {msg}");
+        };
+        refused(&cfg, col("id", DataType::Utf8, false), "must be an integer");
+        refused(&cfg, col("other", DataType::Int64, false), "isn't a column");
+        cfg.column_transforms.insert("id".into(), "id + 1".into());
+        refused(&cfg, col("id", DataType::Int64, false), "column_transforms");
     }
 
     #[test]

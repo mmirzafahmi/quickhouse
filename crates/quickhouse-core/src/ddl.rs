@@ -38,7 +38,7 @@ const ROW_MERGING_ENGINES: [&str; 5] = [
 
 /// Whether `engine`'s row-merging semantics are defined by the sorting key.
 /// Case-sensitive, as ClickHouse engine names are.
-fn is_row_merging_engine(engine: &str) -> bool {
+pub(crate) fn is_row_merging_engine(engine: &str) -> bool {
     let family = engine.split('(').next().unwrap_or(engine).trim();
     let family = family.strip_prefix("Replicated").unwrap_or(family);
     ROW_MERGING_ENGINES.contains(&family)
@@ -206,6 +206,7 @@ pub fn create_state_table(db: &str, state_table: &str) -> String {
          \x20   rows UInt64,\n\
          \x20   chunk_cursor String DEFAULT '',\n\
          \x20   chunk_upper String DEFAULT '',\n\
+         \x20   chunk_read String DEFAULT '',\n\
          \x20   run_ts DateTime64(3) DEFAULT now64(3)\n\
          )\nENGINE = ReplacingMergeTree(run_ts)\nORDER BY (source_table, dest_table)",
         qualified(db, state_table)
@@ -214,8 +215,10 @@ pub fn create_state_table(db: &str, state_table: &str) -> String {
 
 /// The chunk-resume columns `migrate_state_table` adds. Kept in sync with the
 /// columns `create_state_table` declares — a state table carrying all of these
-/// needs no migration. Used by [`state_table_needs_migration`].
-pub const CHUNK_RESUME_COLUMNS: [&str; 2] = ["chunk_cursor", "chunk_upper"];
+/// needs no migration. Used by [`state_table_needs_migration`]. `chunk_read`
+/// (0.20.9) records which read a marker belongs to: see
+/// [`crate::config::TransferConfig::chunk_read_id`].
+pub const CHUNK_RESUME_COLUMNS: [&str; 3] = ["chunk_cursor", "chunk_upper", "chunk_read"];
 
 /// Whether a state table whose current columns are `existing` still needs the
 /// chunk-resume migration — true iff any [`CHUNK_RESUME_COLUMNS`] is absent
@@ -234,14 +237,16 @@ pub fn state_table_needs_migration(existing: &[String]) -> bool {
         .any(|c| !existing.iter().any(|e| e == c))
 }
 
-/// Bring a pre-0.5 state table up to date with the chunk-resume columns (keyset
-/// resumable reads). Idempotent via `ADD COLUMN IF NOT EXISTS`. Only worth
+/// Bring a state table up to date with the chunk-resume columns (keyset
+/// resumable reads): all of them before 0.5, `chunk_read` before 0.20.9.
+/// Idempotent via `ADD COLUMN IF NOT EXISTS`. Only worth
 /// running when [`state_table_needs_migration`] is true — see its docs for why
 /// running it unconditionally is harmful on a replicated engine.
 pub fn migrate_state_table(db: &str, state_table: &str) -> String {
     format!(
         "ALTER TABLE {} ADD COLUMN IF NOT EXISTS chunk_cursor String DEFAULT '', \
-         ADD COLUMN IF NOT EXISTS chunk_upper String DEFAULT ''",
+         ADD COLUMN IF NOT EXISTS chunk_upper String DEFAULT '', \
+         ADD COLUMN IF NOT EXISTS chunk_read String DEFAULT ''",
         qualified(db, state_table)
     )
 }
@@ -391,6 +396,8 @@ mod tests {
             probe_max_cost: crate::source::DEFAULT_PROBE_MAX_COST,
             read_window_rows: None,
             window_target_secs: None,
+            windowed: false,
+            window_bounds: None,
             column_transforms: HashMap::new(),
             column_transform_types: HashMap::new(),
             evolve_schema: false,
@@ -503,8 +510,8 @@ mod tests {
 
     #[test]
     fn state_table_migration_skipped_when_chunk_columns_present() {
-        // A table created by `create_state_table` (0.5+) already carries both
-        // chunk-resume columns, so no migration ALTER should ever fire for it.
+        // A table created by `create_state_table` already carries every
+        // chunk-resume column, so no migration ALTER should ever fire for it.
         let full = [
             "source_table",
             "dest_table",
@@ -512,10 +519,17 @@ mod tests {
             "rows",
             "chunk_cursor",
             "chunk_upper",
+            "chunk_read",
             "run_ts",
         ]
         .map(String::from);
         assert!(!state_table_needs_migration(&full));
+        // One created from 0.5 to 0.20.8 lacks only `chunk_read`.
+        assert!(state_table_needs_migration(&full[..6]));
+        for column in CHUNK_RESUME_COLUMNS {
+            assert!(create_state_table("db", "s").contains(&format!("{column} String")));
+            assert!(migrate_state_table("db", "s").contains(&format!("EXISTS {column} ")));
+        }
     }
 
     #[test]

@@ -134,14 +134,14 @@ incremental-mode only):
       <div class="qh-params__name">advance_watermark</div>
       <div class="qh-params__type">bool = True</div>
     </div>
-    <p class="qh-params__desc">Set to <code>False</code> to read and merge a window <em>without</em> moving the cursor &mdash; for loading a historical backfill without rewinding your regular schedule. The computed watermark is still returned in <code>TransferResult.new_watermark</code>.</p>
+    <p class="qh-params__desc">Set to <code>False</code> to read and merge a window <em>without</em> moving the cursor &mdash; for loading a historical backfill without rewinding your regular schedule. The computed watermark is still returned in <code>TransferResult.new_watermark</code>. To read a long backfill from a hot standby, sweep it in key windows with <code>window_bounds</code> (see <em>Performance &amp; safety</em>).</p>
   </div>
   <div>
     <div>
       <div class="qh-params__name">chunk_rows</div>
       <div class="qh-params__type">Optional[int] = None &mdash; experimental</div>
     </div>
-    <p class="qh-params__desc">Reads the source in keyset-ordered chunks of <code>N</code> rows, committing the cursor per chunk so a mid-read failure resumes instead of restarting. <strong>Incremental only</strong>, and the keyset column (<code>partition_column</code>, else the first <code>key</code>) must be a <strong>unique, NOT NULL integer</strong>. Single-stream (<code>parallelism</code> is ignored). <code>None</code> (default) = one read. On BigQuery each chunk is staged and <code>MERGE</code>d on its own, so a destination clustered by <code>key</code> keeps each merge to its own key range, while an unclustered one is scanned in full once per chunk. With <code>source_query</code>, the keyset is accepted when quickhouse can prove it NOT NULL: on PostgreSQL, a plain NOT NULL table column in a query with no outer join or grouping sets; on MySQL, the query's own result metadata.</p>
+    <p class="qh-params__desc">Reads the source in keyset-ordered chunks of <code>N</code> rows, committing the cursor per chunk so a mid-read failure resumes instead of restarting. <strong>Incremental only</strong>, and the keyset column (<code>partition_column</code>, else the first <code>key</code>) must be a <strong>unique, NOT NULL integer</strong>. Single-stream (<code>parallelism</code> is ignored). <code>None</code> (default) = one read. On BigQuery each chunk is staged and <code>MERGE</code>d on its own, so a destination clustered by <code>key</code> keeps each merge to its own key range, while an unclustered one is scanned in full once per chunk. With <code>source_query</code>, the keyset is accepted when quickhouse can prove it NOT NULL: on PostgreSQL, a plain NOT NULL table column in a query with no outer join or grouping sets; on MySQL, the query's own result metadata. A resume marker belongs to the read that wrote it: under a shared <code>state_key</code> (or a shared <code>source_table</code>, the default key), a different query doesn't resume it, reads from the saved cursor instead, and raises <code>abandoned_resume_marker</code>. Give each backfill range its own <code>state_key</code>, or a failed range's marker is replaced by the next range's.</p>
   </div>
   <div>
     <div>
@@ -278,6 +278,10 @@ to act above a ceiling you set, and a diff that finds *no keys in common at all*
 is refused outright — genuine drift is one-directional, so total disagreement
 means the two sides rendered the key differently or the window predicates
 disagreed, not that everything is deletable.
+
+`reconcile_keys()` sees keys, not values: a row whose key is on both sides but
+whose columns differ looks converged to it. For that, see
+[`reconcile_values()`](data-quality.md#checking-values-after-the-fact).
 
 (append-bronze-landing)=
 ## Append (bronze landing)

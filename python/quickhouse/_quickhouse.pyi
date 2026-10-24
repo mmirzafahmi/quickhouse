@@ -20,14 +20,29 @@ class Postgres:
     ----------
     dsn:
         libpq connection string, e.g. ``postgresql://user:pw@host:5432/db``.
-        Whether TLS is used follows the standard ``sslmode`` query parameter
-        (``disable`` | ``prefer`` (default) | ``require``).
+        Whether TLS is used follows the standard ``sslmode`` query parameter,
+        which takes ``disable``, ``prefer`` (the default) or ``require``.
+        libpq's ``verify-ca`` and ``verify-full`` fail the ``sync`` as an
+        invalid value, and aren't needed: whenever TLS is used, the server's
+        certificate is verified against the public CA store plus
+        ``ca_cert_file``, host name included, so ``require`` is libpq's
+        ``verify-full`` in effect. ``prefer`` reads in plaintext when the
+        server declines TLS; a certificate that fails verification still fails
+        the connection.
+
+        For a read-only session, add
+        ``options=-c%20default_transaction_read_only%3Don`` to the DSN. Every
+        transaction then starts read-only, and the server refuses any
+        statement that would write (SQLSTATE ``25006``), such as a function a
+        ``source_query`` calls that inserts, whatever the user's grants allow.
+        Unlike ``MySQL``, there is no keyword for it: only a DSN can carry it.
     statement_timeout_secs:
         Per-connection statement timeout in seconds (0 = server default).
     ca_cert_file:
         Path to a PEM file with extra trusted CA certificate(s), trusted in
         addition to the public CA store. Needed when the server's certificate
-        doesn't chain to a public CA — e.g. AWS RDS's regional CA bundle.
+        doesn't chain to a public CA — e.g. AWS RDS's regional CA bundle. It
+        adds trust without turning TLS on: pair it with ``sslmode=require``.
     """
 
     def __init__(
@@ -46,9 +61,11 @@ class Postgres:
     ) -> None:
         """Pass either ``dsn`` or discrete ``host``/``port``/``user``/
         ``password``/``database`` fields (not both). The discrete fields are
-        percent-encoded and assembled into a DSN. For mTLS (client-certificate
-        auth), set ``client_cert_file`` and ``client_key_file`` together (both
-        PEM)."""
+        percent-encoded and assembled into a DSN. That DSN has no query
+        parameters, so it always uses ``sslmode=prefer``: it can't require
+        TLS, or ask for a read-only session. Pass a ``dsn`` for either. For
+        mTLS (client-certificate auth), set ``client_cert_file`` and
+        ``client_key_file`` together (both PEM)."""
         ...
 
 class MySQL:
@@ -58,15 +75,23 @@ class MySQL:
     ----------
     dsn:
         MySQL connection string, e.g. ``mysql://user:pw@host:3306/db``.
+        Without ``require_tls``, ``ca_cert_file`` or a client certificate, TLS
+        is what the DSN asks for: none, unless it has ``?require_ssl=true``,
+        and then ``verify_ca=false`` in it turns certificate verification off.
     statement_timeout_secs:
         Per-connection statement timeout in seconds (0 = server default).
     ca_cert_file:
         Path to a PEM file with extra trusted CA certificate(s), trusted in
         addition to the public CA store. Needed when the server's certificate
         doesn't chain to a public CA — e.g. AWS RDS's regional CA bundle.
+        Setting it turns TLS on, as ``require_tls`` does.
     require_tls:
         Require TLS for the connection. MySQL has no `sslmode`-style DSN
-        parameter convention, so this is explicit (unlike ``Postgres``).
+        parameter convention, so this is explicit (unlike ``Postgres``). With
+        it, ``ca_cert_file`` or a client certificate set, quickhouse replaces
+        the DSN's own TLS settings, so the server's certificate is verified in
+        full, host name included, whatever ``verify_ca`` or
+        ``verify_identity`` the DSN carries.
     utc_session:
         Run every connection in UTC (``SET time_zone = '+00:00'``), so a
         ``TIMESTAMP`` column reads as the instant it stores. MySQL renders a
@@ -81,6 +106,19 @@ class MySQL:
         read the same either way.
 
         .. versionadded:: 0.20.5
+    read_only:
+        Make every connection's session read-only (``SET SESSION
+        transaction_read_only = ON``, in the same statement as the timeout and
+        time zone): the setup connection, each partition's, a chunked or
+        windowed read's, a retried attempt's and ``reconcile_keys``'. MySQL
+        then refuses any statement that would write, with error 1792 — a
+        ``source_query`` that calls a function which inserts, or a ``SELECT
+        ... FOR UPDATE`` — whatever the user's grants allow. A second guard on
+        top of a read-only user, not a replacement for one. Needs MySQL
+        5.7.20 or later: a server that doesn't know the variable fails the
+        connection rather than reading without it. Off by default.
+
+        .. versionadded:: 0.20.9
     """
 
     def __init__(
@@ -98,6 +136,7 @@ class MySQL:
         client_cert_file: Optional[str] = None,
         client_key_file: Optional[str] = None,
         utc_session: bool = False,
+        read_only: bool = False,
     ) -> None:
         """Pass either ``dsn`` or discrete ``host``/``port``/``user``/
         ``password``/``database`` fields (not both). The discrete fields are
@@ -675,10 +714,33 @@ class TransferWarning:
       ``chunk_rows`` chunk is committed, whether or not ``fail_on_warnings``
       names it; an append, whose rows are in the destination already, reports
       it. Use ``write_method="insert_all"`` if it recurs. New in 0.20.7.
+    - ``"unsourced_destination_column"`` — the existing destination has a
+      column that no source column feeds (after ``rename``/``include``/
+      ``exclude``) and that it doesn't fill itself: no ``DEFAULT``, nor on
+      ClickHouse a ``MATERIALIZED``, ``ALIAS`` or ``EPHEMERAL`` expression.
+      The rows this run writes carry no value there. On ClickHouse each lands
+      with the type's default (NULL when ``Nullable``), and in a
+      ``ReplacingMergeTree`` it replaces the stored row, so a value already
+      there is lost. On BigQuery the ``MERGE`` keeps the column on rows it
+      updates and leaves it NULL on rows it inserts. A full refresh rebuilds
+      every row without it, on either. Raised at setup, once per column, with
+      ``count`` ``0``; ``column`` is the destination column. Name it in
+      ``fail_on_warnings`` to stop the run before anything is written. New in
+    - ``"abandoned_resume_marker"`` — the state key held the resume marker of
+      an unfinished ``chunk_rows`` read of a different query, so the run
+      didn't resume it. Resuming another query's marker read only where the
+      two ranges overlap, often nothing, and reported success: two backfill
+      ranges on one ``state_key`` were both left unfinished that way. The run
+      reads from the saved cursor instead, so nothing it selects is skipped.
+      The other query's rows past its marker stay unread until it runs again,
+      which matters with ``advance_watermark=False``. ``sample`` is the
+      marker's cursor. Raised at setup, before anything is written. New in
+      0.20.9.
     """
 
     column: Optional[str]
-    """The source column responsible, or ``None`` for a table-level condition."""
+    """The source column responsible, or ``None`` for a table-level condition.
+    For ``"unsourced_destination_column"``, the destination column."""
 
     count: int
     """How many values/rows tripped it. Aggregated per ``(kind, column)`` across
@@ -787,6 +849,63 @@ class ReconcileResult:
     missing_sample: List[str]
     duration_secs: float
 
+class ColumnDrift:
+    """One column's drift, as :func:`reconcile_values` measured it (new in 0.20.9)."""
+
+    column: str
+
+    compared: int
+    """Keys whose value in this column was compared: every compared key."""
+
+    mismatched: int
+    """Keys whose value differs. Includes the two NULL counts below."""
+
+    null_in_dest_only: int
+    """NULL in the destination where the source holds a value: what a sync
+    leaves when it writes a column its source query doesn't carry. In a
+    destination column that can't hold NULL, the value a NULL is stored as there
+    counts as NULL: the column's ``DEFAULT``, else its type's default (``0``,
+    ``''``, ``1970-01-01``)."""
+
+    null_in_source_only: int
+    """NULL in the source where the destination holds a value."""
+
+    sample: List[str]
+    """Up to ``sample_limit`` keys whose value differs, as text."""
+
+class ValueReconcileResult:
+    """What a :func:`reconcile_values` comparison found (new in 0.20.9)."""
+
+    source_rows: int
+    """Rows the source returned in the window."""
+
+    dest_rows: int
+    """Rows the destination returned in the window, after ``FINAL``."""
+
+    compared_keys: int
+    """Keys present exactly once on each side: the ones whose values were
+    compared. Check it is not ``0`` before reading clean columns as a pass."""
+
+    missing_keys: int
+    """Keys in the source that the destination doesn't have."""
+
+    orphan_keys: int
+    """Keys in the destination that the source doesn't have."""
+
+    duplicate_keys: int
+    """Keys that appear more than once on either side. Their rows are left out
+    of the comparison, since there is no telling which one is current."""
+
+    columns: List[ColumnDrift]
+    """One entry per compared column, in source column order."""
+
+    skipped_columns: List[Tuple[str, str]]
+    """``(column, reason)`` for each column on both sides that wasn't compared:
+    a side's type can't be read, or the two types have no common one to compare
+    in. Only when ``columns`` was left out; a named column like that raises."""
+
+    duration_secs: float
+
 def sync(
     # `bytes` is accepted privately: it is how quickhouse.from_pandas() hands an
     # already-serialized Arrow IPC stream to the engine. Not part of the public
@@ -833,6 +952,8 @@ def sync(
     probe_max_cost: float = 50_000.0,
     read_window_rows: Optional[int] = None,
     window_target_secs: Optional[float] = None,
+    windowed: bool = False,
+    window_bounds: Optional[Tuple[int, int]] = None,
     column_transforms: Optional[Mapping[str, str]] = None,
     column_transform_types: Optional[Mapping[str, str]] = None,
     evolve_schema: bool = False,
@@ -1057,9 +1178,10 @@ def sync(
       not the rows returned, so with an index on the key its duration is
       predictable whatever the rest of the WHERE selects; a window cancelled
       anyway is retried at half the width. This activates automatically from
-      the same planner-cost probe as ``probe_max_cost``; the setting only sizes
-      it. Note the whole key space is still swept, so the total work is
-      unchanged \u2014 the gain is that the run *completes*.
+      the same planner-cost probe as ``probe_max_cost``, or on request (see
+      ``windowed``); the setting only sizes it. Note the whole key space is
+      still swept, so the total work is unchanged \u2014 the gain is that the
+      run *completes*.
     - ``window_target_secs`` (default ``5.0``) is what one window should take;
       the sweep re-sizes itself after every window to converge on it. Keep it
       well under the standby's ``max_standby_streaming_delay``. Raising it buys
@@ -1068,6 +1190,37 @@ def sync(
       time is a cancelled window, whose work is thrown away and redone:
       measured, 21 cancellations accounted for ~420s of a 2603s sweep. Measured on one table: p50 3.2s, p90 9.6s,
       max 82s, all at the same target.
+    - ``windowed=True`` sweeps the read in key windows whatever the probes
+      cost. On its own the sweep switches on only when ``MAX(watermark)`` is
+      too costly, and a read can be long for other reasons: a bounded backfill
+      on an indexed primary key (``watermark="id"``,
+      ``advance_watermark=False``) has a cheap probe, so it was read in one
+      pass, which a hot standby cancels on every retry once it outlives
+      ``max_standby_streaming_delay``. The window key is ``partition_column``,
+      else the first ``key``: an integer column the transfer reads
+      untransformed, or the run is refused rather than read in one pass. Its
+      ``MIN``/``MAX`` are probed, on ``source_table`` when it is set, unless
+      ``window_bounds`` gives them. Incremental mode, PostgreSQL and MySQL
+      sources only. The sweep is single-stream, so ``chunk_rows``,
+      ``partition_source_expr`` and a ``parallelism`` above 1 are refused. A
+      sweep doesn't resume: a run that fails reads its range again from the
+      start, where ``chunk_rows`` resumes after its last chunk (but reads every
+      chunk at the same size, and each cancelled one costs a whole-transfer
+      retry out of ``retry_max_attempts``). New in 0.20.9.
+    - ``window_bounds=(lo, hi)`` sweeps the keys from ``lo`` to ``hi``,
+      inclusive, instead of probing for them, and implies ``windowed=True``.
+      New in 0.20.9.
+      They are the range the run reads: a row whose key is outside them, or
+      ``NULL``, isn't read. So they need ``advance_watermark=False`` (the
+      cursor a run computes is the source's ``MAX(watermark)``, past rows
+      outside the range it never read) and can't be combined with
+      ``delete_stale_in_window``. A bounded backfill, with a ``state_key`` of
+      its own so the schedule's cursor isn't its lower bound::
+
+          quickhouse.sync(src, dst, dest_table="orders", source_table="orders",
+                          mode="incremental", watermark="id", key=["id"],
+                          advance_watermark=False, state_key="orders:backfill",
+                          window_bounds=(1, 50_000_000))
     - ``retry_max_attempts`` (default ``1`` = no retry) re-runs the whole
       transfer on a *transient source* error — PostgreSQL hot-standby recovery
       conflict / statement cancel, MySQL server-gone-away / lock-wait / deadlock /
@@ -1484,6 +1637,93 @@ def reconcile_keys(
     is normally itself a mirror rather than the system of record), as is an HTTP
     API source (no keyset query to diff against). Destinations: both ClickHouse
     and BigQuery.
+    """
+    ...
+
+def reconcile_values(
+    source: Union[Postgres, MySQL, ClickHouse],
+    target: ClickHouse,
+    dest_table: str,
+    *,
+    key: str,
+    window: str,
+    source_table: Optional[str] = None,
+    source_query: Optional[str] = None,
+    dest_window: Optional[str] = None,
+    columns: Optional[List[str]] = None,
+    tolerance: Union[float, Mapping[str, float], None] = None,
+    sample_limit: int = 10,
+) -> ValueReconcileResult:
+    """Compare the values a destination holds with its source's, column by
+    column, over a key window. Measures only.
+
+    :func:`reconcile_keys` sees rows the source deleted. It can't see value
+    drift, where the same keys exist on both sides but a column differs, and
+    that leaves every count-based check green: counts match while values rot.
+    In one production case a ``source_query`` missing columns the destination
+    already had made every incremental run write them as NULL, for two months,
+    on 26 tables. A per-column ``null_in_dest_only`` count flags that directly.
+
+    ::
+
+        r = quickhouse.reconcile_values(
+            src, dst, "account_move",
+            source_table="account_move",
+            key="id",
+            window="id > 41000000",
+            tolerance={"amount_total": 0.01},
+        )
+        for c in r.columns:
+            if c.mismatched:
+                print(c.column, c.mismatched, c.null_in_dest_only, c.sample)
+
+    Both sides are read through quickhouse's own readers, the decoders a sync
+    uses, and compared as typed values, never as text:
+
+    - **Integers and decimals** compare exactly, across widths and scales.
+      Anything with a **float** on either side compares as a double: equal when
+      both are the same double, or within ``tolerance``. ClickHouse truncates a
+      float written into a ``Decimal`` column (0.29 lands in ``Decimal(15, 2)``
+      as 0.28), so such a column reports every truncated value unless its
+      tolerance covers one step (``0.01`` there).
+    - **Datetimes** compare as instants, whatever timezone either side's type
+      names, at the destination column's precision: a ``DateTime`` holds whole
+      seconds, so a source's microseconds aren't drift there.
+    - A ``Bool`` destination compares a source integer by its truth, so MySQL's
+      ``tinyint(1)`` matches a ``Bool`` column that way and a ``UInt8`` one by
+      value. ``LowCardinality(T)`` and ``Nullable(T)`` compare as the ``T`` they
+      wrap.
+    - A destination column that can't hold NULL stores a NULL as its
+      ``DEFAULT``, or its type's default (``0``, ``''``): that matches a source
+      NULL, and over a source value it counts as ``null_in_dest_only``.
+    - The destination is read with ``FINAL`` where its engine merges rows (a
+      ``ReplacingMergeTree`` holds several rows per key until it merges). A key
+      that still appears more than once, on either side, is counted in
+      ``duplicate_keys`` and left out.
+
+    :param key: The identifying column, present on both sides under the same
+        name. Matched by typed value, so an ``int4`` key matches an ``Int64``
+        one. A float key is refused.
+    :param window: SQL predicate bounding the source read, in the source's
+        dialect, e.g. ``"id > 41000000"`` for the newest keys. Required: both
+        sides' rows are held in memory.
+    :param dest_window: The same bound in ClickHouse's dialect. Defaults to
+        ``window``.
+    :param columns: Columns to compare, present on both sides under the same
+        name. Default: every column the two share, by exact name. A shared
+        column whose types can't be compared is then skipped and listed in
+        ``skipped_columns``; one named here raises instead.
+    :param tolerance: Absolute tolerance for numeric columns: one number for all
+        of them, or ``{column: number}`` for the ones named. Default exact.
+    :param sample_limit: How many keys to keep per column as samples. The
+        counts are exact regardless.
+
+    Sources: PostgreSQL, MySQL and ClickHouse. Destination: ClickHouse; a
+    BigQuery destination raises (not supported yet). Comparing per window by
+    hashing, to make a whole-table check cheap enough to schedule, and
+    ``repair=True``, which re-syncs only the keys that differ, come next.
+
+    .. versionadded:: 0.20.9
     """
     ...
 

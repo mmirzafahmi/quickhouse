@@ -9,6 +9,115 @@ any breaking change is called out explicitly.
 
 ## [Unreleased]
 
+### Added
+- **A warning for destination columns the source doesn't feed:
+  `unsourced_destination_column`.** A sync into an existing destination now
+  checks the destination's columns against the ones it writes (after `rename`,
+  `include` and `exclude`). It raises one warning per column that no source
+  column feeds and that the destination doesn't fill itself with a `DEFAULT`,
+  or on ClickHouse a `MATERIALIZED`, `ALIAS` or `EPHEMERAL` expression. Until
+  now such a column changed silently, and differently per destination. On
+  ClickHouse each row written carries the type's default (`NULL` when
+  `Nullable`) and, in a `ReplacingMergeTree`, replaces the stored row. A
+  `source_query` whose column list had drifted from the live tables NULLed
+  values on 26 tables this way for two months, while row counts matched. On
+  BigQuery the `MERGE` keeps the column on rows it updates and leaves it NULL
+  on rows it inserts. A full refresh rebuilds every row without it. The check
+  runs before anything is written, so
+  `fail_on_warnings={"unsourced_destination_column"}` stops the run with the
+  destination untouched. It costs one query against the destination's
+  metadata per run. (#28)
+- **`MySQL(..., read_only=True)` reads in a read-only session.** A MySQL
+  source had no way to ask for one: the DSN takes no init statement, and a
+  multi-statement `source_query` fails to prepare. So it rested on the user's
+  grants alone, and on a misgranted user a function a `source_query` called
+  could insert rows, and `SELECT ... FOR UPDATE` could take locks. The option
+  adds `transaction_read_only = ON` to the `SET SESSION` every connection
+  already starts with: the setup connection, each partition's, a chunked or
+  windowed read's, a retried attempt's and `reconcile_keys`'. MySQL then
+  refuses any statement that would write with error 1792; a `source_query`
+  calling a function that inserts fails as the run starts, having written
+  nothing. It needs MySQL 5.7.20 or later, and a server that doesn't know the
+  variable fails the connection rather than reading without it. Off by
+  default, which leaves the session as it was. PostgreSQL already does this
+  through the DSN, `?options=-c%20default_transaction_read_only%3Don`, and the
+  `Postgres` docs now say so. (#31)
+- **`windowed=True` and `window_bounds=(lo, hi)` sweep a read in key windows
+  whatever the probes cost.** The sweep switched on by itself only when the
+  `MAX(watermark)` probe priced too high, so a read long for another reason
+  couldn't ask for it. The main case is a bounded backfill on an indexed
+  primary key (`watermark="id"`, `advance_watermark=False`): its probe is
+  cheap, so it was read in one pass, and on a hot standby that pass was
+  cancelled with `SQLSTATE 40001` once it outlived
+  `max_standby_streaming_delay`, on every retry, since each restarted the same
+  scan. Healing 487M ids took about 974 calls of 500k ids, and a call of 5M ids
+  was cancelled on all 10 of its attempts. `window_bounds` gives the key range
+  to sweep instead of a `MIN`/`MAX` probe, and is the range read: a row whose
+  key is outside it isn't read, so it needs `advance_watermark=False`.
+  `windowed=True` alone probes the bounds. A window the source cancels is read
+  again at half the width, so one call can work through a large range.
+  Incremental mode, PostgreSQL and MySQL sources. A combination the sweep can't
+  serve is a config error: a key that isn't an untransformed integer,
+  `mode="full"`, `chunk_rows`, `parallelism` above 1, `partition_source_expr`,
+  and, with `window_bounds`, `delete_stale_in_window`. (#29)
+- **`quickhouse.reconcile_values()` measures value drift, column by column.**
+  `reconcile_keys` sees rows the source deleted, not keys on both sides whose
+  columns differ, and those leave every count-based check green: a
+  `source_query` that had lost columns made every incremental run write them as
+  NULL for two months, on 26 tables, while key counts matched (#28). This reads
+  a required key window from both sides through the sync's own readers and
+  compares every shared column, or the `columns` named, as typed values. Per
+  column it reports `compared`, `mismatched`, `null_in_dest_only` (that case's
+  signature), `null_in_source_only` and sample keys, and it counts keys missing
+  on either side. Integers and decimals compare exactly; a float compares as a
+  double, within an optional `tolerance` (one number, or per column). Datetimes
+  compare as instants at the destination column's precision. A `Bool` column
+  compares by truth, so `tinyint(1)` matches it, and a `UInt8` one by value. In
+  a column that can't hold NULL, the default a NULL is stored as counts as NULL.
+  The destination is read with `FINAL` where its engine merges rows. Sources:
+  PostgreSQL, MySQL and ClickHouse; destination: ClickHouse only, for now. It
+  measures only: window hashing and `repair=True` come next. (#30)
+- **`ValueReconcileResult`** and its per-column **`ColumnDrift`**. (#30)
+
+### Fixed
+- **A `chunk_rows` read no longer resumes another query's resume marker.** A
+  marker was kept per state key and destination only, so a read of a
+  different query under the same key resumed it. Two backfills of id ranges
+  1-500 and 501-1000 on one `state_key`, the first failing after ids 1-200,
+  left the second resuming past id 200 up to the first range's bound, 500. It
+  read nothing, reported success and cleared the marker, so neither range was
+  finished, and nothing said so. Reads that set the same `source_table` share
+  a key even without a `state_key`. A marker now records which read wrote it
+  (`source_table`, `source_query`, the keyset column, `watermark` and
+  `watermark_source_expr`), and only that read resumes it. Another read
+  starts from the saved cursor, which a chunked run doesn't move until it
+  finishes, so nothing it selects is skipped, and raises the new
+  `abandoned_resume_marker` warning. The state table gains a `chunk_read`
+  column, added in place on first use; a marker written before this release
+  resumes as before. (#32)
+- **A `collapsed_bool` warning's message now gives the same number as its
+  `count`.** Each partition of a parallel read, each `chunk_rows` chunk and
+  each window of a sweep reports the values it flattened, and the run's warning
+  summed their counts but kept the first report's message: two partitions that
+  flattened one value each said "1 tinyint(1) value(s)" with `count` 2. The
+  message now states the run's total, in `TransferResult.warnings` and in the
+  error `fail_on_warnings` raises, as do those of `coerced_date`,
+  `coerced_decimal` and `coerced_scalar`, which fold the same way. (#31)
+
+### Documentation
+- **What the TLS settings verify.** On `Postgres`, `sslmode` takes only
+  `disable`, `prefer` and `require`; `require` checks the certificate chain and
+  the host name, libpq's `verify-full` in effect; `prefer` reads in plaintext
+  when the server declines TLS; `ca_cert_file` doesn't turn TLS on; and the
+  discrete `host=` fields can't set an `sslmode`. On `MySQL`, a DSN's
+  `?require_ssl=true&verify_ca=false` turns certificate verification off,
+  unless `require_tls`, `ca_cert_file` or a client certificate is set, which
+  replace the DSN's TLS settings and verify in full. (#31)
+- **Errors can carry what a log shouldn't.** Without a `source_table`, a
+  `sync()` error starts with the whole `source_query`, and a certificate that
+  doesn't match its host is reported with the host name and the certificate's
+  names. The performance guide's section on diagnosing failures says so. (#31)
+
 ## [0.20.8] — 2026-10-08
 
 ### Fixed
