@@ -687,6 +687,7 @@ impl Warnings {
             .filter(|w| w.kind == first.kind && w.column == first.column)
             .map(|w| w.count)
             .sum();
+        restate_folded_coercion(&mut folded);
         Some(folded)
     }
 
@@ -714,6 +715,7 @@ impl Warnings {
                     if f.sample.is_none() {
                         f.sample = w.sample;
                     }
+                    restate_folded_coercion(f);
                 }
                 None => folded.push(w),
             }
@@ -725,6 +727,26 @@ impl Warnings {
                 .then_with(|| a.column.cmp(&b.column))
         });
         folded
+    }
+}
+
+/// Restate a folded coercion's message for its folded `count`.
+///
+/// Every read that met a coercion reports it — each partition, each chunk,
+/// each window of a sweep — and each wrote the message from its own rows, so
+/// the fold kept the first read's number under the run's total: 2 partitions
+/// that flattened one value each said "1 tinyint(1) value(s)" with `count` 2.
+/// A table-level warning's message is its call site's, and is kept.
+fn restate_folded_coercion(w: &mut TransferWarning) {
+    let coercion = matches!(
+        w.kind,
+        WarningKind::CollapsedBool
+            | WarningKind::CoercedDate
+            | WarningKind::CoercedDecimal
+            | WarningKind::CoercedScalar
+    );
+    if let (true, Some(column)) = (coercion, w.column.as_deref()) {
+        w.message = coercion_message(w.kind, column, w.count);
     }
 }
 
@@ -1778,6 +1800,7 @@ async fn run_transfer_impl(
             my.client_cert_file.clone(),
             my.client_key_file.clone(),
             my.utc_session,
+            my.read_only,
         )),
         SourceConfig::ClickHouse(ch) => Source::ClickHouse(ClickHouseSource::new(ch)?),
         SourceConfig::BigQuery(_) => unreachable!("handled via early return above"),
@@ -8518,6 +8541,49 @@ mod tests {
             "{}",
             out[0].message
         );
+    }
+
+    #[test]
+    fn a_folded_coercion_states_the_runs_total_not_one_partitions() {
+        // Two partitions each flattened one value of the same column.
+        let w = Warnings::default();
+        for part in ["range-0", "range-1"] {
+            report_coercions(
+                &format!("partition '{part}'"),
+                vec![(WarningKind::CollapsedBool, "x_state".to_string(), 1)],
+                &w,
+            );
+        }
+        // A table-level warning's message is its call site's, folded or not.
+        for _ in 0..2 {
+            w.push(TransferWarning {
+                kind: WarningKind::NullWatermark,
+                column: Some("updated_at".into()),
+                count: 3,
+                sample: None,
+                message: "as written".into(),
+            });
+        }
+        // The fail_on_warnings check reads the same fold.
+        let fatal = w.first_of(&[WarningKind::CollapsedBool]).unwrap();
+        assert_eq!(fatal.count, 2);
+        assert!(
+            fatal.message.contains("'x_state': 2 tinyint(1) value(s)"),
+            "{}",
+            fatal.message
+        );
+        let out = w.drain();
+        let collapsed = out
+            .iter()
+            .find(|x| x.kind == WarningKind::CollapsedBool)
+            .unwrap();
+        assert_eq!(collapsed.count, 2);
+        assert_eq!(collapsed.message, fatal.message);
+        let null = out
+            .iter()
+            .find(|x| x.kind == WarningKind::NullWatermark)
+            .unwrap();
+        assert_eq!((null.count, null.message.as_str()), (6, "as written"));
     }
 
     /// One step of a scripted `COPY` byte stream for exercising `CopyChunks`.

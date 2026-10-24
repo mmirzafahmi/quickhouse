@@ -63,21 +63,21 @@ TLS:
       <div class="qh-params__name">sslmode</div>
       <div class="qh-params__type">DSN parameter &mdash; PostgreSQL</div>
     </div>
-    <p class="qh-params__desc">Standard PostgreSQL DSN parameter: <code>disable</code> | <code>prefer</code> (default) | <code>require</code>.</p>
+    <p class="qh-params__desc">Standard PostgreSQL DSN parameter: <code>disable</code> | <code>prefer</code> (default) | <code>require</code>. <code>require</code> verifies the certificate and the host name, as libpq's <code>verify-full</code> does; <code>verify-ca</code> and <code>verify-full</code> themselves are rejected. Only a DSN can set it: the discrete fields always <code>prefer</code>.</p>
   </div>
   <div>
     <div>
       <div class="qh-params__name">require_tls</div>
       <div class="qh-params__type">bool &mdash; MySQL</div>
     </div>
-    <p class="qh-params__desc">MySQL has no <code>sslmode</code> convention, so require TLS explicitly with <code>require_tls=True</code>.</p>
+    <p class="qh-params__desc">MySQL has no <code>sslmode</code> convention, so require TLS explicitly with <code>require_tls=True</code>. It replaces any TLS settings in the DSN (<code>verify_ca=false</code> included) and verifies the certificate in full.</p>
   </div>
   <div>
     <div>
       <div class="qh-params__name">ca_cert_file</div>
       <div class="qh-params__type">str, optional</div>
     </div>
-    <p class="qh-params__desc">Add a private CA (e.g. AWS RDS's regional bundle) &mdash; trusted in addition to the public CA store.</p>
+    <p class="qh-params__desc">Add a private CA (e.g. AWS RDS's regional bundle) &mdash; trusted in addition to the public CA store. On MySQL it turns TLS on, as <code>require_tls</code> does; on PostgreSQL it doesn't, so pair it with <code>sslmode=require</code>.</p>
   </div>
   <div>
     <div>
@@ -97,6 +97,25 @@ qh.Postgres(
     client_key_file="client.key",   # mTLS: both files, or neither
 )
 ```
+
+**Read-only sessions.** A read-only database user is the guard against a
+`source_query` that writes. On top of one, ask the server for a read-only
+session, so it refuses a write whatever the user's grants allow:
+
+```python
+qh.MySQL("mysql://reader:pw@host:3306/db", read_only=True)
+qh.Postgres("postgresql://reader:pw@host:5432/db"
+            "?options=-c%20default_transaction_read_only%3Don")
+```
+
+`read_only=True` adds `transaction_read_only = ON` to the `SET SESSION` every
+MySQL connection of the run starts with, so a statement that would write, such
+as a `source_query` calling a function that inserts, or `SELECT ... FOR
+UPDATE`, fails with error 1792. It needs MySQL 5.7.20 or later; on an older
+server the connection fails rather than reading without it. PostgreSQL has no
+keyword for it: the DSN's `options` parameter sends
+`default_transaction_read_only=on` with the connection, and a write fails with
+SQLSTATE `25006`. The discrete `host=` fields can't carry it, so use a DSN.
 
 **BigQuery** authenticates with a service-account key file, inline JSON
 contents, or Application Default Credentials (ADC):

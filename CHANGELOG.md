@@ -27,6 +27,45 @@ any breaking change is called out explicitly.
   `fail_on_warnings={"unsourced_destination_column"}` stops the run with the
   destination untouched. It costs one query against the destination's
   metadata per run. (#28)
+- **`MySQL(..., read_only=True)` reads in a read-only session.** A MySQL
+  source had no way to ask for one: the DSN takes no init statement, and a
+  multi-statement `source_query` fails to prepare. So it rested on the user's
+  grants alone, and on a misgranted user a function a `source_query` called
+  could insert rows, and `SELECT ... FOR UPDATE` could take locks. The option
+  adds `transaction_read_only = ON` to the `SET SESSION` every connection
+  already starts with: the setup connection, each partition's, a chunked or
+  windowed read's, a retried attempt's and `reconcile_keys`'. MySQL then
+  refuses any statement that would write with error 1792; a `source_query`
+  calling a function that inserts fails as the run starts, having written
+  nothing. It needs MySQL 5.7.20 or later, and a server that doesn't know the
+  variable fails the connection rather than reading without it. Off by
+  default, which leaves the session as it was. PostgreSQL already does this
+  through the DSN, `?options=-c%20default_transaction_read_only%3Don`, and the
+  `Postgres` docs now say so. (#31)
+
+### Fixed
+- **A `collapsed_bool` warning's message now gives the same number as its
+  `count`.** Each partition of a parallel read, each `chunk_rows` chunk and
+  each window of a sweep reports the values it flattened, and the run's warning
+  summed their counts but kept the first report's message: two partitions that
+  flattened one value each said "1 tinyint(1) value(s)" with `count` 2. The
+  message now states the run's total, in `TransferResult.warnings` and in the
+  error `fail_on_warnings` raises, as do those of `coerced_date`,
+  `coerced_decimal` and `coerced_scalar`, which fold the same way. (#31)
+
+### Documentation
+- **What the TLS settings verify.** On `Postgres`, `sslmode` takes only
+  `disable`, `prefer` and `require`; `require` checks the certificate chain and
+  the host name, libpq's `verify-full` in effect; `prefer` reads in plaintext
+  when the server declines TLS; `ca_cert_file` doesn't turn TLS on; and the
+  discrete `host=` fields can't set an `sslmode`. On `MySQL`, a DSN's
+  `?require_ssl=true&verify_ca=false` turns certificate verification off,
+  unless `require_tls`, `ca_cert_file` or a client certificate is set, which
+  replace the DSN's TLS settings and verify in full. (#31)
+- **Errors can carry what a log shouldn't.** Without a `source_table`, a
+  `sync()` error starts with the whole `source_query`, and a certificate that
+  doesn't match its host is reported with the host name and the certificate's
+  names. The performance guide's section on diagnosing failures says so. (#31)
 
 ## [0.20.8] — 2026-10-08
 

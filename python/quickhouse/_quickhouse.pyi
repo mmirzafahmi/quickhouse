@@ -20,14 +20,29 @@ class Postgres:
     ----------
     dsn:
         libpq connection string, e.g. ``postgresql://user:pw@host:5432/db``.
-        Whether TLS is used follows the standard ``sslmode`` query parameter
-        (``disable`` | ``prefer`` (default) | ``require``).
+        Whether TLS is used follows the standard ``sslmode`` query parameter,
+        which takes ``disable``, ``prefer`` (the default) or ``require``.
+        libpq's ``verify-ca`` and ``verify-full`` fail the ``sync`` as an
+        invalid value, and aren't needed: whenever TLS is used, the server's
+        certificate is verified against the public CA store plus
+        ``ca_cert_file``, host name included, so ``require`` is libpq's
+        ``verify-full`` in effect. ``prefer`` reads in plaintext when the
+        server declines TLS; a certificate that fails verification still fails
+        the connection.
+
+        For a read-only session, add
+        ``options=-c%20default_transaction_read_only%3Don`` to the DSN. Every
+        transaction then starts read-only, and the server refuses any
+        statement that would write (SQLSTATE ``25006``), such as a function a
+        ``source_query`` calls that inserts, whatever the user's grants allow.
+        Unlike ``MySQL``, there is no keyword for it: only a DSN can carry it.
     statement_timeout_secs:
         Per-connection statement timeout in seconds (0 = server default).
     ca_cert_file:
         Path to a PEM file with extra trusted CA certificate(s), trusted in
         addition to the public CA store. Needed when the server's certificate
-        doesn't chain to a public CA — e.g. AWS RDS's regional CA bundle.
+        doesn't chain to a public CA — e.g. AWS RDS's regional CA bundle. It
+        adds trust without turning TLS on: pair it with ``sslmode=require``.
     """
 
     def __init__(
@@ -46,9 +61,11 @@ class Postgres:
     ) -> None:
         """Pass either ``dsn`` or discrete ``host``/``port``/``user``/
         ``password``/``database`` fields (not both). The discrete fields are
-        percent-encoded and assembled into a DSN. For mTLS (client-certificate
-        auth), set ``client_cert_file`` and ``client_key_file`` together (both
-        PEM)."""
+        percent-encoded and assembled into a DSN. That DSN has no query
+        parameters, so it always uses ``sslmode=prefer``: it can't require
+        TLS, or ask for a read-only session. Pass a ``dsn`` for either. For
+        mTLS (client-certificate auth), set ``client_cert_file`` and
+        ``client_key_file`` together (both PEM)."""
         ...
 
 class MySQL:
@@ -58,15 +75,23 @@ class MySQL:
     ----------
     dsn:
         MySQL connection string, e.g. ``mysql://user:pw@host:3306/db``.
+        Without ``require_tls``, ``ca_cert_file`` or a client certificate, TLS
+        is what the DSN asks for: none, unless it has ``?require_ssl=true``,
+        and then ``verify_ca=false`` in it turns certificate verification off.
     statement_timeout_secs:
         Per-connection statement timeout in seconds (0 = server default).
     ca_cert_file:
         Path to a PEM file with extra trusted CA certificate(s), trusted in
         addition to the public CA store. Needed when the server's certificate
         doesn't chain to a public CA — e.g. AWS RDS's regional CA bundle.
+        Setting it turns TLS on, as ``require_tls`` does.
     require_tls:
         Require TLS for the connection. MySQL has no `sslmode`-style DSN
-        parameter convention, so this is explicit (unlike ``Postgres``).
+        parameter convention, so this is explicit (unlike ``Postgres``). With
+        it, ``ca_cert_file`` or a client certificate set, quickhouse replaces
+        the DSN's own TLS settings, so the server's certificate is verified in
+        full, host name included, whatever ``verify_ca`` or
+        ``verify_identity`` the DSN carries.
     utc_session:
         Run every connection in UTC (``SET time_zone = '+00:00'``), so a
         ``TIMESTAMP`` column reads as the instant it stores. MySQL renders a
@@ -81,6 +106,19 @@ class MySQL:
         read the same either way.
 
         .. versionadded:: 0.20.5
+    read_only:
+        Make every connection's session read-only (``SET SESSION
+        transaction_read_only = ON``, in the same statement as the timeout and
+        time zone): the setup connection, each partition's, a chunked or
+        windowed read's, a retried attempt's and ``reconcile_keys``'. MySQL
+        then refuses any statement that would write, with error 1792 — a
+        ``source_query`` that calls a function which inserts, or a ``SELECT
+        ... FOR UPDATE`` — whatever the user's grants allow. A second guard on
+        top of a read-only user, not a replacement for one. Needs MySQL
+        5.7.20 or later: a server that doesn't know the variable fails the
+        connection rather than reading without it. Off by default.
+
+        .. versionadded:: 0.20.9
     """
 
     def __init__(
@@ -98,6 +136,7 @@ class MySQL:
         client_cert_file: Optional[str] = None,
         client_key_file: Optional[str] = None,
         utc_session: bool = False,
+        read_only: bool = False,
     ) -> None:
         """Pass either ``dsn`` or discrete ``host``/``port``/``user``/
         ``password``/``database`` fields (not both). The discrete fields are

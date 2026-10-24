@@ -351,3 +351,9 @@ actionable on its own: it names the table involved, and for a bad config or an
 unmappable column it says exactly what's wrong and how to fix it (e.g. `exclude=`
 the column or cast it in a `source_query`). Underlying database errors are
 surfaced verbatim rather than wrapped in something generic.
+
+Verbatim cuts both ways when those errors go to a shared log. Without a
+`source_table`, the table an error names at its front is the whole
+`source_query`, and a server certificate that doesn't match its host is
+reported with the host name and every name on the certificate. Scrub what you
+log if either is sensitive.

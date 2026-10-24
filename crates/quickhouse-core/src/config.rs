@@ -83,6 +83,15 @@ pub struct MySqlConfig {
     /// `NOW()` and `CURDATE()` return in a `source_query`. `DATETIME` columns
     /// carry no zone and read the same either way.
     pub utc_session: bool,
+    /// Make every connection's session read-only (`SET SESSION
+    /// transaction_read_only = ON`, in the same statement as the settings
+    /// above). MySQL then refuses any statement that would write — a
+    /// `source_query` that calls a function which inserts, a `SELECT ... FOR
+    /// UPDATE` — with error 1792, whatever the user's grants allow. A second
+    /// guard on top of a read-only user, not a replacement for one. Needs
+    /// MySQL 5.7.20 or later: a server that doesn't know the variable fails
+    /// the connection rather than reading without it.
+    pub read_only: bool,
 }
 
 /// Where to read from, when the source is Google BigQuery.

@@ -717,6 +717,41 @@ def test_collapsed_tinyint1_names_the_column_it_flattened(
             cur.execute(f"DROP TABLE IF EXISTS `{table}`")
 
 
+def test_a_collapsed_tinyint1_message_counts_every_partition(
+    mysql_conn, ch_client, mysql_source, ch_target, unique_name, capfd
+):
+    """Issue #31: each partition reports the values it flattened, and the
+    run's warning summed their counts but kept the first partition's message,
+    so two partitions with one value each said "1 tinyint(1) value(s)" under
+    count=2. The message now states the run's total."""
+    table = unique_name
+    with mysql_conn.cursor() as cur:
+        cur.execute(f"DROP TABLE IF EXISTS `{table}`")
+        cur.execute(
+            f"CREATE TABLE `{table}` (id BIGINT PRIMARY KEY, x_state TINYINT(1) NOT NULL)"
+        )
+        # parallelism=2 splits the ids into [1, 2] and [3, 4]: one value
+        # outside {0, 1} in each.
+        cur.execute(f"INSERT INTO `{table}` VALUES (1, 2), (2, 0), (3, 1), (4, 3)")
+    _drop_ch(ch_client, table)
+    try:
+        capfd.readouterr()
+        r = quickhouse.sync(
+            mysql_source, ch_target, dest_table=table, source_table=table, mode="full",
+            key=["id"], create_if_missing=True, parallelism=2,
+        )
+        err = capfd.readouterr().err
+        assert "partition 'range-0' complete: 2 rows" in err, err
+        assert "partition 'range-1' complete: 2 rows" in err, err
+        (collapsed,) = [w for w in r.warnings if w.kind == "collapsed_bool"]
+        assert collapsed.count == 2
+        assert "'x_state': 2 tinyint(1) value(s)" in collapsed.message, collapsed.message
+    finally:
+        _drop_ch(ch_client, table)
+        with mysql_conn.cursor() as cur:
+            cur.execute(f"DROP TABLE IF EXISTS `{table}`")
+
+
 def _stream_cursor_sync(mysql_source, ch_target, table, **kw):
     """Incremental sync whose MAX probe is skipped (``probe_max_cost=1.0`` on an
     unindexed watermark), so the cursor is taken from the read stream."""
@@ -1131,6 +1166,188 @@ def test_a_timestamp_lands_shifted_unless_the_session_is_utc(
         _drop_ch(ch_client, table)
         with mysql_conn.cursor() as cur:
             cur.execute(f"DROP TABLE IF EXISTS `{table}`")
+
+
+def _session_probe(table, *cols):
+    """A source_query whose every row says how the connection that read it was
+    set up: the session's read-only flag, and which connection it was."""
+    return (
+        f"SELECT {', '.join(cols)}, @@session.transaction_read_only AS ro, "
+        f"CONNECTION_ID() AS conn FROM `{table}`"
+    )
+
+
+@pytest.mark.parametrize(
+    "shape, logged",
+    [
+        # Range partitions, each read on its own connection.
+        (
+            dict(mode="full", parallelism=3, partition_source_expr="id"),
+            "partition 'range-2' complete",
+        ),
+        # chunk_rows chunks, read on the keyset loop's own connection.
+        (
+            dict(
+                mode="incremental", watermark="write_date", chunk_rows=30,
+                engine="ReplacingMergeTree", order_by=["id"],
+            ),
+            "keyset chunked read complete",
+        ),
+        # A windowed sweep: the MAX probe prices above probe_max_cost on an
+        # unindexed watermark, so the read goes in key windows.
+        (
+            dict(
+                mode="incremental", watermark="write_date", probe_max_cost=1.0,
+                lookback_seconds=1, read_window_rows=40, parallelism=1,
+                engine="ReplacingMergeTree", order_by=["id"],
+            ),
+            "windowed read complete",
+        ),
+    ],
+    ids=["partitions", "chunks", "windows"],
+)
+def test_read_only_holds_on_every_connection_a_read_opens(
+    mysql_conn, ch_client, ch_target, unique_name, capfd, shape, logged
+):
+    """Issue #31: MySQL(read_only=True) adds transaction_read_only = ON to the
+    SET SESSION every connection runs first, so each connection a read opens
+    is read-only, however the read is split. Each row lands with the flag of
+    the session that read it. Left at its default, the session is unchanged."""
+    table = unique_name
+    _seed_table(mysql_conn, table, 120)
+    kw = dict(
+        dest_table=table, source_query=_session_probe(table, "id", "write_date"),
+        key=["id"], create_if_missing=True, **shape,
+    )
+
+    def landed(source, run):
+        _drop_ch(ch_client, table)
+        capfd.readouterr()
+        r = quickhouse.sync(source, ch_target, state_key=f"{table}:{run}", **kw)
+        assert r.rows_written == 120
+        assert logged in capfd.readouterr().err, "the read should be split this way"
+        return ch_client.query(
+            f"SELECT min(ro), max(ro), uniqExact(conn) FROM `{table}`"
+        ).result_rows[0]
+
+    try:
+        assert landed(quickhouse.MySQL(MYSQL_DSN), "default")[:2] == (0, 0)
+        low, high, connections = landed(quickhouse.MySQL(MYSQL_DSN, read_only=True), "ro")
+        assert (low, high) == (1, 1)
+        if shape.get("parallelism") == 3:
+            assert connections == 3, "one connection per partition"
+    finally:
+        _drop_ch(ch_client, table)
+        with mysql_conn.cursor() as cur:
+            cur.execute(f"DROP TABLE IF EXISTS `{table}`")
+
+
+def test_read_only_holds_on_the_connection_a_retry_opens(
+    mysql_conn, ch_client, ch_target, unique_name
+):
+    """Issue #31: a retried attempt opens its connections anew, and they are
+    read-only as well. The reader is killed part-way, the retry reads every
+    row again on a connection of its own, and each row it lands says so. A
+    MergeTree that keeps duplicates stages each attempt, so the rows that land
+    are the retry's alone."""
+    table = unique_name
+    rows = 40_000
+    _seed_wide(mysql_conn, table, rows)
+    _drop_ch(ch_client, table)
+    kw = dict(
+        dest_table=table, source_query=_session_probe(table, "id", "payload"),
+        mode="incremental", watermark="id", key=["id"], create_if_missing=True,
+        engine="MergeTree", order_by=["id"], parallelism=1, batch_rows=1000,
+        insert_bytes=0, read_max_rows_per_sec=10_000, retry_max_attempts=3,
+        state_key=f"{table}:pk",
+    )
+    try:
+        killer, killed = _kill_reader_after(mysql_conn, 1.5, table=table)
+        r = quickhouse.sync(quickhouse.MySQL(MYSQL_DSN, read_only=True), ch_target, **kw)
+        killer.join()
+        assert killed, "the read should have been cut off part-way"
+        assert r.rows_written == rows
+        low, high, connections = ch_client.query(
+            f"SELECT min(ro), max(ro), groupUniqArray(conn) FROM `{table}`"
+        ).result_rows[0]
+        assert (low, high) == (1, 1)
+        assert not set(connections) & set(killed), "every row landed is the retry's"
+    finally:
+        _drop_ch(ch_client, table)
+        with mysql_conn.cursor() as cur:
+            cur.execute(f"DROP TABLE IF EXISTS `{table}`")
+
+
+@contextlib.contextmanager
+def _function_that_inserts(name, log_table):
+    """A stored function that inserts a row into `log_table` and returns 1,
+    which a source_query can call. Made as root: with binary logging on,
+    MySQL refuses to let a user without SUPER create a function (1419)."""
+    pymysql = pytest.importorskip("pymysql")
+    try:
+        root = pymysql.connect(
+            host=MYSQL_HOST, port=MYSQL_PORT, user="root",
+            password=MYSQL_ROOT_PASSWORD, database=MYSQL_DB, autocommit=True,
+        )
+    except Exception as e:  # noqa: BLE001
+        pytest.skip(f"creating a stored function needs MySQL root: {e}")
+    try:
+        with root.cursor() as cur:
+            # INVOKER: the insert runs with the reading user's own grants.
+            cur.execute(
+                f"CREATE FUNCTION `{name}`() RETURNS INT DETERMINISTIC MODIFIES SQL DATA "
+                f"SQL SECURITY INVOKER BEGIN INSERT INTO `{log_table}` VALUES (); RETURN 1; END"
+            )
+        try:
+            yield
+        finally:
+            with root.cursor() as cur:
+                cur.execute(f"DROP FUNCTION IF EXISTS `{name}`")
+    finally:
+        root.close()
+
+
+def test_read_only_refuses_a_source_query_that_writes(
+    mysql_conn, ch_client, ch_target, unique_name
+):
+    """Issue #31: a source_query can call a function that writes, and only the
+    user's grants stood in its way: by default it inserted a row for each row
+    read. With read_only=True MySQL refuses it with 1792 and nothing is
+    written: on the sync's setup connection, which prepares the query before
+    any row is read, and on reconcile_keys' connection."""
+    table, log = unique_name, f"{unique_name}_log"
+    _seed_table(mysql_conn, table, 10)
+    with mysql_conn.cursor() as cur:
+        cur.execute(f"DROP TABLE IF EXISTS `{log}`")
+        cur.execute(f"CREATE TABLE `{log}` (id BIGINT AUTO_INCREMENT PRIMARY KEY)")
+    _drop_ch(ch_client, table)
+    query = f"SELECT id, write_date, `{log}_row`() AS logged FROM `{table}`"
+    kw = dict(dest_table=table, source_query=query, mode="full", key=["id"],
+              create_if_missing=True)
+
+    def logged():
+        return _mysql_scalar(mysql_conn, f"SELECT count(*) FROM `{log}`")
+
+    try:
+        with _function_that_inserts(f"{log}_row", log):
+            r = quickhouse.sync(quickhouse.MySQL(MYSQL_DSN), ch_target, **kw)
+            assert r.rows_written == 10
+            written = logged()
+            assert written >= 10, "by default the function writes"
+
+            read_only = quickhouse.MySQL(MYSQL_DSN, read_only=True)
+            with pytest.raises(RuntimeError, match="resolving mysql columns: .*1792"):
+                quickhouse.sync(read_only, ch_target, **kw)
+            with pytest.raises(RuntimeError, match="1792"):
+                quickhouse.reconcile_keys(
+                    read_only, ch_target, table, key="id", source_query=query
+                )
+            assert logged() == written, "nothing was written"
+    finally:
+        _drop_ch(ch_client, table)
+        with mysql_conn.cursor() as cur:
+            cur.execute(f"DROP TABLE IF EXISTS `{table}`")
+            cur.execute(f"DROP TABLE IF EXISTS `{log}`")
 
 
 def test_an_all_null_watermark_is_reported_on_every_run(
@@ -1632,10 +1849,11 @@ def _seed_wide(mysql_conn, table, rows):
         )
 
 
-def _kill_reader_after(mysql_conn, delay):
+def _kill_reader_after(mysql_conn, delay, table=None):
     """Kill quickhouse's read connection after `delay` seconds, as a replica
     restart would, from a thread of its own: every connection of the test
-    user but this test's own."""
+    user but this test's own, or with `table`, only those running a statement
+    that names it."""
     pymysql = pytest.importorskip("pymysql")
     with mysql_conn.cursor() as cur:
         cur.execute("SELECT CONNECTION_ID()")
@@ -1650,8 +1868,9 @@ def _kill_reader_after(mysql_conn, delay):
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT id FROM information_schema.processlist "
-                "WHERE user = %s AND id NOT IN (%s, CONNECTION_ID())",
-                (MYSQL_USER, fixture),
+                "WHERE user = %s AND id NOT IN (%s, CONNECTION_ID()) "
+                "AND (%s IS NULL OR info LIKE %s)",
+                (MYSQL_USER, fixture, table, f"%{table}%"),
             )
             killed.extend(thread for (thread,) in cur.fetchall())
             for thread in killed:
