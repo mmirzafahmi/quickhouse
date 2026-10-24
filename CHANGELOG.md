@@ -9,6 +9,25 @@ any breaking change is called out explicitly.
 
 ## [Unreleased]
 
+### Added
+- **A warning for destination columns the source doesn't feed:
+  `unsourced_destination_column`.** A sync into an existing destination now
+  checks the destination's columns against the ones it writes (after `rename`,
+  `include` and `exclude`). It raises one warning per column that no source
+  column feeds and that the destination doesn't fill itself with a `DEFAULT`,
+  or on ClickHouse a `MATERIALIZED`, `ALIAS` or `EPHEMERAL` expression. Until
+  now such a column changed silently, and differently per destination. On
+  ClickHouse each row written carries the type's default (`NULL` when
+  `Nullable`) and, in a `ReplacingMergeTree`, replaces the stored row. A
+  `source_query` whose column list had drifted from the live tables NULLed
+  values on 26 tables this way for two months, while row counts matched. On
+  BigQuery the `MERGE` keeps the column on rows it updates and leaves it NULL
+  on rows it inserts. A full refresh rebuilds every row without it. The check
+  runs before anything is written, so
+  `fail_on_warnings={"unsourced_destination_column"}` stops the run with the
+  destination untouched. It costs one query against the destination's
+  metadata per run. (#28)
+
 ## [0.20.8] — 2026-10-08
 
 ### Fixed

@@ -1468,3 +1468,67 @@ def test_a_resumed_first_read_into_a_replacing_merge_tree_leaves_out_null_waterm
         assert ch_client.command(f"SELECT count() FROM `{table}` FINAL") == 189
     finally:
         _drop_ch(ch_client, table)
+
+
+def test_a_destination_column_no_source_column_feeds_is_reported_before_writing(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """Issue #28: a ClickHouse row a sync writes carries no value for a
+    destination column the source doesn't feed, so in a ReplacingMergeTree the
+    stored value is replaced with NULL. The run reports each such column before
+    writing, and fail_on_warnings stops it with the destination untouched. A
+    column the destination fills itself isn't reported."""
+    table = unique_name
+    _seed_table(pg_conn, table, 10)
+    _drop_ch(ch_client, table)
+    kw = dict(
+        dest_table=table, source_table=table, mode="incremental", watermark="write_date",
+        key=["id"], create_if_missing=True, engine="ReplacingMergeTree", order_by=["id"],
+        state_key=f"{table}:unsourced",
+    )
+    row = f"SELECT name, legacy FROM `{table}` FINAL WHERE id = 1"
+    try:
+        first = quickhouse.sync(pg_source, ch_target, **kw)
+        assert first.rows_written == 10
+        assert "unsourced_destination_column" not in {w.kind for w in first.warnings}
+        # Columns another loader added: one only it fills, and three the
+        # destination fills itself.
+        ch_client.command(
+            f"ALTER TABLE `{table}` ADD COLUMN legacy Nullable(String), "
+            "ADD COLUMN loaded_at DateTime DEFAULT now(), "
+            "ADD COLUMN doubled Int64 MATERIALIZED id * 2, "
+            "ADD COLUMN label String ALIAS concat('#', toString(id))"
+        )
+        ch_client.command(
+            f"ALTER TABLE `{table}` UPDATE legacy = 'kept' WHERE 1",
+            settings={"mutations_sync": 2},
+        )
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE \"{table}\" SET name = 'changed', write_date = '2024-02-01' WHERE id = 1"
+            )
+        # A column list that drifted from the table: `note` is no longer fed.
+        drifted = dict(kw, exclude=["note"])
+        fatal = {"unsourced_destination_column"}
+
+        with pytest.raises(
+            RuntimeError, match="fail_on_warnings: unsourced_destination_column"
+        ) as err:
+            quickhouse.sync(pg_source, ch_target, fail_on_warnings=fatal, **drifted)
+        assert "Nothing was written" in str(err.value)
+        assert ch_client.query(row).result_rows == [("row-1", "kept")]
+        full = dict(drifted, mode="full", allow_full_refresh_shrink=True)
+        with pytest.raises(RuntimeError, match="Nothing was written"):
+            quickhouse.sync(pg_source, ch_target, fail_on_warnings=fatal, **full)
+        assert ch_client.query(row).result_rows == [("row-1", "kept")]
+
+        # Without it the run goes ahead, and says what it did.
+        r = quickhouse.sync(pg_source, ch_target, **drifted)
+        assert r.rows_written == 1
+        unsourced = [w for w in r.warnings if w.kind == "unsourced_destination_column"]
+        assert sorted(w.column for w in unsourced) == ["legacy", "note"]
+        assert all(w.count == 0 for w in unsourced)
+        assert "ReplacingMergeTree" in unsourced[0].message
+        assert ch_client.query(row).result_rows == [("changed", None)]
+    finally:
+        _drop_ch(ch_client, table)

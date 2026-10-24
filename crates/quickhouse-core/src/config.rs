@@ -1804,6 +1804,17 @@ pub enum WarningKind {
     /// is only reported when the rows went straight into the destination
     /// (append), where failing would take nothing back.
     StorageWriteCountMismatch,
+    /// The existing destination has a column that no source column feeds
+    /// (after `rename` / `include` / `exclude`) and that it doesn't fill
+    /// itself: no `DEFAULT`, nor on ClickHouse a `MATERIALIZED`, `ALIAS` or
+    /// `EPHEMERAL` expression. Every row the run writes lands without a value
+    /// there. On ClickHouse that is the type's default (NULL when
+    /// `Nullable`), and in a `ReplacingMergeTree` the row replaces the stored
+    /// one, value and all. On BigQuery a `MERGE` leaves the column alone on
+    /// rows it updates and NULL on rows it inserts. A full refresh rebuilds
+    /// every row without it. Raised at setup, before anything is written,
+    /// once per column with `count` `0`; `column` is the destination column.
+    UnsourcedDestinationColumn,
 }
 
 impl WarningKind {
@@ -1830,6 +1841,7 @@ impl WarningKind {
             WarningKind::NullCheckSkipped => "null_check_skipped",
             WarningKind::RetriedAfterPartialWrite => "retried_after_partial_write",
             WarningKind::StorageWriteCountMismatch => "storage_write_count_mismatch",
+            WarningKind::UnsourcedDestinationColumn => "unsourced_destination_column",
         }
     }
 
@@ -1839,7 +1851,7 @@ impl WarningKind {
     }
 
     /// Every kind, in declaration order.
-    pub const ALL: [WarningKind; 18] = [
+    pub const ALL: [WarningKind; 19] = [
         WarningKind::CollapsedBool,
         WarningKind::CoercedDate,
         WarningKind::CoercedDecimal,
@@ -1858,6 +1870,7 @@ impl WarningKind {
         WarningKind::NullCheckSkipped,
         WarningKind::RetriedAfterPartialWrite,
         WarningKind::StorageWriteCountMismatch,
+        WarningKind::UnsourcedDestinationColumn,
     ];
 }
 
@@ -1872,8 +1885,9 @@ impl WarningKind {
 pub struct TransferWarning {
     pub kind: WarningKind,
     /// The source column responsible, when the condition is attributable to
-    /// one. `None` for table-level conditions (a full-refresh shrink, an
-    /// unclustered merge target).
+    /// one: for [`WarningKind::UnsourcedDestinationColumn`], the destination
+    /// column no source column feeds. `None` for table-level conditions (a
+    /// full-refresh shrink, an unclustered merge target).
     pub column: Option<String>,
     /// How many values/rows tripped this condition. Table-level warnings use
     /// the count that makes the condition concrete (rows lost to a shrink,
@@ -2263,7 +2277,8 @@ mod tests {
             | WarningKind::WindowBoundsUnavailable
             | WarningKind::NullCheckSkipped
             | WarningKind::RetriedAfterPartialWrite
-            | WarningKind::StorageWriteCountMismatch => WarningKind::ALL.contains(&k),
+            | WarningKind::StorageWriteCountMismatch
+            | WarningKind::UnsourcedDestinationColumn => WarningKind::ALL.contains(&k),
         };
         assert!(WarningKind::ALL.into_iter().all(listed));
     }

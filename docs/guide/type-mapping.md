@@ -167,6 +167,23 @@ qh.sync(..., source_table="orders",
 the destination lacks, instead of erroring. ADD-only — it never drops or retypes
 a column. Default `False`.
 
+The other direction is a warning, not an error: a destination column that no
+source column feeds (after `rename`/`include`/`exclude`) raises
+`unsourced_destination_column`, once per column, before anything is written.
+The two destinations treat such a column differently:
+
+- **ClickHouse** writes whole rows. Each row a sync writes carries the column's
+  type default (`NULL` when `Nullable`), and in a `ReplacingMergeTree` it
+  replaces the stored row, so a value already there is lost.
+- **BigQuery**'s `MERGE` updates only the columns the source provides. Updated
+  rows keep the value; inserted rows get `NULL`.
+
+A full refresh rebuilds every row without it on either destination. A column
+the destination fills itself (a `DEFAULT`, or a ClickHouse `MATERIALIZED`,
+`ALIAS` or `EPHEMERAL` expression) isn't reported. To stop the run instead,
+pass `fail_on_warnings={"unsourced_destination_column"}`. The fix is to select
+the column in the source, or to drop it from the destination.
+
 ## Not yet supported
 
 Arrays and composite (`RECORD`/`STRUCT`) types aren't mapped yet. For API sources,

@@ -675,10 +675,24 @@ class TransferWarning:
       ``chunk_rows`` chunk is committed, whether or not ``fail_on_warnings``
       names it; an append, whose rows are in the destination already, reports
       it. Use ``write_method="insert_all"`` if it recurs. New in 0.20.7.
+    - ``"unsourced_destination_column"`` — the existing destination has a
+      column that no source column feeds (after ``rename``/``include``/
+      ``exclude``) and that it doesn't fill itself: no ``DEFAULT``, nor on
+      ClickHouse a ``MATERIALIZED``, ``ALIAS`` or ``EPHEMERAL`` expression.
+      The rows this run writes carry no value there. On ClickHouse each lands
+      with the type's default (NULL when ``Nullable``), and in a
+      ``ReplacingMergeTree`` it replaces the stored row, so a value already
+      there is lost. On BigQuery the ``MERGE`` keeps the column on rows it
+      updates and leaves it NULL on rows it inserts. A full refresh rebuilds
+      every row without it, on either. Raised at setup, once per column, with
+      ``count`` ``0``; ``column`` is the destination column. Name it in
+      ``fail_on_warnings`` to stop the run before anything is written. New in
+      0.20.9.
     """
 
     column: Optional[str]
-    """The source column responsible, or ``None`` for a table-level condition."""
+    """The source column responsible, or ``None`` for a table-level condition.
+    For ``"unsourced_destination_column"``, the destination column."""
 
     count: int
     """How many values/rows tripped it. Aggregated per ``(kind, column)`` across

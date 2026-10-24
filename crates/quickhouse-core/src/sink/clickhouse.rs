@@ -308,6 +308,30 @@ impl ClickHouseSink {
         Ok(added)
     }
 
+    /// See [`crate::sink::Sink::unsourced_columns`]. A column with a
+    /// `default_kind` (`DEFAULT`, `MATERIALIZED`, `ALIAS`, `EPHEMERAL`) is the
+    /// table's own to fill, so it is never one. Case-sensitive, as
+    /// ClickHouse column names are.
+    pub async fn unsourced_columns(
+        &self,
+        table: &str,
+        columns: &[ColumnType],
+    ) -> Result<Vec<String>> {
+        let sql = format!(
+            "SELECT name FROM system.columns WHERE database = '{}' AND table = '{}' \
+             AND default_kind = '' ORDER BY position",
+            escape_sql_string(&self.cfg.database),
+            escape_sql_string(table),
+        );
+        let existing = self
+            .query_column(&sql)
+            .await?
+            .iter()
+            .filter_map(|name| crate::source::clickhouse::tsv_field(name))
+            .collect();
+        Ok(crate::sink::unsourced_columns(existing, columns, false))
+    }
+
     /// Generate and run this destination's own `CREATE TABLE` DDL for `table`.
     pub async fn create_table(
         &self,
@@ -1052,6 +1076,9 @@ impl Sink for ClickHouseSink {
         cfg: &TransferConfig,
     ) -> Result<Vec<String>> {
         ClickHouseSink::add_missing_columns(self, table, columns, cfg).await
+    }
+    async fn unsourced_columns(&self, table: &str, columns: &[ColumnType]) -> Result<Vec<String>> {
+        ClickHouseSink::unsourced_columns(self, table, columns).await
     }
     fn dest_kind(&self) -> crate::config::DestKind {
         crate::config::DestKind::ClickHouse

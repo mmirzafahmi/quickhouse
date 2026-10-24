@@ -1137,6 +1137,30 @@ impl BigQuerySink {
         Ok(added)
     }
 
+    /// See [`crate::sink::Sink::unsourced_columns`]. A column with a default
+    /// value expression is never one: BigQuery writes the default into a row
+    /// added without the column, which is what the `MERGE` and the swap do
+    /// (both name their columns), and a Storage Write stream whose schema
+    /// leaves it out. Case-insensitive, as BigQuery column names are.
+    pub async fn unsourced_columns(
+        &self,
+        table: &str,
+        columns: &[ColumnType],
+    ) -> Result<Vec<String>> {
+        let Some(t) = self.get_table(table).await? else {
+            return Ok(Vec::new());
+        };
+        let existing = t
+            .schema
+            .map(|s| s.fields)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|f| f.default_value_expression.is_none())
+            .map(|f| f.name)
+            .collect();
+        Ok(crate::sink::unsourced_columns(existing, columns, true))
+    }
+
     /// Create the internal `_quickhouse_state` watermark-tracking table if
     /// it doesn't exist yet. Unlike ClickHouse's `CREATE TABLE IF NOT
     /// EXISTS`, BigQuery's table creation has no such clause, so the
@@ -1838,6 +1862,9 @@ impl Sink for BigQuerySink {
         cfg: &TransferConfig,
     ) -> Result<Vec<String>> {
         BigQuerySink::add_missing_columns(self, table, columns, cfg).await
+    }
+    async fn unsourced_columns(&self, table: &str, columns: &[ColumnType]) -> Result<Vec<String>> {
+        BigQuerySink::unsourced_columns(self, table, columns).await
     }
     fn dest_kind(&self) -> crate::config::DestKind {
         crate::config::DestKind::BigQuery

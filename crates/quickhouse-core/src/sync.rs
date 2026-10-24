@@ -2264,8 +2264,10 @@ async fn run_transfer_impl(
     // snapshot, so a stream-derived cursor has to allow for how long it took.
     let read_spans_statements =
         window_plan.is_some() || partitions.len() > 1 || chunk_plan.is_some();
-    // Setup raised its warnings already: one that is fatal stops the run here,
-    // before any table is created or written.
+    // Setup raised its warnings already, and the destination's columns raise
+    // theirs here: one that is fatal stops the run before any table is
+    // created or written.
+    warn_on_unsourced_columns(sink.as_ref(), &cfg, &plan.dest_columns, &warnings).await?;
     check_fatal(&cfg, sink.as_ref(), &warnings, Before::Write)?;
 
     // --- Ensure destination / staging tables exist. ---
@@ -2807,6 +2809,7 @@ async fn run_transfer_bigquery(
         ));
     }
 
+    warn_on_unsourced_columns(sink.as_ref(), &cfg, &plan.dest_columns, &warnings).await?;
     check_fatal(&cfg, sink.as_ref(), &warnings, Before::Write)?;
     let target_table = prepare_target(
         &sink,
@@ -3297,6 +3300,7 @@ async fn run_transfer_api(
         ));
     }
 
+    warn_on_unsourced_columns(sink.as_ref(), &cfg, &plan.dest_columns, &warnings).await?;
     check_fatal(&cfg, sink.as_ref(), &warnings, Before::Write)?;
     let target_table = prepare_target(
         &sink,
@@ -3752,6 +3756,7 @@ async fn run_transfer_frame(
         ));
     }
 
+    warn_on_unsourced_columns(sink.as_ref(), &cfg, &plan.dest_columns, &warnings).await?;
     check_fatal(&cfg, sink.as_ref(), &warnings, Before::Write)?;
     let target_table = prepare_target(
         &sink,
@@ -6133,7 +6138,8 @@ fn coercion_message(kind: WarningKind, column: &str, n: u64) -> String {
         | WarningKind::WindowBoundsUnavailable
         | WarningKind::NullCheckSkipped
         | WarningKind::RetriedAfterPartialWrite
-        | WarningKind::StorageWriteCountMismatch => {
+        | WarningKind::StorageWriteCountMismatch
+        | WarningKind::UnsourcedDestinationColumn => {
             format!("column '{column}': {n} affected row(s)")
         }
     }
@@ -7200,6 +7206,67 @@ fn warn_mixed_decimals(table: &str, decimal: &[String], float: &[String], warnin
         sample: None,
         message,
     });
+}
+
+/// Raise [`WarningKind::UnsourcedDestinationColumn`] for each column of the
+/// existing destination that the rows this run writes leave without a value.
+/// Checked before anything is written, so a `fail_on_warnings` that names it
+/// stops the run with the destination untouched.
+async fn warn_on_unsourced_columns(
+    sink: &dyn Sink,
+    cfg: &TransferConfig,
+    dest_columns: &[ColumnType],
+    warnings: &Warnings,
+) -> Result<()> {
+    let unsourced = sink
+        .unsourced_columns(&cfg.dest_table, dest_columns)
+        .await?;
+    let effect = unsourced_effect(sink.dest_kind(), cfg.mode);
+    for column in unsourced {
+        let message = format!(
+            "destination column '{column}' of '{}' gets no value from this run: no source column \
+             feeds it (after rename/include/exclude) and it has no DEFAULT. {effect}. Select it \
+             in the source, or drop it from the destination if nothing needs it.",
+            cfg.dest_table,
+        );
+        tracing::warn!("{message}");
+        warnings.push(TransferWarning {
+            kind: WarningKind::UnsourcedDestinationColumn,
+            column: Some(column),
+            count: 0,
+            sample: None,
+            message,
+        });
+    }
+    Ok(())
+}
+
+/// What a run in `mode` does to a destination column it has no value for. The
+/// destinations differ: a ClickHouse row replaces the stored one whole, while
+/// a BigQuery `MERGE` sets only the columns it names.
+fn unsourced_effect(kind: crate::config::DestKind, mode: SyncMode) -> &'static str {
+    use crate::config::DestKind;
+    match (kind, mode) {
+        (DestKind::ClickHouse, SyncMode::Incremental) => {
+            "Every row this run writes sets it to the type's default (NULL when Nullable), and in \
+             a ReplacingMergeTree that row replaces the stored one, so a value already there is \
+             lost"
+        }
+        (DestKind::BigQuery, SyncMode::Incremental) => {
+            "The MERGE keeps it on rows this run updates and sets it NULL on rows it inserts"
+        }
+        (DestKind::ClickHouse, SyncMode::Full) => {
+            "The refresh rebuilds every row without it, so every row ends up with the type's \
+             default (NULL when Nullable)"
+        }
+        (DestKind::BigQuery, SyncMode::Full) => {
+            "The refresh rebuilds every row without it, so every row ends up NULL there"
+        }
+        (DestKind::ClickHouse, SyncMode::Append) => {
+            "Every row this run appends gets the type's default there (NULL when Nullable)"
+        }
+        (DestKind::BigQuery, SyncMode::Append) => "Every row this run appends gets NULL there",
+    }
 }
 
 /// What the destination table already holds, for
