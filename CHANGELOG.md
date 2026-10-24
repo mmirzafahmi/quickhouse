@@ -80,6 +80,21 @@ any breaking change is called out explicitly.
 - **`ValueReconcileResult`** and its per-column **`ColumnDrift`**. (#30)
 
 ### Fixed
+- **A `chunk_rows` read no longer resumes another query's resume marker.** A
+  marker was kept per state key and destination only, so a read of a
+  different query under the same key resumed it. Two backfills of id ranges
+  1-500 and 501-1000 on one `state_key`, the first failing after ids 1-200,
+  left the second resuming past id 200 up to the first range's bound, 500. It
+  read nothing, reported success and cleared the marker, so neither range was
+  finished, and nothing said so. Reads that set the same `source_table` share
+  a key even without a `state_key`. A marker now records which read wrote it
+  (`source_table`, `source_query`, the keyset column, `watermark` and
+  `watermark_source_expr`), and only that read resumes it. Another read
+  starts from the saved cursor, which a chunked run doesn't move until it
+  finishes, so nothing it selects is skipped, and raises the new
+  `abandoned_resume_marker` warning. The state table gains a `chunk_read`
+  column, added in place on first use; a marker written before this release
+  resumes as before. (#32)
 - **A `collapsed_bool` warning's message now gives the same number as its
   `count`.** Each partition of a parallel read, each `chunk_rows` chunk and
   each window of a sweep reports the values it flattened, and the run's warning

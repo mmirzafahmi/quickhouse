@@ -251,7 +251,8 @@ impl CoercionTally {
             | WarningKind::NullCheckSkipped
             | WarningKind::RetriedAfterPartialWrite
             | WarningKind::StorageWriteCountMismatch
-            | WarningKind::UnsourcedDestinationColumn => None,
+            | WarningKind::UnsourcedDestinationColumn
+            | WarningKind::AbandonedResumeMarker => None,
         }
     }
 

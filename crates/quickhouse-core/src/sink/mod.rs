@@ -83,6 +83,18 @@ pub(crate) fn unsourced_columns(
         .collect()
 }
 
+/// An in-progress chunk-resume marker, as [`Sink::read_chunk_state`] reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkMarker {
+    /// The keyset cursor the interrupted run had durably read past.
+    pub cursor: String,
+    /// The bound it froze (see `sync::MarkerBound`); empty for none.
+    pub upper: String,
+    /// The [`TransferConfig::chunk_read_id`] of the read that wrote it; empty
+    /// for a marker written before 0.20.9, which can't say.
+    pub read: String,
+}
+
 /// One `(state_key, dest_table)` cursor in a state table, as
 /// [`Sink::state_keys`] lists it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -248,13 +260,14 @@ pub trait Sink: Send + Sync {
         false
     }
 
-    /// In-progress chunk-resume marker `(cursor, upper)`, or `None`. Default
-    /// `None` — a destination without chunked-read support has nothing to resume.
-    async fn read_chunk_state(&self, _cfg: &TransferConfig) -> Result<Option<(String, String)>> {
+    /// In-progress chunk-resume marker, or `None`. Default `None` — a
+    /// destination without chunked-read support has nothing to resume.
+    async fn read_chunk_state(&self, _cfg: &TransferConfig) -> Result<Option<ChunkMarker>> {
         Ok(None)
     }
 
-    /// Persist a per-chunk resume marker. Default: unsupported — only a
+    /// Persist a per-chunk resume marker, recording `cfg`'s
+    /// [`TransferConfig::chunk_read_id`] with it. Default: unsupported — only a
     /// destination that actually supports chunked resumable reads is ever asked.
     async fn persist_chunk_cursor(
         &self,

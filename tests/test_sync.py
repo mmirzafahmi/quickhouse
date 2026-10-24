@@ -1532,3 +1532,53 @@ def test_a_destination_column_no_source_column_feeds_is_reported_before_writing(
         assert ch_client.query(row).result_rows == [("changed", None)]
     finally:
         _drop_ch(ch_client, table)
+
+
+def test_a_resume_marker_from_another_query_on_the_same_state_key_is_not_resumed(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """A chunked backfill of ids 1-500 fails after committing ids 1-200, and
+    leaves its resume marker. A backfill of ids 501-1000 on the same
+    state_key used to resume that marker: it read past id 200 up to the
+    other range's upper bound, 500, which this range has no ids in, so it
+    read nothing, reported success, and cleared the marker. Both ranges were
+    left unread. A marker now records which query wrote it, and another
+    query reads its own range and says what it didn't resume."""
+    table = unique_name
+    _seed_table(pg_conn, table, 1000)
+    _drop_ch(ch_client, table)
+    state_key = f"{table}:backfill"
+    query = f'SELECT * FROM "{table}" WHERE id {{}}'
+    kw = dict(
+        dest_table=table, mode="incremental", watermark="id", key=["id"], chunk_rows=100,
+        advance_watermark=False, create_if_missing=True, engine="ReplacingMergeTree",
+        order_by=["id"], state_key=state_key,
+    )
+    first = dict(kw, source_query=query.format("<= 500"))
+    second = dict(kw, source_query=query.format("> 500"))
+    try:
+        assert quickhouse.sync(pg_source, ch_target, **first).rows_read == 500
+        ch_client.command(f"ALTER TABLE `{table}` ADD CONSTRAINT stop_here CHECK id <= 250")
+        with pytest.raises(RuntimeError, match="stop_here"):
+            quickhouse.sync(pg_source, ch_target, **first)
+        ch_client.command(f"ALTER TABLE `{table}` DROP CONSTRAINT stop_here")
+        assert _latest_state(ch_client, state_key)[1:] == ("200", "500")
+
+        r = quickhouse.sync(pg_source, ch_target, **second)
+        assert r.rows_read == 500
+        assert ch_client.command(f"SELECT count() FROM `{table}` FINAL WHERE id > 500") == 500
+        abandoned = [w for w in r.warnings if w.kind == "abandoned_resume_marker"]
+        assert len(abandoned) == 1, r.warnings
+        assert "200" in abandoned[0].message
+        assert _latest_state(ch_client, state_key)[1:] == ("", "")
+
+        # The same query still resumes its own marker, and says nothing.
+        ch_client.command(f"ALTER TABLE `{table}` ADD CONSTRAINT stop_here CHECK id <= 750")
+        with pytest.raises(RuntimeError, match="stop_here"):
+            quickhouse.sync(pg_source, ch_target, **second)
+        ch_client.command(f"ALTER TABLE `{table}` DROP CONSTRAINT stop_here")
+        r = quickhouse.sync(pg_source, ch_target, **second)
+        assert r.rows_read == 300, "resumes after the two committed chunks, ids 501-700"
+        assert "abandoned_resume_marker" not in {w.kind for w in r.warnings}
+    finally:
+        _drop_ch(ch_client, table)

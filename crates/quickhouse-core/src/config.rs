@@ -1484,6 +1484,44 @@ impl TransferConfig {
         self.windowed || self.window_bounds.is_some()
     }
 
+    /// Which read a `chunk_rows` resume marker belongs to, recorded with it so
+    /// that only the same read resumes it. The state key alone can't say:
+    /// `state_key` is meant to stay put across query edits, and without one,
+    /// reads that set the same `source_table` share theirs. A stable hash
+    /// (64-bit FNV-1a, as hex) of what decides the rows a keyset cursor
+    /// walks: `source_table`, `source_query`, the keyset column, `watermark`
+    /// and `watermark_source_expr`.
+    pub fn chunk_read_id(&self) -> String {
+        let keyset = self.keyset_column();
+        let parts = [
+            self.source_table.as_deref(),
+            self.source_query.as_deref(),
+            keyset.as_deref(),
+            self.watermark.as_deref(),
+            self.watermark_source_expr.as_deref(),
+        ];
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut feed = |bytes: &[u8]| {
+            for &b in bytes {
+                hash ^= u64::from(b);
+                hash = hash.wrapping_mul(0x0100_0000_01b3);
+            }
+        };
+        // Each part is tagged and length-prefixed, so no two different
+        // tuples feed the same bytes.
+        for part in parts {
+            match part {
+                None => feed(&[0]),
+                Some(s) => {
+                    feed(&[1]);
+                    feed(&(s.len() as u64).to_le_bytes());
+                    feed(s.as_bytes());
+                }
+            }
+        }
+        format!("{hash:016x}")
+    }
+
     /// Validation for a DB source (Postgres/MySQL/BigQuery/ClickHouse) —
     /// byte-identical to the original `validate`.
     pub fn validate(&self) -> crate::error::Result<()> {
@@ -1941,6 +1979,17 @@ pub enum WarningKind {
     /// every row without it. Raised at setup, before anything is written,
     /// once per column with `count` `0`; `column` is the destination column.
     UnsourcedDestinationColumn,
+    /// The state key held the resume marker of an unfinished `chunk_rows`
+    /// read of a different query (see [`TransferConfig::chunk_read_id`]), so
+    /// the run didn't resume it: a marker's keyset cursor and frozen upper
+    /// bound mean nothing to another query, whose resume would read only
+    /// their overlap and report success. It read from the committed cursor
+    /// instead, so nothing it selects is skipped. The other query's rows past
+    /// its marker stay unread until it runs again, which matters when nothing
+    /// else reads them (`advance_watermark=false`). `sample` is the marker's
+    /// cursor. Raised at setup, before anything is written. Table-level:
+    /// `column` is `None`.
+    AbandonedResumeMarker,
 }
 
 impl WarningKind {
@@ -1968,6 +2017,7 @@ impl WarningKind {
             WarningKind::RetriedAfterPartialWrite => "retried_after_partial_write",
             WarningKind::StorageWriteCountMismatch => "storage_write_count_mismatch",
             WarningKind::UnsourcedDestinationColumn => "unsourced_destination_column",
+            WarningKind::AbandonedResumeMarker => "abandoned_resume_marker",
         }
     }
 
@@ -1977,7 +2027,7 @@ impl WarningKind {
     }
 
     /// Every kind, in declaration order.
-    pub const ALL: [WarningKind; 19] = [
+    pub const ALL: [WarningKind; 20] = [
         WarningKind::CollapsedBool,
         WarningKind::CoercedDate,
         WarningKind::CoercedDecimal,
@@ -1997,6 +2047,7 @@ impl WarningKind {
         WarningKind::RetriedAfterPartialWrite,
         WarningKind::StorageWriteCountMismatch,
         WarningKind::UnsourcedDestinationColumn,
+        WarningKind::AbandonedResumeMarker,
     ];
 }
 
@@ -2345,6 +2396,44 @@ mod tests {
     }
 
     #[test]
+    fn a_chunk_read_id_names_the_read_not_the_state_key() {
+        let c = cfg(SyncMode::Incremental, Some("write_date"));
+        // Persisted with every resume marker, so it can never change between
+        // releases: an unfinished read would no longer recognise its marker.
+        assert_eq!(c.chunk_read_id(), "72e7c1b8e7a66aec");
+        let id = |f: &dyn Fn(&mut TransferConfig)| {
+            let mut c = cfg(SyncMode::Incremental, Some("write_date"));
+            f(&mut c);
+            c.chunk_read_id()
+        };
+        // The state key and the projection don't decide which rows a keyset
+        // cursor walks.
+        assert_eq!(id(&|c| c.state_key = Some("k".into())), c.chunk_read_id());
+        assert_eq!(id(&|c| c.exclude = vec!["note".into()]), c.chunk_read_id());
+        // What does, does.
+        for changed in [
+            id(&|c| c.source_query = Some("SELECT * FROM t WHERE id > 5".into())),
+            id(&|c| c.partition_column = Some("seq".into())),
+            id(&|c| c.watermark = Some("id".into())),
+            id(&|c| c.watermark_source_expr = Some("write_date + 1".into())),
+        ] {
+            assert_ne!(changed, c.chunk_read_id());
+        }
+        // Fields are kept apart: the same text split differently is a
+        // different read.
+        assert_ne!(
+            id(&|c| {
+                c.source_table = Some("ab".into());
+                c.source_query = None;
+            }),
+            id(&|c| {
+                c.source_table = Some("a".into());
+                c.source_query = Some("b".into());
+            })
+        );
+    }
+
+    #[test]
     fn validate_rejects_seed_and_freeze_outside_incremental() {
         let mut c = cfg(SyncMode::Full, None);
         c.seed_watermark = WatermarkSeed::CurrentMax;
@@ -2408,7 +2497,8 @@ mod tests {
             | WarningKind::NullCheckSkipped
             | WarningKind::RetriedAfterPartialWrite
             | WarningKind::StorageWriteCountMismatch
-            | WarningKind::UnsourcedDestinationColumn => WarningKind::ALL.contains(&k),
+            | WarningKind::UnsourcedDestinationColumn
+            | WarningKind::AbandonedResumeMarker => WarningKind::ALL.contains(&k),
         };
         assert!(WarningKind::ALL.into_iter().all(listed));
     }

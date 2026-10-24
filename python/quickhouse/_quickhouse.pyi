@@ -726,6 +726,15 @@ class TransferWarning:
       every row without it, on either. Raised at setup, once per column, with
       ``count`` ``0``; ``column`` is the destination column. Name it in
       ``fail_on_warnings`` to stop the run before anything is written. New in
+    - ``"abandoned_resume_marker"`` — the state key held the resume marker of
+      an unfinished ``chunk_rows`` read of a different query, so the run
+      didn't resume it. Resuming another query's marker read only where the
+      two ranges overlap, often nothing, and reported success: two backfill
+      ranges on one ``state_key`` were both left unfinished that way. The run
+      reads from the saved cursor instead, so nothing it selects is skipped.
+      The other query's rows past its marker stay unread until it runs again,
+      which matters with ``advance_watermark=False``. ``sample`` is the
+      marker's cursor. Raised at setup, before anything is written. New in
       0.20.9.
     """
 

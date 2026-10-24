@@ -1389,18 +1389,24 @@ impl BigQuerySink {
         }
     }
 
-    /// Read an in-progress chunk-resume marker `(cursor, upper)` for this
-    /// `(state_key, dest_table)`: the latest state row's chunk columns. `None`
-    /// when there is no state yet, when the table predates the chunk columns
-    /// (read before `ensure_state_table` has migrated it, so no marker can
-    /// exist), or when the latest row carries none: `persist_watermark` leaves
-    /// them NULL, which is how a finished run clears the marker.
-    pub async fn read_chunk_state(&self, cfg: &TransferConfig) -> Result<Option<(String, String)>> {
+    /// Read an in-progress chunk-resume marker for this `(state_key,
+    /// dest_table)`: the latest state row's chunk columns. `None` when there
+    /// is no state yet, when the table predates the chunk columns (read before
+    /// `ensure_state_table` has migrated it, so no marker can exist), or when
+    /// the latest row carries none: `persist_watermark` leaves them NULL,
+    /// which is how a finished run clears the marker. A table from 0.5 to
+    /// 0.20.8 has no `chunk_read` yet, so its marker reads with none.
+    pub async fn read_chunk_state(
+        &self,
+        cfg: &TransferConfig,
+    ) -> Result<Option<crate::sink::ChunkMarker>> {
         let Some(t) = self.get_table(&cfg.state_table_name).await? else {
             return Ok(None);
         };
         let fields = t.schema.map(|s| s.fields).unwrap_or_default();
-        if !missing_state_chunk_fields(&fields).is_empty() {
+        let missing = missing_state_chunk_fields(&fields);
+        let with_read = !missing.iter().any(|f| f.name == "chunk_read");
+        if missing.len() > usize::from(!with_read) {
             return Ok(None);
         }
         let request = QueryRequest {
@@ -1410,6 +1416,7 @@ impl BigQuerySink {
                 &cfg.state_table_name,
                 &cfg.effective_state_key(),
                 &cfg.dest_table,
+                with_read,
             ),
             ..Default::default()
         };
@@ -1429,10 +1436,13 @@ impl BigQuerySink {
             row.column::<Option<String>>(i)
                 .map_err(|e| EtlError::other(format!("bigquery column error: {e}")))
         };
+        let read = if with_read { column(2)? } else { None };
         Ok(match (column(0)?, column(1)?) {
-            (Some(cursor), upper) if !cursor.is_empty() => {
-                Some((cursor, upper.unwrap_or_default()))
-            }
+            (Some(cursor), upper) if !cursor.is_empty() => Some(crate::sink::ChunkMarker {
+                cursor,
+                upper: upper.unwrap_or_default(),
+                read: read.unwrap_or_default(),
+            }),
             _ => None,
         })
     }
@@ -1457,6 +1467,7 @@ impl BigQuerySink {
             committed.unwrap_or(""),
             cursor,
             upper,
+            &cfg.chunk_read_id(),
             rows,
         );
         self.run_query_job(query, "persist_chunk", &cfg.dest_table)
@@ -1769,9 +1780,10 @@ fn build_state_keys_sql(
 
 /// The state table's chunk-resume columns. `NULLABLE`, so a state table can
 /// gain them in place and `persist_watermark`, which doesn't write them,
-/// leaves them NULL.
-fn state_chunk_fields() -> [TableFieldSchema; 2] {
-    ["chunk_cursor", "chunk_upper"].map(|name| TableFieldSchema {
+/// leaves them NULL. `chunk_read` came in 0.20.9: see
+/// `TransferConfig::chunk_read_id`.
+fn state_chunk_fields() -> [TableFieldSchema; 3] {
+    ["chunk_cursor", "chunk_upper", "chunk_read"].map(|name| TableFieldSchema {
         name: name.to_string(),
         data_type: TableFieldType::String,
         mode: Some(TableFieldMode::Nullable),
@@ -1842,7 +1854,10 @@ impl Sink for BigQuerySink {
     ) -> Result<()> {
         BigQuerySink::persist_watermark(self, cfg, watermark, rows).await
     }
-    async fn read_chunk_state(&self, cfg: &TransferConfig) -> Result<Option<(String, String)>> {
+    async fn read_chunk_state(
+        &self,
+        cfg: &TransferConfig,
+    ) -> Result<Option<crate::sink::ChunkMarker>> {
         BigQuerySink::read_chunk_state(self, cfg).await
     }
     async fn persist_chunk_cursor(
@@ -2127,16 +2142,18 @@ fn build_persist_watermark_sql(
 }
 
 /// The latest state row's chunk-resume columns for one `(state_key,
-/// dest_table)`.
+/// dest_table)`, `chunk_read` among them when the table has it (`with_read`).
 fn build_read_chunk_state_sql(
     project_id: &str,
     dataset_id: &str,
     state_table: &str,
     source_id: &str,
     dest_table: &str,
+    with_read: bool,
 ) -> String {
+    let read = if with_read { ", chunk_read" } else { "" };
     format!(
-        "SELECT chunk_cursor, chunk_upper FROM `{project_id}`.`{dataset_id}`.`{state_table}` \
+        "SELECT chunk_cursor, chunk_upper{read} FROM `{project_id}`.`{dataset_id}`.`{state_table}` \
          WHERE source_table = '{}' AND dest_table = '{}' \
          ORDER BY run_ts DESC LIMIT 1",
         escape_sql_string(source_id),
@@ -2154,17 +2171,20 @@ fn build_persist_chunk_cursor_sql(
     committed: &str,
     cursor: &str,
     upper: &str,
+    read: &str,
     rows: u64,
 ) -> String {
     format!(
         "INSERT INTO `{project_id}`.`{dataset_id}`.`{state_table}` \
-         (source_table, dest_table, last_watermark, `rows`, run_ts, chunk_cursor, chunk_upper) \
-         VALUES ('{}', '{}', '{}', {rows}, CURRENT_TIMESTAMP(), '{}', '{}')",
+         (source_table, dest_table, last_watermark, `rows`, run_ts, chunk_cursor, chunk_upper, \
+         chunk_read) \
+         VALUES ('{}', '{}', '{}', {rows}, CURRENT_TIMESTAMP(), '{}', '{}', '{}')",
         escape_sql_string(source_id),
         escape_sql_string(dest_table),
         escape_sql_string(committed),
         escape_sql_string(cursor),
         escape_sql_string(upper),
+        escape_sql_string(read),
     )
 }
 
@@ -3369,13 +3389,21 @@ mod tests {
     /// chunk columns, escaped like every other literal here.
     #[test]
     fn chunk_state_sql_reads_and_writes_the_chunk_columns() {
-        let read = build_read_chunk_state_sql("p", "d", "_quickhouse_state", "o'k", "dest");
+        let read = build_read_chunk_state_sql("p", "d", "_quickhouse_state", "o'k", "dest", true);
         assert!(
-            read.starts_with("SELECT chunk_cursor, chunk_upper FROM `p`.`d`.`_quickhouse_state`"),
+            read.starts_with(
+                "SELECT chunk_cursor, chunk_upper, chunk_read FROM `p`.`d`.`_quickhouse_state`"
+            ),
             "{read}"
         );
         assert!(read.contains(r"source_table = 'o\'k'"), "{read}");
         assert!(read.ends_with("ORDER BY run_ts DESC LIMIT 1"), "{read}");
+        // A table from before 0.20.9 has no `chunk_read` to select.
+        let old = build_read_chunk_state_sql("p", "d", "_quickhouse_state", "o'k", "dest", false);
+        assert!(
+            old.starts_with("SELECT chunk_cursor, chunk_upper FROM "),
+            "{old}"
+        );
 
         let write = build_persist_chunk_cursor_sql(
             "p",
@@ -3386,13 +3414,14 @@ mod tests {
             "2024-06-01 00:00:00",
             "41",
             "2024-06-10 00:00:00",
+            "72e7c1b8e7a66aec",
             7,
         );
         assert!(
             write.contains(
                 "(source_table, dest_table, last_watermark, `rows`, run_ts, chunk_cursor, \
-                 chunk_upper) VALUES ('orders', 'dest', '2024-06-01 00:00:00', 7, \
-                 CURRENT_TIMESTAMP(), '41', '2024-06-10 00:00:00')"
+                 chunk_upper, chunk_read) VALUES ('orders', 'dest', '2024-06-01 00:00:00', 7, \
+                 CURRENT_TIMESTAMP(), '41', '2024-06-10 00:00:00', '72e7c1b8e7a66aec')"
             ),
             "{write}"
         );
@@ -3408,16 +3437,25 @@ mod tests {
         let missing = missing_state_chunk_fields(&old);
         assert_eq!(
             missing.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
-            ["chunk_cursor", "chunk_upper"]
+            ["chunk_cursor", "chunk_upper", "chunk_read"]
         );
         assert!(missing
             .iter()
             .all(|f| f.mode == Some(TableFieldMode::Nullable)));
-        let migrated = vec![
+        let mut migrated = vec![
             named("source_table"),
             named("CHUNK_CURSOR"),
             named("chunk_upper"),
         ];
+        // A table from 0.5 to 0.20.8 lacks only `chunk_read`.
+        assert_eq!(
+            missing_state_chunk_fields(&migrated)
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>(),
+            ["chunk_read"]
+        );
+        migrated.push(named("chunk_read"));
         assert!(missing_state_chunk_fields(&migrated).is_empty());
     }
 

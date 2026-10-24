@@ -29,7 +29,7 @@ use crate::decode_clickhouse::ChArrowDecoder;
 use crate::decode_mysql::MySqlBatcher;
 use crate::error::{EtlError, Result};
 use crate::memory::{MemoryBudget, Reservation};
-use crate::sink::{build_sink, Sink};
+use crate::sink::{build_sink, ChunkMarker, Sink};
 use crate::source::appsflyer::AppsFlyerSource;
 use crate::source::clevertap::CleverTapSource;
 use crate::source::clickhouse::quote_ch_table;
@@ -1869,13 +1869,14 @@ async fn run_transfer_impl(
 
     // The committed cursor from the last fully-successful run (None on a first
     // run), and an in-progress chunk-resume marker (frozen upper + last durable
-    // cursor; chunked reads only, and only if a prior run was cut short). Read
-    // before the source is probed, because the probes can use the cursor: see
-    // `partitions_above` and `watermark_bounds_the_key`.
+    // cursor; chunked reads only, and only if a prior run of this read was cut
+    // short). Read before the source is probed, because the probes can use the
+    // cursor: see `partitions_above` and `watermark_bounds_the_key`.
     let (committed, resume) = if cfg.mode == SyncMode::Incremental {
         let committed = sink.read_last_watermark(&cfg).await?;
         let resume = if cfg.chunk_rows.is_some() {
-            sink.read_chunk_state(&cfg).await?
+            let marker = sink.read_chunk_state(&cfg).await?;
+            resumable_marker(marker, &cfg, committed.as_deref(), &warnings)
         } else {
             None
         };
@@ -4457,6 +4458,52 @@ async fn setup_mysql(
     })
 }
 
+/// The `(cursor, upper)` of a chunk-resume marker this run may resume: one its
+/// own read wrote, or one from before 0.20.9, which can't say whose it is.
+/// Another read's marker, under a shared state key, is left alone and
+/// reported as [`WarningKind::AbandonedResumeMarker`]: its cursor and frozen
+/// bound belong to that read's range, so resuming it would read only where
+/// the two ranges overlap, often nothing, and report success.
+fn resumable_marker(
+    marker: Option<ChunkMarker>,
+    cfg: &TransferConfig,
+    committed: Option<&str>,
+    warnings: &Warnings,
+) -> Option<(String, String)> {
+    let marker = marker?;
+    if marker.read.is_empty() || marker.read == cfg.chunk_read_id() {
+        return Some((marker.cursor, marker.upper));
+    }
+    let keyset = cfg.keyset_column().unwrap_or_default();
+    let from = match committed {
+        Some(c) => format!("the saved cursor, {c}"),
+        None => "the start".to_string(),
+    };
+    let unread = if cfg.advance_watermark {
+        ""
+    } else {
+        " With advance_watermark=False nothing else reads the rest of that query's range: run \
+         it again to read it, under a state_key of its own so no other read replaces its marker."
+    };
+    let message = format!(
+        "state_key '{}' into '{}' holds the resume marker of an unfinished chunk_rows read of a \
+         different query, stopped past {keyset} {}. This run doesn't resume it, and reads from \
+         {from} instead.{unread}",
+        cfg.effective_state_key(),
+        cfg.dest_table,
+        marker.cursor,
+    );
+    tracing::warn!("{message}");
+    warnings.push(TransferWarning {
+        kind: WarningKind::AbandonedResumeMarker,
+        column: None,
+        count: 0,
+        sample: Some(marker.cursor),
+        message,
+    });
+    None
+}
+
 /// Resolved plan for a keyset-chunked resumable read (see
 /// `TransferConfig::chunk_rows`). Built once per run in `run_transfer_impl`.
 /// Split a chunk-resume marker `(cursor, upper)` into the frozen upper bound
@@ -6225,7 +6272,8 @@ fn coercion_message(kind: WarningKind, column: &str, n: u64) -> String {
         | WarningKind::NullCheckSkipped
         | WarningKind::RetriedAfterPartialWrite
         | WarningKind::StorageWriteCountMismatch
-        | WarningKind::UnsourcedDestinationColumn => {
+        | WarningKind::UnsourcedDestinationColumn
+        | WarningKind::AbandonedResumeMarker => {
             format!("column '{column}': {n} affected row(s)")
         }
     }
@@ -9764,6 +9812,60 @@ mod tests {
         buf.truncate(mark);
         assert!(buf.is_empty());
         assert_eq!(buf.bytes, 0);
+    }
+
+    #[test]
+    fn only_the_read_that_wrote_a_resume_marker_resumes_it() {
+        let mut cfg = crate::config::default_test_config();
+        cfg.mode = SyncMode::Incremental;
+        cfg.watermark = Some("id".into());
+        cfg.key = vec!["id".into()];
+        cfg.state_key = Some("orders:backfill".into());
+        cfg.source_query = Some("SELECT * FROM t WHERE id <= 500".into());
+        let marker = |read: &str| ChunkMarker {
+            cursor: "200".into(),
+            upper: "500".into(),
+            read: read.into(),
+        };
+        let w = Warnings::default();
+        let own = cfg.chunk_read_id();
+        let resumed = Some(("200".to_string(), "500".to_string()));
+        assert_eq!(
+            resumable_marker(Some(marker(&own)), &cfg, None, &w),
+            resumed
+        );
+        // Written before 0.20.9: it can't say whose it is, so it resumes as before.
+        assert_eq!(resumable_marker(Some(marker("")), &cfg, None, &w), resumed);
+        assert_eq!(resumable_marker(None, &cfg, None, &w), None);
+        assert!(w.drain().is_empty());
+
+        // Another range's marker under the same state key.
+        cfg.source_query = Some("SELECT * FROM t WHERE id > 500".into());
+        cfg.advance_watermark = false;
+        assert_eq!(resumable_marker(Some(marker(&own)), &cfg, None, &w), None);
+        let raised = w.drain();
+        assert_eq!(raised.len(), 1);
+        assert_eq!(raised[0].kind, WarningKind::AbandonedResumeMarker);
+        assert_eq!(raised[0].sample.as_deref(), Some("200"));
+        let msg = &raised[0].message;
+        assert!(
+            msg.contains("stopped past id 200") && msg.contains("from the start"),
+            "{msg}"
+        );
+        assert!(msg.contains("run it again"), "{msg}");
+
+        // A query edited between a failed run and the next: that one goes on
+        // from the saved cursor, which nothing has moved, so all is read.
+        cfg.advance_watermark = true;
+        assert_eq!(
+            resumable_marker(Some(marker(&own)), &cfg, Some("100"), &w),
+            None
+        );
+        let msg = &w.drain()[0].message;
+        assert!(
+            msg.contains("the saved cursor, 100") && !msg.contains("run it again"),
+            "{msg}"
+        );
     }
 
     #[test]
