@@ -164,11 +164,13 @@ qh.sync(..., source_table="orders",
 ## Schema evolution
 
 `evolve_schema=True` auto-`ADD COLUMN` (as Nullable) when the source has a column
-the destination lacks, instead of erroring. ADD-only — it never drops or retypes
-a column. Default `False`.
+the destination lacks. ADD-only — it never drops or retypes a column. Default
+`False`, and then a ClickHouse destination drops such a column from every row it
+writes, without a warning: turn it on, or select only the columns the destination
+has.
 
-The other direction is a warning, not an error: a destination column that no
-source column feeds (after `rename`/`include`/`exclude`) raises
+The other direction is reported: a destination column that no source column
+feeds (after `rename`/`include`/`exclude`) raises
 `unsourced_destination_column`, once per column, before anything is written.
 The two destinations treat such a column differently:
 
