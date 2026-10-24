@@ -395,3 +395,85 @@ def test_a_chunked_read_whose_max_is_too_costly_lands_every_row(
     got = _rows(bq, f"SELECT COUNT(*) AS n, COUNT(DISTINCT id) AS k FROM {_fq(bq, dest)}")[0]
     assert (got.n, got.k) == (120, 120)
     assert _staging(bq, dest) == []
+
+
+def test_a_resume_marker_from_0_20_8_resumes_and_another_reads_does_not(
+    bq, pg_conn, pg_source, bq_target, dest
+):
+    """Issue #32 on BigQuery. A state table from 0.20.8 has no chunk_read
+    column, so its in-flight marker can't say which read wrote it: the next
+    chunked run resumes it as before, and the table gains the column. A
+    marker another read wrote is not resumed: the run reads from the saved
+    cursor and reports it."""
+    bigquery = pytest.importorskip("google.cloud.bigquery")
+    state = f"{bq.project}.{BQ_DATASET}.{dest}_state"
+    old = bigquery.Table(
+        state,
+        schema=[
+            bigquery.SchemaField("source_table", "STRING", mode="REQUIRED"),
+            bigquery.SchemaField("dest_table", "STRING", mode="REQUIRED"),
+            bigquery.SchemaField("last_watermark", "STRING", mode="REQUIRED"),
+            bigquery.SchemaField("rows", "INTEGER", mode="REQUIRED"),
+            bigquery.SchemaField("run_ts", "TIMESTAMP", mode="REQUIRED"),
+            bigquery.SchemaField("chunk_cursor", "STRING", mode="NULLABLE"),
+            bigquery.SchemaField("chunk_upper", "STRING", mode="NULLABLE"),
+        ],
+    )
+    old.clustering_fields = ["source_table", "dest_table"]
+    bq.create_table(old)
+    columns = "(source_table, dest_table, last_watermark, `rows`, run_ts, chunk_cursor, chunk_upper"
+    # What 0.20.8 left after committing the chunks up to id 100.
+    bq.query(
+        f"INSERT INTO `{state}` {columns}) VALUES "
+        f"('{dest}', '{dest}', '', 0, CURRENT_TIMESTAMP(), '100', '2024-01-01 00:00:00')"
+    ).result()
+    _seed(pg_conn, dest, range(1, 301))
+
+    r = _sync(pg_source, bq_target, dest, chunk_rows=50)
+    assert r.rows_read == 200, "resumed past id 100"
+    assert "abandoned_resume_marker" not in {w.kind for w in r.warnings}, r.warnings
+    assert "chunk_read" in [f.name for f in bq.get_table(state).schema]
+
+    # A marker another read wrote, past the saved cursor.
+    bq.query(
+        f"INSERT INTO `{state}` {columns}, chunk_read) VALUES "
+        f"('{dest}', '{dest}', '2024-01-01 00:00:00', 0, CURRENT_TIMESTAMP(), '250', "
+        "'2024-01-01 00:00:00', '0000000000000000')"
+    ).result()
+    _add(pg_conn, dest, range(301, 311), "2024-02-01 00:00:00")
+    r = _sync(pg_source, bq_target, dest, chunk_rows=50)
+    assert r.rows_read == 10, "read from the saved cursor, not past the other read's marker"
+    (abandoned,) = [w for w in r.warnings if w.kind == "abandoned_resume_marker"]
+    assert abandoned.sample == "250"
+
+
+def test_a_destination_column_the_source_does_not_feed_is_reported_unless_it_has_a_default(
+    bq, pg_conn, pg_source, bq_target, dest
+):
+    """Issue #28 on BigQuery. The MERGE sets only the columns the source
+    feeds: a destination-only column is NULL on the rows it inserts, and the
+    run says so before writing. One with a DEFAULT gets its default there, so
+    it isn't reported."""
+    bigquery = pytest.importorskip("google.cloud.bigquery")
+    bq.create_table(
+        bigquery.Table(
+            f"{bq.project}.{BQ_DATASET}.{dest}",
+            schema=[
+                bigquery.SchemaField("id", "INTEGER", mode="REQUIRED"),
+                bigquery.SchemaField("amount", "FLOAT"),
+                bigquery.SchemaField("write_date", "DATETIME", mode="REQUIRED"),
+                bigquery.SchemaField("legacy", "STRING"),
+                bigquery.SchemaField(
+                    "loaded_at", "TIMESTAMP", default_value_expression="CURRENT_TIMESTAMP()"
+                ),
+            ],
+        )
+    )
+    _seed(pg_conn, dest, range(1, 6))
+    r = _sync(pg_source, bq_target, dest)
+    assert r.rows_written == 5
+    unsourced = [w.column for w in r.warnings if w.kind == "unsourced_destination_column"]
+    assert unsourced == ["legacy"], r.warnings
+    got = _rows(bq, f"SELECT COUNTIF(legacy IS NULL) AS legacy_null, "
+                    f"COUNTIF(loaded_at IS NULL) AS loaded_null FROM {_fq(bq, dest)}")[0]
+    assert (got.legacy_null, got.loaded_null) == (5, 0)
