@@ -9,6 +9,8 @@ any breaking change is called out explicitly.
 
 ## [Unreleased]
 
+## [0.20.9] — 2026-10-24
+
 ### Added
 - **A warning for destination columns the source doesn't feed:
   `unsourced_destination_column`.** A sync into an existing destination now
