@@ -60,6 +60,24 @@ any breaking change is called out explicitly.
   serve is a config error: a key that isn't an untransformed integer,
   `mode="full"`, `chunk_rows`, `parallelism` above 1, `partition_source_expr`,
   and, with `window_bounds`, `delete_stale_in_window`. (#29)
+- **`quickhouse.reconcile_values()` measures value drift, column by column.**
+  `reconcile_keys` sees rows the source deleted, not keys on both sides whose
+  columns differ, and those leave every count-based check green: a
+  `source_query` that had lost columns made every incremental run write them as
+  NULL for two months, on 26 tables, while key counts matched (#28). This reads
+  a required key window from both sides through the sync's own readers and
+  compares every shared column, or the `columns` named, as typed values. Per
+  column it reports `compared`, `mismatched`, `null_in_dest_only` (that case's
+  signature), `null_in_source_only` and sample keys, and it counts keys missing
+  on either side. Integers and decimals compare exactly; a float compares as a
+  double, within an optional `tolerance` (one number, or per column). Datetimes
+  compare as instants at the destination column's precision. A `Bool` column
+  compares by truth, so `tinyint(1)` matches it, and a `UInt8` one by value. In
+  a column that can't hold NULL, the default a NULL is stored as counts as NULL.
+  The destination is read with `FINAL` where its engine merges rows. Sources:
+  PostgreSQL, MySQL and ClickHouse; destination: ClickHouse only, for now. It
+  measures only: window hashing and `repair=True` come next. (#30)
+- **`ValueReconcileResult`** and its per-column **`ColumnDrift`**. (#30)
 
 ### Fixed
 - **A `collapsed_bool` warning's message now gives the same number as its

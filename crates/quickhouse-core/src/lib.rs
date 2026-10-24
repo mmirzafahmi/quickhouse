@@ -24,6 +24,7 @@ pub mod error;
 pub mod host;
 pub mod memory;
 pub mod reconcile;
+pub mod reconcile_values;
 pub mod sink;
 pub mod source;
 pub mod state;
@@ -41,6 +42,9 @@ pub use config::{
 };
 pub use error::{EtlError, Result};
 pub use reconcile::{reconcile_keys, ReconcileConfig, ReconcileResult};
+pub use reconcile_values::{
+    reconcile_values, ColumnDrift, ValueReconcileConfig, ValueReconcileResult,
+};
 pub use sink::{build_sink, BigQuerySink, ClickHouseSink, Sink, StateKey};
 pub use state::{compact_state, state_keys};
 pub use sync::{run_transfer, Progress, ProgressCb, StagedInfo, StagedValidationCb};
@@ -98,4 +102,18 @@ pub fn reconcile_keys_blocking(
         .build()
         .map_err(EtlError::from)?;
     runtime.block_on(reconcile_keys(source_cfg, dest, cfg))
+}
+
+/// [`reconcile_values`] on a dedicated Tokio runtime, for synchronous callers
+/// such as the Python binding.
+pub fn reconcile_values_blocking(
+    source_cfg: SourceConfig,
+    dest: DestinationConfig,
+    cfg: ValueReconcileConfig,
+) -> Result<ValueReconcileResult> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(EtlError::from)?;
+    runtime.block_on(reconcile_values(source_cfg, dest, cfg))
 }

@@ -38,7 +38,7 @@ const ROW_MERGING_ENGINES: [&str; 5] = [
 
 /// Whether `engine`'s row-merging semantics are defined by the sorting key.
 /// Case-sensitive, as ClickHouse engine names are.
-fn is_row_merging_engine(engine: &str) -> bool {
+pub(crate) fn is_row_merging_engine(engine: &str) -> bool {
     let family = engine.split('(').next().unwrap_or(engine).trim();
     let family = family.strip_prefix("Replicated").unwrap_or(family);
     ROW_MERGING_ENGINES.contains(&family)

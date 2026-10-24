@@ -27,7 +27,8 @@ Reads go over the HTTP interface in ClickHouse's own `FORMAT ArrowStream`, so
 rows are never converted out of Arrow between the two servers. Everything the
 Postgres and MySQL sources support works here too: range partitioning across
 `parallelism` connections, incremental watermarks, `chunk_rows` resumable reads,
-`column_transforms`, `read_max_rows_per_sec`, and `reconcile_keys`.
+`column_transforms`, `read_max_rows_per_sec`, `reconcile_keys`, and
+`reconcile_values`.
 
 `source_table` may be `"table"` (in the descriptor's `database`) or
 `"other_db.table"`. `batch_rows` is pushed down as the server's `max_block_size`,

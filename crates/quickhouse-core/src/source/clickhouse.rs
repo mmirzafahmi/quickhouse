@@ -137,7 +137,7 @@ impl ClickHouseSource {
     }
 
     /// Run `sql` and return its rows as already-unescaped `TabSeparated` fields.
-    async fn query_rows(&self, sql: &str) -> Result<Vec<Vec<Option<String>>>> {
+    pub(crate) async fn query_rows(&self, sql: &str) -> Result<Vec<Vec<Option<String>>>> {
         let body = self.query_tsv(sql).await?;
         Ok(body
             .lines()

@@ -119,3 +119,57 @@ The gate runs inside the native engine, so a Python exception raised from
 original failure (the suite name and staging table). Catch it around the
 `sync()` call to handle a rejected load.
 ```
+
+## Checking values after the fact
+
+The gate checks a batch before it lands. It can't see damage a sync does to rows
+already in the destination. In one production case a `source_query` had lost
+columns the destination held, and every incremental run wrote them as NULL over
+existing values, for two months, on 26 tables. Row counts matched throughout.
+{func}`quickhouse.reconcile_values` is the check for that: it reads the same key
+window from both sides and compares every column the two share, value by value.
+
+```python
+r = quickhouse.reconcile_values(
+    src, dst, "account_move",
+    source_table="account_move",
+    key="id",
+    window="id > 41000000",            # required: the newest keys, say
+    tolerance={"amount_total": 0.01},
+)
+for c in r.columns:
+    if c.mismatched:
+        print(c.column, c.mismatched, c.null_in_dest_only, c.sample)
+```
+
+Each column reports `compared` and `mismatched`, `null_in_dest_only` (NULL in
+the destination where the source holds a value, the signature of the case
+above) and `null_in_source_only`, with sample keys. The result also counts keys
+missing on either side; {func}`quickhouse.reconcile_keys` covers those in depth.
+
+Both sides are read through quickhouse's own readers and compared as typed
+values, not as text:
+
+- **Numbers.** Integers and decimals compare exactly. A float on either side
+  compares as a double, within `tolerance` if you give one. ClickHouse truncates
+  a float written into a `Decimal` column (0.29 lands in `Decimal(15, 2)` as
+  0.28), so such a column needs a tolerance of one step to read clean.
+- **Datetimes** compare as instants, whatever timezone either type names, at the
+  destination column's precision: a `DateTime` holds whole seconds, so a
+  source's microseconds aren't drift.
+- **Booleans.** MySQL's `tinyint(1)` matches a `Bool` column by truth and a
+  `UInt8` one by value.
+- **Wrappers.** `LowCardinality(T)` and `Nullable(T)` compare as the `T` they
+  wrap.
+- **NULLs.** A ClickHouse column that can't hold NULL stores one as its
+  `DEFAULT`, or its type's default (`0`, `''`). That matches a source NULL, and
+  over a source value it counts as `null_in_dest_only`.
+- **Several rows per key.** The destination is read with `FINAL` where its
+  engine merges rows, so an unmerged `ReplacingMergeTree` is compared on its
+  newest row per key. A key still doubled after that, on either side, is counted
+  in `duplicate_keys` and left out.
+
+Both sides' rows are held in memory, which is why `window` is required. The
+destination must be ClickHouse for now. It measures only: comparing per window
+by hashing, to make a whole-table check cheap enough to schedule, and
+`repair=True`, which re-syncs only the keys that differ, are next.

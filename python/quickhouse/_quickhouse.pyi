@@ -840,6 +840,63 @@ class ReconcileResult:
     missing_sample: List[str]
     duration_secs: float
 
+class ColumnDrift:
+    """One column's drift, as :func:`reconcile_values` measured it (new in 0.20.9)."""
+
+    column: str
+
+    compared: int
+    """Keys whose value in this column was compared: every compared key."""
+
+    mismatched: int
+    """Keys whose value differs. Includes the two NULL counts below."""
+
+    null_in_dest_only: int
+    """NULL in the destination where the source holds a value: what a sync
+    leaves when it writes a column its source query doesn't carry. In a
+    destination column that can't hold NULL, the value a NULL is stored as there
+    counts as NULL: the column's ``DEFAULT``, else its type's default (``0``,
+    ``''``, ``1970-01-01``)."""
+
+    null_in_source_only: int
+    """NULL in the source where the destination holds a value."""
+
+    sample: List[str]
+    """Up to ``sample_limit`` keys whose value differs, as text."""
+
+class ValueReconcileResult:
+    """What a :func:`reconcile_values` comparison found (new in 0.20.9)."""
+
+    source_rows: int
+    """Rows the source returned in the window."""
+
+    dest_rows: int
+    """Rows the destination returned in the window, after ``FINAL``."""
+
+    compared_keys: int
+    """Keys present exactly once on each side: the ones whose values were
+    compared. Check it is not ``0`` before reading clean columns as a pass."""
+
+    missing_keys: int
+    """Keys in the source that the destination doesn't have."""
+
+    orphan_keys: int
+    """Keys in the destination that the source doesn't have."""
+
+    duplicate_keys: int
+    """Keys that appear more than once on either side. Their rows are left out
+    of the comparison, since there is no telling which one is current."""
+
+    columns: List[ColumnDrift]
+    """One entry per compared column, in source column order."""
+
+    skipped_columns: List[Tuple[str, str]]
+    """``(column, reason)`` for each column on both sides that wasn't compared:
+    a side's type can't be read, or the two types have no common one to compare
+    in. Only when ``columns`` was left out; a named column like that raises."""
+
+    duration_secs: float
+
 def sync(
     # `bytes` is accepted privately: it is how quickhouse.from_pandas() hands an
     # already-serialized Arrow IPC stream to the engine. Not part of the public
@@ -1571,6 +1628,93 @@ def reconcile_keys(
     is normally itself a mirror rather than the system of record), as is an HTTP
     API source (no keyset query to diff against). Destinations: both ClickHouse
     and BigQuery.
+    """
+    ...
+
+def reconcile_values(
+    source: Union[Postgres, MySQL, ClickHouse],
+    target: ClickHouse,
+    dest_table: str,
+    *,
+    key: str,
+    window: str,
+    source_table: Optional[str] = None,
+    source_query: Optional[str] = None,
+    dest_window: Optional[str] = None,
+    columns: Optional[List[str]] = None,
+    tolerance: Union[float, Mapping[str, float], None] = None,
+    sample_limit: int = 10,
+) -> ValueReconcileResult:
+    """Compare the values a destination holds with its source's, column by
+    column, over a key window. Measures only.
+
+    :func:`reconcile_keys` sees rows the source deleted. It can't see value
+    drift, where the same keys exist on both sides but a column differs, and
+    that leaves every count-based check green: counts match while values rot.
+    In one production case a ``source_query`` missing columns the destination
+    already had made every incremental run write them as NULL, for two months,
+    on 26 tables. A per-column ``null_in_dest_only`` count flags that directly.
+
+    ::
+
+        r = quickhouse.reconcile_values(
+            src, dst, "account_move",
+            source_table="account_move",
+            key="id",
+            window="id > 41000000",
+            tolerance={"amount_total": 0.01},
+        )
+        for c in r.columns:
+            if c.mismatched:
+                print(c.column, c.mismatched, c.null_in_dest_only, c.sample)
+
+    Both sides are read through quickhouse's own readers, the decoders a sync
+    uses, and compared as typed values, never as text:
+
+    - **Integers and decimals** compare exactly, across widths and scales.
+      Anything with a **float** on either side compares as a double: equal when
+      both are the same double, or within ``tolerance``. ClickHouse truncates a
+      float written into a ``Decimal`` column (0.29 lands in ``Decimal(15, 2)``
+      as 0.28), so such a column reports every truncated value unless its
+      tolerance covers one step (``0.01`` there).
+    - **Datetimes** compare as instants, whatever timezone either side's type
+      names, at the destination column's precision: a ``DateTime`` holds whole
+      seconds, so a source's microseconds aren't drift there.
+    - A ``Bool`` destination compares a source integer by its truth, so MySQL's
+      ``tinyint(1)`` matches a ``Bool`` column that way and a ``UInt8`` one by
+      value. ``LowCardinality(T)`` and ``Nullable(T)`` compare as the ``T`` they
+      wrap.
+    - A destination column that can't hold NULL stores a NULL as its
+      ``DEFAULT``, or its type's default (``0``, ``''``): that matches a source
+      NULL, and over a source value it counts as ``null_in_dest_only``.
+    - The destination is read with ``FINAL`` where its engine merges rows (a
+      ``ReplacingMergeTree`` holds several rows per key until it merges). A key
+      that still appears more than once, on either side, is counted in
+      ``duplicate_keys`` and left out.
+
+    :param key: The identifying column, present on both sides under the same
+        name. Matched by typed value, so an ``int4`` key matches an ``Int64``
+        one. A float key is refused.
+    :param window: SQL predicate bounding the source read, in the source's
+        dialect, e.g. ``"id > 41000000"`` for the newest keys. Required: both
+        sides' rows are held in memory.
+    :param dest_window: The same bound in ClickHouse's dialect. Defaults to
+        ``window``.
+    :param columns: Columns to compare, present on both sides under the same
+        name. Default: every column the two share, by exact name. A shared
+        column whose types can't be compared is then skipped and listed in
+        ``skipped_columns``; one named here raises instead.
+    :param tolerance: Absolute tolerance for numeric columns: one number for all
+        of them, or ``{column: number}`` for the ones named. Default exact.
+    :param sample_limit: How many keys to keep per column as samples. The
+        counts are exact regardless.
+
+    Sources: PostgreSQL, MySQL and ClickHouse. Destination: ClickHouse; a
+    BigQuery destination raises (not supported yet). Comparing per window by
+    hashing, to make a whole-table check cheap enough to schedule, and
+    ``repair=True``, which re-syncs only the keys that differ, come next.
+
+    .. versionadded:: 0.20.9
     """
     ...
 

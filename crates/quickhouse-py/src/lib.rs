@@ -1199,6 +1199,105 @@ impl ReconcileResult {
     }
 }
 
+/// One column's drift, from `reconcile_values()`.
+#[pyclass]
+struct ColumnDrift {
+    #[pyo3(get)]
+    column: String,
+    #[pyo3(get)]
+    compared: u64,
+    #[pyo3(get)]
+    mismatched: u64,
+    #[pyo3(get)]
+    null_in_dest_only: u64,
+    #[pyo3(get)]
+    null_in_source_only: u64,
+    #[pyo3(get)]
+    sample: Vec<String>,
+}
+
+#[pymethods]
+impl ColumnDrift {
+    fn __repr__(&self) -> String {
+        format!(
+            "ColumnDrift(column={:?}, compared={}, mismatched={}, null_in_dest_only={}, \
+             null_in_source_only={})",
+            self.column,
+            self.compared,
+            self.mismatched,
+            self.null_in_dest_only,
+            self.null_in_source_only,
+        )
+    }
+}
+
+/// What a `reconcile_values()` comparison found.
+#[pyclass]
+struct ValueReconcileResult {
+    #[pyo3(get)]
+    source_rows: u64,
+    #[pyo3(get)]
+    dest_rows: u64,
+    #[pyo3(get)]
+    compared_keys: u64,
+    #[pyo3(get)]
+    missing_keys: u64,
+    #[pyo3(get)]
+    orphan_keys: u64,
+    #[pyo3(get)]
+    duplicate_keys: u64,
+    #[pyo3(get)]
+    columns: Vec<Py<ColumnDrift>>,
+    #[pyo3(get)]
+    skipped_columns: Vec<(String, String)>,
+    #[pyo3(get)]
+    duration_secs: f64,
+}
+
+#[pymethods]
+impl ValueReconcileResult {
+    fn __repr__(&self, py: Python<'_>) -> String {
+        let drifting = self
+            .columns
+            .iter()
+            .filter(|c| c.borrow(py).mismatched > 0)
+            .count();
+        format!(
+            "ValueReconcileResult(source_rows={}, dest_rows={}, compared_keys={}, \
+             missing_keys={}, orphan_keys={}, duplicate_keys={}, columns={}, \
+             drifting_columns={}, duration_secs={:.3})",
+            self.source_rows,
+            self.dest_rows,
+            self.compared_keys,
+            self.missing_keys,
+            self.orphan_keys,
+            self.duplicate_keys,
+            self.columns.len(),
+            drifting,
+            self.duration_secs,
+        )
+    }
+}
+
+/// `tolerance=`: one number for every numeric column, or a dict of column
+/// name to number for the columns named.
+fn parse_tolerance(tolerance: Option<Bound<'_, PyAny>>) -> PyResult<(f64, HashMap<String, f64>)> {
+    let Some(t) = tolerance else {
+        return Ok((0.0, HashMap::new()));
+    };
+    if let Ok(per_column) = t.extract::<HashMap<String, f64>>() {
+        return Ok((0.0, per_column));
+    }
+    t.extract::<f64>()
+        .map(|all| (all, HashMap::new()))
+        .map_err(|_| {
+            PyRuntimeError::new_err(
+                "tolerance must be a number, or a dict of column name to number, e.g. \
+                 tolerance={\"amount\": 0.01}",
+            )
+        })
+}
+
 /// `mode` has no safe default, so there isn't one.
 ///
 /// It used to default to `"full"`, which means "replace the destination
@@ -1630,6 +1729,92 @@ fn reconcile_keys(
     })
 }
 
+/// Compare the values a destination holds with its source's, per column, over
+/// a key window. Measures only.
+///
+/// `reconcile_keys()` sees rows the source deleted; this sees rows whose keys
+/// match but whose values don't, which every count-based check misses. Its
+/// `null_in_dest_only` count is the signature of a sync that wrote a column as
+/// NULL over values the source still has.
+#[pyfunction]
+#[pyo3(signature = (
+    source,
+    target,
+    dest_table,
+    *,
+    key,
+    window,
+    source_table=None,
+    source_query=None,
+    dest_window=None,
+    columns=None,
+    tolerance=None,
+    sample_limit=10,
+))]
+#[allow(clippy::too_many_arguments)]
+fn reconcile_values(
+    py: Python<'_>,
+    source: AnySource,
+    target: AnyDestination,
+    dest_table: String,
+    key: String,
+    window: String,
+    source_table: Option<String>,
+    source_query: Option<String>,
+    dest_window: Option<String>,
+    columns: Option<Vec<String>>,
+    tolerance: Option<Bound<'_, PyAny>>,
+    sample_limit: usize,
+) -> PyResult<ValueReconcileResult> {
+    init_logging();
+    let source_cfg: core::SourceConfig = source.into();
+    let dest_cfg = target.into_config()?;
+    let (tolerance, column_tolerance) = parse_tolerance(tolerance)?;
+    let cfg = core::ValueReconcileConfig {
+        source_table,
+        source_query,
+        dest_table,
+        key,
+        columns: columns.unwrap_or_default(),
+        window,
+        dest_window,
+        tolerance,
+        column_tolerance,
+        sample_limit,
+    };
+    let result = py
+        .allow_threads(|| core::reconcile_values_blocking(source_cfg, dest_cfg, cfg))
+        .map_err(map_err)?;
+    let columns = result
+        .columns
+        .into_iter()
+        .map(|c| {
+            Py::new(
+                py,
+                ColumnDrift {
+                    column: c.column,
+                    compared: c.compared,
+                    mismatched: c.mismatched,
+                    null_in_dest_only: c.null_in_dest_only,
+                    null_in_source_only: c.null_in_source_only,
+                    sample: c.sample,
+                },
+            )
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    Ok(ValueReconcileResult {
+        source_rows: result.source_rows,
+        dest_rows: result.dest_rows,
+        compared_keys: result.compared_keys,
+        missing_keys: result.missing_keys,
+        orphan_keys: result.orphan_keys,
+        duplicate_keys: result.duplicate_keys,
+        columns,
+        skipped_columns: result.skipped_columns,
+        duration_secs: result.duration_secs,
+    })
+}
+
 /// One cursor in the state table: see `state_keys()`.
 #[pyclass]
 struct StateKey {
@@ -1721,9 +1906,12 @@ fn _quickhouse(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TransferResult>()?;
     m.add_class::<TransferWarning>()?;
     m.add_class::<ReconcileResult>()?;
+    m.add_class::<ValueReconcileResult>()?;
+    m.add_class::<ColumnDrift>()?;
     m.add_class::<StateKey>()?;
     m.add_function(wrap_pyfunction!(sync, m)?)?;
     m.add_function(wrap_pyfunction!(reconcile_keys, m)?)?;
+    m.add_function(wrap_pyfunction!(reconcile_values, m)?)?;
     m.add_function(wrap_pyfunction!(compact_state, m)?)?;
     m.add_function(wrap_pyfunction!(state_keys, m)?)?;
     m.add_function(wrap_pyfunction!(version, m)?)?;

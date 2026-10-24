@@ -1144,7 +1144,7 @@ fn ident(name: &str) -> String {
 /// query built from it (independently verified against a real ClickHouse
 /// server: `SELECT 'ends_with_backslash\'` fails with "Code: 62. Single
 /// quoted string is not closed").
-fn escape_sql_string(s: &str) -> String {
+pub(crate) fn escape_sql_string(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\'', "''")
 }
 

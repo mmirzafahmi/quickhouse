@@ -279,6 +279,10 @@ is refused outright — genuine drift is one-directional, so total disagreement
 means the two sides rendered the key differently or the window predicates
 disagreed, not that everything is deletable.
 
+`reconcile_keys()` sees keys, not values: a row whose key is on both sides but
+whose columns differ looks converged to it. For that, see
+[`reconcile_values()`](data-quality.md#checking-values-after-the-fact).
+
 (append-bronze-landing)=
 ## Append (bronze landing)
 
