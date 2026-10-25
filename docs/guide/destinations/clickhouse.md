@@ -7,7 +7,8 @@ compressed inserts. The DDL knobs it accepts are on the
 The same class is also a [source](../sources/databases.md#clickhouse-as-a-source);
 `compression`, `archive` and `insert_dedup_token` below are write-path only and
 are ignored in that role — an `archive` set there raises an
-`ignored_source_archive` warning rather than writing anything.
+`ignored_source_archive` warning rather than writing anything. The other way
+round, `final` is read-path only and does nothing on a destination.
 
 ## Insert compression
 

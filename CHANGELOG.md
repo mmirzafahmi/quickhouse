@@ -33,6 +33,32 @@ any breaking change is called out explicitly.
   succeeds, without those rows: name `null_key` in `fail_on_warnings` to keep
   it failing. A DataFrame's incremental de-duplication on `key` leaves rows
   with a NULL key alone, so `null_key` counts each of them. (#49, #45)
+- **A ClickHouse `source_table` whose engine merges rows is read with
+  `FINAL`.** A `ReplacingMergeTree` (every table quickhouse creates for an
+  incremental sync is one), `CollapsingMergeTree`,
+  `VersionedCollapsingMergeTree`, `SummingMergeTree` or `AggregatingMergeTree`,
+  `Replicated*` forms included, keeps old versions of a row until a background
+  merge removes them, and quickhouse copied those too: a full copy of 10 keys
+  with 2 unmerged versions wrote 12 rows into a `MergeTree`, where they never
+  collapse. The engine is now read from `system.tables`, and every read of such
+  a table adds `FINAL`: the one-stream read, each parallel range, each
+  `chunk_rows` chunk and an incremental read. The run logs it, naming the
+  engine. **What it costs:** ClickHouse merges the versions as it reads, so a
+  read uses more CPU and memory and takes longer. A filter on a column outside
+  the sorting key, such as an incremental `watermark` or a `chunk_rows` key,
+  no longer narrows what is merged: ClickHouse applies it after the merge
+  (checked on 24.8), so each incremental read merges the whole table, less what
+  the primary key and partition pruning leave out. **To keep the old
+  behaviour**, pass `final=False` to the source's `ClickHouse(...)`. A
+  `source_query` is still sent as written, so put `FINAL` in it yourself. (#39)
+- **A parallel range read of a table read with `FINAL` splits on its sorting
+  key.** Every version of a row shares its sorting-key values, so a range over
+  a sorting-key column holds them all, and one over the sorting key's first
+  column reads and merges only its own slice. A range over any other column
+  would merge the whole table once per range. When `partition_column` (or the
+  first `key`) is outside the sorting key, the read now splits on the sorting
+  key's first column instead, or runs in one stream when that column isn't an
+  integer, and logs which. (#39)
 
 ### Added
 - **A warning for a `type_overrides` entry an existing table ignores:
@@ -54,6 +80,14 @@ any breaking change is called out explicitly.
   which quickhouse passes to a BigQuery destination as overrides of its own,
   aren't checked. It costs one query against the destination's metadata per
   run that passes `type_overrides`. (#50)
+- **`ClickHouse(final=...)`** chooses whether a source's reads of
+  `source_table` add `FINAL`: `None` (the default) by the table's engine, as
+  above; `True` always, for a `Distributed` table or a materialized view,
+  whose own engine doesn't merge rows but whose underlying table does; `False`
+  never. ClickHouse refuses `FINAL` on a plain `MergeTree` (`ILLEGAL_FINAL`),
+  so `final=True` there stops the run before anything is written, with an
+  error naming `final=True`. Ignored when the descriptor is a destination.
+  (#39)
 
 ### Fixed
 - **A NULL watermark is left out of a `ReplacingMergeTree`, as on a database
@@ -102,6 +136,27 @@ any breaking change is called out explicitly.
   there: with `skip_to_max=True` that run wrote 0 rows. The clause is now
   there only when the run reads from the start, with no saved cursor, no
   `chunk_rows` resume marker and no seed. (#50)
+- **A ClickHouse source's incremental cursor comes from the rows it read.** The
+  `MAX(watermark)` probe that sets the read's upper bound and the next cursor
+  is read with `FINAL` too. Read as stored, it could come from a version a
+  newer one had replaced: a stale version with a later watermark moved the
+  cursor past every row the run read, and a row written afterwards between the
+  two was skipped. The count behind the `null_watermark` warning counts the
+  merged rows the same way, and asks for `FINAL` only when the stored count
+  isn't 0. (#39)
+- **`reconcile_keys()` finds a key a ClickHouse source deleted through its
+  engine.** A `CollapsingMergeTree` cancel row or a
+  `ReplacingMergeTree(ver, is_deleted)` delete removes a key only from the
+  merged rows, and the source's keys were read as stored, so such a key was
+  never reported as an orphan. They are read with `FINAL` by the same rule.
+  `reconcile_values()` already read a merging source table with `FINAL`; it now
+  follows the source's `final=` too. (#39)
+
+### Documentation
+- **ClickHouse sources.** The source guide and the tutorials described a table
+  read without `FINAL` and the `source_query="SELECT * FROM t FINAL"`
+  workaround. They now describe `final=`, its cost and the range-read
+  choice. (#39)
 
 ## [0.20.11] — 2026-10-25
 

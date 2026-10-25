@@ -364,6 +364,11 @@ async fn read_source_keys(source_cfg: &SourceConfig, cfg: &ReconcileConfig) -> R
         }
         SourceConfig::ClickHouse(ch) => {
             let source = ClickHouseSource::new(ch)?;
+            // A key deleted through a merging engine is gone only from the
+            // merged rows, so its keyset is read with `FINAL` there (#39).
+            source
+                .resolve_final(cfg.source_table.as_deref(), cfg.source_query.as_deref())
+                .await?;
             source
                 .distinct_keys(
                     cfg.source_table.as_deref(),

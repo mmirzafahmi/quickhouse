@@ -484,8 +484,13 @@ class ClickHouse:
 
     ``url``, ``database``, ``user``, ``password`` and ``settings`` apply in both
     roles. ``compression``, ``archive`` and ``insert_dedup_token`` are write-path
-    only and are ignored as a ``source=``; ``statement_timeout_secs`` is
-    read-path only and is ignored as a ``target=``.
+    only and are ignored as a ``source=``; ``statement_timeout_secs`` and
+    ``final`` are read-path only and are ignored as a ``target=``.
+
+    A ``source_table`` whose engine merges rows (a ``ReplacingMergeTree``, as
+    every table quickhouse creates for an incremental sync is) is read with
+    ``FINAL``, so old versions of a row that background merges haven't removed
+    yet aren't copied: see ``final``.
 
     Types read from a ClickHouse source keep their declared type at the
     destination where one exists — ``UUID``, ``IPv4``/``IPv6``, ``Enum8``/
@@ -564,6 +569,44 @@ class ClickHouse:
         also a no-op on engines without replicated dedup.
 
         .. versionadded:: 0.14.0
+    final:
+        *Source only.* Whether quickhouse's reads of ``source_table`` add
+        ``FINAL``, which makes ClickHouse merge a row's versions as it reads.
+
+        - ``None`` (default): add it when the table's engine merges rows that
+          share a sorting key: ``ReplacingMergeTree``, ``CollapsingMergeTree``,
+          ``VersionedCollapsingMergeTree``, ``SummingMergeTree`` and
+          ``AggregatingMergeTree``, and their ``Replicated*`` and ``Shared*``
+          forms. The engine is read from ``system.tables``, and the run logs
+          it when ``FINAL`` is added. Only the table's own engine counts, so a
+          ``Distributed`` table or a materialized view over such a table is
+          read as stored unless you pass ``True``.
+        - ``True``: always add it. ClickHouse refuses ``FINAL`` on an engine
+          that doesn't merge rows (a plain ``MergeTree``, ``Memory``, ``Log``:
+          ``ILLEGAL_FINAL``), so the run fails before anything is written. A
+          ``Distributed`` table or a materialized view passes it on to the
+          table it reads; a plain ``VIEW`` accepts it and ignores it (24.8), so
+          write ``FINAL`` inside the view instead.
+        - ``False``: never add it: every stored row is read, as before 0.20.12.
+
+        It applies to the rows read (one stream, each parallel range, each
+        ``chunk_rows`` chunk, an incremental read), the ``MAX(watermark)``
+        probe that sets the cursor, the count of NULL watermarks, and
+        ``reconcile_keys``/``reconcile_values`` reads of ``source_table``. It
+        never changes a ``source_query``, which is sent as written: put
+        ``FINAL`` in the query yourself.
+
+        ``FINAL`` costs a merge at read time: more CPU and memory, and a
+        longer read. A filter on a column outside the sorting key (a
+        ``watermark``, a ``chunk_rows`` key) is applied after the merge, so it
+        doesn't narrow what is merged; the primary key and partition pruning
+        still do. A parallel range read splits on a sorting-key column: when
+        the range column (``partition_column``, else the first ``key``) is
+        outside the sorting key, the read splits on the sorting key's first
+        column instead, or runs in one stream when that one isn't an integer,
+        and logs which.
+
+        .. versionadded:: 0.20.12
     """
 
     def __init__(
@@ -578,6 +621,7 @@ class ClickHouse:
         settings: Optional[Mapping[str, str]] = None,
         insert_dedup_token: bool = False,
         statement_timeout_secs: int = 0,
+        final: Optional[bool] = None,
     ) -> None: ...
 
 class Progress:
@@ -1809,9 +1853,10 @@ def reconcile_values(
       ``DEFAULT``, or its type's default (``0``, ``''``): that matches a source
       NULL, and over a source value it counts as ``null_in_dest_only``.
     - The destination is read with ``FINAL`` where its engine merges rows (a
-      ``ReplacingMergeTree`` holds several rows per key until it merges). A key
-      that still appears more than once, on either side, is counted in
-      ``duplicate_keys`` and left out.
+      ``ReplacingMergeTree`` holds several rows per key until it merges). A
+      ClickHouse ``source_table`` is read as a sync reads it, by the source
+      descriptor's ``final``. A key that still appears more than once, on
+      either side, is counted in ``duplicate_keys`` and left out.
 
     :param key: The identifying column, present on both sides under the same
         name. Matched by typed value, so an ``int4`` key matches an ``Int64``

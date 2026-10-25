@@ -35,7 +35,7 @@ use crate::null_guard::{self, NullFate, NullGuard};
 use crate::sink::{build_sink, ChunkMarker, Sink};
 use crate::source::appsflyer::AppsFlyerSource;
 use crate::source::clevertap::CleverTapSource;
-use crate::source::clickhouse::quote_ch_table;
+use crate::source::clickhouse::{final_range_column, FinalRange, FinalRead};
 use crate::source::mysql::{quote_my, quote_my_table};
 use crate::source::postgres::{quote_pg, quote_pg_table};
 use crate::source::{
@@ -6450,12 +6450,15 @@ async fn setup_clickhouse(
         ));
     }
     tracing::info!("resolving clickhouse source schema...");
+    // Before the first read: every read of `source_table` from here on adds
+    // `FINAL` or doesn't by what this decides (#39).
+    let final_read = s.resolve_final(base_table, base_query).await?;
     // `source_query` wins, matching `ClickHouseSource::select_sql` and
     // `source_table`'s documented contract — see the equivalent comment in
     // `setup_postgres` for the mis-decode this inversion caused.
     let schema_probe = match (base_table, base_query) {
         (_, Some(q)) => q.to_string(),
-        (Some(t), None) => format!("SELECT * FROM {}", quote_ch_table(t)),
+        (Some(t), None) => s.table_probe(t),
         (None, None) => unreachable!("validated above"),
     };
     if base_table.is_some() && base_query.is_some() {
@@ -6501,7 +6504,7 @@ async fn setup_clickhouse(
         (None, None)
     };
 
-    let partitions = compute_partitions_clickhouse(s, cfg, &source_cols).await?;
+    let partitions = compute_partitions_clickhouse(s, cfg, &source_cols, &final_read).await?;
     Ok(SourceSetup {
         source_cols,
         snapshot_max,
@@ -6523,6 +6526,7 @@ async fn compute_partitions_clickhouse(
     source: &ClickHouseSource,
     cfg: &TransferConfig,
     source_cols: &[ColumnType],
+    final_read: &FinalRead,
 ) -> Result<Vec<Partition>> {
     let single = vec![Partition {
         label: "all".into(),
@@ -6545,11 +6549,45 @@ async fn compute_partitions_clickhouse(
         .partition_column
         .clone()
         .or_else(|| cfg.key.first().cloned());
-    let part_col = match part_col {
+    let mut part_col = match part_col {
         Some(c) => c,
         None => return Ok(single),
     };
-    let source_expr = cfg.partition_source_expr.as_deref();
+    let mut source_expr = cfg.partition_source_expr.as_deref();
+    // A table read with `FINAL` splits on a sorting-key column: see
+    // `final_range_column`. A `source_query` is never given one.
+    if final_read.on && base_query.is_none() {
+        let wanted = source_expr.unwrap_or(&part_col).to_string();
+        let partitionable = |name: &str| {
+            source_cols.iter().any(|c| {
+                c.name == name && crate::types::clickhouse::is_range_partitionable(c.type_id)
+            })
+        };
+        let table = from_table.unwrap_or_default();
+        let sorting_key = final_read.sorting_key.join(", ");
+        match final_range_column(&final_read.sorting_key, &wanted, partitionable) {
+            FinalRange::Keep => {}
+            FinalRange::Switch(col) => {
+                tracing::info!(
+                    "the parallel read of '{table}' splits on '{col}' instead of '{wanted}': \
+                     it is read with FINAL, and '{wanted}' is not in its sorting key \
+                     ({sorting_key}), so every range would merge the whole table, where '{col}' \
+                     leads the sorting key and each range merges only its own rows"
+                );
+                part_col = col;
+                source_expr = None;
+            }
+            FinalRange::Single => {
+                tracing::info!(
+                    "'{table}' is read in one stream: it is read with FINAL, '{wanted}' is not \
+                     in its sorting key ({sorting_key}), and the sorting key's first column is \
+                     not an integer to split ranges on, so every range would merge the whole \
+                     table. ClickHouse still spreads the merge over max_final_threads"
+                );
+                return Ok(single);
+            }
+        }
+    }
     let (type_id, nullable) = match partition_key_type(
         source_cols,
         &part_col,

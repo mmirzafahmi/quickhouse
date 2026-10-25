@@ -41,12 +41,47 @@ for the transfer and use `read_idle_timeout_secs` to catch a stalled source.
 Anything else ClickHouse exposes goes through `settings={...}`, which is applied
 last and therefore always wins.
 
-A table is read as stored, without `FINAL`. From a `ReplacingMergeTree` (every
-table quickhouse creates for an incremental sync is one) that includes old
-versions of rows that background merges haven't removed yet, so a copy can hold
-a key more than once. To copy only the newest version of each row, read through
-`source_query="SELECT * FROM orders FINAL"`, which gives up the parallel range
-reads.
+A table whose engine merges rows is read with `FINAL`. A `ReplacingMergeTree`
+(every table quickhouse creates for an incremental sync is one) keeps old
+versions of a row until a background merge removes them, and without `FINAL`
+those were copied too, so a copy could hold a key more than once. quickhouse
+reads the engine from `system.tables` and adds `FINAL` for
+`ReplacingMergeTree`, `CollapsingMergeTree`, `VersionedCollapsingMergeTree`,
+`SummingMergeTree` and `AggregatingMergeTree`, including their `Replicated*`
+forms, and logs it:
+
+```text
+source table 'orders' is a ReplacingMergeTree, which keeps old versions of a row until a background merge removes them: reading it with FINAL (pass final=False to read it as stored)
+```
+
+`FINAL` goes on every read of the rows, including each parallel range, each
+`chunk_rows` chunk and an incremental read, and on the `MAX(watermark)` probe
+that sets the cursor, so the cursor comes from rows that were read. A
+`source_query` is never changed: put `FINAL` in it yourself.
+
+`FINAL` makes ClickHouse merge a row's versions as it reads, which costs CPU,
+memory and time. A filter on a column outside the sorting key, such as the
+watermark, is applied after the merge, so it doesn't narrow what is merged;
+the primary key and partition pruning still do. The parallel range read splits
+on a sorting-key column, where every version of a row falls in the same range.
+If `partition_column` (or the first `key`) isn't in the sorting key, the read
+splits on the sorting key's first column instead, or runs in one stream when
+that column isn't an integer, and the log says which.
+
+Pass `final=` on the source descriptor to choose:
+
+```python
+qh.ClickHouse(url, database="raw")               # FINAL where the engine merges rows
+qh.ClickHouse(url, database="raw", final=False)  # read every stored row, as before 0.20.12
+qh.ClickHouse(url, database="raw", final=True)   # always, e.g. a Distributed table
+```
+
+`final=True` on an engine that doesn't merge rows fails before anything is
+written: ClickHouse refuses `FINAL` on a plain `MergeTree` (`ILLEGAL_FINAL`). A
+`Distributed` table and a materialized view pass `FINAL` on to the table they
+read, so they need `final=True`, since only the table's own engine is looked
+at. A plain `VIEW` accepts `FINAL` and ignores it, so put `FINAL` inside the
+view. `final` does nothing when the descriptor is a destination.
 
 ### Types
 

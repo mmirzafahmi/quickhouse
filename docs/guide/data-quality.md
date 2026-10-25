@@ -170,8 +170,10 @@ values, not as text:
   over a source value it counts as `null_in_dest_only`.
 - **Several rows per key.** The destination is read with `FINAL` where its
   engine merges rows, so an unmerged `ReplacingMergeTree` is compared on its
-  newest row per key. A key still doubled after that, on either side, is counted
-  in `duplicate_keys` and left out.
+  newest row per key. A ClickHouse `source_table` is read the way a sync reads
+  it, with `FINAL` where its engine merges rows unless the source descriptor
+  says `final=False`. A key still doubled after that, on either side, is
+  counted in `duplicate_keys` and left out.
 
 Both sides' rows are held in memory, which is why `window` is required. The
 destination must be ClickHouse for now. It measures only: comparing per window

@@ -256,6 +256,9 @@ pub async fn reconcile_values(
         password: dest.password.clone(),
         settings: dest.settings.clone(),
         statement_timeout_secs: 0,
+        // `dest_base_query` writes the destination's own `FINAL`, by its
+        // engine, into the query this reader wraps.
+        read_final: Some(false),
     })?;
 
     // Both schemas first: the plan decides which columns either read carries.
@@ -314,8 +317,7 @@ const READ_BATCH_ROWS: usize = 65_536;
 enum SourceReader {
     Postgres(PgSource),
     MySql(MySqlSource),
-    /// With the database a bare `source_table` resolves against.
-    ClickHouse(ClickHouseSource, String),
+    ClickHouse(ClickHouseSource),
 }
 
 impl SourceReader {
@@ -339,9 +341,7 @@ impl SourceReader {
                 my.utc_session,
                 my.read_only,
             )),
-            SourceConfig::ClickHouse(ch) => {
-                SourceReader::ClickHouse(ClickHouseSource::new(ch)?, ch.database.clone())
-            }
+            SourceConfig::ClickHouse(ch) => SourceReader::ClickHouse(ClickHouseSource::new(ch)?),
             other => {
                 return Err(EtlError::config(format!(
                     "reconcile_values does not support a {} source (PostgreSQL, MySQL and \
@@ -401,7 +401,7 @@ async fn resolve_source(
             // an integer one by value (see `Rule::Truth`).
             s.resolve_columns(&mut conn, &probe, false).await
         }
-        SourceReader::ClickHouse(s, _) => {
+        SourceReader::ClickHouse(s) => {
             let probe = source_probe(cfg, quote_ident, quote_ch_table);
             s.resolve_columns(&probe, &[], &[]).await
         }
@@ -495,11 +495,10 @@ struct DestTable {
 /// Whether a table engine (as `system.tables` names it) merges rows sharing a
 /// sorting key, so a read needs `FINAL` to see one row per key. A plain
 /// `MergeTree` keeps every row and rejects `FINAL` outright (`Code: 181
-/// ILLEGAL_FINAL` on 24.8); so does anything that isn't a `MergeTree`.
+/// ILLEGAL_FINAL` on 24.8); so does anything that isn't a `MergeTree`. The
+/// same test a ClickHouse source's default `final=` makes.
 fn merges_rows(engine: &str) -> bool {
-    // ClickHouse Cloud spells its engines `Shared*`.
-    let engine = engine.strip_prefix("Shared").unwrap_or(engine);
-    crate::ddl::is_row_merging_engine(engine)
+    crate::source::clickhouse::engine_merges_rows(engine)
 }
 
 async fn describe_dest(
@@ -975,18 +974,14 @@ async fn read_source(
             }
             batches.extend(batcher.finish()?);
         }
-        SourceReader::ClickHouse(s, database) => {
+        SourceReader::ClickHouse(s) => {
             let from = match (query, table) {
                 (Some(q), _) => format!("({q}) AS _src"),
                 (None, Some(t)) => {
-                    // Qualified or not, as `quote_ch_table` reads it.
-                    let (db, name) = match t.split_once('.') {
-                        Some((d, n)) => (d.trim().trim_matches('`'), n.trim().trim_matches('`')),
-                        None => (database.as_str(), t.trim().trim_matches('`')),
-                    };
-                    let engine = table_engine(s, db, name).await?;
-                    let final_ = if merges_rows(&engine) { " FINAL" } else { "" };
-                    format!("{}{final_}", quote_ch_table(t))
+                    // `FINAL` by the descriptor's `final=`, by default where
+                    // the table's engine merges rows, as a sync reads it.
+                    s.resolve_final(Some(t), None).await?;
+                    s.table_from(t)
                 }
                 (None, None) => unreachable!("validated: one of source_table/source_query"),
             };

@@ -28,14 +28,29 @@
 //! Authentication and settings mirror the ClickHouse *sink* (`X-ClickHouse-User`
 //! / `X-ClickHouse-Key` headers, caller settings as query parameters), so one
 //! `quickhouse.ClickHouse(...)` descriptor works in either role.
+//!
+//! **`FINAL`.** A table whose engine merges rows sharing a sorting key
+//! (`ReplacingMergeTree` and its kin) holds old row versions until a background
+//! merge removes them, so a plain `SELECT` returns them too. Reads of
+//! `source_table` add `FINAL` where [`ClickHouseSource::resolve_final`] says so,
+//! which by default is exactly those engines. A `source_query` is never
+//! rewritten. On 24.8 a `WHERE` over such a read is applied *after* the merge
+//! for any column outside the sorting key, even with
+//! `optimize_move_to_prewhere_if_final=1` (which moves only sorting-key
+//! conditions, all of a key's versions sharing those values), so a watermark
+//! window or a range predicate never resurrects a version that a newer one
+//! replaced. Only an explicit `PREWHERE` filters before the merge, and this
+//! module never writes one.
 
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 
 use reqwest::{Client, RequestBuilder, Response};
 
 use crate::config::ClickHouseSourceConfig;
 use crate::ddl::quote_ident;
 use crate::error::{EtlError, Result};
+use crate::sink::clickhouse::escape_sql_string;
 use crate::source::Keyset;
 use crate::types::clickhouse::{arrow_to_ch_cast_type, map_ch_type};
 use crate::types::ColumnType;
@@ -70,6 +85,114 @@ fn arrow_output_settings() -> [(&'static str, &'static str); 4] {
     ]
 }
 
+/// What [`ClickHouseSource::resolve_final`] decided about a source table.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FinalRead {
+    /// Generated reads of the table add `FINAL`.
+    pub on: bool,
+    /// The table's engine, as `system.tables` names it (empty when not read).
+    pub engine: String,
+    /// The table's sorting key, one element per entry, a bare column name
+    /// without its backticks (empty when unknown: not read, or an engine
+    /// without one, such as `Distributed`).
+    pub sorting_key: Vec<String>,
+}
+
+/// Which column a parallel range read splits on when the reads add `FINAL`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FinalRange {
+    /// The configured column is in the sorting key (or the sorting key is
+    /// unknown): split on it, as without `FINAL`.
+    Keep,
+    /// Split on this column, the sorting key's first, instead.
+    Switch(String),
+    /// Nothing to split on: read in one stream.
+    Single,
+}
+
+/// The column a range-partitioned read of a table read with `FINAL` splits on.
+///
+/// Every version of a row shares its sorting-key values, so a range over a
+/// sorting-key column puts them all in the same partition, and a range over
+/// the sorting key's first column also prunes by the primary key: each
+/// partition reads and merges only its own slice of the table. A range over
+/// any other column is still correct on 24.8, because ClickHouse applies it
+/// after the merge, but no index narrows it, so each of the N partitions
+/// merges the whole table: N times the work of one stream. Such a column is
+/// swapped for the sorting key's first column when that one is an integer
+/// (`partitionable`), and the read runs in one stream when it isn't.
+///
+/// `wanted` is the configured column, or a `partition_source_expr`, matched
+/// against the sorting key's elements as written. An unknown (empty) sorting
+/// key keeps it: there is nothing to judge it by.
+pub(crate) fn final_range_column(
+    sorting_key: &[String],
+    wanted: &str,
+    partitionable: impl Fn(&str) -> bool,
+) -> FinalRange {
+    if sorting_key.is_empty() {
+        return FinalRange::Keep;
+    }
+    let wanted = unquote_ident(wanted.trim());
+    if sorting_key.iter().any(|k| k == wanted) {
+        return FinalRange::Keep;
+    }
+    match sorting_key.first() {
+        Some(first) if partitionable(first) => FinalRange::Switch(first.clone()),
+        _ => FinalRange::Single,
+    }
+}
+
+/// Whether a ClickHouse engine, as `system.tables` names it, merges rows
+/// sharing a sorting key, so only a `FINAL` read returns one row per key.
+/// ClickHouse Cloud spells its engines `Shared*`; the `Replicated*` forms are
+/// matched by [`crate::ddl::is_row_merging_engine`].
+pub(crate) fn engine_merges_rows(engine: &str) -> bool {
+    let engine = engine.strip_prefix("Shared").unwrap_or(engine);
+    crate::ddl::is_row_merging_engine(engine)
+}
+
+/// Split `system.tables.sorting_key` (`` `my id`, toDate(ts) ``) into its
+/// elements, commas inside parentheses or quotes not counting, each trimmed
+/// and, when it is one quoted identifier, unquoted.
+fn parse_sorting_key(raw: &str) -> Vec<String> {
+    let (mut parts, mut current) = (Vec::new(), String::new());
+    let (mut depth, mut quote) = (0i32, None::<char>);
+    for ch in raw.chars() {
+        match (quote, ch) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '`' | '"' | '\'') => quote = Some(ch),
+            (None, '(') => depth += 1,
+            (None, ')') => depth -= 1,
+            (None, ',') if depth == 0 => {
+                parts.push(std::mem::take(&mut current));
+                continue;
+            }
+            _ => {}
+        }
+        current.push(ch);
+    }
+    parts.push(current);
+    parts
+        .iter()
+        .map(|p| unquote_ident(p.trim()).to_string())
+        .filter(|p| !p.is_empty())
+        .collect()
+}
+
+/// `` `my id` `` as `my id`; anything that isn't one quoted identifier as is.
+fn unquote_ident(s: &str) -> &str {
+    for q in ['`', '"'] {
+        if let Some(inner) = s.strip_prefix(q).and_then(|r| r.strip_suffix(q)) {
+            if !inner.contains(q) {
+                return inner;
+            }
+        }
+    }
+    s
+}
+
 pub struct ClickHouseSource {
     client: Client,
     url: String,
@@ -78,6 +201,12 @@ pub struct ClickHouseSource {
     password: String,
     settings: BTreeMap<String, String>,
     statement_timeout_secs: u64,
+    /// The descriptor's `final=`: see [`ClickHouseSourceConfig::read_final`].
+    read_final: Option<bool>,
+    /// Whether reads of `source_table` add `FINAL`, once
+    /// [`Self::resolve_final`] has decided. One source reads one table, so one
+    /// decision serves every read of it.
+    final_reads: OnceLock<bool>,
 }
 
 impl ClickHouseSource {
@@ -91,7 +220,122 @@ impl ClickHouseSource {
             password: cfg.password.clone(),
             settings: cfg.settings.clone(),
             statement_timeout_secs: cfg.statement_timeout_secs,
+            read_final: cfg.read_final,
+            final_reads: OnceLock::new(),
         })
+    }
+
+    /// Whether reads of `source_table` add `FINAL`: what
+    /// [`Self::resolve_final`] decided, or, before it has, only an explicit
+    /// `final=True`.
+    pub fn reads_final(&self) -> bool {
+        self.final_reads
+            .get()
+            .copied()
+            .unwrap_or(self.read_final == Some(true))
+    }
+
+    /// Decide whether this source's reads of `table` add `FINAL`, and return
+    /// what the decision was made from. Call it once, before the first read.
+    ///
+    /// `final=False` decides no without a query. Otherwise the table's engine
+    /// and sorting key come from `system.tables`: `final=True` adds `FINAL`
+    /// whatever the engine (ClickHouse refuses it on a plain `MergeTree`, see
+    /// [`Self::resolve_columns`]), and the default adds it when the engine
+    /// merges rows ([`engine_merges_rows`]). Only the table's own engine is
+    /// looked at, so a `Distributed` table or a materialized view over a
+    /// merging table needs `final=True`.
+    ///
+    /// A `query` is never changed. With no `table` nothing is decided; with
+    /// both (the table is then read only to check a cursor that is ahead of
+    /// the query's MAX), the decision applies to that check alone.
+    pub async fn resolve_final(
+        &self,
+        table: Option<&str>,
+        query: Option<&str>,
+    ) -> Result<FinalRead> {
+        if self.read_final == Some(true) && query.is_some() {
+            tracing::warn!(
+                "final=True does not change source_query, which is sent as written: add FINAL \
+                 after the table name in the query to read it merged"
+            );
+        }
+        let Some(table) = table else {
+            let _ = self.final_reads.set(false);
+            return Ok(FinalRead::default());
+        };
+        if self.read_final == Some(false) {
+            let _ = self.final_reads.set(false);
+            return Ok(FinalRead::default());
+        }
+        let (engine, sorting_key) = self.table_engine(table).await?;
+        let on = self.read_final == Some(true) || engine_merges_rows(&engine);
+        match (on, query, self.read_final) {
+            (false, _, _) => {}
+            // The rows come from the query: saying the table is read with
+            // FINAL would suggest the query is too.
+            (true, Some(_), _) => tracing::debug!(
+                "source_table '{table}' ({engine}) is checked with FINAL; source_query is sent \
+                 as written"
+            ),
+            (true, None, Some(true)) => {
+                tracing::info!("final=True: reading source table '{table}' with FINAL")
+            }
+            (true, None, _) => tracing::info!(
+                "source table '{table}' is a {engine}, which keeps old versions of a row until \
+                 a background merge removes them: reading it with FINAL (pass final=False to \
+                 read it as stored)"
+            ),
+        }
+        let _ = self.final_reads.set(on);
+        Ok(FinalRead {
+            on,
+            engine,
+            sorting_key,
+        })
+    }
+
+    /// `table`'s engine and parsed sorting key from `system.tables`; empty for
+    /// a table it doesn't list. A bare name is looked up in the descriptor's
+    /// `database`, as [`quote_ch_table`] reads it.
+    async fn table_engine(&self, table: &str) -> Result<(String, Vec<String>)> {
+        let (db, name) = match table.split_once('.') {
+            Some((d, t)) => (d.trim().trim_matches('`'), t.trim().trim_matches('`')),
+            None => (self.database.as_str(), table.trim().trim_matches('`')),
+        };
+        let rows = self
+            .query_rows(&format!(
+                "SELECT engine, sorting_key FROM system.tables WHERE database = '{}' AND \
+                 name = '{}' FORMAT TabSeparated",
+                escape_sql_string(db),
+                escape_sql_string(name),
+            ))
+            .await
+            .map_err(|e| {
+                e.context(
+                    "reading the source table's engine from system.tables, to decide whether \
+                     to read it with FINAL (pass final=True or final=False to skip this)",
+                )
+            })?;
+        let row = rows.into_iter().next().unwrap_or_default();
+        let cell = |i: usize| row.get(i).cloned().flatten().unwrap_or_default();
+        Ok((cell(0), parse_sorting_key(&cell(1))))
+    }
+
+    /// The statement a source table's schema is resolved from: `SELECT *`
+    /// over it, with `FINAL` when its reads add it, so a `final=True` that
+    /// ClickHouse refuses fails here, before anything is written.
+    pub fn table_probe(&self, table: &str) -> String {
+        format!(
+            "SELECT * FROM {}",
+            from_source(Some(table), None, self.reads_final())
+        )
+    }
+
+    /// `table` as a `FROM` clause body: quoted, with `FINAL` when its reads
+    /// add it.
+    pub(crate) fn table_from(&self, table: &str) -> String {
+        from_source(Some(table), None, self.reads_final())
     }
 
     /// A POST request carrying auth, the database, and the effective settings.
@@ -168,6 +412,11 @@ impl ClickHouseSource {
     /// column is never dropped here even when filtered out, so nothing
     /// downstream that inspects the resolved schema (the watermark and
     /// partition-key lookups) changes behaviour.
+    ///
+    /// A [`Self::table_probe`] carries the read's `FINAL`, and ClickHouse
+    /// analyses it here: an engine that refuses `FINAL` (a plain `MergeTree`,
+    /// `Memory`, `Log`: `Code: 181 ILLEGAL_FINAL` on 24.8) fails the run before
+    /// anything is written, with the error naming `final=True`.
     pub async fn resolve_columns(
         &self,
         schema_probe: &str,
@@ -175,7 +424,19 @@ impl ClickHouseSource {
         exclude: &[String],
     ) -> Result<Vec<ColumnType>> {
         let sql = format!("DESCRIBE ({schema_probe}) FORMAT TabSeparated");
-        let rows = self.query_rows(&sql).await?;
+        let rows = self.query_rows(&sql).await.map_err(|e| {
+            if self.read_final == Some(true) && e.to_string().contains("ILLEGAL_FINAL") {
+                EtlError::config(format!(
+                    "final=True, but ClickHouse refuses FINAL on this source table: {e}. FINAL \
+                     applies to the MergeTree engines that merge rows (ReplacingMergeTree, \
+                     CollapsingMergeTree and the like) and to tables that pass it on to one \
+                     (Distributed, a materialized view). Leave final unset to add it only where \
+                     the table's engine merges rows."
+                ))
+            } else {
+                e
+            }
+        })?;
         let mut cols = Vec::with_capacity(rows.len());
         for row in rows {
             let name = row
@@ -265,10 +526,17 @@ impl ClickHouseSource {
         // return the column type's *default* (0, or the epoch) rather than
         // NULL, so an empty source would otherwise look like the single-valued
         // range `[0, 0]` instead of "nothing to partition".
+        //
+        // Never with `FINAL`, even when the reads add it. The range column is
+        // then a sorting-key column (see `final_range_column`), and a merged
+        // row keeps the sorting-key values of the stored rows it merged, so
+        // the stored MIN/MAX bound every row the reads return, and a stored
+        // count of 0 is a merged one of 0. Without `FINAL` the probe skips a
+        // merge of the whole table.
         let sql = format!(
             "SELECT toString(min({key})), toString(max({key})), toString(count()) \
              FROM {src} FORMAT TabSeparated",
-            src = from_source(from_table, base_query),
+            src = from_source(from_table, base_query, false),
         );
         let rows = self.query_rows(&sql).await.map_err(|e| match source_expr {
             // A bad `partition_source_expr` surfaces here as an opaque SQL
@@ -362,9 +630,14 @@ impl ClickHouseSource {
             })
             .unwrap_or_default();
 
+        // Every read of the rows themselves takes `FINAL` when the table's
+        // reads add it: the one-stream read, each range partition, each
+        // `chunk_rows` chunk, and an incremental read. Their filters (the
+        // range, the keyset cursor, the watermark window) apply to the merged
+        // rows: see the module docs.
         let mut sql = format!(
             "SELECT {col_list} FROM {}",
-            from_source(from_table, base_query)
+            from_source(from_table, base_query, self.reads_final())
         );
         if let Some(f) = filters {
             sql.push_str(&format!(" WHERE {f}"));
@@ -409,6 +682,12 @@ impl ClickHouseSource {
     /// — so the cursor is local wall-clock text, not UTC. The filter reads it
     /// back as `CAST(... AS <this type>)`, which parses it in that same zone
     /// (see `build_watermark_filter_clickhouse`).
+    ///
+    /// With `FINAL` when the table's reads add it. This MAX becomes the read's
+    /// upper bound and then the cursor, so it must come from the rows the read
+    /// returns: a stored MAX can come from a version that a newer one replaced
+    /// (or a row a `CollapsingMergeTree` cancelled), and a cursor above every
+    /// row the read returned skips any row later written between the two.
     pub async fn max_watermark(
         &self,
         from_table: Option<&str>,
@@ -422,7 +701,7 @@ impl ClickHouseSource {
         let sql = format!(
             "SELECT if(count({w}) = 0, NULL, toString(max({w}))), toTypeName(max({w})) \
              FROM {src} FORMAT TabSeparated",
-            src = from_source(from_table, base_query),
+            src = from_source(from_table, base_query, self.reads_final()),
         );
         let rows = self
             .query_rows(&sql)
@@ -453,6 +732,13 @@ impl ClickHouseSource {
 
     /// Count rows whose watermark value is NULL — see
     /// `PgSource::count_null_watermark` for why this matters.
+    ///
+    /// When the table's reads add `FINAL`, the count is of the merged rows, the
+    /// ones the read returns: a NULL in a version a newer one replaced is never
+    /// read. The stored rows are counted first, and `FINAL` only asked for when
+    /// that count isn't 0: a merged row's watermark is NULL only where a stored
+    /// row's is, so a stored 0 is a merged 0, and the usual answer costs no
+    /// merge.
     pub async fn count_null_watermark(
         &self,
         from_table: Option<&str>,
@@ -463,25 +749,41 @@ impl ClickHouseSource {
         let w = source_expr
             .map(str::to_string)
             .unwrap_or_else(|| quote_ident(watermark));
-        let sql = format!(
-            "SELECT toString(count()) FROM {src} WHERE {w} IS NULL FORMAT TabSeparated",
-            src = from_source(from_table, base_query),
-        );
-        let rows = self
-            .query_rows(&sql)
-            .await
-            .map_err(|e| e.context("reading clickhouse null-watermark count"))?;
-        Ok(rows
-            .first()
-            .and_then(|r| r.first().cloned())
-            .flatten()
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(0))
+        let count = |final_: bool| {
+            let sql = format!(
+                "SELECT toString(count()) FROM {src} WHERE {w} IS NULL FORMAT TabSeparated",
+                src = from_source(from_table, base_query, final_),
+            );
+            async move {
+                let rows = self
+                    .query_rows(&sql)
+                    .await
+                    .map_err(|e| e.context("reading clickhouse null-watermark count"))?;
+                Ok::<i64, EtlError>(
+                    rows.first()
+                        .and_then(|r| r.first().cloned())
+                        .flatten()
+                        .and_then(|s| s.trim().parse().ok())
+                        .unwrap_or(0),
+                )
+            }
+        };
+        let stored = count(false).await?;
+        if stored == 0 || base_query.is_some() || !self.reads_final() {
+            return Ok(stored);
+        }
+        count(true).await
     }
 
     /// Every distinct non-NULL value of `key`, as text, over the rows `window`
     /// admits — the ClickHouse half of a `reconcile::reconcile_keys` diff. See
     /// `PgSource::distinct_keys` for why the values come back as text.
+    ///
+    /// With `FINAL` when the table's reads add it ([`Self::resolve_final`]):
+    /// a row deleted through the engine (a `CollapsingMergeTree` cancel row, a
+    /// `ReplacingMergeTree(ver, is_deleted)` delete) is gone only from the
+    /// merged rows, and finding keys the source deleted is what the diff is
+    /// for. The window applies to each key's newest version.
     pub async fn distinct_keys(
         &self,
         from_table: Option<&str>,
@@ -496,7 +798,7 @@ impl ClickHouseSource {
         };
         let sql = format!(
             "SELECT DISTINCT toString({k}) FROM {src} {where_sql} FORMAT TabSeparated",
-            src = from_source(from_table, base_query),
+            src = from_source(from_table, base_query, self.reads_final()),
         );
         let rows = self
             .query_rows(&sql)
@@ -510,11 +812,20 @@ impl ClickHouseSource {
 }
 
 /// The `FROM` clause body: a wrapped `source_query` when present, else the
-/// quoted table. `source_query` wins, matching every other source.
-fn from_source(from_table: Option<&str>, base_query: Option<&str>) -> String {
+/// quoted table, followed by `FINAL` when `final_`. `source_query` wins,
+/// matching every other source, and is never given a `FINAL`: it is the
+/// caller's SQL, sent as written.
+fn from_source(from_table: Option<&str>, base_query: Option<&str>, final_: bool) -> String {
     match base_query {
         Some(q) => format!("({q}) AS _src"),
-        None => quote_ch_table(from_table.expect("table or query required")),
+        None => {
+            let table = quote_ch_table(from_table.expect("table or query required"));
+            if final_ {
+                format!("{table} FINAL")
+            } else {
+                table
+            }
+        }
     }
 }
 
@@ -610,6 +921,10 @@ mod tests {
     }
 
     fn source() -> ClickHouseSource {
+        source_with(None)
+    }
+
+    fn source_with(read_final: Option<bool>) -> ClickHouseSource {
         ClickHouseSource::new(&ClickHouseSourceConfig {
             url: "http://localhost:8123".into(),
             database: "default".into(),
@@ -617,8 +932,205 @@ mod tests {
             password: String::new(),
             settings: Default::default(),
             statement_timeout_secs: 0,
+            read_final,
         })
         .unwrap()
+    }
+
+    /// A source whose reads add `FINAL`, as `resolve_final` leaves one over a
+    /// `ReplacingMergeTree`.
+    fn final_source() -> ClickHouseSource {
+        let src = source();
+        src.final_reads.set(true).unwrap();
+        src
+    }
+
+    fn all() -> Partition {
+        Partition {
+            label: "all".into(),
+            predicate: None,
+        }
+    }
+
+    #[test]
+    fn select_sql_adds_final_after_the_table_and_before_every_filter() {
+        let src = final_source();
+        let part = Partition {
+            label: "range-0".into(),
+            predicate: Some("`id` >= 1 AND `id` <= 100".into()),
+        };
+        // A range partition with an incremental window.
+        let sql = src.select_sql(
+            &["id".to_string()],
+            &[None],
+            &[col("id", DataType::Int64, false)],
+            Some("shop.orders"),
+            None,
+            &part,
+            Some("`updated_at` > '2024-01-01'"),
+            None,
+        );
+        assert!(
+            sql.ends_with(
+                "FROM `shop`.`orders` FINAL WHERE (`id` >= 1 AND `id` <= 100) AND \
+                 (`updated_at` > '2024-01-01')"
+            ),
+            "{sql}"
+        );
+        // A `chunk_rows` chunk.
+        let sql = src.select_sql(
+            &["id".to_string()],
+            &[None],
+            &[col("id", DataType::Int64, false)],
+            Some("orders"),
+            None,
+            &all(),
+            None,
+            Some(Keyset {
+                col_quoted: "`id`".into(),
+                cursor: Some("42".into()),
+                bound: KeysetBound::OrderedLimit(500),
+            }),
+        );
+        assert!(
+            sql.ends_with("FROM `orders` FINAL WHERE `id` > 42 ORDER BY `id` ASC LIMIT 500"),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn select_sql_never_rewrites_a_source_query() {
+        // The caller's SQL is sent as written, whatever the table's reads do.
+        let src = final_source();
+        let sql = src.select_sql(
+            &["id".to_string()],
+            &[None],
+            &[col("id", DataType::Int64, false)],
+            None,
+            Some("SELECT id FROM orders"),
+            &all(),
+            None,
+            None,
+        );
+        assert!(
+            sql.ends_with("FROM (SELECT id FROM orders) AS _src"),
+            "{sql}"
+        );
+        assert!(!sql.contains("FINAL"), "{sql}");
+    }
+
+    #[test]
+    fn select_sql_reads_as_stored_without_final() {
+        for src in [source(), source_with(Some(false))] {
+            let sql = src.select_sql(
+                &["id".to_string()],
+                &[None],
+                &[col("id", DataType::Int64, false)],
+                Some("orders"),
+                None,
+                &all(),
+                None,
+                None,
+            );
+            assert!(sql.ends_with("FROM `orders`"), "{sql}");
+        }
+    }
+
+    #[test]
+    fn reads_final_follows_the_option_until_resolved() {
+        // Unresolved: only an explicit final=True adds it.
+        assert!(!source().reads_final());
+        assert!(!source_with(Some(false)).reads_final());
+        assert!(source_with(Some(true)).reads_final());
+        // Resolved: the decision.
+        assert!(final_source().reads_final());
+        let src = source_with(Some(true));
+        src.final_reads.set(false).unwrap();
+        assert!(!src.reads_final());
+    }
+
+    #[test]
+    fn table_probe_and_from_carry_final() {
+        let src = final_source();
+        assert_eq!(src.table_probe("db.t"), "SELECT * FROM `db`.`t` FINAL");
+        assert_eq!(src.table_from("t"), "`t` FINAL");
+        assert_eq!(source().table_probe("t"), "SELECT * FROM `t`");
+    }
+
+    #[test]
+    fn from_source_puts_final_only_on_a_table() {
+        assert_eq!(from_source(Some("t"), None, true), "`t` FINAL");
+        assert_eq!(from_source(Some("t"), None, false), "`t`");
+        assert_eq!(
+            from_source(Some("t"), Some("SELECT 1"), true),
+            "(SELECT 1) AS _src"
+        );
+    }
+
+    #[test]
+    fn engine_merges_rows_covers_the_merging_families_and_their_prefixes() {
+        for e in [
+            "ReplacingMergeTree",
+            "CollapsingMergeTree",
+            "VersionedCollapsingMergeTree",
+            "SummingMergeTree",
+            "AggregatingMergeTree",
+            "ReplicatedReplacingMergeTree",
+            "ReplicatedCollapsingMergeTree",
+            "ReplicatedVersionedCollapsingMergeTree",
+            "SharedReplacingMergeTree",
+        ] {
+            assert!(engine_merges_rows(e), "{e}");
+        }
+        for e in [
+            "MergeTree",
+            "ReplicatedMergeTree",
+            "SharedMergeTree",
+            "Distributed",
+            "View",
+            "MaterializedView",
+            "Memory",
+            "",
+        ] {
+            assert!(!engine_merges_rows(e), "{e}");
+        }
+    }
+
+    #[test]
+    fn parse_sorting_key_splits_top_level_and_unquotes() {
+        assert_eq!(parse_sorting_key("id"), vec!["id"]);
+        assert_eq!(
+            parse_sorting_key("`my id`, toDate(ts), intHash32(a, b)"),
+            vec!["my id", "toDate(ts)", "intHash32(a, b)"]
+        );
+        assert_eq!(parse_sorting_key("`a,b`, c"), vec!["a,b", "c"]);
+        assert!(parse_sorting_key("").is_empty());
+    }
+
+    #[test]
+    fn final_range_column_keeps_a_sorting_key_column() {
+        let sk = vec!["tenant".to_string(), "id".to_string()];
+        let int = |c: &str| c == "id" || c == "grp";
+        assert_eq!(final_range_column(&sk, "id", int), FinalRange::Keep);
+        assert_eq!(final_range_column(&sk, "`id`", int), FinalRange::Keep);
+        // Nothing to judge by: keep it.
+        assert_eq!(final_range_column(&[], "grp", int), FinalRange::Keep);
+    }
+
+    #[test]
+    fn final_range_column_moves_to_the_leading_integer_column_or_one_stream() {
+        let sk = vec!["id".to_string(), "toDate(ts)".to_string()];
+        let int = |c: &str| c == "id" || c == "grp";
+        assert_eq!(
+            final_range_column(&sk, "grp", int),
+            FinalRange::Switch("id".into())
+        );
+        // The leading column is not an integer.
+        let sk = vec!["name".to_string(), "id".to_string()];
+        assert_eq!(final_range_column(&sk, "grp", int), FinalRange::Single);
+        // Nor is an expression one.
+        let sk = vec!["toDate(ts)".to_string()];
+        assert_eq!(final_range_column(&sk, "grp", int), FinalRange::Single);
     }
 
     #[test]

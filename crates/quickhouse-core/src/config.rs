@@ -139,6 +139,16 @@ pub struct ClickHouseSourceConfig {
     /// [`ClickHouseConfig::settings`]. Applied *after* the settings quickhouse
     /// chooses for the Arrow read path, so an explicit value always wins.
     pub settings: std::collections::BTreeMap<String, String>,
+    /// Whether quickhouse's own reads of `source_table` add `FINAL` (the
+    /// Python descriptor's `final=`). `None` adds it when the table's engine
+    /// merges rows sharing a sorting key (`ReplacingMergeTree`,
+    /// `CollapsingMergeTree`, `VersionedCollapsingMergeTree`,
+    /// `SummingMergeTree`, `AggregatingMergeTree`, in their `Replicated*` and
+    /// `Shared*` forms too), which keep old row versions until a background
+    /// merge removes them. `Some(true)` always adds it, `Some(false)` never
+    /// does. A `source_query` is sent as written either way. See
+    /// [`crate::source::ClickHouseSource::resolve_final`].
+    pub read_final: Option<bool>,
 }
 
 /// One declared output column for an HTTP API source. API responses have no
