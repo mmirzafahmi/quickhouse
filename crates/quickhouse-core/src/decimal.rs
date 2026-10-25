@@ -256,7 +256,8 @@ impl CoercionTally {
             | WarningKind::AbandonedResumeMarker
             | WarningKind::DroppedSourceColumn
             | WarningKind::RecreatedDestination
-            | WarningKind::NonReplacingIncrementalTarget => None,
+            | WarningKind::NonReplacingIncrementalTarget
+            | WarningKind::IgnoredTypeOverride => None,
         }
     }
 

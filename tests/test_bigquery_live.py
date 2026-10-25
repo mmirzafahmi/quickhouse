@@ -616,3 +616,60 @@ def test_a_bigquery_source_leaves_out_a_null_key(bq, bq_source, ch_client, ch_ta
         assert ch_client.command(f"SELECT count() FROM `{dest}`") == 2
     finally:
         ch_client.command(f"DROP TABLE IF EXISTS `{dest}`")
+
+
+def test_a_type_override_an_existing_column_ignores_is_reported_on_bigquery(
+    bq, pg_conn, pg_source, bq_target, dest
+):
+    """Issue #50 on a BigQuery destination: type_overrides applies only when
+    quickhouse creates the table, so an override naming a column the existing
+    table types differently is reported before writing. One naming the type
+    the column has, in BigQuery's other spelling (FLOAT64 for FLOAT), is not."""
+    _existing_dest(bq, dest)
+    _seed(pg_conn, dest, range(1, 6))
+    with pytest.raises(RuntimeError, match="fail_on_warnings: ignored_type_override") as err:
+        _sync(
+            pg_source, bq_target, dest, type_overrides={"amount": "NUMERIC"},
+            fail_on_warnings={"ignored_type_override"},
+        )
+    assert "on column 'amount'" in str(err.value)
+    assert "'FLOAT'" in str(err.value) and "'NUMERIC'" in str(err.value)
+    assert "(count" not in str(err.value)
+
+    r = _sync(
+        pg_source, bq_target, dest,
+        type_overrides={"amount": "FLOAT64", "id": "INT64", "write_date": "DATETIME"},
+    )
+    assert r.rows_written == 5
+    assert [w for w in r.warnings if w.kind == "ignored_type_override"] == [], r.warnings
+    types = {f.name: f.field_type for f in bq.get_table(_fq(bq, dest).strip("`")).schema}
+    assert types["amount"] == "FLOAT"
+
+
+def test_a_type_override_an_existing_column_ignores_is_reported_from_a_bigquery_source(
+    bq, bq_source, ch_client, ch_target, dest
+):
+    """Issue #50 on the BigQuery-source flow, into ClickHouse."""
+    _bq_table(
+        bq,
+        dest,
+        ", ".join(
+            f"STRUCT({i} AS id, DATETIME '2024-01-01 00:00:00' AS updated_at)" for i in range(1, 4)
+        ),
+    )
+    ch_client.command(f"DROP TABLE IF EXISTS `{dest}`")
+    kw = dict(
+        dest_table=dest, source_table=f"{BQ_DATASET}.{dest}", mode="full", key=["id"],
+        create_if_missing=True,
+    )
+    try:
+        first = quickhouse.sync(bq_source, ch_target, **kw)
+        assert [w for w in first.warnings if w.kind == "ignored_type_override"] == []
+        r = quickhouse.sync(
+            bq_source, ch_target, type_overrides={"id": "Int32", "updated_at": "DATETIME"}, **kw
+        )
+        assert r.rows_written == 3
+        got = [(w.column, w.sample) for w in r.warnings if w.kind == "ignored_type_override"]
+        assert got == [("id", "Int64")], r.warnings
+    finally:
+        ch_client.command(f"DROP TABLE IF EXISTS `{dest}`")

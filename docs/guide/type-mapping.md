@@ -205,6 +205,17 @@ the destination fills itself (a `DEFAULT`, or a ClickHouse `MATERIALIZED`,
 pass `fail_on_warnings={"unsourced_destination_column"}`. The fix is to select
 the column in the source, or to drop it from the destination.
 
+`type_overrides` never retypes a column either: it applies when quickhouse
+creates the table, or adds the column with `evolve_schema`. An override that
+names a column the existing destination already has, as another type, raises
+`ignored_type_override` before anything is written, naming the column, its
+type (also the `sample`) and the override. The column keeps its type, and the
+values the run writes are converted to it. The same type spelled another way
+isn't reported: `Decimal(12,2)` for a `Nullable(Decimal(12, 2))` column,
+`numeric(12, 2)` (ClickHouse resolves the alias), or `FLOAT64` for a BigQuery
+`FLOAT`. To get the override's type, `ALTER` the column, or drop the table and
+let the next run create it.
+
 ## Not yet supported
 
 Arrays and composite (`RECORD`/`STRUCT`) types aren't mapped yet. For API sources,

@@ -102,7 +102,7 @@ changed, so they deserve the most attention:
 - **`full_refresh_shrink`**: a full refresh left the table smaller than before.
   You only see it when you allowed that with `allow_full_refresh_shrink=True`.
 
-Four more compare the run with the destination table that's already there, and
+Five more compare the run with the destination table that's already there, and
 are raised before anything is written:
 
 - **`dropped_source_column`**: a source column has no column in the ClickHouse
@@ -117,6 +117,10 @@ are raised before anything is written:
 - **`recreated_destination`**: the incremental table was dropped, so the run
   creates it again and reads from the start
   ([Keeping tables up to date](incremental.md#where-quickhouse-keeps-its-place)).
+- **`ignored_type_override`**: a `type_overrides` entry asks for a type that
+  a column of the existing table doesn't have. Overrides only apply when
+  quickhouse creates the table, so the column keeps its type
+  ([Type mapping](../guide/type-mapping.md#schema-evolution)).
 
 The complete list is in the
 [performance and safety guide](../guide/performance.md#failing-a-run-on-a-warning).

@@ -91,7 +91,8 @@ mode and source leaves such a row out and counts it in a `null_key` warning
 
 `engine`, `order_by`, `partition_by` and `type_overrides` only apply when a
 table is created, so dropping the destination and letting the next run create
-it is how you change them. The cursor lives in `_quickhouse_state`, not in the
+it is how you change them (a `type_overrides` entry that an existing column's
+type disagrees with raises `ignored_type_override`). The cursor lives in `_quickhouse_state`, not in the
 table. A run that creates the destination while its state key still holds a
 cursor (or a `chunk_rows` resume marker) starts over, as a first run does, so
 the new table gets every row; it clears the old cursor and raises

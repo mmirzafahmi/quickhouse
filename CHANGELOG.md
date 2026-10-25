@@ -34,6 +34,27 @@ any breaking change is called out explicitly.
   it failing. A DataFrame's incremental de-duplication on `key` leaves rows
   with a NULL key alone, so `null_key` counts each of them. (#49, #45)
 
+### Added
+- **A warning for a `type_overrides` entry an existing table ignores:
+  `ignored_type_override`.** `type_overrides` only applies when quickhouse
+  creates the table, or adds the column with `evolve_schema`, so an entry
+  naming a column the existing destination already has, as another type, did
+  nothing, and the run said nothing: `type_overrides={"amount": "Decimal(12, 2)"}`
+  left a `Nullable(Decimal(38, 9))` column as it was, with `warnings` empty.
+  The run now raises the warning once per such column, before anything is
+  written, naming the column, its type (also the `sample`) and the override,
+  so `fail_on_warnings={"ignored_type_override"}` stops it with the
+  destination untouched. `column` is the `type_overrides` key. The same type
+  spelled another way isn't reported: spaces and a `Nullable(...)` wrapper
+  don't count, ClickHouse resolves an alias such as `numeric(12, 2)` or
+  `Decimal64(2)` when the spellings still differ (one query, made only then),
+  and BigQuery's `INT64`/`INTEGER`, `FLOAT64`/`FLOAT`, `BOOL`/`BOOLEAN` and
+  `DECIMAL`/`NUMERIC` count as the same. Both destinations, and every source:
+  database, BigQuery, API and DataFrame. The declared types of an API source,
+  which quickhouse passes to a BigQuery destination as overrides of its own,
+  aren't checked. It costs one query against the destination's metadata per
+  run that passes `type_overrides`. (#50)
+
 ### Fixed
 - **A NULL watermark is left out of a `ReplacingMergeTree`, as on a database
   source, instead of landing as `1970-01-01`.** The watermark is a
@@ -65,6 +86,22 @@ any breaking change is called out explicitly.
   refresh, and the `full_refresh_shrink` warning, also say how many rows the
   run left out for a NULL key or watermark, since those count as lost
   there. (#49)
+- **A `fail_on_warnings` error no longer says `(count 0)`.** A warning about
+  the destination rather than about rows, such as `recreated_destination`,
+  `dropped_source_column` or `non_replacing_incremental_target`, is raised
+  before anything is written and has no row count, so its `count` is 0, and
+  the error read `fail_on_warnings: recreated_destination (count 0) stopped
+  the run`. The error now leaves a count of 0 out. `count` itself is
+  unchanged, and is documented as 0 for such warnings. `dropped_source_column`
+  stays at 0 as well: the rows written without the column are known only
+  after the check that can stop the run. (#50)
+- **`non_replacing_incremental_target` says a run writes the whole source only
+  when it does.** Its message said that a first run, with no cursor yet,
+  writes the whole source again, including on a first run with
+  `skip_to_max=True` or `seed_watermark`, which starts past the rows already
+  there: with `skip_to_max=True` that run wrote 0 rows. The clause is now
+  there only when the run reads from the start, with no saved cursor, no
+  `chunk_rows` resume marker and no seed. (#50)
 
 ## [0.20.11] — 2026-10-25
 

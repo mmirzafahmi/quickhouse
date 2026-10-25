@@ -976,11 +976,16 @@ fn fatal_warning_error(w: &TransferWarning, at: Before, requested: bool) -> EtlE
     } else {
         at.describe()
     };
+    // A warning about the destination rather than about rows counts none,
+    // and "(count 0) stopped the run" reads as if nothing did.
+    let count = match w.count {
+        0 => String::new(),
+        n => format!(" (count {n})"),
+    };
     EtlError::other(format!(
-        "{by}{kind}{column} (count {count}) stopped the run. {state} The warning: {message}",
+        "{by}{kind}{column}{count} stopped the run. {state} The warning: {message}",
         by = if requested { "fail_on_warnings: " } else { "" },
         kind = w.kind.as_str(),
-        count = w.count,
         message = w.message,
     ))
 }
@@ -2552,6 +2557,8 @@ async fn run_transfer_impl(
         &cfg,
         &plan,
         force_stage_incremental,
+        cursor_plan.last.is_none() && resume.is_none(),
+        &cfg.type_overrides,
         &warnings,
     )
     .await?;
@@ -3025,6 +3032,8 @@ async fn run_transfer_bigquery(
     let archive_info = archive_info.map(|a| a.with_null_guard(null_guard.clone()));
 
     let mut discarded_state = false;
+    // No cursor or seed bounds the read: see `warn_on_destination`.
+    let mut from_start = false;
     let (row_restriction, new_watermark, cursor_check) = if cfg.mode == SyncMode::Incremental {
         let watermark = cfg.watermark.as_ref().unwrap();
         ensure_watermark_column(watermark, &source_cols)?;
@@ -3085,6 +3094,7 @@ async fn run_transfer_bigquery(
                            unfiltered table to check it against.";
             c.warn_if_cursor_ahead(&cfg, through_query.then_some(why), &warnings);
         }
+        from_start = last.is_none();
         (filter, snapshot_max, cursor_check)
     } else {
         (None, None, None)
@@ -3119,6 +3129,8 @@ async fn run_transfer_bigquery(
         &cfg,
         &plan,
         force_stage_incremental,
+        from_start,
+        &cfg.type_overrides,
         &warnings,
     )
     .await?;
@@ -3616,6 +3628,9 @@ async fn run_transfer_api(
     // instead takes its column types from the resolved Arrow/ClickHouse mapping,
     // so seeding BigQuery names there would produce invalid DDL — skip it.
     let seeded = matches!(sink.dest_kind(), crate::config::DestKind::BigQuery);
+    // The caller's own overrides, which an existing table can ignore; the
+    // seeded declared types are quickhouse's, and aren't checked.
+    let overrides = cfg.type_overrides.clone();
     if seeded {
         seed_api_type_overrides(&mut cfg, &cols)?;
     }
@@ -3682,6 +3697,8 @@ async fn run_transfer_api(
     } else {
         SavedState::default()
     };
+    // No cursor or seed bounds the window: it opens at `from_date`.
+    let from_start = saved.committed.is_none() && cfg.seed_watermark == WatermarkSeed::None;
     let (from, to, new_watermark) = derive_api_window(&cfg, &source_cfg, saved.committed)?;
 
     // Force a staging table for a gated incremental run into a directly-inserting
@@ -3707,6 +3724,8 @@ async fn run_transfer_api(
         &cfg,
         &plan,
         force_stage_incremental,
+        from_start,
+        &overrides,
         &warnings,
     )
     .await?;
@@ -4174,11 +4193,14 @@ async fn run_transfer_frame(
         ));
     }
 
+    // A frame has no cursor: each incremental run writes all of it.
     warn_on_destination(
         sink.as_ref(),
         &cfg,
         &plan,
         force_stage_incremental,
+        true,
+        &cfg.type_overrides,
         &warnings,
     )
     .await?;
@@ -6866,7 +6888,8 @@ fn coercion_message(kind: WarningKind, column: &str, n: u64, fate: Option<NullFa
         | WarningKind::AbandonedResumeMarker
         | WarningKind::DroppedSourceColumn
         | WarningKind::RecreatedDestination
-        | WarningKind::NonReplacingIncrementalTarget => {
+        | WarningKind::NonReplacingIncrementalTarget
+        | WarningKind::IgnoredTypeOverride => {
             format!("column '{column}': {n} affected row(s)")
         }
     }
@@ -7944,17 +7967,182 @@ fn warn_mixed_decimals(table: &str, decimal: &[String], float: &[String], warnin
 /// raised before anything is written, so a `fail_on_warnings` that names one
 /// stops the run with the destination untouched. `staged` is
 /// `force_stage_incremental`: an incremental run into a destination that
-/// would insert directly stages instead.
+/// would insert directly stages instead. `from_start` says an incremental
+/// run reads the source from the start: no saved cursor, resume marker or
+/// seed. `overrides` are the caller's `type_overrides`, without the declared
+/// types an API source seeds into `cfg` for a BigQuery destination.
 async fn warn_on_destination(
     sink: &dyn Sink,
     cfg: &TransferConfig,
     plan: &SelectPlan,
     staged: bool,
+    from_start: bool,
+    overrides: &std::collections::HashMap<String, String>,
     warnings: &Warnings,
 ) -> Result<()> {
     warn_on_unsourced_columns(sink, cfg, &plan.dest_columns, warnings).await?;
     warn_on_dropped_columns(sink, cfg, plan, staged, warnings).await?;
-    warn_on_non_replacing_target(sink, cfg, warnings).await
+    warn_on_ignored_overrides(sink, cfg, plan, overrides, warnings).await?;
+    warn_on_non_replacing_target(sink, cfg, from_start, warnings).await
+}
+
+/// Raise [`WarningKind::IgnoredTypeOverride`] for each entry of `overrides`
+/// that names a column the existing destination already has, as another
+/// type: an override only types a column quickhouse creates. An entry is
+/// matched as the plan matches it, by source name, then by destination name.
+/// Nothing to compare when there are no overrides, so the destination isn't
+/// asked then.
+async fn warn_on_ignored_overrides(
+    sink: &dyn Sink,
+    cfg: &TransferConfig,
+    plan: &SelectPlan,
+    overrides: &std::collections::HashMap<String, String>,
+    warnings: &Warnings,
+) -> Result<()> {
+    use crate::config::DestKind;
+    if overrides.is_empty() {
+        return Ok(());
+    }
+    let Some(existing) = sink.column_types(&cfg.dest_table).await? else {
+        return Ok(());
+    };
+    let kind = sink.dest_kind();
+    for (source, column) in plan.source_columns.iter().zip(&plan.dest_columns) {
+        let Some((key, asked)) = overrides
+            .get_key_value(source)
+            .or_else(|| overrides.get_key_value(&column.name))
+        else {
+            continue;
+        };
+        // BigQuery column names compare case-insensitively; ClickHouse ones
+        // don't, and a column only a case apart is a different column there.
+        let has = existing.get(&column.name).or_else(|| match kind {
+            DestKind::BigQuery => existing
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(&column.name))
+                .map(|(_, ty)| ty),
+            DestKind::ClickHouse => None,
+        });
+        // A column the table lacks is created with the override, under
+        // `evolve_schema`, or left out (`dropped_source_column`).
+        let Some(has) = has else {
+            continue;
+        };
+        // What the override creates: on ClickHouse the plan's type, which
+        // spells a portable DATETIME/TIMESTAMP as the type it stands for.
+        let wanted = match kind {
+            DestKind::ClickHouse => column.clickhouse_inner.as_str(),
+            DestKind::BigQuery => asked.as_str(),
+        };
+        if same_column_type(kind, wanted, has) {
+            continue;
+        }
+        // Spelled differently, it may still be the same type under an alias
+        // (`numeric(12, 2)`, `Decimal64(2)`): asked only then.
+        if let Some(canonical) = sink.canonical_type(wanted).await {
+            if same_column_type(kind, &canonical, has) {
+                continue;
+            }
+        }
+        let message = ignored_override_message(cfg, key, asked, &column.name, has);
+        tracing::warn!("{message}");
+        warnings.push(TransferWarning {
+            kind: WarningKind::IgnoredTypeOverride,
+            column: Some(key.clone()),
+            count: 0,
+            sample: Some(has.clone()),
+            message,
+        });
+    }
+    Ok(())
+}
+
+/// Whether column types `a` and `b`, as `kind` spells them, are the same
+/// type. Nullability is the source column's, not an override's, so a
+/// `Nullable(...)` wrapper doesn't count, and neither does spacing.
+fn same_column_type(kind: crate::config::DestKind, a: &str, b: &str) -> bool {
+    use crate::config::DestKind;
+    match kind {
+        DestKind::ClickHouse => normalized_clickhouse_type(a) == normalized_clickhouse_type(b),
+        DestKind::BigQuery => normalized_bigquery_type(a) == normalized_bigquery_type(b),
+    }
+}
+
+/// A ClickHouse type with spaces outside quotes removed and nullability
+/// taken out: `Nullable(Decimal(12, 2))` and `Decimal(12,2)` both read
+/// `Decimal(12,2)`, and `LowCardinality(Nullable(String))`
+/// `LowCardinality(String)`. Aliases (`numeric(12, 2)`) are left to the
+/// server: see [`Sink::canonical_type`].
+fn normalized_clickhouse_type(t: &str) -> String {
+    let mut out = String::with_capacity(t.len());
+    let mut quoted = false;
+    for c in t.trim().chars() {
+        if c == '\'' {
+            quoted = !quoted;
+        }
+        if quoted || !c.is_whitespace() {
+            out.push(c);
+        }
+    }
+    let out = match out
+        .strip_prefix("Nullable(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        Some(inner) => inner.to_string(),
+        None => out,
+    };
+    match out
+        .strip_prefix("LowCardinality(Nullable(")
+        .and_then(|s| s.strip_suffix("))"))
+    {
+        Some(inner) => format!("LowCardinality({inner})"),
+        None => out,
+    }
+}
+
+/// A BigQuery type, upper-cased, without spaces, and with the names the
+/// tables API reports (`INTEGER`, `FLOAT`, `BOOLEAN`, `RECORD`, `NUMERIC`,
+/// `BIGNUMERIC`) for their standard SQL aliases.
+fn normalized_bigquery_type(t: &str) -> String {
+    let t: String = t
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_ascii_uppercase();
+    let (base, params) = t.split_at(t.find('(').unwrap_or(t.len()));
+    let base = match base {
+        "INT64" => "INTEGER",
+        "FLOAT64" => "FLOAT",
+        "BOOL" => "BOOLEAN",
+        "STRUCT" => "RECORD",
+        "DECIMAL" => "NUMERIC",
+        "BIGDECIMAL" => "BIGNUMERIC",
+        other => other,
+    };
+    format!("{base}{params}")
+}
+
+/// The [`WarningKind::IgnoredTypeOverride`] message for the override `key`
+/// (as written, `asked`) of destination column `column`, typed `has`.
+fn ignored_override_message(
+    cfg: &TransferConfig,
+    key: &str,
+    asked: &str,
+    column: &str,
+    has: &str,
+) -> String {
+    let name = if key == column {
+        format!("column '{column}'")
+    } else {
+        format!("column '{key}' (renamed '{column}')")
+    };
+    format!(
+        "type_overrides asks for {name} to be '{asked}', but destination '{}' already has it \
+         as '{has}', and type_overrides only applies when quickhouse creates a table or adds a \
+         column, so it stays '{has}'. ALTER the column to change its type, or drop the table so \
+         the next run creates it with the override; if '{has}' is right, remove the override.",
+        cfg.dest_table,
+    )
 }
 
 /// Raise [`WarningKind::UnsourcedDestinationColumn`] for each column of the
@@ -8084,9 +8272,11 @@ fn dropped_column_message(cfg: &TransferConfig, source: &str, column: &str) -> S
 /// Raise [`WarningKind::NonReplacingIncrementalTarget`] when an incremental
 /// run with a `key` writes into an existing table whose engine keeps every
 /// copy of a row: there the upsert the key asks for is an append.
+/// `from_start` as in [`warn_on_destination`].
 async fn warn_on_non_replacing_target(
     sink: &dyn Sink,
     cfg: &TransferConfig,
+    from_start: bool,
     warnings: &Warnings,
 ) -> Result<()> {
     if cfg.mode != SyncMode::Incremental || cfg.key.is_empty() {
@@ -8095,7 +8285,7 @@ async fn warn_on_non_replacing_target(
     let Some(engine) = sink.non_replacing_engine(&cfg.dest_table, cfg).await? else {
         return Ok(());
     };
-    let message = non_replacing_target_message(cfg, &engine);
+    let message = non_replacing_target_message(cfg, &engine, from_start);
     tracing::warn!("{message}");
     warnings.push(TransferWarning {
         kind: WarningKind::NonReplacingIncrementalTarget,
@@ -8108,15 +8298,21 @@ async fn warn_on_non_replacing_target(
 }
 
 /// The [`WarningKind::NonReplacingIncrementalTarget`] message for a
-/// destination whose engine is `engine`.
-fn non_replacing_target_message(cfg: &TransferConfig, engine: &str) -> String {
+/// destination whose engine is `engine`. It says the run writes the whole
+/// source only when it does (`from_start`): a first run that `skip_to_max`
+/// or `seed_watermark` starts past the rows already there doesn't.
+fn non_replacing_target_message(cfg: &TransferConfig, engine: &str, from_start: bool) -> String {
+    let whole = if from_start {
+        " (with no cursor to start from, this run writes the whole source)"
+    } else {
+        ""
+    };
     format!(
         "destination '{}' is a {engine}, which doesn't replace a stored row with a newer one of \
          the same key the way a ReplacingMergeTree does. This incremental run with key={:?} \
-         writes each changed row again (a first run, with no cursor yet, the whole source), and \
-         the table keeps both. Drop the table and let the next run create it as a \
-         ReplacingMergeTree (it then reads the source from the start), or pass \
-         engine='{engine}' if the copies are wanted.",
+         writes each changed row again{whole}, and the table keeps both. Drop the table and let \
+         the next run create it as a ReplacingMergeTree (it then reads the source from the \
+         start), or pass engine='{engine}' if the copies are wanted.",
         cfg.dest_table, cfg.key,
     )
 }
@@ -10623,6 +10819,39 @@ mod tests {
         assert_eq!(w.drain().len(), 1);
     }
 
+    /// Issue #50: a warning about the destination counts no rows, and its
+    /// error read "(count 0) stopped the run". A count of 0 is left out.
+    #[test]
+    fn a_fatal_warning_with_no_count_says_none() {
+        let mut warning = TransferWarning {
+            kind: WarningKind::RecreatedDestination,
+            column: None,
+            count: 0,
+            sample: Some("5".into()),
+            message: "recreated".into(),
+        };
+        let err = fatal_warning_error(&warning, Before::Write, true).to_string();
+        assert!(
+            err.starts_with("fail_on_warnings: recreated_destination stopped the run. Nothing"),
+            "{err}"
+        );
+        assert!(!err.contains("count"), "{err}");
+        warning.kind = WarningKind::DroppedSourceColumn;
+        warning.column = Some("extra".into());
+        let err = fatal_warning_error(&warning, Before::Write, true).to_string();
+        assert!(
+            err.contains("dropped_source_column on column 'extra' stopped the run"),
+            "{err}"
+        );
+        // A count above 0 is still given.
+        warning.count = 2;
+        let err = fatal_warning_error(&warning, Before::Write, true).to_string();
+        assert!(
+            err.contains("on column 'extra' (count 2) stopped the run"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn a_fatal_warning_in_a_run_that_created_the_destination_says_it_is_left_empty() {
         // #45: a full refresh into a table that didn't exist created it, empty,
@@ -12465,6 +12694,11 @@ mod tests {
         marker: Option<ChunkMarker>,
         dropped: Vec<String>,
         engine: Option<String>,
+        /// What `column_types` answers.
+        columns: Option<std::collections::HashMap<String, String>>,
+        /// `canonical_type`'s answers: the alias, then the type it names.
+        canonical: Vec<(&'static str, &'static str)>,
+        bigquery: bool,
         calls: Mutex<Vec<String>>,
     }
 
@@ -12533,8 +12767,26 @@ mod tests {
         ) -> Result<Option<String>> {
             Ok(self.engine.clone())
         }
+        async fn column_types(
+            &self,
+            table: &str,
+        ) -> Result<Option<std::collections::HashMap<String, String>>> {
+            self.calls.lock().unwrap().push(format!("columns {table}"));
+            Ok(self.columns.clone())
+        }
+        async fn canonical_type(&self, ty: &str) -> Option<String> {
+            self.calls.lock().unwrap().push(format!("canonical {ty}"));
+            self.canonical
+                .iter()
+                .find(|(alias, _)| *alias == ty)
+                .map(|(_, canonical)| canonical.to_string())
+        }
         fn dest_kind(&self) -> crate::config::DestKind {
-            crate::config::DestKind::ClickHouse
+            if self.bigquery {
+                crate::config::DestKind::BigQuery
+            } else {
+                crate::config::DestKind::ClickHouse
+            }
         }
         fn namespace(&self) -> &str {
             "db"
@@ -12768,11 +13020,14 @@ mod tests {
             ..Default::default()
         };
         let w = Warnings::default();
-        warn_on_non_replacing_target(&sink, &cfg, &w).await.unwrap();
+        warn_on_non_replacing_target(&sink, &cfg, true, &w)
+            .await
+            .unwrap();
         let raised = w.drain();
         assert_eq!(raised.len(), 1);
         assert_eq!(raised[0].kind, WarningKind::NonReplacingIncrementalTarget);
         assert_eq!(raised[0].sample.as_deref(), Some("MergeTree"));
+        assert_eq!(raised[0].count, 0);
         let msg = &raised[0].message;
         assert!(msg.contains("'orders' is a MergeTree"), "{msg}");
         assert!(
@@ -12783,11 +13038,15 @@ mod tests {
         // Without a key there is nothing to upsert on, and the other modes
         // don't upsert.
         cfg.key.clear();
-        warn_on_non_replacing_target(&sink, &cfg, &w).await.unwrap();
+        warn_on_non_replacing_target(&sink, &cfg, true, &w)
+            .await
+            .unwrap();
         cfg.key = vec!["id".into()];
         for mode in [SyncMode::Full, SyncMode::Append] {
             cfg.mode = mode;
-            warn_on_non_replacing_target(&sink, &cfg, &w).await.unwrap();
+            warn_on_non_replacing_target(&sink, &cfg, true, &w)
+                .await
+                .unwrap();
         }
         assert!(w.drain().is_empty());
     }
@@ -13142,5 +13401,244 @@ mod tests {
         let kept = archived_rows(Some(&guard), &batch).unwrap();
         assert_eq!(kept.num_rows(), 1);
         assert!(!kept.schema().field(1).is_nullable());
+    }
+
+    /// Issue #50: the message said a first run with no cursor writes the
+    /// whole source, also on one that `skip_to_max` or `seed_watermark`
+    /// starts past it, which wrote 0 rows. It says so only for a run that
+    /// reads from the start.
+    #[tokio::test]
+    async fn a_non_replacing_target_says_the_whole_source_only_when_the_run_reads_it() {
+        let cfg = incremental_cfg();
+        let sink = SetupSink {
+            engine: Some("MergeTree".into()),
+            ..Default::default()
+        };
+        let w = Warnings::default();
+        warn_on_non_replacing_target(&sink, &cfg, true, &w)
+            .await
+            .unwrap();
+        let msg = w.drain().remove(0).message;
+        assert!(
+            msg.contains(
+                "writes each changed row again (with no cursor to start from, this run writes \
+                 the whole source), and the table keeps both"
+            ),
+            "{msg}"
+        );
+        warn_on_non_replacing_target(&sink, &cfg, false, &w)
+            .await
+            .unwrap();
+        let msg = w.drain().remove(0).message;
+        assert!(
+            msg.contains("writes each changed row again, and the table keeps both"),
+            "{msg}"
+        );
+        assert!(!msg.contains("whole source"), "{msg}");
+    }
+
+    fn typed_pcol(name: &str, inner: &str, nullable: bool) -> ColumnType {
+        ColumnType {
+            clickhouse_inner: inner.into(),
+            ..pcol(name, 0, nullable)
+        }
+    }
+
+    fn overrides(entries: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        entries
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// Issue #50: an override only types a column quickhouse creates, so one
+    /// naming a column the existing table types differently did nothing, and
+    /// the run said nothing. Reported now, unless only the spelling differs.
+    #[tokio::test]
+    async fn an_override_an_existing_column_ignores_is_reported() {
+        let mut cfg = incremental_cfg();
+        cfg.rename = std::collections::HashMap::from([("amt".to_string(), "amount".to_string())]);
+        // The plan's types: the override's for the overridden columns, as
+        // transform::plan resolves them (TIMESTAMP is DateTime64(6, 'UTC')).
+        let plan = SelectPlan {
+            source_columns: ["id", "amt", "qty", "ts", "code", "fresh"]
+                .map(String::from)
+                .to_vec(),
+            source_select_exprs: vec![None; 6],
+            dest_columns: vec![
+                typed_pcol("id", "Int64", false),
+                typed_pcol("amount", "Decimal(12,2)", true),
+                typed_pcol("qty", "Int64", true),
+                typed_pcol("ts", "DateTime64(6, 'UTC')", true),
+                typed_pcol("code", "numeric(12, 2)", true),
+                typed_pcol("fresh", "String", true),
+            ],
+        };
+        let existing = [
+            ("id", "Int64"),
+            ("amount", "Nullable(Decimal(12, 2))"),
+            ("qty", "Nullable(Int32)"),
+            ("ts", "Nullable(DateTime64(6, 'UTC'))"),
+            ("code", "Nullable(Decimal(12, 2))"),
+            ("Fresh", "String"),
+        ];
+        let sink = SetupSink {
+            columns: Some(overrides(&existing)),
+            canonical: vec![("numeric(12, 2)", "Decimal(12, 2)")],
+            ..Default::default()
+        };
+        let w = Warnings::default();
+        let asked = overrides(&[
+            ("amt", "Decimal(12,2)"),
+            ("qty", "Int64"),
+            ("ts", "TIMESTAMP"),
+            ("code", "numeric(12, 2)"),
+            // Not a column of the table (ClickHouse names are case-sensitive):
+            // created under evolve_schema, or left out.
+            ("fresh", "String"),
+        ]);
+        warn_on_ignored_overrides(&sink, &cfg, &plan, &asked, &w)
+            .await
+            .unwrap();
+        let raised = w.drain();
+        assert_eq!(raised.len(), 1, "{raised:?}");
+        assert_eq!(raised[0].kind, WarningKind::IgnoredTypeOverride);
+        assert_eq!(raised[0].column.as_deref(), Some("qty"));
+        assert_eq!(raised[0].sample.as_deref(), Some("Nullable(Int32)"));
+        assert_eq!(raised[0].count, 0);
+        let msg = &raised[0].message;
+        assert!(
+            msg.contains("asks for column 'qty' to be 'Int64'")
+                && msg.contains("'orders' already has it as 'Nullable(Int32)'"),
+            "{msg}"
+        );
+        // Only the alias that the cheap comparison couldn't settle was sent.
+        assert_eq!(
+            sink.calls(),
+            vec![
+                "columns orders",
+                "canonical Int64",
+                "canonical numeric(12, 2)"
+            ]
+        );
+
+        // Keyed by its source name, a renamed column is named both ways.
+        let asked = overrides(&[("amt", "Decimal(18, 4)")]);
+        let mut plan = plan;
+        plan.dest_columns[1].clickhouse_inner = "Decimal(18, 4)".into();
+        warn_on_ignored_overrides(&sink, &cfg, &plan, &asked, &w)
+            .await
+            .unwrap();
+        let raised = w.drain();
+        assert_eq!(raised[0].column.as_deref(), Some("amt"));
+        assert!(
+            raised[0]
+                .message
+                .contains("column 'amt' (renamed 'amount') to be 'Decimal(18, 4)'"),
+            "{}",
+            raised[0].message
+        );
+
+        // A table that doesn't exist yet is created with them.
+        cfg.dest_table = "new".into();
+        let sink = SetupSink {
+            columns: Some(Default::default()),
+            ..Default::default()
+        };
+        warn_on_ignored_overrides(&sink, &cfg, &plan, &asked, &w)
+            .await
+            .unwrap();
+        assert!(w.drain().is_empty());
+        // No overrides, nothing to ask the destination.
+        warn_on_ignored_overrides(&sink, &cfg, &plan, &overrides(&[]), &w)
+            .await
+            .unwrap();
+        assert_eq!(sink.calls(), vec!["columns new"]);
+    }
+
+    /// Issue #50 on BigQuery: the tables API reports the legacy type names,
+    /// and column names compare case-insensitively.
+    #[tokio::test]
+    async fn an_override_bigquery_ignores_is_reported_by_its_type_name() {
+        let cfg = incremental_cfg();
+        let plan = plan_of(&[("id", "id"), ("amount", "amount"), ("ok", "ok")]);
+        let sink = SetupSink {
+            columns: Some(overrides(&[
+                ("id", "INTEGER"),
+                ("Amount", "FLOAT"),
+                ("ok", "BOOLEAN"),
+            ])),
+            bigquery: true,
+            ..Default::default()
+        };
+        let w = Warnings::default();
+        let asked = overrides(&[("id", "INT64"), ("amount", "NUMERIC"), ("ok", "bool")]);
+        warn_on_ignored_overrides(&sink, &cfg, &plan, &asked, &w)
+            .await
+            .unwrap();
+        let raised = w.drain();
+        assert_eq!(raised.len(), 1, "{raised:?}");
+        assert_eq!(raised[0].column.as_deref(), Some("amount"));
+        assert_eq!(raised[0].sample.as_deref(), Some("FLOAT"));
+        assert!(
+            raised[0]
+                .message
+                .contains("to be 'NUMERIC', but destination 'orders' already has it as 'FLOAT'"),
+            "{}",
+            raised[0].message
+        );
+        // BigQuery reports no table as None.
+        let sink = SetupSink {
+            bigquery: true,
+            ..Default::default()
+        };
+        warn_on_ignored_overrides(&sink, &cfg, &plan, &asked, &w)
+            .await
+            .unwrap();
+        assert!(w.drain().is_empty());
+    }
+
+    #[test]
+    fn column_types_compare_without_spacing_or_nullability() {
+        use crate::config::DestKind::{BigQuery, ClickHouse};
+        for (a, b) in [
+            ("Decimal(12,2)", "Decimal(12, 2)"),
+            ("Decimal(12, 2)", "Nullable(Decimal(12, 2))"),
+            ("Nullable(String)", "String"),
+            ("DateTime64(6,'UTC')", "Nullable(DateTime64(6, 'UTC'))"),
+            ("LowCardinality(String)", "LowCardinality(Nullable(String))"),
+            (" Int64 ", "Int64"),
+        ] {
+            assert!(same_column_type(ClickHouse, a, b), "{a} vs {b}");
+        }
+        for (a, b) in [
+            ("Decimal(12, 2)", "Decimal(18, 2)"),
+            ("String", "LowCardinality(String)"),
+            ("DateTime64(6)", "DateTime64(6, 'UTC')"),
+            // A space inside a quoted argument is part of it.
+            ("Enum8('a b' = 1)", "Enum8('ab' = 1)"),
+            ("Int32", "Int64"),
+        ] {
+            assert!(!same_column_type(ClickHouse, a, b), "{a} vs {b}");
+        }
+        for (a, b) in [
+            ("INT64", "INTEGER"),
+            ("float64", "FLOAT"),
+            ("BOOL", "BOOLEAN"),
+            ("DECIMAL", "NUMERIC"),
+            ("BIGDECIMAL", "BIGNUMERIC"),
+            ("STRUCT", "RECORD"),
+            ("NUMERIC(12, 2)", "numeric(12,2)"),
+        ] {
+            assert!(same_column_type(BigQuery, a, b), "{a} vs {b}");
+        }
+        for (a, b) in [
+            ("NUMERIC", "FLOAT"),
+            ("NUMERIC", "BIGNUMERIC"),
+            ("NUMERIC(12, 2)", "NUMERIC"),
+            ("DATETIME", "TIMESTAMP"),
+        ] {
+            assert!(!same_column_type(BigQuery, a, b), "{a} vs {b}");
+        }
     }
 }

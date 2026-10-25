@@ -799,22 +799,41 @@ class TransferWarning:
       every row it is sent, such as the plain ``MergeTree`` that
       ``mode="full"`` creates, instead of replacing a row with a newer one of
       the same key the way a ``ReplacingMergeTree`` does. Each changed row is
-      written again and the table keeps both copies; a first run, with no
-      cursor yet, writes the whole source again. Not raised when ``engine=``
-      names such an engine, which says the copies are wanted, nor for a table
-      the run creates. ``sample`` is the engine. Raised at setup, before
-      anything is written. Table-level. New in 0.20.10.
+      written again and the table keeps both copies; a run with nothing to
+      start from (no saved cursor, ``seed_watermark`` or ``skip_to_max``)
+      writes the whole source again, and only then does the message say so.
+      Not raised when ``engine=`` names such an engine, which says the copies
+      are wanted, nor for a table the run creates. ``sample`` is the engine.
+      Raised at setup, before anything is written. Table-level. New in
+      0.20.10.
+    - ``"ignored_type_override"`` — a ``type_overrides`` entry names a column
+      the existing destination already has, as another type. An override
+      only applies when quickhouse creates the table (or adds the column with
+      ``evolve_schema``), so the column keeps its type and this run's values
+      are converted to it. The same type spelled another way isn't reported:
+      ``Decimal(12,2)`` for ``Nullable(Decimal(12, 2))``, ``numeric(12, 2)``,
+      ``FLOAT64`` for BigQuery's ``FLOAT``. ``column`` is the
+      ``type_overrides`` key and ``sample`` the column's existing type.
+      ALTER the column, or drop the table so the next run creates it with
+      the override. Both destinations, every source. Raised at setup, before
+      anything is written. New in 0.20.12.
     """
 
     column: Optional[str]
     """The source column responsible, or ``None`` for a table-level condition.
     For ``"unsourced_destination_column"``, the destination column; for
-    ``"dropped_source_column"``, the source column's name before ``rename``."""
+    ``"dropped_source_column"``, the source column's name before ``rename``;
+    for ``"ignored_type_override"``, the ``type_overrides`` key."""
 
     count: int
     """How many values/rows tripped it. Aggregated per ``(kind, column)`` across
     the whole run, so a badly-legacy table yields one entry with a large count
-    rather than millions of entries."""
+    rather than millions of entries. ``0`` for a warning about the destination
+    or the run's setup rather than about rows, such as those raised before
+    anything is written: ``"unsourced_destination_column"``,
+    ``"dropped_source_column"``, ``"recreated_destination"``,
+    ``"non_replacing_incremental_target"`` and ``"ignored_type_override"``.
+    A ``fail_on_warnings`` error leaves a count of ``0`` out."""
 
     sample: Optional[str]
     """A representative offending value where one was free to capture at the

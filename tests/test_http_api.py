@@ -327,3 +327,33 @@ def test_fail_on_null_key_stops_an_api_full_refresh_before_the_swap(
         assert _rows(ch_client, table) == [("A1", 1)]
     finally:
         _drop(ch_client, table)
+
+
+def test_a_type_override_an_existing_column_ignores_is_reported(
+    ch_client, ch_target, api_url, unique_name
+):
+    """Issue #50, its own repro: type_overrides applies only when quickhouse
+    creates the table, and the run into an existing one said nothing. It now
+    names the column, its type and the override; the same type in another
+    spelling is no news."""
+    table = unique_name
+    _drop(ch_client, table)
+    url = api_url([{"code": "A1", "amount": "123.45"}])
+    src = quickhouse.HttpApi(
+        url, columns=[("code", "STRING"), ("amount", "NUMERIC")], from_date="2024-01-01"
+    )
+    kw = dict(dest_table=table, mode="full", key=["code"])
+    try:
+        first = quickhouse.sync(src, ch_target, create_if_missing=True, **kw)
+        assert first.warnings == []
+        r = quickhouse.sync(src, ch_target, type_overrides={"amount": "Decimal(12, 2)"}, **kw)
+        assert r.rows_written == 1
+        (w,) = [w for w in r.warnings if w.kind == "ignored_type_override"]
+        assert (w.column, w.sample, w.count) == ("amount", "Nullable(Decimal(38, 9))", 0)
+        assert "'Decimal(12, 2)'" in w.message, w.message
+        assert _column_type(ch_client, table, "amount") == "Nullable(Decimal(38, 9))"
+
+        r = quickhouse.sync(src, ch_target, type_overrides={"amount": "Decimal(38,9)"}, **kw)
+        assert [w for w in r.warnings if w.kind == "ignored_type_override"] == []
+    finally:
+        _drop(ch_client, table)

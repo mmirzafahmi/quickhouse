@@ -291,6 +291,17 @@ pub trait Sink: Send + Sync {
         Ok(None)
     }
 
+    /// `ty`, a column type as a caller writes it, in the spelling
+    /// [`Self::column_types`] reports an existing column's type in, with
+    /// aliases resolved (ClickHouse: `numeric(12, 2)` is `Decimal(12, 2)`).
+    /// `None` when the destination can't say: a type it doesn't know, or no
+    /// way to ask. Tells an override that only spells an existing column's
+    /// type differently from one that names another type (see
+    /// [`crate::config::WarningKind::IgnoredTypeOverride`]). Default: `None`.
+    async fn canonical_type(&self, _ty: &str) -> Option<String> {
+        None
+    }
+
     /// Which destination engine this writes to — threaded into `transform::plan`
     /// for destination-aware type promotion. Pure/no I/O.
     fn dest_kind(&self) -> crate::config::DestKind;

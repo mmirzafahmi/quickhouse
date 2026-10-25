@@ -150,7 +150,9 @@ impl ClickHouseSink {
     }
 
     /// `table`'s columns and their types (`Nullable(Decimal(15, 2))`, ...),
-    /// from `system.columns`. Empty when the table doesn't exist.
+    /// from `system.columns`. Empty when the table doesn't exist. Unescaped
+    /// from TabSeparated, which writes `DateTime64(6, 'UTC')` with its quotes
+    /// backslashed.
     pub async fn column_types(
         &self,
         table: &str,
@@ -166,9 +168,24 @@ impl ClickHouseSink {
             .into_iter()
             .filter_map(|line| {
                 let (name, ty) = line.split_once('\t')?;
-                Some((name.to_string(), ty.to_string()))
+                Some((
+                    crate::source::clickhouse::tsv_field(name)?,
+                    crate::source::clickhouse::tsv_field(ty)?,
+                ))
             })
             .collect())
+    }
+
+    /// See [`Sink::canonical_type`]: the type ClickHouse itself names for
+    /// `ty`, which resolves its aliases and spacing as `system.columns`
+    /// reports them. `None` for a type it rejects, or any other error.
+    pub async fn canonical_type(&self, ty: &str) -> Option<String> {
+        let sql = format!(
+            "SELECT toTypeName(defaultValueOfTypeName('{}')) FORMAT TabSeparated",
+            escape_sql_string(ty),
+        );
+        let raw = self.query_scalar(&sql).await.ok()??;
+        crate::source::clickhouse::tsv_field(&raw)
     }
 
     /// Whether an incremental run with retries should stage each attempt:
@@ -1204,6 +1221,9 @@ impl Sink for ClickHouseSink {
         cfg: &TransferConfig,
     ) -> Result<Option<String>> {
         ClickHouseSink::non_replacing_engine(self, table, cfg).await
+    }
+    async fn canonical_type(&self, ty: &str) -> Option<String> {
+        ClickHouseSink::canonical_type(self, ty).await
     }
     fn dest_kind(&self) -> crate::config::DestKind {
         crate::config::DestKind::ClickHouse

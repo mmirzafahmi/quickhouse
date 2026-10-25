@@ -2103,12 +2103,24 @@ pub enum WarningKind {
     /// table whose engine keeps every row it is sent (a plain `MergeTree`,
     /// such as one `mode="full"` created) rather than replacing a row with a
     /// newer one of the same key the way a `ReplacingMergeTree` does. Each
-    /// changed row is written again and the table keeps both copies; a first
-    /// run, with no cursor yet, writes the whole source again. Not raised when
-    /// `engine=` names such an engine, which says the copies are wanted.
-    /// Raised at setup, before anything is written; `sample` is the engine.
-    /// Table-level: `column` is `None`.
+    /// changed row is written again and the table keeps both copies; a run
+    /// with nothing to start from (no saved cursor, resume marker or
+    /// `seed_watermark`) writes the whole source again, and only then does
+    /// the message say so. Not raised when `engine=` names such an engine,
+    /// which says the copies are wanted. Raised at setup, before anything is
+    /// written; `sample` is the engine. Table-level: `column` is `None`.
     NonReplacingIncrementalTarget,
+    /// A `type_overrides` entry names a column the existing destination
+    /// already has, as another type. An override applies only when
+    /// quickhouse creates the table (or adds the column under
+    /// `evolve_schema`), so the column keeps its type. The same type spelled
+    /// another way isn't one: spaces, a `Nullable(...)` wrapper and, on
+    /// ClickHouse, an alias the server resolves (`numeric(12, 2)`,
+    /// `Decimal64(2)`), or on BigQuery a legacy name (`FLOAT` for
+    /// `FLOAT64`), don't count. Raised at setup, before anything is written,
+    /// once per column with `count` `0`; `column` is the `type_overrides` key
+    /// and `sample` the column's existing type.
+    IgnoredTypeOverride,
 }
 
 impl WarningKind {
@@ -2141,6 +2153,7 @@ impl WarningKind {
             WarningKind::DroppedSourceColumn => "dropped_source_column",
             WarningKind::RecreatedDestination => "recreated_destination",
             WarningKind::NonReplacingIncrementalTarget => "non_replacing_incremental_target",
+            WarningKind::IgnoredTypeOverride => "ignored_type_override",
         }
     }
 
@@ -2150,7 +2163,7 @@ impl WarningKind {
     }
 
     /// Every kind, in declaration order.
-    pub const ALL: [WarningKind; 24] = [
+    pub const ALL: [WarningKind; 25] = [
         WarningKind::CollapsedBool,
         WarningKind::CoercedDate,
         WarningKind::CoercedDecimal,
@@ -2175,6 +2188,7 @@ impl WarningKind {
         WarningKind::DroppedSourceColumn,
         WarningKind::RecreatedDestination,
         WarningKind::NonReplacingIncrementalTarget,
+        WarningKind::IgnoredTypeOverride,
     ];
 }
 
@@ -2190,12 +2204,17 @@ pub struct TransferWarning {
     pub kind: WarningKind,
     /// The source column responsible, when the condition is attributable to
     /// one: for [`WarningKind::UnsourcedDestinationColumn`], the destination
-    /// column no source column feeds. `None` for table-level conditions (a
-    /// full-refresh shrink, an unclustered merge target).
+    /// column no source column feeds; for
+    /// [`WarningKind::IgnoredTypeOverride`], the `type_overrides` key. `None`
+    /// for table-level conditions (a full-refresh shrink, an unclustered
+    /// merge target).
     pub column: Option<String>,
     /// How many values/rows tripped this condition. Table-level warnings use
     /// the count that makes the condition concrete (rows lost to a shrink,
-    /// rows holding a NULL watermark); `0` where no count applies.
+    /// rows holding a NULL watermark); `0` where no count applies: a warning
+    /// about the destination or the run's setup rather than about rows, such
+    /// as the ones raised before anything is written. A `fail_on_warnings`
+    /// error leaves a `0` out.
     pub count: u64,
     /// A representative offending value, where capturing one is free at the
     /// point of detection. `None` otherwise — an absent sample never means the
@@ -2629,7 +2648,8 @@ mod tests {
             | WarningKind::AbandonedResumeMarker
             | WarningKind::DroppedSourceColumn
             | WarningKind::RecreatedDestination
-            | WarningKind::NonReplacingIncrementalTarget => WarningKind::ALL.contains(&k),
+            | WarningKind::NonReplacingIncrementalTarget
+            | WarningKind::IgnoredTypeOverride => WarningKind::ALL.contains(&k),
         };
         assert!(WarningKind::ALL.into_iter().all(listed));
     }
