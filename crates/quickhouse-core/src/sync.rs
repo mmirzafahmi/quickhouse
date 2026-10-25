@@ -3342,11 +3342,28 @@ async fn run_transfer_api(
     // destination (they seed its exact DDL type). A ClickHouse destination
     // instead takes its column types from the resolved Arrow/ClickHouse mapping,
     // so seeding BigQuery names there would produce invalid DDL — skip it.
-    if matches!(sink.dest_kind(), crate::config::DestKind::BigQuery) {
+    let seeded = matches!(sink.dest_kind(), crate::config::DestKind::BigQuery);
+    if seeded {
         seed_api_type_overrides(&mut cfg, &cols)?;
     }
     let source_cols = resolve_api_columns(&cols)?;
-    let plan: SelectPlan = transform::plan(&source_cols, &cfg, sink.dest_kind())?;
+    // A declared NUMERIC defaults to the exact `Decimal(38, 9)` it decodes as,
+    // but never against a destination column that already holds something else
+    // (an API table created by an earlier release holds `Float64` there) — so
+    // the destination is consulted when one is declared, as on the DB path. A
+    // seeded destination never needs it: every declared column has its type.
+    let existing = if !seeded && source_cols.iter().any(|c| c.declared_decimal.is_some()) {
+        existing_columns(sink.as_ref(), &cfg.dest_table).await?
+    } else {
+        transform::ExistingColumns::NoTable
+    };
+    let plan: SelectPlan =
+        transform::plan_for_destination(&source_cols, &cfg, sink.dest_kind(), true, &existing)?;
+    if let transform::ExistingDecimals::Mixed { decimal, float } =
+        transform::existing_decimals(&source_cols, &cfg, sink.dest_kind(), &existing)
+    {
+        warn_mixed_decimals(&cfg.dest_table, &decimal, &float, &warnings);
+    }
 
     // Per-output-column lookup path, aligned to `plan.source_columns` (which
     // survives include/exclude; keyed on the source name, unaffected by rename).

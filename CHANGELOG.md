@@ -95,6 +95,43 @@ any breaking change is called out explicitly.
   the same way. The wait now counts as idle time and toward `read_secs`, for
   PostgreSQL, MySQL (the prepare too) and ClickHouse sources, in a one-pass,
   chunked or windowed read. (#41)
+- **An API source reads a 13-digit integer `TIMESTAMP` or `DATE` as epoch
+  milliseconds, and nulls a date outside 1900-2299.** Every integer was read
+  as epoch seconds, so the milliseconds many APIs send, `1729750000000` for
+  2024-10-24 06:06:40 UTC, became a date tens of thousands of years ahead, and
+  ClickHouse stored it as 2299-12-31 with no warning. Length tells the two
+  apart, as it already did for CleverTap's 14-digit packed civil form:
+  13-digit epoch seconds would be past the year 33,000. A date or timestamp
+  that parses but falls outside ClickHouse's 1900-2299 window, in any accepted
+  form, now becomes NULL with a `coerced_date` warning, into either
+  destination, as it does from the database sources. So the next unit
+  mismatch shows: 12-digit milliseconds from before 2001 are read as seconds
+  and come out NULL, counted, rather than at 2299. A `DATE` fared worse: a
+  value outside the window failed the whole transfer into ClickHouse with
+  `Code: 321 VALUE_IS_OUT_OF_RANGE_OF_DATA_TYPE`, and a far-future epoch value
+  could wrap around to an arbitrary day inside it. Both are NULL now. (#42)
+- **An API source's declared `NUMERIC` lands in ClickHouse as `Decimal(38, 9)`.**
+  It was decoded exactly, as `Decimal128(38, 9)`, then created on ClickHouse as
+  `Float64`, so `"123.45"` was stored as a float; into BigQuery it was already
+  `NUMERIC`. It now follows the same rules as a PostgreSQL `numeric(P, S)`: the
+  exact type for a table or column created fresh, while an existing column
+  that is already `Float64` keeps its type and keeps receiving floats, with no
+  `ALTER` and no failed insert, and a `NUMERIC` column new to such a table is
+  `Float64` too. Pin `type_overrides={"col": "Float64"}` to keep the old type
+  on a new table. (#43)
+- **A `validate=` gate's exception reaches the caller unchanged.** `sync()`
+  turned whatever the gate raised into a `RuntimeError` holding only its text,
+  so `except quickhouse.ValidationFailed` never ran, its `.result` (the Great
+  Expectations validation result) was out of reach, and a custom gate's
+  exception lost its type. `sync()` now raises the gate's own exception, the
+  same object, with a note naming the transfer
+  (`orders -> orders: data-quality validation rejected the staged data`).
+  The data-quality guide, the `quality` module and the docs home page already
+  said it raised `ValidationFailed`; that is now true. `ValidationFailed` now
+  subclasses `RuntimeError`, so code that caught `RuntimeError` around a gated
+  `sync()`, as the guide's "Failure type across the boundary" note said to,
+  still catches a rejection. A custom gate's own exception type is raised as
+  it is. Every other failure is still a `RuntimeError`. (#40)
 
 ## [0.20.9] — 2026-10-24
 

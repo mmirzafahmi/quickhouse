@@ -334,12 +334,16 @@ class CleverTap:
     top level. ``bq_type`` is a BigQuery type name (STRING/INTEGER/FLOAT/
     BOOLEAN/TIMESTAMP/DATETIME/DATE/TIME/NUMERIC/BIGNUMERIC/BYTES/JSON); NUMERIC
     is delivered exactly (declare NUMERIC only for values sent as JSON strings
-    or integers), BIGNUMERIC is lossy (Float64). Nested RECORD/STRUCT types can't
+    or integers), as BigQuery NUMERIC or ClickHouse ``Decimal(38, 9)`` (an
+    existing ClickHouse column that is already ``Float64`` keeps its type),
+    BIGNUMERIC is lossy (Float64). Nested RECORD/STRUCT types can't
     be declared — point a JSON (or STRING) column at a nested object/array via
     ``path`` and it lands as compact JSON text. The top-level ``ts`` is a packed
     ``yyyyMMddHHmmSS`` integer in several regions (e.g. ``sg1``), **not** epoch
     seconds — declare it as TIMESTAMP/DATETIME (or DATE) and it is parsed as UTC
-    civil time; 10-digit epoch seconds are also accepted. ``region`` selects the
+    civil time; 10-digit epoch seconds and 13-digit epoch milliseconds are also
+    accepted. A date or timestamp outside 1900-2299 becomes NULL with a
+    ``coerced_date`` warning. ``region`` selects the
     API host (default ``sg1`` ->
     ``https://sg1.api.clevertap.com``). ``[from_date, to_date]`` (``"YYYY-MM-DD"``)
     is the full-refresh window; in incremental mode ``from_date`` is only the
@@ -1093,9 +1097,12 @@ def sync(
     once after the per-run staging table is fully loaded but *before* it is
     promoted (swap / ``MERGE`` / insert). Raising from it aborts the promotion,
     drops staging, and fails the transfer — so rejected data never reaches the
-    destination. Pass a :class:`quickhouse.Validation` to run a Great Expectations
-    suite (``pip install quickhouse[quality]``), or any callable that raises to
-    reject. Works in full-refresh and incremental mode into either destination —
+    destination. ``sync()`` then raises the gate's own exception, unchanged (a
+    :class:`quickhouse.ValidationFailed` keeps its ``.result``), with a note
+    naming the transfer. Pass a :class:`quickhouse.Validation` to run a Great
+    Expectations suite (``pip install quickhouse[quality]``), or any callable
+    that raises to reject. Works in full-refresh and incremental mode into
+    either destination —
     a ClickHouse incremental sync (which normally inserts directly) is
     transparently routed through a staging table when a gate is attached, then
     promoted via ``INSERT … SELECT``. Append mode and ``chunk_rows`` commit

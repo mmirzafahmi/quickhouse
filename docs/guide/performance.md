@@ -413,7 +413,10 @@ When something goes wrong, `sync()` raises a `RuntimeError` written to be
 actionable on its own: it names the table involved, and for a bad config or an
 unmappable column it says exactly what's wrong and how to fix it (e.g. `exclude=`
 the column or cast it in a `source_query`). Underlying database errors are
-surfaced verbatim rather than wrapped in something generic.
+surfaced verbatim rather than wrapped in something generic. A `validate=`
+gate's rejection is the exception the gate raised: `quickhouse.ValidationFailed`
+(a `RuntimeError` subclass, with the validation `.result`) or a custom gate's
+own type (see [Data quality](data-quality.md)).
 
 Verbatim cuts both ways when those errors go to a shared log. Without a
 `source_table`, the table an error names at its front is the whole

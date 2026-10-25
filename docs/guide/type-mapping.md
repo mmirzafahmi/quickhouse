@@ -10,8 +10,9 @@ A few deliberate choices are worth knowing.
 ## Arbitrary-precision decimals
 
 A decimal column that **declares** its precision — PostgreSQL `numeric(P, S)`,
-MySQL `DECIMAL(P, S)` — lands as the exact **`Decimal(P, S)`** (BigQuery
-`NUMERIC`) and is decoded exactly, with no `Float64` round-trip. That covers
+MySQL `DECIMAL(P, S)`, an API source's declared `NUMERIC` (as `Decimal(38, 9)`)
+— lands as the exact **`Decimal(P, S)`** (BigQuery `NUMERIC`) and is decoded
+exactly, with no `Float64` round-trip. That covers
 `P <= 38`; wider types stay `Float64`, as does an unconstrained PostgreSQL
 `numeric`, whose type carries no precision to use. BigQuery sources are
 unchanged: their `NUMERIC` stays `Float64` unless you ask for more.

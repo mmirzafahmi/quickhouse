@@ -40,7 +40,8 @@ account.
 
 The top-level `ts` is a packed `yyyyMMddHHmmSS` integer in several regions (e.g.
 `sg1`), **not** epoch seconds — declare it `TIMESTAMP`/`DATETIME`/`DATE` and it
-is parsed as UTC civil time (10-digit epoch seconds are also accepted).
+is parsed as UTC civil time (10-digit epoch seconds and 13-digit epoch
+milliseconds are also accepted).
 
 ## AppsFlyer
 
@@ -64,7 +65,9 @@ timezone unless you pass `extra_params={"timezone": "UTC"}`.
 ## Notes for both API sources
 
 - **Types.** `NUMERIC` is delivered exactly (declare it only for values sent as
-  JSON strings/integers); `BIGNUMERIC` is lossy. Nested `RECORD`/`STRUCT` types
+  JSON strings/integers), as BigQuery `NUMERIC` or ClickHouse `Decimal(38, 9)`;
+  an existing ClickHouse column that is already `Float64` keeps its type.
+  `BIGNUMERIC` is lossy. Nested `RECORD`/`STRUCT` types
   can't be declared — point a `JSON` (or `STRING`) column at a nested
   object/array via its `path` and it lands as compact JSON text.
 - **Incremental re-pulls the boundary day** each run, so `key` is required

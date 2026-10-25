@@ -158,15 +158,89 @@ def test_gate_fails_and_blocks_the_swap(pg_conn, ch_client, pg_source, ch_target
         on_result=lambda r: seen.update(success=r.success),
     )
     try:
-        with pytest.raises(RuntimeError, match="validation"):
+        with pytest.raises(quickhouse.ValidationFailed) as raised:
             quickhouse.sync(
                 pg_source, ch_target, dest_table=table, source_table=table,
                 mode="full", key=["id"], create_if_missing=True, validate=validate,
             )
         assert seen.get("success") is False, "on_result should see the failed result"
+        # Issue #40: the suite's own exception, with its GX result, not a
+        # RuntimeError holding its text. Still a RuntimeError, so code that
+        # caught that keeps working.
+        assert raised.value.result.success is False
+        assert isinstance(raised.value, RuntimeError)
+        assert f"suite_{table}" in str(raised.value)
+        assert raised.value.__notes__ == [
+            f"{table} -> {table}: data-quality validation rejected the staged data"
+        ]
         # The rejected rows never landed, and staging was cleaned up.
         assert (_ch_count(ch_client, table) or 0) != n
         assert _staging_leftovers(ch_client, table) == 0
+    finally:
+        _drop_ch(ch_client, table)
+
+
+class _GateRejected(Exception):
+    def __init__(self, message: str, detail: dict) -> None:
+        super().__init__(message)
+        self.detail = detail
+
+
+def test_a_custom_gate_s_exception_reaches_the_caller_unchanged(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """Issue #40: whatever a gate raises is what sync() raises — the same
+    object, its type and attributes, with the gate's frame in its traceback —
+    rather than a RuntimeError holding its text."""
+    table = unique_name
+    _seed(pg_conn, table, 10)
+    _drop_ch(ch_client, table)
+    raised_by_gate = []
+
+    def gate(info):
+        e = _GateRejected(f"refusing {info.rows_written} rows", detail={"rows": info.rows_written})
+        raised_by_gate.append(e)
+        raise e
+
+    try:
+        with pytest.raises(_GateRejected) as raised:
+            quickhouse.sync(
+                pg_source, ch_target, dest_table=table, source_table=table,
+                mode="full", key=["id"], create_if_missing=True, validate=gate,
+            )
+        assert raised.value is raised_by_gate[0]
+        assert raised.value.detail == {"rows": 10}
+        assert str(raised.value) == "refusing 10 rows"
+        assert raised.value.__notes__ == [
+            f"{table} -> {table}: data-quality validation rejected the staged data"
+        ]
+        assert any(entry.name == "gate" for entry in raised.traceback)
+        assert (_ch_count(ch_client, table) or 0) == 0
+        assert _staging_leftovers(ch_client, table) == 0
+    finally:
+        _drop_ch(ch_client, table)
+
+
+def test_a_validation_failed_from_a_bare_callable_keeps_its_result(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """The issue's reproduction: no Great Expectations involved."""
+    table = unique_name
+    _seed(pg_conn, table, 10)
+    _drop_ch(ch_client, table)
+
+    def gate(info):
+        raise quickhouse.ValidationFailed(
+            "suite 'orders_quality' failed", result={"success": False}
+        )
+
+    try:
+        with pytest.raises(quickhouse.ValidationFailed) as raised:
+            quickhouse.sync(
+                pg_source, ch_target, dest_table=table, source_table=table,
+                mode="full", key=["id"], create_if_missing=True, validate=gate,
+            )
+        assert raised.value.result == {"success": False}
     finally:
         _drop_ch(ch_client, table)
 
@@ -221,7 +295,7 @@ def test_gate_incremental_fails_and_blocks_the_insert(
     suite = gx.ExpectationSuite(name=f"suite_{table}")
     suite.add_expectation(gx.expectations.ExpectColumnValuesToNotBeNull(column="note"))
     try:
-        with pytest.raises(RuntimeError, match="validation"):
+        with pytest.raises(quickhouse.ValidationFailed) as raised:
             quickhouse.sync(
                 pg_source, ch_target, dest_table=table, source_table=table,
                 mode="incremental", watermark="ts", key=["id"], create_if_missing=True,
@@ -229,6 +303,7 @@ def test_gate_incremental_fails_and_blocks_the_insert(
                     suite=suite, context=context, datasource=f"ds_{table}"
                 ),
             )
+        assert raised.value.result.success is False
         # The dest table was created empty, and the insert-select was blocked,
         # so no rows landed; staging was cleaned up.
         assert (_ch_count(ch_client, table) or 0) == 0

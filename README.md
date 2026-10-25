@@ -381,7 +381,10 @@ When something goes wrong, `sync()` raises a `RuntimeError` written to be
 actionable on its own: it names the table involved, and for a bad config or an
 unmappable column it says exactly what's wrong and how to fix it (e.g.
 `exclude=` the column or cast it in a `source_query`). Underlying database
-errors are surfaced verbatim rather than wrapped in something generic.
+errors are surfaced verbatim rather than wrapped in something generic. A
+`validate=` gate's rejection is the exception the gate raised:
+`qh.ValidationFailed` (a `RuntimeError` subclass, with the validation `.result`)
+or a custom gate's own type.
 
 ### Full parameter list
 
