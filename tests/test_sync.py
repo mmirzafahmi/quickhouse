@@ -469,6 +469,63 @@ def test_column_mapping(pg_conn, ch_client, pg_source, ch_target, unique_name):
         _drop_ch(ch_client, table)
 
 
+def test_a_key_named_before_its_rename_is_a_config_error(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """Issue #45: key takes destination names, and the source name reached
+    the DDL, failing with ClickHouse's UNKNOWN_IDENTIFIER. It is now refused
+    before the destination is created."""
+    table = unique_name
+    _seed_table(pg_conn, table, 3)
+    _drop_ch(ch_client, table)
+    try:
+        with pytest.raises(RuntimeError, match="rename turns source column 'id' into 'order_id'"):
+            quickhouse.sync(
+                pg_source,
+                ch_target,
+                dest_table=table,
+                source_table=table,
+                mode="full",
+                key=["id"],
+                rename={"id": "order_id"},
+            )
+        assert not int(ch_client.command(f"EXISTS TABLE `{table}`")), "nothing was created"
+    finally:
+        _drop_ch(ch_client, table)
+
+
+def test_a_fatal_warning_before_the_first_swap_says_the_new_table_is_left_empty(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """Issue #45: a full refresh into a table that didn't exist creates it
+    before reading, so stopping at the swap leaves it there, empty. The error
+    said the destination was untouched."""
+    table = unique_name
+    with pg_conn.cursor() as cur:
+        cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+        cur.execute(f'CREATE TABLE "{table}" (id bigint PRIMARY KEY, amount numeric)')
+        # Twelve integer digits: past Decimal(10,2), so it becomes NULL.
+        cur.execute(f'INSERT INTO "{table}" VALUES (1, 1.5), (2, 123456789012.5)')
+    _drop_ch(ch_client, table)
+    try:
+        with pytest.raises(RuntimeError, match="fail_on_warnings: coerced_decimal") as err:
+            quickhouse.sync(
+                pg_source,
+                ch_target,
+                dest_table=table,
+                source_table=table,
+                mode="full",
+                key=["id"],
+                numeric_as_decimal="Decimal(10,2)",
+                fail_on_warnings={"coerced_decimal"},
+            )
+        assert "the destination this run created is left empty" in str(err.value)
+        assert "untouched" not in str(err.value)
+        assert int(ch_client.command(f"SELECT count() FROM `{table}`")) == 0
+    finally:
+        _drop_ch(ch_client, table)
+
+
 def test_full_refresh_decimal_override_preserves_exact_precision(
     pg_conn, ch_client, pg_source, ch_target, unique_name
 ):

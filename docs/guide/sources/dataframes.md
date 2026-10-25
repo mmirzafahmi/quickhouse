@@ -95,12 +95,13 @@ Converted for you: nanosecond timestamps → microseconds, categoricals →
 their values, `float16` → `float32`, `date64` → `date32`, time-of-day → text,
 `large_string`/`string_view` → `string`, and a fixed-offset timezone → UTC (with
 a warning; ClickHouse's `DateTime64` takes a zone *name*, and the instant is
-preserved either way).
+preserved either way), and an all-null column → a nullable string (with a
+warning; give the column a dtype to choose its type yourself).
 
 Refused, naming the column and the fix: sub-microsecond precision, values
 outside ClickHouse's 1900–2299 window, nested types (`list`/`struct`/`map`),
-`Decimal256`, durations and intervals, all-null columns, duplicate column names
-and non-string column names.
+`Decimal256`, durations and intervals, duplicate column names and non-string
+column names.
 
 ## Memory
 

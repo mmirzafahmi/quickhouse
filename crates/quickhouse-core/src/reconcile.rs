@@ -184,6 +184,9 @@ pub async fn reconcile_keys(
     // `sync::run_transfer_impl` for why it lives at the entry point.
     let _ = rustls::crypto::ring::default_provider().install_default();
     cfg.validate()?;
+    // Before the destination is read, so an unsupported source is what the
+    // error names, not whatever the destination read failed on first (#45).
+    ensure_keyset_source(&source_cfg)?;
     let started = Instant::now();
 
     let sink = build_sink(dest).await?;
@@ -370,6 +373,16 @@ async fn read_source_keys(source_cfg: &SourceConfig, cfg: &ReconcileConfig) -> R
                 )
                 .await
         }
+        // `reconcile_keys` refused every other source before it read the
+        // destination; this arm only keeps the match exhaustive.
+        other => ensure_keyset_source(other).map(|()| Vec::new()),
+    }
+}
+
+/// Refuse a source [`read_source_keys`] has no keyset read for.
+fn ensure_keyset_source(source_cfg: &SourceConfig) -> Result<()> {
+    match source_cfg {
+        SourceConfig::Postgres(_) | SourceConfig::MySql(_) | SourceConfig::ClickHouse(_) => Ok(()),
         other => Err(EtlError::config(format!(
             "reconcile_keys does not support a {} source (PostgreSQL, MySQL and ClickHouse \
              only): a BigQuery source is normally itself a mirror rather than the system of \
@@ -434,6 +447,33 @@ mod tests {
         c.dest_window = None;
         c.delete = false;
         assert!(c.validate().is_ok());
+    }
+
+    /// #45: the destination was read first, so a missing destination table
+    /// failed with ClickHouse's error instead of this one. Nothing listens on
+    /// the destination's port, so reading it would fail with something else.
+    #[tokio::test]
+    async fn a_bigquery_source_is_refused_before_the_destination_is_read() {
+        let src = SourceConfig::BigQuery(crate::config::BigQueryConfig {
+            project_id: Some("p".into()),
+            credentials_file: None,
+            credentials_json: None,
+        });
+        let dst = DestinationConfig::ClickHouse(crate::config::ClickHouseConfig {
+            url: "http://127.0.0.1:1".into(),
+            database: "default".into(),
+            user: "default".into(),
+            password: String::new(),
+            compression: crate::config::Compression::None,
+            insert_dedup_token: false,
+            settings: Default::default(),
+            archive: None,
+        });
+        let err = reconcile_keys(src, dst, cfg())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not support a bigquery source"), "{err}");
     }
 
     #[test]

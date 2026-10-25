@@ -297,7 +297,7 @@ impl ChunkStager {
 ///
 /// Split out as a pure function so the rule is testable without a live
 /// destination — the same reason `full_refresh_shrink_verdict` is one.
-fn clustering_binds(clustering: Option<&[String]>, key: &[String]) -> bool {
+pub(crate) fn clustering_binds(clustering: Option<&[String]>, key: &[String]) -> bool {
     match clustering {
         Some(cols) if !cols.is_empty() && !key.is_empty() => key
             .iter()
@@ -758,8 +758,12 @@ enum Before {
     Write,
     /// A full refresh's swap.
     Swap,
+    /// A full refresh's swap, into a destination this run created empty.
+    SwapIntoNew,
     /// An incremental run's `MERGE` or insert-select from staging.
     Merge,
+    /// The same, into a destination this run created empty.
+    MergeIntoNew,
     /// The cursor is saved, with the rows already in the destination.
     Cursor,
     /// A `chunk_rows` chunk is committed.
@@ -773,6 +777,26 @@ enum Before {
 }
 
 impl Before {
+    /// The swap checkpoint of a run that did or didn't create the destination.
+    /// A table the run created stays, empty, when the run stops there, so it
+    /// isn't "untouched" (#45).
+    fn swap(created_dest: bool) -> Self {
+        if created_dest {
+            Before::SwapIntoNew
+        } else {
+            Before::Swap
+        }
+    }
+
+    /// [`Self::swap`] for the merge checkpoint.
+    fn merge(created_dest: bool) -> Self {
+        if created_dest {
+            Before::MergeIntoNew
+        } else {
+            Before::Merge
+        }
+    }
+
     fn describe(self) -> &'static str {
         match self {
             Before::Write => {
@@ -781,9 +805,17 @@ impl Before {
             Before::Swap => {
                 "The destination is untouched: the staged rows were dropped before the swap."
             }
+            Before::SwapIntoNew => {
+                "Nothing was swapped in: the staged rows were dropped before the swap, so the \
+                 destination this run created is left empty."
+            }
             Before::Merge => {
                 "The destination is untouched (the staged rows were dropped before the merge), \
                  and the cursor was not saved."
+            }
+            Before::MergeIntoNew => {
+                "Nothing was merged in (the staged rows were dropped before the merge), so the \
+                 destination this run created is left empty, and the cursor was not saved."
             }
             Before::Cursor => {
                 "The rows are already in the destination, but the cursor was not saved, so once \
@@ -836,7 +868,10 @@ fn check_fatal(
     for w in sink.take_write_warnings() {
         warnings.push(w);
     }
-    if matches!(at, Before::Swap | Before::Merge | Before::Chunk) {
+    if matches!(
+        at,
+        Before::Swap | Before::SwapIntoNew | Before::Merge | Before::MergeIntoNew | Before::Chunk
+    ) {
         if let Some(w) = warnings.first_of(&[WarningKind::StorageWriteCountMismatch]) {
             return Err(fatal_warning_error(&w, at, false));
         }
@@ -2303,7 +2338,7 @@ async fn run_transfer_impl(
     }
 
     // --- Ensure destination / staging tables exist. ---
-    let target_table = prepare_target(
+    let (target_table, created_dest) = prepare_target(
         &sink,
         &cfg,
         &plan.dest_columns,
@@ -2468,7 +2503,7 @@ async fn run_transfer_impl(
                 &warnings,
             )
             .await?;
-            check_fatal(&cfg, sink.as_ref(), &warnings, Before::Swap)?;
+            check_fatal(&cfg, sink.as_ref(), &warnings, Before::swap(created_dest))?;
             tracing::info!("swapping staging table into '{}'", cfg.dest_table);
             sink.atomic_swap(&cfg.dest_table, &staging, &plan.dest_columns).await?;
             sink.drop_table(&staging).await?;
@@ -2502,7 +2537,7 @@ async fn run_transfer_impl(
                 // template its tables were cloned from is left.
                 sink.drop_table(&staging).await?;
             } else if used_staging {
-                check_fatal(&cfg, sink.as_ref(), &warnings, Before::Merge)?;
+                check_fatal(&cfg, sink.as_ref(), &warnings, Before::merge(created_dest))?;
                 rows_deleted = promote_staged_incremental(
                     sink.as_ref(),
                     &cfg.dest_table,
@@ -2864,7 +2899,7 @@ async fn run_transfer_bigquery(
     if discarded_state {
         clear_discarded_state(sink.as_ref(), &cfg).await?;
     }
-    let target_table = prepare_target(
+    let (target_table, created_dest) = prepare_target(
         &sink,
         &cfg,
         &plan.dest_columns,
@@ -2980,7 +3015,7 @@ async fn run_transfer_bigquery(
                 &warnings,
             )
             .await?;
-            check_fatal(&cfg, sink.as_ref(), &warnings, Before::Swap)?;
+            check_fatal(&cfg, sink.as_ref(), &warnings, Before::swap(created_dest))?;
             tracing::info!("swapping staging table into '{}'", cfg.dest_table);
             sink.atomic_swap(&cfg.dest_table, &staging, &plan.dest_columns).await?;
             sink.drop_table(&staging).await?;
@@ -2988,7 +3023,7 @@ async fn run_transfer_bigquery(
         let mut rows_deleted = 0u64;
         if cfg.mode == SyncMode::Incremental {
             if used_staging {
-                check_fatal(&cfg, sink.as_ref(), &warnings, Before::Merge)?;
+                check_fatal(&cfg, sink.as_ref(), &warnings, Before::merge(created_dest))?;
                 rows_deleted = promote_staged_incremental(
                     sink.as_ref(),
                     &cfg.dest_table,
@@ -3430,7 +3465,7 @@ async fn run_transfer_api(
     if saved.discarded {
         clear_discarded_state(sink.as_ref(), &cfg).await?;
     }
-    let target_table = prepare_target(
+    let (target_table, created_dest) = prepare_target(
         &sink,
         &cfg,
         &plan.dest_columns,
@@ -3700,7 +3735,7 @@ async fn run_transfer_api(
                 &warnings,
             )
             .await?;
-            check_fatal(&cfg, sink.as_ref(), &warnings, Before::Swap)?;
+            check_fatal(&cfg, sink.as_ref(), &warnings, Before::swap(created_dest))?;
             tracing::info!("swapping staging table into '{}'", cfg.dest_table);
             sink.atomic_swap(&cfg.dest_table, &staging, &plan.dest_columns).await?;
             sink.drop_table(&staging).await?;
@@ -3708,7 +3743,7 @@ async fn run_transfer_api(
         let mut rows_deleted = 0u64;
         if cfg.mode == SyncMode::Incremental {
             if used_staging {
-                check_fatal(&cfg, sink.as_ref(), &warnings, Before::Merge)?;
+                check_fatal(&cfg, sink.as_ref(), &warnings, Before::merge(created_dest))?;
                 rows_deleted = promote_staged_incremental(
                     sink.as_ref(),
                     &cfg.dest_table,
@@ -3894,7 +3929,7 @@ async fn run_transfer_frame(
     )
     .await?;
     check_fatal(&cfg, sink.as_ref(), &warnings, Before::Write)?;
-    let target_table = prepare_target(
+    let (target_table, created_dest) = prepare_target(
         &sink,
         &cfg,
         &plan.dest_columns,
@@ -4004,7 +4039,7 @@ async fn run_transfer_frame(
                 &warnings,
             )
             .await?;
-            check_fatal(&cfg, sink.as_ref(), &warnings, Before::Swap)?;
+            check_fatal(&cfg, sink.as_ref(), &warnings, Before::swap(created_dest))?;
             tracing::info!("swapping staging table into '{}'", cfg.dest_table);
             sink.atomic_swap(&cfg.dest_table, &staging, &plan.dest_columns)
                 .await?;
@@ -4017,7 +4052,7 @@ async fn run_transfer_frame(
             // destinations already fall back to ordering by the key list. Pass
             // it through anyway, so a caller who *did* nominate one gets
             // last-wins ordering rather than an arbitrary winner.
-            check_fatal(&cfg, sink.as_ref(), &warnings, Before::Merge)?;
+            check_fatal(&cfg, sink.as_ref(), &warnings, Before::merge(created_dest))?;
             rows_deleted = promote_staged_incremental(
                 sink.as_ref(),
                 &cfg.dest_table,
@@ -7059,10 +7094,11 @@ fn emit_progress(counters: &Counters, progress: &Option<ProgressCb>, started: In
     }
 }
 
-/// Create/verify the destination table and return the table to write rows into.
-/// For full refresh this is a fresh staging table; for incremental it's the
-/// destination table itself. Destination-agnostic: `sink.create_table` builds
-/// whichever native DDL/schema the concrete destination needs.
+/// Create/verify the destination table and return the table to write rows into,
+/// and whether this created the destination. For full refresh this is a fresh
+/// staging table; for incremental it's the destination table itself.
+/// Destination-agnostic: `sink.create_table` builds whichever native DDL/schema
+/// the concrete destination needs.
 async fn prepare_target(
     sink: &Arc<dyn Sink>,
     cfg: &TransferConfig,
@@ -7073,7 +7109,7 @@ async fn prepare_target(
     // destination. No effect on full-refresh (always stages) or on a
     // destination that already stages for its MERGE (BigQuery).
     force_stage_incremental: bool,
-) -> Result<String> {
+) -> Result<(String, bool)> {
     match cfg.mode {
         SyncMode::Full => {
             // Destination must exist for the atomic swap; create it empty if allowed.
@@ -7146,7 +7182,7 @@ async fn prepare_target(
                 // so build both dest (above) and staging fresh from `cfg`.
                 sink.create_table(staging, dest_columns, cfg).await?;
             }
-            Ok(staging.to_string())
+            Ok((staging.to_string(), !dest_existed))
         }
         SyncMode::Incremental => {
             // Checked first, before any network I/O: MERGE has nothing to
@@ -7222,9 +7258,9 @@ async fn prepare_target(
                     // from `cfg`/the resolved source schema.
                     sink.create_table(staging, dest_columns, cfg).await?;
                 }
-                Ok(staging.to_string())
+                Ok((staging.to_string(), !dest_existed))
             } else {
-                Ok(cfg.dest_table.clone())
+                Ok((cfg.dest_table.clone(), !dest_existed))
             }
         }
         SyncMode::Append => {
@@ -7232,7 +7268,8 @@ async fn prepare_target(
             // no merge, no swap, no key, no dedup. Create the dest if missing,
             // evolve it (inserts reference its columns), and ensure the state
             // table so the resume cursor can be persisted.
-            if !sink.table_exists(&cfg.dest_table).await? {
+            let dest_existed = sink.table_exists(&cfg.dest_table).await?;
+            if !dest_existed {
                 if cfg.create_if_missing {
                     tracing::info!(
                         "destination table '{}' does not exist; creating it",
@@ -7260,7 +7297,7 @@ async fn prepare_target(
                 }
             }
             sink.ensure_state_table(&cfg.state_table_name).await?;
-            Ok(cfg.dest_table.clone())
+            Ok((cfg.dest_table.clone(), !dest_existed))
         }
     }
 }
@@ -10289,6 +10326,39 @@ mod tests {
         assert!(err.contains("cursor was not saved"), "{err}");
         // Checking takes nothing: the result still reports it.
         assert_eq!(w.drain().len(), 1);
+    }
+
+    #[test]
+    fn a_fatal_warning_in_a_run_that_created_the_destination_says_it_is_left_empty() {
+        // #45: a full refresh into a table that didn't exist created it, empty,
+        // stopped before the swap, and said the destination was untouched.
+        let mut cfg = crate::config::default_test_config();
+        cfg.fail_on_warnings = vec![WarningKind::CollapsedBool];
+        let w = Warnings::default();
+        w.push(TransferWarning {
+            kind: WarningKind::CollapsedBool,
+            column: Some("x_state".into()),
+            count: 3,
+            sample: None,
+            message: "flattened".into(),
+        });
+        let err = |at| check_fatal_warnings(&cfg, &w, at).unwrap_err().to_string();
+
+        let swap = err(Before::swap(true));
+        assert!(
+            swap.contains("the destination this run created is left empty"),
+            "{swap}"
+        );
+        assert!(!swap.contains("untouched"), "{swap}");
+        let merge = err(Before::merge(true));
+        assert!(
+            merge.contains("the destination this run created is left empty"),
+            "{merge}"
+        );
+        assert!(merge.contains("cursor was not saved"), "{merge}");
+        // A destination that was there before the run is still untouched.
+        assert!(err(Before::swap(false)).contains("destination is untouched"));
+        assert!(err(Before::merge(false)).contains("destination is untouched"));
     }
 
     #[test]

@@ -8,8 +8,11 @@ tables — ``[source]``, ``[target]``, and ``[sync]``. ``type`` selects the engi
 (``postgres`` | ``mysql`` | ``bigquery`` | ``clickhouse`` | ``clevertap`` |
 ``appsflyer`` for a source, ``clickhouse`` | ``bigquery`` for a target);
 every other key maps straight to that descriptor's constructor / to ``sync()``'s
-keyword arguments. String values are passed through :func:`os.path.expandvars`,
-so ``${ENV_VAR}`` lets you keep credentials out of the file.
+keyword arguments; a ``[sync]`` key ``sync()`` doesn't take is refused before
+anything runs. String values are passed through :func:`os.path.expandvars`, so
+``${ENV_VAR}`` lets you keep credentials out of the file. A ``${ENV_VAR}`` whose
+variable is unset stops the job before anything runs, naming it; an unset bare
+``$NAME`` stays as written, as ``expandvars`` leaves it.
 
 Example ``job.toml``::
 
@@ -33,7 +36,10 @@ Example ``job.toml``::
 from __future__ import annotations
 
 import argparse
+import difflib
+import inspect
 import os
+import re
 import sys
 from typing import Any
 
@@ -70,6 +76,41 @@ def _load_toml(path: str) -> dict:
         sys.exit(f"invalid TOML in {path}: {e}")
 
 
+# The ``${NAME}`` form, which says a variable is meant. A bare ``$NAME`` can as
+# well be text (a ``$1`` placeholder, a ``$`` in a password), so an unset one
+# is left alone, as ``os.path.expandvars`` leaves it.
+_BRACED_VAR = re.compile(r"\$\{([^}]*)\}")
+
+
+def _unset_vars(job: dict) -> list[str]:
+    """Each ``${NAME}`` in the job's string values whose variable is unset, as
+    ``"NAME ([section] key)"``. ``expandvars`` leaves one as literal text, and
+    the run then failed far from the cause, as an invalid DSN (#45)."""
+    found: list[str] = []
+
+    def walk(value: Any, where: str) -> None:
+        if isinstance(value, str):
+            found.extend(
+                f"{name} ({where})"
+                for name in _BRACED_VAR.findall(value)
+                if name not in os.environ
+            )
+        elif isinstance(value, list):
+            for v in value:
+                walk(v, where)
+        elif isinstance(value, dict):
+            for k, v in value.items():
+                walk(v, f"{where}.{k}")
+
+    for section, table in job.items():
+        if isinstance(table, dict):
+            for key, value in table.items():
+                walk(value, f"[{section}] {key}")
+        else:
+            walk(table, section)
+    return found
+
+
 def _expand(value: Any) -> Any:
     """Recursively expand ${ENV_VAR} / $ENV_VAR in string values."""
     if isinstance(value, str):
@@ -95,8 +136,28 @@ def _descriptor(section: dict, registry: dict, role: str):
         sys.exit(f"[{role}] ({typ}) config error: {e}")
 
 
+def _check_sync_keys(sync_kwargs: dict) -> None:
+    """Refuse a ``[sync]`` key ``sync()`` doesn't take, naming it. Passed
+    through, it ended in a ``TypeError`` traceback (#45)."""
+    try:
+        params = inspect.signature(qh.sync).parameters
+    except (TypeError, ValueError):
+        return  # no signature to check against: sync() itself says
+    # source and target come from their own tables.
+    known = [name for name in params if name not in ("source", "target")]
+    for key in sync_kwargs:
+        if key not in known:
+            close = difflib.get_close_matches(key, known, n=1)
+            hint = f" (did you mean {close[0]!r}?)" if close else ""
+            sys.exit(f"[sync] config error: unknown key {key!r}{hint}")
+
+
 def _cmd_run(args: argparse.Namespace) -> None:
-    job = _expand(_load_toml(args.job))
+    raw = _load_toml(args.job)
+    unset = _unset_vars(raw)
+    if unset:
+        sys.exit(f"{args.job} uses unset environment variable(s): {', '.join(unset)}")
+    job = _expand(raw)
     for required in ("source", "target", "sync"):
         if required not in job:
             sys.exit(f"job file must contain a [{required}] table")
@@ -105,7 +166,13 @@ def _cmd_run(args: argparse.Namespace) -> None:
     sync_kwargs = job["sync"]
     if not isinstance(sync_kwargs, dict):
         sys.exit("[sync] must be a table of quickhouse.sync() keyword arguments")
-    result = qh.sync(src, dst, **sync_kwargs)
+    _check_sync_keys(sync_kwargs)
+    try:
+        result = qh.sync(src, dst, **sync_kwargs)
+    except TypeError as e:
+        # A value of the wrong type (`key = "id"` for a list), raised while
+        # sync() reads its arguments, before anything runs.
+        sys.exit(f"[sync] config error: {e}")
     print(result)
 
 

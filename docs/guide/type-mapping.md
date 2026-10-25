@@ -108,9 +108,13 @@ is kept rather than flattened: `UUID`, `IPv4`/`IPv6`, `Enum8`/`Enum16`,
 `FixedString(N)` and `LowCardinality(...)` are recreated as themselves at a
 ClickHouse destination (and land as `STRING` in BigQuery). `Decimal(P, S)` is
 read exactly, without the `Float64` round-trip the other engines' unparameterised
-decimals take. `Date`, `Date32`, `DateTime` and `DateTime64(P[, tz])` all resolve
-to a UTC-aware timestamp, since a ClickHouse datetime is an absolute instant
-whatever timezone its type names.
+decimals take. `Date`, `Date32`, `DateTime` and `DateTime64(P[, tz])` keep their
+declared types at a ClickHouse destination, time zone and precision included:
+a `DateTime64(3, 'Asia/Jakarta')` column is created as
+`DateTime64(3, 'Asia/Jakarta')`. In BigQuery, `Date` and `Date32` land as
+`DATE`, and `DateTime` and `DateTime64` as a UTC-aware `TIMESTAMP`, since a
+ClickHouse datetime is an absolute instant whatever timezone its type names;
+`type_overrides={"col": "DATETIME"}` is the per-column opt-out to a naive one.
 
 `Array`, `Map`, `Tuple`, `Nested`, `JSON`, the 256-bit integers and `Decimal256`
 aren't readable yet — each is a clear error naming the column. Cast it to
@@ -134,15 +138,22 @@ conversions are applied in Python, before anything reaches the engine:
 | `date64`, `time32`/`time64` | `Date32`, `String` | TIME as text, matching every other source |
 | `large_string`, `string_view`, `large_binary` | `String`, `String` | the `pd.ArrowDtype` / polars family |
 
+A column that holds only nulls, with nothing to infer a type from (an `object`
+column of `None`s, or Arrow's `null` type from pyarrow or polars), becomes a
+nullable string, `Nullable(String)` on ClickHouse, with a `QuickhouseWarning`.
+Give it a dtype, such as `df["note"].astype("string")`, to choose its type
+yourself.
+
 Refused, naming the column and the fix: values outside the 1900–2299 window
 (checked with one vectorised pass, rather than letting the server reject the
 insert partway through), nested `list`/`struct`/`map`, `Decimal256`, durations
-and intervals, all-null columns, duplicate column names, and non-string column
-names.
+and intervals, duplicate column names, and non-string column names.
 
-Note `NaN` in a float column is a *value*, not a null: ClickHouse stores a NaN,
-BigQuery converts it to NULL. Use `pd.NA` (or a nullable dtype) if you mean
-missing.
+`NaN` in a float column depends on the library. pandas uses `NaN` as its
+missing-value marker, so in a pandas float column it arrives as `NULL`. In a
+pyarrow or polars float column it is a *value*, not a null: ClickHouse stores a
+NaN, BigQuery converts it to NULL. Use `None` there (or `pd.NA`, or a nullable
+dtype, in pandas) if you mean missing.
 
 ## Out-of-range and zero dates
 

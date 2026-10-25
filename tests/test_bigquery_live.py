@@ -514,3 +514,39 @@ def test_a_dropped_destination_is_rebuilt_whole_on_bigquery(
     (recreated,) = [w for w in r.warnings if w.kind == "recreated_destination"]
     assert recreated.sample is not None and recreated.sample.startswith("2024-01-01")
     assert _rows(bq, f"SELECT COUNT(*) AS n FROM {_fq(bq, dest)}")[0].n == 11
+
+
+def test_a_new_incremental_destination_is_clustered_by_its_key_first(
+    bq, pg_conn, pg_source, bq_target, dest
+):
+    """Issue #44: the generated clustering put order_by before key, so the
+    MERGE's key bound pruned nothing, and quickhouse raised
+    unclustered_merge_target against a table it had created itself."""
+    _seed(pg_conn, dest, range(1, 6))
+    first = _sync(pg_source, bq_target, dest, order_by=["write_date"])
+    assert bq.get_table(_fq(bq, dest).strip("`")).clustering_fields == ["id", "write_date"]
+    _add(pg_conn, dest, range(6, 9), "2024-02-01 00:00:00")
+    second = _sync(pg_source, bq_target, dest, order_by=["write_date"])
+    assert second.rows_written == 3
+    for r in (first, second):
+        assert "unclustered_merge_target" not in {w.kind for w in r.warnings}, r.warnings
+
+
+def test_a_new_full_refresh_destination_keeps_order_by_first(
+    bq, pg_conn, pg_source, bq_target, dest
+):
+    """Issue #44 changed only an incremental table: a full refresh runs no
+    MERGE, so order_by still leads its clustering."""
+    _seed(pg_conn, dest, range(1, 6))
+    r = quickhouse.sync(
+        pg_source,
+        bq_target,
+        dest_table=dest,
+        source_table=dest,
+        mode="full",
+        order_by=["write_date"],
+        key=["id"],
+        create_if_missing=True,
+    )
+    assert r.rows_written == 5
+    assert bq.get_table(_fq(bq, dest).strip("`")).clustering_fields == ["write_date", "id"]

@@ -85,6 +85,31 @@ def test_both_destinations_accept_a_gcs_archive():
     quickhouse.BigQuery("some-project", dataset_id="analytics", archive=archive)
 
 
+def test_an_archive_refuses_an_unknown_compression_when_it_is_built():
+    """Issue #45: ``compression="lz4"`` was accepted here and failed only
+    inside ``sync()``, while ``backup()`` already checked ``format`` up front."""
+    for cls in (quickhouse.GcsArchive, quickhouse.S3Archive):
+        with pytest.raises(RuntimeError, match="invalid archive compression"):
+            cls(bucket="b", compression="lz4")
+        cls(bucket="b", compression="snappy")
+    with pytest.raises(RuntimeError, match="invalid archive compression"):
+        quickhouse.backup(destination="s3", bucket="b", compression="lz4")
+
+
+def test_descriptor_reprs_read_like_python():
+    """Issue #45: an unset option showed as Rust's ``None`` beside a set one's
+    ``Some("...")``, and every string in Rust's double quotes."""
+    assert repr(quickhouse.S3Archive(bucket="lake")) == (
+        "S3Archive(bucket='lake', prefix='', endpoint=None)"
+    )
+    assert repr(quickhouse.GcsArchive(bucket="lake", endpoint="http://gcs")) == (
+        "GcsArchive(bucket='lake', prefix='', endpoint='http://gcs')"
+    )
+    assert repr(quickhouse.BigQuery(dataset_id="analytics")) == (
+        "BigQuery(project_id=None, dataset_id='analytics', write_method='storage_write')"
+    )
+
+
 def test_archive_on_the_source_descriptor_warns(pg_conn, ch_client, pg_source, ch_target, unique_name):
     """`archive=` belongs on the destination. Set on a source it does nothing
     — archiving is a write-path option — and that used to pass in total

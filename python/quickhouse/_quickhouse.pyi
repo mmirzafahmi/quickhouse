@@ -187,11 +187,16 @@ class BigQuery:
     connections, unlike the Postgres/MySQL sources).
 
     As a destination: rows are written via ``write_method`` (see above); the
-    full-refresh atomic swap uses a ``WRITE_TRUNCATE`` copy job (BigQuery has
+    full-refresh atomic swap is one transaction, ``BEGIN TRANSACTION;
+    TRUNCATE TABLE dest; INSERT INTO dest SELECT ... FROM staging; COMMIT
+    TRANSACTION``, billed as a query over the staged rows (BigQuery has
     no `EXCHANGE TABLES` equivalent). ``partition_by`` must be a bare
     ``DATE``/``DATETIME``/``TIMESTAMP`` column name (not a SQL expression like
     ClickHouse's); ``order_by``/``key`` become clustering columns (at most 4
-    total). Incremental mode has no engine-level dedup here (unlike
+    total). ``order_by`` comes first, except in incremental mode, where
+    ``key`` leads so that the ``MERGE``'s key bound can prune; this applies
+    only to tables quickhouse creates, and an existing table keeps its
+    clustering. Incremental mode has no engine-level dedup here (unlike
     ClickHouse's `ReplacingMergeTree`), so it upserts via a ``MERGE``
     statement matched on ``key`` instead — making ``key`` **required** for
     incremental syncs into BigQuery specifically.
@@ -214,16 +219,17 @@ class BigQuery:
 
 class S3Archive:
     """Optional S3 (or S3-compatible, e.g. MinIO) data-lake archive attached
-    to a :class:`ClickHouse` destination via its ``archive=`` parameter.
+    to a :class:`ClickHouse` or :class:`BigQuery` destination via its
+    ``archive=`` parameter.
 
-    Every batch synced into ClickHouse is also written as Parquet — one
+    Every batch synced into the destination is also written as Parquet — one
     streamed file per parallel partition (per chunk, with ``chunk_rows``),
     never fully buffered in memory — to
     ``s3://{bucket}/{prefix}/{dest_table}/dt=<date>/run=<id>/
     part-<partition>.parquet``. A secondary, best-effort-free backup/
     historical side channel: omitting ``archive`` entirely disables this and
-    has zero effect on the ClickHouse write path. A persistent S3 failure
-    fails the whole ``sync()`` call (matching how the ClickHouse insert path
+    has zero effect on the destination write path. A persistent S3 failure
+    fails the whole ``sync()`` call (matching how the destination write path
     itself already behaves), so the archive never silently falls behind.
 
     Parameters
@@ -243,7 +249,8 @@ class S3Archive:
     compression:
         Parquet's own internal compression: ``"zstd"`` (default),
         ``"snappy"``, or ``"uncompressed"`` — distinct from ClickHouse's own
-        HTTP transport compression, which is unaffected.
+        HTTP transport compression, which is unaffected. Any other value
+        raises ``RuntimeError`` here, not at ``sync()``.
 
     Note
     ----
@@ -298,7 +305,8 @@ class GcsArchive:
         ``region``.
     compression:
         Parquet's own internal compression: ``"zstd"`` (default),
-        ``"snappy"``, or ``"uncompressed"``.
+        ``"snappy"``, or ``"uncompressed"``. Any other value raises
+        ``RuntimeError`` here, not at ``sync()``.
 
     Note
     ----
@@ -370,8 +378,8 @@ class CleverTap:
     ) -> None: ...
 
 class AppsFlyer:
-    """AppsFlyer raw-data Pull API source (CSV report). **BigQuery destination
-    only.**
+    """AppsFlyer raw-data Pull API source (CSV report). Writes to BigQuery or
+    ClickHouse.
 
     Declare the output schema via ``columns`` (same forms as ``CleverTap``);
     each column reads the CSV header equal to its ``path`` (or ``name``). Auth

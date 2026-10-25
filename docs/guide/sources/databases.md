@@ -41,14 +41,23 @@ for the transfer and use `read_idle_timeout_secs` to catch a stalled source.
 Anything else ClickHouse exposes goes through `settings={...}`, which is applied
 last and therefore always wins.
 
+A table is read as stored, without `FINAL`. From a `ReplacingMergeTree` (every
+table quickhouse creates for an incremental sync is one) that includes old
+versions of rows that background merges haven't removed yet, so a copy can hold
+a key more than once. To copy only the newest version of each row, read through
+`source_query="SELECT * FROM orders FINAL"`, which gives up the parallel range
+reads.
+
 ### Types
 
 Types that have no counterpart elsewhere are preserved rather than flattened:
 `UUID`, `IPv4`/`IPv6`, `Enum8`/`Enum16`, `FixedString(N)` and
 `LowCardinality(...)` are recreated as themselves at a ClickHouse destination,
 and land as `STRING` in BigQuery. `Date`, `Date32`, `DateTime` and
-`DateTime64(P[, tz])` all resolve to a UTC-aware timestamp — a ClickHouse
-datetime is an absolute instant whatever timezone its type names — with
+`DateTime64(P[, tz])` keep their declared types at a ClickHouse destination,
+time zone included. In BigQuery, `Date` and `Date32` land as `DATE`, and
+`DateTime` and `DateTime64` as a UTC-aware `TIMESTAMP` — a ClickHouse datetime
+is an absolute instant whatever timezone its type names — with
 `type_overrides={"col": "DATETIME"}` as the per-column opt-out to a naive one.
 
 Not readable yet: `Array`, `Map`, `Tuple`, `Nested`, `JSON`, the 256-bit
