@@ -386,6 +386,21 @@ def _dedupe_on_key(table, key: Sequence[str], pa, pc, watermark: str | None = No
             f"watermark={watermark!r} is not in the frame; it names the column that decides "
             f"which duplicate wins. Frame columns: {table.column_names!r}"
         )
+    # A row with a NULL key isn't a duplicate of another: the engine leaves
+    # every such row out and counts them all in its `null_key` warning, so
+    # keeping only one of them here would undercount.
+    null_key = None
+    for k in key:
+        is_null = pc.is_null(table.column(k))
+        null_key = is_null if null_key is None else pc.or_(null_key, is_null)
+    no_key = None
+    if null_key is not None and pc.any(null_key).as_py():
+        no_key = table.filter(null_key)
+        table = table.filter(pc.invert(null_key))
+
+    def with_no_key(deduped):
+        return deduped if no_key is None else pa.concat_tables([deduped, no_key])
+
     ordinal = "__quickhouse_ordinal"
     with_ord = table.append_column(
         ordinal, pa.array(range(table.num_rows), type=pa.int64())
@@ -406,7 +421,7 @@ def _dedupe_on_key(table, key: Sequence[str], pa, pc, watermark: str | None = No
     wanted = keep.column(f"{ordinal}_max")
     dropped = table.num_rows - keep.num_rows
     if dropped == 0:
-        return table
+        return with_no_key(table)
     mask = pc.is_in(with_ord.column(ordinal), value_set=wanted.combine_chunks())
     by = f"highest {watermark!r}" if watermark is not None else "last"
     warnings.warn(
@@ -422,7 +437,7 @@ def _dedupe_on_key(table, key: Sequence[str], pa, pc, watermark: str | None = No
         QuickhouseWarning,
         stacklevel=3,
     )
-    return with_ord.filter(mask).drop([ordinal])
+    return with_no_key(with_ord.filter(mask).drop([ordinal]))
 
 
 # --------------------------------------------------------------------------

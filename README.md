@@ -415,7 +415,7 @@ or a custom gate's own type.
 | `batch_rows` / `batch_bytes` | Per-batch size knobs (rows, or estimated bytes) |
 | `max_memory_bytes` | Hard ceiling on total in-flight memory; decoding blocks when hit (default 512 MiB, `0` = unbounded) |
 | `read_max_rows_per_sec` | Cap the aggregate source read rate to be gentle on a small DB; `None` = unlimited (default). Postgres/MySQL/ClickHouse only |
-| `type_overrides` | Force a destination column type, e.g. `{"qty": "Decimal(18, 3)"}` |
+| `type_overrides` | Force a destination column type, e.g. `{"qty": "Decimal(18, 3)"}`. Applies when quickhouse creates the table or adds the column; one an existing column's type disagrees with raises `ignored_type_override` |
 | `rename`, `include`, `exclude` | Column renames and allow/deny lists |
 | `on_progress` | Progress callback |
 

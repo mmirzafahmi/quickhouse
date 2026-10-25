@@ -715,6 +715,7 @@ impl From<AnySource> for core::SourceConfig {
                     password: c.password,
                     statement_timeout_secs: c.statement_timeout_secs,
                     settings: c.settings,
+                    read_final: c.read_final,
                     // compression/archive/insert_dedup_token are write-path
                     // fields (see ClickHouse's doc comment) — ignored here.
                 })
@@ -947,7 +948,7 @@ fn archive_config(archive: Option<AnyArchive>) -> PyResult<Option<core::ArchiveC
 /// `url`, `database`, `user`, `password` and `settings` apply in both roles.
 /// `compression`, `archive` and `insert_dedup_token` are write-path only and
 /// are ignored when this is plugged in as a `source=`; `statement_timeout_secs`
-/// is read-path only and is ignored as a `target=`.
+/// and `final` are read-path only and are ignored as a `target=`.
 ///
 /// As a source, reads go over the same HTTP interface in `FORMAT ArrowStream`,
 /// which makes ClickHouse -> ClickHouse (a cross-cluster or cross-database
@@ -966,12 +967,16 @@ struct ClickHouse {
     settings: BTreeMap<String, String>,
     insert_dedup_token: bool,
     statement_timeout_secs: u64,
+    /// `final=`: see `core::ClickHouseSourceConfig::read_final`.
+    read_final: Option<bool>,
 }
 
 #[pymethods]
 impl ClickHouse {
+    /// `final` is a reserved word in Rust, so the argument is the raw
+    /// identifier `r#final`, which pyo3 exposes to Python as `final`.
     #[new]
-    #[pyo3(signature = (url, *, database="default".to_string(), user="default".to_string(), password="".to_string(), compression="zstd".to_string(), archive=None, settings=None, insert_dedup_token=false, statement_timeout_secs=0))]
+    #[pyo3(signature = (url, *, database="default".to_string(), user="default".to_string(), password="".to_string(), compression="zstd".to_string(), archive=None, settings=None, insert_dedup_token=false, statement_timeout_secs=0, r#final=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         url: String,
@@ -983,6 +988,7 @@ impl ClickHouse {
         settings: Option<BTreeMap<String, String>>,
         insert_dedup_token: bool,
         statement_timeout_secs: u64,
+        r#final: Option<bool>,
     ) -> Self {
         ClickHouse {
             url,
@@ -994,6 +1000,7 @@ impl ClickHouse {
             settings: settings.unwrap_or_default(),
             insert_dedup_token,
             statement_timeout_secs,
+            read_final: r#final,
         }
     }
 

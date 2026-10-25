@@ -2048,3 +2048,51 @@ def test_read_idle_timeout_secs_times_the_wait_for_the_first_row(
         assert r.read_secs >= 1.5, r.read_secs
     finally:
         _drop_ch(ch_client, table)
+
+
+def test_a_zero_date_watermark_is_left_out_of_a_replacing_merge_tree(
+    mysql_conn, ch_client, mysql_source, ch_target, unique_name
+):
+    """Issue #49: a zero-date reads as NULL, which a ReplacingMergeTree's
+    version column can't hold, so it failed the insert with an Arrow error.
+    The row is left out now and reported as null_watermark, as a NULL one the
+    read leaves out is, and coerced_date says the row was left out. A NULL in
+    the nullable key column is left out with null_key."""
+    table = unique_name
+    with mysql_conn.cursor() as cur:
+        cur.execute(f"DROP TABLE IF EXISTS `{table}`")
+        cur.execute(
+            f"CREATE TABLE `{table}` (id BIGINT PRIMARY KEY, code VARCHAR(8) NULL, "
+            "updated_at DATETIME NOT NULL)"
+        )
+        cur.execute("SELECT @@SESSION.sql_mode")
+        (orig_mode,) = cur.fetchone()
+        try:
+            cur.execute("SET SESSION sql_mode = ''")
+            cur.executemany(
+                f"INSERT INTO `{table}` VALUES (%s, %s, %s)",
+                [
+                    (1, "a", "2024-05-01 10:00:00"),
+                    (2, "b", "0000-00-00 00:00:00"),
+                    (3, None, "2024-05-02 10:00:00"),
+                ],
+            )
+        finally:
+            cur.execute("SET SESSION sql_mode = %s", (orig_mode,))
+    _drop_ch(ch_client, table)
+    try:
+        r = quickhouse.sync(
+            mysql_source, ch_target, dest_table=table, source_table=table, mode="incremental",
+            watermark="updated_at", key=["code"], create_if_missing=True, state_key=table,
+        )
+        assert (r.rows_read, r.rows_written) == (3, 1)
+        by_kind = {w.kind: w for w in r.warnings}
+        assert (by_kind["null_watermark"].column, by_kind["null_watermark"].count) == (
+            "updated_at",
+            1,
+        )
+        assert (by_kind["null_key"].column, by_kind["null_key"].count) == ("code", 1)
+        assert "left out" in by_kind["coerced_date"].message, by_kind["coerced_date"].message
+        assert ch_client.query(f"SELECT id FROM `{table}`").result_rows == [(1,)]
+    finally:
+        _drop_ch(ch_client, table)

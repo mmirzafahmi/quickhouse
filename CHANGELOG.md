@@ -9,6 +9,155 @@ any breaking change is called out explicitly.
 
 ## [Unreleased]
 
+### Changed — please read before upgrading
+- **A row with a NULL `key` is left out and counted in a new warning,
+  `null_key`, on every source.** No destination can hold a NULL key:
+  ClickHouse doesn't allow NULL in a sorting key, and in a BigQuery `MERGE` a
+  NULL key never matches, so the row would be inserted again on every run. A
+  database source (PostgreSQL, MySQL, ClickHouse, BigQuery) with a nullable
+  key column failed the write partway, with Arrow's `Column 'code' is
+  declared as non-nullable but contains null values`, which named neither
+  `key` nor a fix; a DataFrame failed the same way. An API source (`HttpApi`,
+  `CleverTap`, `AppsFlyer`) stored the type's default instead (`''`, or `0`
+  for an INTEGER key that didn't parse), with no warning, so such records
+  shared one key and collapsed into one row. Every source now leaves the row
+  out, in every mode, and raises `null_key` naming the key column (as `key`
+  names it), with `count` the rows left out; a row with several NULL keys
+  counts once. `rows_read` includes them and `rows_written` doesn't, an
+  `archive` doesn't hold them either, and an incremental cursor moves past
+  them, as a cursor taken from the source's `MAX` always did.
+  `fail_on_warnings={"null_key"}` stops the run at the first step that would
+  make anything permanent after the read: a full refresh before its swap, an
+  incremental run before its `MERGE` or its cursor, a `chunk_rows` read
+  before the chunk is committed. A run that failed with the Arrow error now
+  succeeds, without those rows: name `null_key` in `fail_on_warnings` to keep
+  it failing. A DataFrame's incremental de-duplication on `key` leaves rows
+  with a NULL key alone, so `null_key` counts each of them. (#49, #45)
+- **A ClickHouse `source_table` whose engine merges rows is read with
+  `FINAL`.** A `ReplacingMergeTree` (every table quickhouse creates for an
+  incremental sync is one), `CollapsingMergeTree`,
+  `VersionedCollapsingMergeTree`, `SummingMergeTree` or `AggregatingMergeTree`,
+  `Replicated*` forms included, keeps old versions of a row until a background
+  merge removes them, and quickhouse copied those too: a full copy of 10 keys
+  with 2 unmerged versions wrote 12 rows into a `MergeTree`, where they never
+  collapse. The engine is now read from `system.tables`, and every read of such
+  a table adds `FINAL`: the one-stream read, each parallel range, each
+  `chunk_rows` chunk and an incremental read. The run logs it, naming the
+  engine. **What it costs:** ClickHouse merges the versions as it reads, so a
+  read uses more CPU and memory and takes longer. A filter on a column outside
+  the sorting key, such as an incremental `watermark` or a `chunk_rows` key,
+  no longer narrows what is merged: ClickHouse applies it after the merge
+  (checked on 24.8), so each incremental read merges the whole table, less what
+  the primary key and partition pruning leave out. **To keep the old
+  behaviour**, pass `final=False` to the source's `ClickHouse(...)`. A
+  `source_query` is still sent as written, so put `FINAL` in it yourself. (#39)
+- **A parallel range read of a table read with `FINAL` splits on its sorting
+  key.** Every version of a row shares its sorting-key values, so a range over
+  a sorting-key column holds them all, and one over the sorting key's first
+  column reads and merges only its own slice. A range over any other column
+  would merge the whole table once per range. When `partition_column` (or the
+  first `key`) is outside the sorting key, the read now splits on the sorting
+  key's first column instead, or runs in one stream when that column isn't an
+  integer, and logs which. (#39)
+
+### Added
+- **A warning for a `type_overrides` entry an existing table ignores:
+  `ignored_type_override`.** `type_overrides` only applies when quickhouse
+  creates the table, or adds the column with `evolve_schema`, so an entry
+  naming a column the existing destination already has, as another type, did
+  nothing, and the run said nothing: `type_overrides={"amount": "Decimal(12, 2)"}`
+  left a `Nullable(Decimal(38, 9))` column as it was, with `warnings` empty.
+  The run now raises the warning once per such column, before anything is
+  written, naming the column, its type (also the `sample`) and the override,
+  so `fail_on_warnings={"ignored_type_override"}` stops it with the
+  destination untouched. `column` is the `type_overrides` key. The same type
+  spelled another way isn't reported: spaces and a `Nullable(...)` wrapper
+  don't count, ClickHouse resolves an alias such as `numeric(12, 2)` or
+  `Decimal64(2)` when the spellings still differ (one query, made only then),
+  and BigQuery's `INT64`/`INTEGER`, `FLOAT64`/`FLOAT`, `BOOL`/`BOOLEAN` and
+  `DECIMAL`/`NUMERIC` count as the same. Both destinations, and every source:
+  database, BigQuery, API and DataFrame. The declared types of an API source,
+  which quickhouse passes to a BigQuery destination as overrides of its own,
+  aren't checked. It costs one query against the destination's metadata per
+  run that passes `type_overrides`. (#50)
+- **`ClickHouse(final=...)`** chooses whether a source's reads of
+  `source_table` add `FINAL`: `None` (the default) by the table's engine, as
+  above; `True` always, for a `Distributed` table or a materialized view,
+  whose own engine doesn't merge rows but whose underlying table does; `False`
+  never. ClickHouse refuses `FINAL` on a plain `MergeTree` (`ILLEGAL_FINAL`),
+  so `final=True` there stops the run before anything is written, with an
+  error naming `final=True`. Ignored when the descriptor is a destination.
+  (#39)
+
+### Fixed
+- **A NULL watermark is left out of a `ReplacingMergeTree`, as on a database
+  source, instead of landing as `1970-01-01`.** The watermark is a
+  `ReplacingMergeTree`'s version column, which can't be NULL. An API source's
+  watermark that was missing, or that couldn't be read (a 12-digit number, a
+  year past 2299), landed as `1970-01-01 00:00:00`, so a newer version of a
+  row lost to the one already stored, with only a `coerced_date` warning that
+  said the value was "coerced to NULL" and no `null_watermark`. A database
+  source's read already leaves NULL watermarks out; a value its decoder
+  couldn't read (a MySQL zero-date) failed the insert with an Arrow error.
+  Every source now leaves those rows out and reports them in
+  `null_watermark`, with `count` the rows. Where the destination's watermark
+  can hold NULL (BigQuery, or a ClickHouse table whose version column isn't
+  the watermark), the row still lands with a NULL there. (#49)
+- **A ClickHouse source with a nullable watermark reads into a
+  `ReplacingMergeTree`.** The read casts each column to its destination type,
+  and ClickHouse evaluates that cast on rows the `IS NOT NULL` filter goes on
+  to drop, so a NULL watermark failed the whole read with
+  `Code: 349 CANNOT_INSERT_NULL_IN_ORDINARY_COLUMN`, as did a NULL in a
+  nullable key column. The cast keeps NULL in those two columns now; the
+  filter leaves the NULL-watermark rows out, `null_watermark` counts them as
+  before, and a NULL key is left out with `null_key`. (#49)
+- **`coerced_date`, `coerced_decimal` and `coerced_scalar` say what became of
+  the value.** They said the value was "coerced to NULL" even where the row
+  was then left out, or, from an API source into a ClickHouse column that
+  can't be NULL (an `order_by` column, say), where ClickHouse stored the
+  column's default instead. The message now says the row was left out (and
+  which warning counts it), or that the default was stored. A refused full
+  refresh, and the `full_refresh_shrink` warning, also say how many rows the
+  run left out for a NULL key or watermark, since those count as lost
+  there. (#49)
+- **A `fail_on_warnings` error no longer says `(count 0)`.** A warning about
+  the destination rather than about rows, such as `recreated_destination`,
+  `dropped_source_column` or `non_replacing_incremental_target`, is raised
+  before anything is written and has no row count, so its `count` is 0, and
+  the error read `fail_on_warnings: recreated_destination (count 0) stopped
+  the run`. The error now leaves a count of 0 out. `count` itself is
+  unchanged, and is documented as 0 for such warnings. `dropped_source_column`
+  stays at 0 as well: the rows written without the column are known only
+  after the check that can stop the run. (#50)
+- **`non_replacing_incremental_target` says a run writes the whole source only
+  when it does.** Its message said that a first run, with no cursor yet,
+  writes the whole source again, including on a first run with
+  `skip_to_max=True` or `seed_watermark`, which starts past the rows already
+  there: with `skip_to_max=True` that run wrote 0 rows. The clause is now
+  there only when the run reads from the start, with no saved cursor, no
+  `chunk_rows` resume marker and no seed. (#50)
+- **A ClickHouse source's incremental cursor comes from the rows it read.** The
+  `MAX(watermark)` probe that sets the read's upper bound and the next cursor
+  is read with `FINAL` too. Read as stored, it could come from a version a
+  newer one had replaced: a stale version with a later watermark moved the
+  cursor past every row the run read, and a row written afterwards between the
+  two was skipped. The count behind the `null_watermark` warning counts the
+  merged rows the same way, and asks for `FINAL` only when the stored count
+  isn't 0. (#39)
+- **`reconcile_keys()` finds a key a ClickHouse source deleted through its
+  engine.** A `CollapsingMergeTree` cancel row or a
+  `ReplacingMergeTree(ver, is_deleted)` delete removes a key only from the
+  merged rows, and the source's keys were read as stored, so such a key was
+  never reported as an orphan. They are read with `FINAL` by the same rule.
+  `reconcile_values()` already read a merging source table with `FINAL`; it now
+  follows the source's `final=` too. (#39)
+
+### Documentation
+- **ClickHouse sources.** The source guide and the tutorials described a table
+  read without `FINAL` and the `source_query="SELECT * FROM t FINAL"`
+  workaround. They now describe `final=`, its cost and the range-read
+  choice. (#39)
+
 ## [0.20.11] — 2026-10-25
 
 ### Changed — please read before upgrading

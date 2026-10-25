@@ -2062,3 +2062,322 @@ def test_an_incremental_run_into_a_table_that_keeps_duplicates_is_reported_befor
         assert ch_client.command(f"SELECT count() FROM `{table}` FINAL") == 10
     finally:
         _drop_ch(ch_client, table)
+
+
+def _null_key_table(pg_conn, table):
+    """Keyed on a nullable `code`, NULL on ids 2 and 4. Id 4 holds the newest
+    write_date."""
+    with pg_conn.cursor() as cur:
+        cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+        cur.execute(f'CREATE TABLE "{table}" (id bigint, code text, write_date timestamp NOT NULL)')
+        cur.execute(
+            f"INSERT INTO \"{table}\" VALUES "
+            "(1, 'A', '2024-01-01'), (2, NULL, '2024-01-02'), (3, 'C', '2024-01-03'), "
+            "(4, NULL, '2024-01-09'), (5, 'E', '2024-01-05')"
+        )
+
+
+def _null_keys(result):
+    return [(w.column, w.count) for w in result.warnings if w.kind == "null_key"]
+
+
+def test_a_null_key_from_postgres_is_left_out_with_a_null_key_warning(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """Issue #49: a NULL in a nullable key column failed the write partway with
+    Arrow's "Column 'code' is declared as non-nullable but contains null
+    values", which named neither `key` nor a fix. The row is left out now, and
+    null_key names the column and counts it. The cursor moves past such a row
+    like past any other row the run read, whether it is the MAX or comes from
+    the rows read."""
+    table = unique_name
+    _null_key_table(pg_conn, table)
+    _drop_ch(ch_client, table)
+    try:
+        full = quickhouse.sync(
+            pg_source, ch_target, dest_table=table, source_table=table, mode="full", key=["code"]
+        )
+        assert (full.rows_read, full.rows_written) == (5, 3)
+        assert _null_keys(full) == [("code", 2)]
+        assert "left out" in [w for w in full.warnings if w.kind == "null_key"][0].message
+        rows = sorted(ch_client.query(f"SELECT code FROM `{table}`").result_rows)
+        assert rows == [("A",), ("C",), ("E",)]
+
+        kw = dict(
+            dest_table=table, source_table=table, mode="incremental", watermark="write_date",
+            key=["code"], create_if_missing=True, state_key=table,
+        )
+        for extra in ({}, {"probe_max_cost": 1.0, "lookback_seconds": 60}):
+            _drop_ch(ch_client, table)
+            r = quickhouse.sync(pg_source, ch_target, **kw, **extra)
+            assert (r.rows_read, r.rows_written) == (5, 3), extra
+            assert _null_keys(r) == [("code", 2)], extra
+            assert r.new_watermark.startswith("2024-01-09"), (extra, r.new_watermark)
+    finally:
+        _drop_ch(ch_client, table)
+
+
+def test_fail_on_null_key_stops_a_postgres_run_before_it_commits(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """Issue #49: null_key is counted while reading, so fail_on_warnings checks
+    it where each run commits. A full refresh stops before its swap, and the
+    destination keeps its rows. An incremental run into a ReplacingMergeTree
+    stops before its cursor is saved, so the next run reads the rows again."""
+    table, inc = unique_name, f"{unique_name}_inc"
+    _null_key_table(pg_conn, table)
+    _drop_ch(ch_client, table)
+    _drop_ch(ch_client, inc)
+    fatal = {"null_key"}
+    try:
+        full = dict(dest_table=table, source_table=table, mode="full", key=["code"])
+        quickhouse.sync(pg_source, ch_target, **full)
+        with pg_conn.cursor() as cur:
+            cur.execute(f"INSERT INTO \"{table}\" VALUES (6, 'F', '2024-01-06')")
+        with pytest.raises(RuntimeError, match="fail_on_warnings: null_key on column 'code'") as err:
+            quickhouse.sync(pg_source, ch_target, fail_on_warnings=fatal, **full)
+        assert "(count 2)" in str(err.value), err.value
+        assert "untouched" in str(err.value), err.value
+        assert ch_client.command(f"SELECT count() FROM `{table}`") == 3
+
+        kw = dict(
+            dest_table=inc, source_table=table, mode="incremental", watermark="write_date",
+            key=["code"], create_if_missing=True, state_key=inc,
+        )
+        with pytest.raises(RuntimeError, match="fail_on_warnings: null_key") as err:
+            quickhouse.sync(pg_source, ch_target, fail_on_warnings=fatal, **kw)
+        assert "the cursor was not saved" in str(err.value), err.value
+        assert ch_client.command(
+            f"SELECT count() FROM _quickhouse_state WHERE source_table = '{inc}'"
+        ) == 0
+        r = quickhouse.sync(pg_source, ch_target, **kw)
+        assert (r.rows_read, r.rows_written) == (6, 4)
+
+        # Staged (validate= stages a ClickHouse incremental run): it stops
+        # before the insert-select from staging, and the gate never runs.
+        gated = []
+        staged = dict(kw, dest_table=f"{inc}_stg", state_key=f"{inc}_stg")
+        with pytest.raises(RuntimeError, match="fail_on_warnings: null_key") as err:
+            quickhouse.sync(
+                pg_source, ch_target, fail_on_warnings=fatal, validate=gated.append, **staged
+            )
+        assert "Nothing was merged in" in str(err.value), err.value
+        assert gated == []
+        assert ch_client.command(f"SELECT count() FROM `{inc}_stg`") == 0
+    finally:
+        _drop_ch(ch_client, table)
+        _drop_ch(ch_client, inc)
+        _drop_ch(ch_client, f"{inc}_stg")
+
+
+def test_a_chunked_read_leaves_null_keys_out_and_keeps_going(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """Issue #49: a chunk_rows read takes its keyset cursor from every row it
+    read, so a chunk whose rows are all left out for a NULL key still moves
+    the cursor on, and the rows around it all land."""
+    table = unique_name
+    with pg_conn.cursor() as cur:
+        cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+        cur.execute(
+            f'CREATE TABLE "{table}" (id bigint PRIMARY KEY, code text, write_date timestamp NOT NULL)'
+        )
+        cur.execute(
+            f"INSERT INTO \"{table}\" SELECT g, "
+            "CASE WHEN g IN (3, 4, 7) THEN NULL ELSE 'c' || g END, "
+            "timestamp '2024-01-01' + g * interval '1 hour' FROM generate_series(1, 9) g"
+        )
+    _drop_ch(ch_client, table)
+    kw = dict(
+        dest_table=table, source_table=table, mode="incremental", watermark="write_date",
+        key=["id", "code"], create_if_missing=True, chunk_rows=2, state_key=table,
+    )
+    try:
+        r = quickhouse.sync(pg_source, ch_target, **kw)
+        assert (r.rows_read, r.rows_written) == (9, 6)
+        assert _null_keys(r) == [("code", 3)]
+        ids = [i for (i,) in ch_client.query(f"SELECT id FROM `{table}` ORDER BY id").result_rows]
+        assert ids == [1, 2, 5, 6, 8, 9]
+        assert _latest_state(ch_client, table) == ("2024-01-01 09:00:00", "", "")
+    finally:
+        _drop_ch(ch_client, table)
+
+
+def test_a_fail_on_warnings_error_leaves_out_a_count_of_0(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """Issue #50: a warning about the destination counts no rows, so its
+    count is 0, and the fail_on_warnings error read "(count 0) stopped the
+    run". A count of 0 is left out now."""
+    table = unique_name
+    _seed_table(pg_conn, table, 3)
+    _drop_ch(ch_client, table)
+    try:
+        quickhouse.sync(
+            pg_source, ch_target, dest_table=table, source_table=table, mode="full",
+            key=["id"], create_if_missing=True,
+        )
+        fatal = "non_replacing_incremental_target"
+        with pytest.raises(RuntimeError, match=f"fail_on_warnings: {fatal} stopped the run"):
+            quickhouse.sync(
+                pg_source, ch_target, dest_table=table, source_table=table, mode="incremental",
+                watermark="write_date", key=["id"], state_key=f"{table}:count",
+                fail_on_warnings={fatal},
+            )
+    finally:
+        _drop_ch(ch_client, table)
+
+
+def _ch_type(ch_client, table, column):
+    # query(), not command(): command() returns TSV, which escapes a quote.
+    return ch_client.query(
+        "SELECT type FROM system.columns WHERE database = currentDatabase() "
+        f"AND table = '{table}' AND name = '{column}'"
+    ).result_rows[0][0]
+
+
+def _ignored_overrides(r):
+    return [w for w in r.warnings if w.kind == "ignored_type_override"]
+
+
+def test_a_type_override_an_existing_column_ignores_is_reported_before_writing(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """Issue #50: type_overrides applies only when quickhouse creates the
+    table, so an override naming a column the existing destination types
+    differently did nothing, and the run said nothing. It now names the
+    column, its type and the override before writing, unless the two are the
+    same type however they are spelled."""
+    table = unique_name
+    _seed_table(pg_conn, table, 3)
+    _drop_ch(ch_client, table)
+    kw = dict(dest_table=table, source_table=table, mode="full", key=["id"], create_if_missing=True)
+    try:
+        # Overrides that create the table apply: nothing to report.
+        first = quickhouse.sync(
+            pg_source, ch_target,
+            type_overrides={"amount": "Decimal(12,2)", "write_date": "TIMESTAMP"}, **kw,
+        )
+        assert _ignored_overrides(first) == [], first.warnings
+        assert _ch_type(ch_client, table, "amount") == "Nullable(Decimal(12, 2))"
+        assert _ch_type(ch_client, table, "write_date") == "Nullable(DateTime64(6, 'UTC'))"
+
+        # The type a column has, spelled another way, is no news.
+        for same in (
+            {"amount": "Decimal(12, 2)"},
+            {"amount": "Nullable(Decimal(12, 2))"},
+            {"amount": "numeric(12,2)"},
+            {"write_date": "DateTime64(6,'UTC')"},
+            {"write_date": "TIMESTAMP"},
+            {"id": "BIGINT"},
+        ):
+            r = quickhouse.sync(pg_source, ch_target, type_overrides=same, **kw)
+            assert _ignored_overrides(r) == [], (same, r.warnings)
+
+        # Another type is reported before anything is written.
+        changed = {"amount": "Decimal(18, 4)", "qty": "Int64"}
+        with pytest.raises(RuntimeError, match="fail_on_warnings: ignored_type_override") as err:
+            quickhouse.sync(
+                pg_source, ch_target, type_overrides=changed,
+                fail_on_warnings={"ignored_type_override"}, **kw,
+            )
+        assert "Nothing was written" in str(err.value)
+        # A warning about the destination counts no rows, and says no count.
+        assert "(count" not in str(err.value), str(err.value)
+
+        r = quickhouse.sync(pg_source, ch_target, type_overrides=changed, **kw)
+        assert r.rows_written == 3
+        got = sorted((w.column, w.sample, w.count) for w in _ignored_overrides(r))
+        assert got == [
+            ("amount", "Nullable(Decimal(12, 2))", 0),
+            ("qty", "Nullable(Int32)", 0),
+        ], r.warnings
+        msg = next(w.message for w in _ignored_overrides(r) if w.column == "amount")
+        assert "'Decimal(18, 4)'" in msg and "'Nullable(Decimal(12, 2))'" in msg, msg
+        assert _ch_type(ch_client, table, "amount") == "Nullable(Decimal(12, 2))"
+        assert _ch_type(ch_client, table, "qty") == "Nullable(Int32)"
+    finally:
+        _drop_ch(ch_client, table)
+
+
+def test_a_type_override_an_existing_column_ignores_is_reported_for_a_frame(
+    ch_client, ch_target, unique_name
+):
+    """Issue #50, from a DataFrame: the same check runs on the frame path, and
+    an override keyed by the source name of a renamed column counts too."""
+    pd = pytest.importorskip("pandas")
+    table = unique_name
+    _drop_ch(ch_client, table)
+    frame = pd.DataFrame({"id": [1, 2], "amount": [1.5, 2.5]})
+    kw = dict(dest_table=table, mode="incremental", key=["id"], rename={"amount": "amt"})
+    try:
+        first = quickhouse.from_pandas(frame, ch_target, **kw)
+        assert _ignored_overrides(first) == [], first.warnings
+        assert _ch_type(ch_client, table, "amt") == "Nullable(Float64)"
+        r = quickhouse.from_pandas(
+            frame, ch_target, type_overrides={"amount": "Decimal(12, 2)"}, **kw
+        )
+        assert r.rows_written == 2
+        (w,) = _ignored_overrides(r)
+        assert (w.column, w.sample, w.count) == ("amount", "Nullable(Float64)", 0)
+        assert "'amt'" in w.message, w.message
+        assert _ch_type(ch_client, table, "amt") == "Nullable(Float64)"
+        r = quickhouse.from_pandas(frame, ch_target, type_overrides={"amt": "Float64"}, **kw)
+        assert _ignored_overrides(r) == [], r.warnings
+    finally:
+        _drop_ch(ch_client, table)
+
+
+def test_a_non_replacing_target_says_the_whole_source_only_when_the_run_reads_it(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """Issue #50: non_replacing_incremental_target said a first run with no
+    cursor writes the whole source, even with skip_to_max=True, whose first
+    run wrote nothing. The clause is there only when the run reads from the
+    start: no saved cursor, no seed_watermark, no skip_to_max."""
+    table = unique_name
+    _seed_table(pg_conn, table, 10)
+    _drop_ch(ch_client, table)
+    kw = dict(
+        dest_table=table, source_table=table, mode="incremental", watermark="write_date",
+        key=["id"],
+    )
+    whole = "the whole source"
+
+    def warned(r):
+        (w,) = [w for w in r.warnings if w.kind == "non_replacing_incremental_target"]
+        assert w.count == 0
+        return w.message
+
+    try:
+        quickhouse.sync(
+            pg_source, ch_target, dest_table=table, source_table=table, mode="full",
+            key=["id"], create_if_missing=True,
+        )
+        r = quickhouse.sync(pg_source, ch_target, skip_to_max=True, state_key=f"{table}:max", **kw)
+        assert r.rows_written == 0
+        assert whole not in warned(r)
+        r = quickhouse.sync(
+            pg_source, ch_target, seed_watermark="2024-01-01 00:00:00",
+            state_key=f"{table}:seed", **kw,
+        )
+        assert r.rows_written == 0
+        assert whole not in warned(r)
+
+        start = dict(kw, state_key=f"{table}:start")
+        fatal = {"non_replacing_incremental_target"}
+        with pytest.raises(
+            RuntimeError, match="fail_on_warnings: non_replacing_incremental_target"
+        ) as err:
+            quickhouse.sync(pg_source, ch_target, fail_on_warnings=fatal, **start)
+        assert whole in str(err.value)
+        assert "(count" not in str(err.value), str(err.value)
+        r = quickhouse.sync(pg_source, ch_target, **start)
+        assert r.rows_written == 10
+        assert whole in warned(r)
+        # With its cursor saved, the next run reads only past it.
+        r = quickhouse.sync(pg_source, ch_target, **start)
+        assert r.rows_written == 0
+        assert whole not in warned(r)
+    finally:
+        _drop_ch(ch_client, table)

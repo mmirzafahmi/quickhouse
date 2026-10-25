@@ -493,3 +493,25 @@ def test_narrowing_a_decimal_column_keeps_values_exact(ch_client, ch_target, uni
         assert [(w.column, w.count) for w in coerced] == [("amount", 1)]
     finally:
         _drop(ch_client, table)
+
+
+@pytest.mark.parametrize("mode", ["full", "incremental"])
+def test_a_row_with_no_key_is_left_out_with_a_null_key_warning(
+    ch_client, ch_target, unique_name, mode
+):
+    """Issue #49: a frame row with no key failed the run with an Arrow error.
+    It is left out now, and null_key counts every such row: incremental
+    dedupes the frame on its key first, which leaves rows with no key alone
+    rather than keep one of them."""
+    table = unique_name
+    frame = pd.DataFrame({"code": ["a", None, "c", None], "n": [1, 2, 3, 4]})
+    _drop(ch_client, table)
+    try:
+        result = quickhouse.from_pandas(frame, ch_target, dest_table=table, mode=mode, key=["code"])
+        assert (result.rows_read, result.rows_written) == (4, 2)
+        null_key = [(w.column, w.count) for w in result.warnings if w.kind == "null_key"]
+        assert null_key == [("code", 2)]
+        rows = ch_client.query(f"SELECT code, n FROM `{table}` ORDER BY code").result_rows
+        assert rows == [("a", 1), ("c", 3)]
+    finally:
+        _drop(ch_client, table)

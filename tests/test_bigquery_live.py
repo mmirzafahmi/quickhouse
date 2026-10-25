@@ -550,3 +550,126 @@ def test_a_new_full_refresh_destination_keeps_order_by_first(
     )
     assert r.rows_written == 5
     assert bq.get_table(_fq(bq, dest).strip("`")).clustering_fields == ["write_date", "id"]
+
+
+def test_a_null_key_is_left_out_of_a_merge_into_a_nullable_key_column(
+    bq, pg_conn, pg_source, bq_target, dest
+):
+    """Issue #49: into an existing table whose key column is NULLABLE, a NULL
+    key never matches in the MERGE, so each run that read the row inserted it
+    again. It is left out now, and null_key counts it."""
+    bigquery = pytest.importorskip("google.cloud.bigquery")
+    with pg_conn.cursor() as cur:
+        cur.execute(f'DROP TABLE IF EXISTS "{dest}"')
+        cur.execute(f'CREATE TABLE "{dest}" (code text, n int, write_date timestamp NOT NULL)')
+        cur.execute(
+            f"INSERT INTO \"{dest}\" VALUES ('a', 1, '2024-01-01'), (NULL, 2, '2024-01-01'), "
+            "('c', 3, '2024-01-01')"
+        )
+    bq.create_table(
+        bigquery.Table(
+            f"{bq.project}.{BQ_DATASET}.{dest}",
+            schema=[
+                bigquery.SchemaField("code", "STRING"),
+                bigquery.SchemaField("n", "INTEGER"),
+                bigquery.SchemaField("write_date", "DATETIME"),
+            ],
+        )
+    )
+    kw = dict(
+        dest_table=dest, source_table=dest, mode="incremental", watermark="write_date",
+        key=["code"], state_table_name=f"{dest}_state",
+    )
+
+    def null_keys(r):
+        return [(w.column, w.count) for w in r.warnings if w.kind == "null_key"]
+
+    r = quickhouse.sync(pg_source, bq_target, **kw)
+    assert (r.rows_read, r.rows_written) == (3, 2)
+    assert null_keys(r) == [("code", 1)]
+    # The row changes, so the next run reads it again, and leaves it out again.
+    with pg_conn.cursor() as cur:
+        cur.execute(f"UPDATE \"{dest}\" SET write_date = '2024-02-01' WHERE code IS NULL")
+    r = quickhouse.sync(pg_source, bq_target, **kw)
+    assert (r.rows_read, r.rows_written) == (1, 0)
+    assert null_keys(r) == [("code", 1)]
+    got = _rows(bq, f"SELECT COUNT(*) AS n, COUNTIF(code IS NULL) AS null_codes FROM {_fq(bq, dest)}")
+    assert (got[0].n, got[0].null_codes) == (2, 0)
+
+
+def test_a_bigquery_source_leaves_out_a_null_key(bq, bq_source, ch_client, ch_target, dest):
+    """Issue #49 on the BigQuery-source flow: a NULL in the key column failed
+    the write with an Arrow error. The row is left out, and null_key counts
+    it."""
+    bq.query(
+        f"CREATE OR REPLACE TABLE {_fq(bq, dest)} (code STRING, n INT64) AS "
+        "SELECT * FROM UNNEST([STRUCT('a' AS code, 1 AS n), STRUCT(NULL, 2), STRUCT('c', 3)])"
+    ).result()
+    ch_client.command(f"DROP TABLE IF EXISTS `{dest}`")
+    try:
+        r = quickhouse.sync(
+            bq_source, ch_target, dest_table=dest, source_table=f"{BQ_DATASET}.{dest}",
+            mode="full", key=["code"], create_if_missing=True,
+        )
+        assert (r.rows_read, r.rows_written) == (3, 2)
+        assert [(w.column, w.count) for w in r.warnings if w.kind == "null_key"] == [("code", 1)]
+        assert ch_client.command(f"SELECT count() FROM `{dest}`") == 2
+    finally:
+        ch_client.command(f"DROP TABLE IF EXISTS `{dest}`")
+
+
+def test_a_type_override_an_existing_column_ignores_is_reported_on_bigquery(
+    bq, pg_conn, pg_source, bq_target, dest
+):
+    """Issue #50 on a BigQuery destination: type_overrides applies only when
+    quickhouse creates the table, so an override naming a column the existing
+    table types differently is reported before writing. One naming the type
+    the column has, in BigQuery's other spelling (FLOAT64 for FLOAT), is not."""
+    _existing_dest(bq, dest)
+    _seed(pg_conn, dest, range(1, 6))
+    with pytest.raises(RuntimeError, match="fail_on_warnings: ignored_type_override") as err:
+        _sync(
+            pg_source, bq_target, dest, type_overrides={"amount": "NUMERIC"},
+            fail_on_warnings={"ignored_type_override"},
+        )
+    assert "on column 'amount'" in str(err.value)
+    assert "'FLOAT'" in str(err.value) and "'NUMERIC'" in str(err.value)
+    assert "(count" not in str(err.value)
+
+    r = _sync(
+        pg_source, bq_target, dest,
+        type_overrides={"amount": "FLOAT64", "id": "INT64", "write_date": "DATETIME"},
+    )
+    assert r.rows_written == 5
+    assert [w for w in r.warnings if w.kind == "ignored_type_override"] == [], r.warnings
+    types = {f.name: f.field_type for f in bq.get_table(_fq(bq, dest).strip("`")).schema}
+    assert types["amount"] == "FLOAT"
+
+
+def test_a_type_override_an_existing_column_ignores_is_reported_from_a_bigquery_source(
+    bq, bq_source, ch_client, ch_target, dest
+):
+    """Issue #50 on the BigQuery-source flow, into ClickHouse."""
+    _bq_table(
+        bq,
+        dest,
+        ", ".join(
+            f"STRUCT({i} AS id, DATETIME '2024-01-01 00:00:00' AS updated_at)" for i in range(1, 4)
+        ),
+    )
+    ch_client.command(f"DROP TABLE IF EXISTS `{dest}`")
+    kw = dict(
+        dest_table=dest, source_table=f"{BQ_DATASET}.{dest}", mode="full", key=["id"],
+        create_if_missing=True,
+    )
+    try:
+        first = quickhouse.sync(bq_source, ch_target, **kw)
+        assert [w for w in first.warnings if w.kind == "ignored_type_override"] == []
+        r = quickhouse.sync(
+            bq_source, ch_target, type_overrides={"id": "Int32", "updated_at": "DATETIME"}, **kw
+        )
+        assert r.rows_written == 3
+        got = [(w.column, w.sample) for w in r.warnings if w.kind == "ignored_type_override"]
+        assert got == [("id", "Int64")], r.warnings
+    finally:
+        ch_client.command(f"DROP TABLE IF EXISTS `{dest}`")

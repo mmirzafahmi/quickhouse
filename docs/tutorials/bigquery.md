@@ -331,12 +331,13 @@ qh.sync(src, dst, source_table="daily_sales", dest_table="daily_sales",
 ClickHouse types with no BigQuery equivalent, such as `UUID`, `IPv4`, `Enum`
 and `LowCardinality(String)`, arrive as `STRING`.
 
-```{important}
+```{note}
 If the ClickHouse table is a `ReplacingMergeTree` (as every table quickhouse
-creates for an incremental sync is), read it with `FINAL`, for example
-`source_query="SELECT * FROM orders_live FINAL"`. Otherwise rows whose old
-versions haven't been merged away yet are copied twice.
-[Designing ClickHouse tables](clickhouse-tables.md) explains why.
+creates for an incremental sync is), quickhouse reads it with `FINAL`, so rows
+whose old versions haven't been merged away yet are copied once.
+[Designing ClickHouse tables](clickhouse-tables.md) explains why. A
+`source_query` is sent as written, so add `FINAL` to it yourself, for example
+`source_query="SELECT * FROM orders_live FINAL"`.
 ```
 
 ## Recap

@@ -367,11 +367,13 @@ clusters. `source_table` can also be written `"raw.app_sessions"` to read from
 a database other than the descriptor's.
 
 ```{tip}
-quickhouse reads a ClickHouse table as it is, without `FINAL`. If the source is
-a `ReplacingMergeTree` table, it may still hold old versions of some rows (see
-[Keeping tables up to date](incremental.md)), and those are copied too. To copy
-only the newest version of each row, read through a query that adds `FINAL`,
-for example `source_query="SELECT * FROM raw.app_sessions FINAL"`.
+A `ReplacingMergeTree` table may still hold old versions of some rows (see
+[Keeping tables up to date](incremental.md)). quickhouse checks the source
+table's engine and reads such a table with `FINAL`, so only the newest version
+of each row is copied, and the log says so. A `source_query` is sent as
+written, so add `FINAL` to it yourself, for example
+`source_query="SELECT * FROM raw.app_sessions FINAL"`. To copy every stored
+version instead, pass `final=False` to the source's `qh.ClickHouse(...)`.
 ```
 
 ClickHouse-only types survive the copy. In the example, `UUID`, `IPv4`,

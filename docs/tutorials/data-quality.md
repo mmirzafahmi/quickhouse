@@ -82,23 +82,27 @@ names; the wording of the messages can change between versions.
 
 ### The warnings worth knowing
 
-quickhouse has more than twenty kinds of warning. These five mean your data
+quickhouse has more than twenty kinds of warning. These six mean your data
 changed, so they deserve the most attention:
 
 - **`null_watermark`**: some rows have an empty (`NULL`) watermark, so an
   incremental sync skips them on this run and every future one, while still
   reporting success. This is the most dangerous one.
+- **`null_key`**: some rows have an empty (`NULL`) value in a `key` column, so
+  they were left out: a key can't be empty in the destination. `count` says
+  how many.
 - **`collapsed_bool`**: a MySQL `tinyint(1)` held numbers other than 0 and 1,
   and they were squeezed into true/false, as you just saw.
 - **`coerced_decimal`**: a decimal number didn't fit the column's declared size
   (or wasn't a number at all), so it was stored as `NULL`.
 - **`coerced_date`**: a date couldn't be stored, such as MySQL's `0000-00-00` or
   a year outside ClickHouse's range of 1900 to 2299, so it was stored as
-  `NULL`.
+  `NULL`. In a key or watermark column that can't be `NULL`, the row is left
+  out instead, and the message says so.
 - **`full_refresh_shrink`**: a full refresh left the table smaller than before.
   You only see it when you allowed that with `allow_full_refresh_shrink=True`.
 
-Four more compare the run with the destination table that's already there, and
+Five more compare the run with the destination table that's already there, and
 are raised before anything is written:
 
 - **`dropped_source_column`**: a source column has no column in the ClickHouse
@@ -113,6 +117,10 @@ are raised before anything is written:
 - **`recreated_destination`**: the incremental table was dropped, so the run
   creates it again and reads from the start
   ([Keeping tables up to date](incremental.md#where-quickhouse-keeps-its-place)).
+- **`ignored_type_override`**: a `type_overrides` entry asks for a type that
+  a column of the existing table doesn't have. Overrides only apply when
+  quickhouse creates the table, so the column keeps its type
+  ([Type mapping](../guide/type-mapping.md#schema-evolution)).
 
 The complete list is in the
 [performance and safety guide](../guide/performance.md#failing-a-run-on-a-warning).
@@ -210,8 +218,8 @@ No warnings, and `priority` holds 0, 1, 2 and 3 again.
 
 ```{tip}
 A good starting set for `fail_on_warnings` is the warnings that mean data was
-lost: `null_watermark`, `collapsed_bool`, `coerced_decimal`, `coerced_date`,
-`dropped_source_column` and `unsourced_destination_column`.
+lost: `null_watermark`, `null_key`, `collapsed_bool`, `coerced_decimal`,
+`coerced_date`, `dropped_source_column` and `unsourced_destination_column`.
 Leave out any you've decided to accept, such as `coerced_date` on a legacy
 table you know is full of `0000-00-00` dates.
 ```

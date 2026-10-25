@@ -484,8 +484,13 @@ class ClickHouse:
 
     ``url``, ``database``, ``user``, ``password`` and ``settings`` apply in both
     roles. ``compression``, ``archive`` and ``insert_dedup_token`` are write-path
-    only and are ignored as a ``source=``; ``statement_timeout_secs`` is
-    read-path only and is ignored as a ``target=``.
+    only and are ignored as a ``source=``; ``statement_timeout_secs`` and
+    ``final`` are read-path only and are ignored as a ``target=``.
+
+    A ``source_table`` whose engine merges rows (a ``ReplacingMergeTree``, as
+    every table quickhouse creates for an incremental sync is) is read with
+    ``FINAL``, so old versions of a row that background merges haven't removed
+    yet aren't copied: see ``final``.
 
     Types read from a ClickHouse source keep their declared type at the
     destination where one exists — ``UUID``, ``IPv4``/``IPv6``, ``Enum8``/
@@ -564,6 +569,44 @@ class ClickHouse:
         also a no-op on engines without replicated dedup.
 
         .. versionadded:: 0.14.0
+    final:
+        *Source only.* Whether quickhouse's reads of ``source_table`` add
+        ``FINAL``, which makes ClickHouse merge a row's versions as it reads.
+
+        - ``None`` (default): add it when the table's engine merges rows that
+          share a sorting key: ``ReplacingMergeTree``, ``CollapsingMergeTree``,
+          ``VersionedCollapsingMergeTree``, ``SummingMergeTree`` and
+          ``AggregatingMergeTree``, and their ``Replicated*`` and ``Shared*``
+          forms. The engine is read from ``system.tables``, and the run logs
+          it when ``FINAL`` is added. Only the table's own engine counts, so a
+          ``Distributed`` table or a materialized view over such a table is
+          read as stored unless you pass ``True``.
+        - ``True``: always add it. ClickHouse refuses ``FINAL`` on an engine
+          that doesn't merge rows (a plain ``MergeTree``, ``Memory``, ``Log``:
+          ``ILLEGAL_FINAL``), so the run fails before anything is written. A
+          ``Distributed`` table or a materialized view passes it on to the
+          table it reads; a plain ``VIEW`` accepts it and ignores it (24.8), so
+          write ``FINAL`` inside the view instead.
+        - ``False``: never add it: every stored row is read, as before 0.20.12.
+
+        It applies to the rows read (one stream, each parallel range, each
+        ``chunk_rows`` chunk, an incremental read), the ``MAX(watermark)``
+        probe that sets the cursor, the count of NULL watermarks, and
+        ``reconcile_keys``/``reconcile_values`` reads of ``source_table``. It
+        never changes a ``source_query``, which is sent as written: put
+        ``FINAL`` in the query yourself.
+
+        ``FINAL`` costs a merge at read time: more CPU and memory, and a
+        longer read. A filter on a column outside the sorting key (a
+        ``watermark``, a ``chunk_rows`` key) is applied after the merge, so it
+        doesn't narrow what is merged; the primary key and partition pruning
+        still do. A parallel range read splits on a sorting-key column: when
+        the range column (``partition_column``, else the first ``key``) is
+        outside the sorting key, the read splits on the sorting key's first
+        column instead, or runs in one stream when that one isn't an integer,
+        and logs which.
+
+        .. versionadded:: 0.20.12
     """
 
     def __init__(
@@ -578,6 +621,7 @@ class ClickHouse:
         settings: Optional[Mapping[str, str]] = None,
         insert_dedup_token: bool = False,
         statement_timeout_secs: int = 0,
+        final: Optional[bool] = None,
     ) -> None: ...
 
 class Progress:
@@ -632,11 +676,16 @@ class TransferWarning:
       was flattened to a boolean, losing e.g. the difference between 2 and 3.
       See ``tinyint1_as_bool``.
     - ``"coerced_date"`` — a date/datetime became NULL (a zero-date, or a year
-      outside ClickHouse's representable 1900-2299 window).
+      outside ClickHouse's representable 1900-2299 window). In a column the
+      destination can't hold NULL in, the message says what happened instead:
+      the row was left out (``"null_key"``, ``"null_watermark"``), or, from an
+      API source into ClickHouse, the column's default was stored (0.20.12).
     - ``"coerced_decimal"`` — a decimal became NULL (it exceeded the declared
-      ``Decimal(P,S)``, or was NaN/Infinity).
+      ``Decimal(P,S)``, or was NaN/Infinity). In a column the destination
+      can't hold NULL in, as for ``"coerced_date"``.
     - ``"coerced_scalar"`` — an API source's scalar failed to parse and became
-      NULL.
+      NULL. In a column the destination can't hold NULL in, as for
+      ``"coerced_date"``.
     - ``"null_watermark"`` — the watermark column is nullable and rows hold a
       NULL there, so they are excluded from this and every future incremental
       run. The most dangerous of these. Also raised, with ``count`` the rows
@@ -647,7 +696,25 @@ class TransferWarning:
       that can't hold a NULL watermark, such as a ClickHouse
       ``ReplacingMergeTree`` whose version column is the watermark: a first
       read leaves those rows out unread, so only the count reports them
-      (0.20.8).
+      (0.20.8). Into such a destination it is also raised, with ``count`` the
+      rows, for rows the run read and left out because their watermark was
+      NULL: from a source with no read filter (an API, a DataFrame), or a
+      value quickhouse couldn't read (with its ``"coerced_date"``). Those
+      used to land with ``1970-01-01`` and lose to the row already stored
+      (0.20.12).
+    - ``"null_key"`` — rows were left out because a ``key`` column was NULL in
+      them. No destination can hold a NULL key: ClickHouse sorts and replaces
+      rows by it, and a NULL never matches in a BigQuery ``MERGE``, so the row
+      would be added again on every run. ``column`` is the key column and
+      ``count`` the rows left out; a row with several NULL keys counts once.
+      A value quickhouse couldn't read there counts too, beside its
+      ``"coerced_*"`` warning. ``rows_read`` includes these rows and
+      ``rows_written`` doesn't, and an incremental cursor still moves past
+      them. Every source: a database source used to fail the write with an
+      Arrow error, and an API source stored ``''`` or ``0``, so such rows
+      collapsed into one. Counted while reading, so ``fail_on_warnings``
+      stops a full refresh before its swap and an incremental run before its
+      ``MERGE`` or cursor. New in 0.20.12.
     - ``"full_refresh_shrink"`` — a full refresh left the destination smaller,
       permitted by ``allow_full_refresh_shrink``.
     - ``"unclustered_merge_target"`` — a BigQuery ``MERGE`` ran against a
@@ -776,22 +843,41 @@ class TransferWarning:
       every row it is sent, such as the plain ``MergeTree`` that
       ``mode="full"`` creates, instead of replacing a row with a newer one of
       the same key the way a ``ReplacingMergeTree`` does. Each changed row is
-      written again and the table keeps both copies; a first run, with no
-      cursor yet, writes the whole source again. Not raised when ``engine=``
-      names such an engine, which says the copies are wanted, nor for a table
-      the run creates. ``sample`` is the engine. Raised at setup, before
-      anything is written. Table-level. New in 0.20.10.
+      written again and the table keeps both copies; a run with nothing to
+      start from (no saved cursor, ``seed_watermark`` or ``skip_to_max``)
+      writes the whole source again, and only then does the message say so.
+      Not raised when ``engine=`` names such an engine, which says the copies
+      are wanted, nor for a table the run creates. ``sample`` is the engine.
+      Raised at setup, before anything is written. Table-level. New in
+      0.20.10.
+    - ``"ignored_type_override"`` — a ``type_overrides`` entry names a column
+      the existing destination already has, as another type. An override
+      only applies when quickhouse creates the table (or adds the column with
+      ``evolve_schema``), so the column keeps its type and this run's values
+      are converted to it. The same type spelled another way isn't reported:
+      ``Decimal(12,2)`` for ``Nullable(Decimal(12, 2))``, ``numeric(12, 2)``,
+      ``FLOAT64`` for BigQuery's ``FLOAT``. ``column`` is the
+      ``type_overrides`` key and ``sample`` the column's existing type.
+      ALTER the column, or drop the table so the next run creates it with
+      the override. Both destinations, every source. Raised at setup, before
+      anything is written. New in 0.20.12.
     """
 
     column: Optional[str]
     """The source column responsible, or ``None`` for a table-level condition.
     For ``"unsourced_destination_column"``, the destination column; for
-    ``"dropped_source_column"``, the source column's name before ``rename``."""
+    ``"dropped_source_column"``, the source column's name before ``rename``;
+    for ``"ignored_type_override"``, the ``type_overrides`` key."""
 
     count: int
     """How many values/rows tripped it. Aggregated per ``(kind, column)`` across
     the whole run, so a badly-legacy table yields one entry with a large count
-    rather than millions of entries."""
+    rather than millions of entries. ``0`` for a warning about the destination
+    or the run's setup rather than about rows, such as those raised before
+    anything is written: ``"unsourced_destination_column"``,
+    ``"dropped_source_column"``, ``"recreated_destination"``,
+    ``"non_replacing_incremental_target"`` and ``"ignored_type_override"``.
+    A ``fail_on_warnings`` error leaves a count of ``0`` out."""
 
     sample: Optional[str]
     """A representative offending value where one was free to capture at the
@@ -1290,7 +1376,9 @@ def sync(
       ClickHouse has written its rows, but the cursor isn't saved, so the next
       run reads the same range again. The error names the kind, the column, the
       count and what was left in place. An unknown kind is an error. New in
-      0.20.7.
+      0.20.7. A kind counted while reading, such as ``"null_key"``, is checked
+      at the first of those steps after the read; an append, which writes as
+      it reads and saves its cursor first, is checked after both.
     - ``column_transforms={col: "<SQL expr>"}`` applies a per-column SQL value
       transform in the source SELECT (e.g. ``{"amt": "ROUND(amt, 9)"}``,
       ``{"ts": "ts AT TIME ZONE 'UTC'"}``) over ``source_table=`` — so range
@@ -1765,9 +1853,10 @@ def reconcile_values(
       ``DEFAULT``, or its type's default (``0``, ``''``): that matches a source
       NULL, and over a source value it counts as ``null_in_dest_only``.
     - The destination is read with ``FINAL`` where its engine merges rows (a
-      ``ReplacingMergeTree`` holds several rows per key until it merges). A key
-      that still appears more than once, on either side, is counted in
-      ``duplicate_keys`` and left out.
+      ``ReplacingMergeTree`` holds several rows per key until it merges). A
+      ClickHouse ``source_table`` is read as a sync reads it, by the source
+      descriptor's ``final``. A key that still appears more than once, on
+      either side, is counted in ``duplicate_keys`` and left out.
 
     :param key: The identifying column, present on both sides under the same
         name. Matched by typed value, so an ``int4`` key matches an ``Int64``

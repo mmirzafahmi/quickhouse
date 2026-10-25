@@ -105,12 +105,13 @@ time later the background merge catches up, and the plain query returns the
 same answer. You can't predict when, so **use `FINAL` whenever you read a
 `ReplacingMergeTree` table**, in dashboards, reports and anywhere else.
 
-```{important}
-The same applies when you *copy* the table somewhere else. If you use this
-ClickHouse table as a quickhouse source, read it with
-`source_query="SELECT * FROM orders_live FINAL"`. A plain `source_table` reads
-every stored version, so an order whose old version hasn't been removed yet is
-copied twice.
+```{note}
+The same applies when you *copy* the table somewhere else, and quickhouse
+handles it for you. When this table is a quickhouse `source_table`, quickhouse
+sees that it's a `ReplacingMergeTree` and reads it with `FINAL`, so an order
+whose old version hasn't been removed yet is copied once. If you read it
+through a `source_query` instead, write `FINAL` in the query yourself:
+`source_query="SELECT * FROM orders_live FINAL"`.
 ```
 
 ### Why an incremental table needs a key
