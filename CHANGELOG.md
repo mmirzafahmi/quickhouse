@@ -9,6 +9,8 @@ any breaking change is called out explicitly.
 
 ## [Unreleased]
 
+## [0.20.11] — 2026-10-25
+
 ### Changed — please read before upgrading
 - **A `key` that names no destination column is a config error.** `key` takes
   destination names, after `rename`, `include` and `exclude`. A source name
