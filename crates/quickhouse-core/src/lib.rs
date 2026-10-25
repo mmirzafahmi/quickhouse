@@ -23,6 +23,7 @@ pub mod decode_mysql;
 pub mod error;
 pub mod host;
 pub mod memory;
+mod null_guard;
 pub mod reconcile;
 pub mod reconcile_values;
 pub mod sink;

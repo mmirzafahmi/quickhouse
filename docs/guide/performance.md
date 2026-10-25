@@ -327,7 +327,12 @@ if the run created it, left empty). An
 incremental that inserts straight into ClickHouse has written its rows, but the
 cursor isn't saved, so once the cause is fixed the next run reads the same range
 again (a `ReplacingMergeTree` converges on it). The error names the kind, the
-column, the count and what was left in place.
+column, the count and what was left in place. Kinds counted while reading, such
+as `null_key` and the `coerced_*` kinds, are checked at the first of those steps
+after the read, so `fail_on_warnings={"null_key"}` stops a full refresh before
+its swap and an incremental run before its `MERGE` or cursor. An append, and a
+DataFrame written straight into the destination, have nothing left to hold back
+by then: they write as they read, so the check comes after the write.
 
 Raising on `result.warnings` after `sync()` returns can't do that. By then the
 cursor is saved: the run goes red once, the orchestrator's retry starts past
@@ -339,11 +344,12 @@ Each warning carries `.kind` (stable, machine-readable — match on this, never 
 
 | `kind` | What happened |
 | --- | --- |
-| `null_watermark` | The watermark column is nullable and rows hold `NULL` there. `WHERE watermark > x` never matches `NULL`, so those rows are excluded from this and **every future** incremental run. The most dangerous one — the transfer reports success while permanently dropping rows. Also raised when an incremental read returns rows and none has a watermark: there is no cursor to save, so every run re-reads them all. |
+| `null_watermark` | The watermark column is nullable and rows hold `NULL` there. `WHERE watermark > x` never matches `NULL`, so those rows are excluded from this and **every future** incremental run. The most dangerous one — the transfer reports success while permanently dropping rows. Also raised when an incremental read returns rows and none has a watermark: there is no cursor to save, so every run re-reads them all. And raised, with the count, for rows the run read and left out because their watermark was `NULL` where the destination's can't be, such as a `ReplacingMergeTree`'s version column: from a source with no read filter (an API, a DataFrame), or a value quickhouse couldn't read (a `coerced_date`). Those rows used to land with `1970-01-01` and lose to the row already stored (0.20.12). |
+| `null_key` | Rows were left out because a `key` column was `NULL` in them. No destination can hold a `NULL` key: ClickHouse sorts and replaces rows by it, and a `NULL` never matches in a BigQuery `MERGE`, so the row would be added again on every run. `column` is the key column and `count` the rows left out; a row with several `NULL` keys counts once. A value quickhouse couldn't read there counts too, beside its `coerced_*` warning. `rows_read` includes these rows and `rows_written` doesn't, and an incremental cursor still moves past them. A database source used to fail the write with an Arrow error, and an API source stored `''` or `0`, so such rows collapsed into one (0.20.12). |
 | `collapsed_bool` | A MySQL `tinyint(1)` value outside `{0, 1}` was flattened to a boolean, losing e.g. the difference between 2 and 3. `type_overrides` can't repair it after the fact, so early detection is the only defence — see `tinyint1_as_bool=False`. |
-| `coerced_decimal` | A decimal became `NULL`: it exceeded the declared `Decimal(P,S)`, or was NaN/Infinity. Silent data loss with a correct-looking row count. |
-| `coerced_date` | A date/datetime became `NULL` — a zero-date, or a year outside ClickHouse's representable 1900–2299 window. |
-| `coerced_scalar` | An API source's scalar didn't parse as its declared type and became `NULL`. |
+| `coerced_decimal` | A decimal became `NULL`: it exceeded the declared `Decimal(P,S)`, or was NaN/Infinity. Silent data loss with a correct-looking row count. In a column the destination can't hold `NULL` in, the message says what happened instead: the row was left out (`null_key`, `null_watermark`), or, from an API source into ClickHouse, the column's default was stored. |
+| `coerced_date` | A date/datetime became `NULL` — a zero-date, or a year outside ClickHouse's representable 1900–2299 window. In a column the destination can't hold `NULL` in, as for `coerced_decimal`. |
+| `coerced_scalar` | An API source's scalar didn't parse as its declared type and became `NULL`. In a column the destination can't hold `NULL` in, as for `coerced_decimal`. |
 | `full_refresh_shrink` | A full refresh left the destination smaller than it was, permitted by `allow_full_refresh_shrink=True`. (Without that flag the same condition is a hard error.) |
 | `unclustered_merge_target` | A BigQuery `MERGE` ran against a destination not clustered by the merge key, so the key bound pruned nothing and the statement scanned the whole table. A cost problem, not a data one. |
 | `watermark_not_advanced` | The `MAX(watermark)` probe found a value past the run's lower bound, yet the read returned 0 rows. The row holding that MAX matches the filter, so the cursor and the predicate disagree: the cursor may never advance again. Only raised when the probe ran. |

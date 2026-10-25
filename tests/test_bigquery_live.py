@@ -550,3 +550,69 @@ def test_a_new_full_refresh_destination_keeps_order_by_first(
     )
     assert r.rows_written == 5
     assert bq.get_table(_fq(bq, dest).strip("`")).clustering_fields == ["write_date", "id"]
+
+
+def test_a_null_key_is_left_out_of_a_merge_into_a_nullable_key_column(
+    bq, pg_conn, pg_source, bq_target, dest
+):
+    """Issue #49: into an existing table whose key column is NULLABLE, a NULL
+    key never matches in the MERGE, so each run that read the row inserted it
+    again. It is left out now, and null_key counts it."""
+    bigquery = pytest.importorskip("google.cloud.bigquery")
+    with pg_conn.cursor() as cur:
+        cur.execute(f'DROP TABLE IF EXISTS "{dest}"')
+        cur.execute(f'CREATE TABLE "{dest}" (code text, n int, write_date timestamp NOT NULL)')
+        cur.execute(
+            f"INSERT INTO \"{dest}\" VALUES ('a', 1, '2024-01-01'), (NULL, 2, '2024-01-01'), "
+            "('c', 3, '2024-01-01')"
+        )
+    bq.create_table(
+        bigquery.Table(
+            f"{bq.project}.{BQ_DATASET}.{dest}",
+            schema=[
+                bigquery.SchemaField("code", "STRING"),
+                bigquery.SchemaField("n", "INTEGER"),
+                bigquery.SchemaField("write_date", "DATETIME"),
+            ],
+        )
+    )
+    kw = dict(
+        dest_table=dest, source_table=dest, mode="incremental", watermark="write_date",
+        key=["code"], state_table_name=f"{dest}_state",
+    )
+
+    def null_keys(r):
+        return [(w.column, w.count) for w in r.warnings if w.kind == "null_key"]
+
+    r = quickhouse.sync(pg_source, bq_target, **kw)
+    assert (r.rows_read, r.rows_written) == (3, 2)
+    assert null_keys(r) == [("code", 1)]
+    # The row changes, so the next run reads it again, and leaves it out again.
+    with pg_conn.cursor() as cur:
+        cur.execute(f"UPDATE \"{dest}\" SET write_date = '2024-02-01' WHERE code IS NULL")
+    r = quickhouse.sync(pg_source, bq_target, **kw)
+    assert (r.rows_read, r.rows_written) == (1, 0)
+    assert null_keys(r) == [("code", 1)]
+    got = _rows(bq, f"SELECT COUNT(*) AS n, COUNTIF(code IS NULL) AS nulls FROM {_fq(bq, dest)}")
+    assert (got[0].n, got[0].nulls) == (2, 0)
+
+
+def test_a_bigquery_source_leaves_out_a_null_key(bq, bq_source, ch_client, ch_target, dest):
+    """Issue #49 on the BigQuery-source flow: a NULL in the key column failed
+    the write with an Arrow error. The row is left out, and null_key counts
+    it."""
+    bq.query(
+        f"CREATE OR REPLACE TABLE {_fq(bq, dest)} (code STRING, n INT64) AS "
+        "SELECT * FROM UNNEST([STRUCT('a' AS code, 1 AS n), STRUCT(NULL, 2), STRUCT('c', 3)])"
+    ).result()
+    ch_client.command(f"DROP TABLE IF EXISTS `{dest}`")
+    try:
+        r = quickhouse.sync(
+            bq_source, ch_target, dest_table=dest, source_table=f"{BQ_DATASET}.{dest}",
+            mode="full", key=["code"], create_if_missing=True,
+        )
+        assert (r.rows_read, r.rows_written) == (3, 2)
+        assert [(w.column, w.count) for w in r.warnings if w.kind == "null_key"] == [("code", 1)]
+        assert ch_client.command(f"SELECT count() FROM `{dest}`") == 2
+    finally:
+        ch_client.command(f"DROP TABLE IF EXISTS `{dest}`")

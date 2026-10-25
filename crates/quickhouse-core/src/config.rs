@@ -1926,18 +1926,44 @@ pub enum WarningKind {
     /// [`TransferConfig::tinyint1_as_bool`].
     CollapsedBool,
     /// A date/datetime was coerced to NULL: a zero-date, or a year outside
-    /// ClickHouse's representable `[1900, 2299]` window.
+    /// ClickHouse's representable `[1900, 2299]` window. In a column the
+    /// destination can't hold NULL in, the row was left out instead
+    /// ([`WarningKind::NullKey`], [`WarningKind::NullWatermark`]), or, from an
+    /// API source into ClickHouse, the column's default was stored; the
+    /// message says which.
     CoercedDate,
     /// A decimal was coerced to NULL: it exceeded the declared `Decimal(P,S)`
-    /// precision, or was NaN/Infinity.
+    /// precision, or was NaN/Infinity. In a column the destination can't hold
+    /// NULL in, as for [`WarningKind::CoercedDate`].
     CoercedDecimal,
     /// An API source's scalar (int/float/bool/bytes) failed to parse -> NULL.
+    /// In a column the destination can't hold NULL in, as for
+    /// [`WarningKind::CoercedDate`].
     CoercedScalar,
     /// The incremental watermark column is nullable and rows currently hold a
     /// NULL there. `WHERE watermark > x` never matches NULL, so those rows are
     /// excluded from this and every future incremental run — silently, and
     /// permanently. The most dangerous condition in this list.
+    ///
+    /// Also raised, with `count` the rows, when rows the run read were left
+    /// out because their watermark was NULL where the destination's can't be
+    /// (a ClickHouse `ReplacingMergeTree`'s version column): from a source
+    /// with no read filter (an API, a DataFrame), or a value the decoder
+    /// couldn't read. These used to land with the type's default, which lost
+    /// to the row already stored, or fail the insert.
     NullWatermark,
+    /// Rows were left out because a `key` column was NULL in them, which no
+    /// destination can hold: a ClickHouse sorting key can't be NULL, and in a
+    /// BigQuery `MERGE` a NULL key never matches, so the row would be inserted
+    /// again on every run. `column` is the key column (as `key` names it) and
+    /// `count` the rows left out; a row with several NULL keys counts once,
+    /// against the first. A value the decoder couldn't read counts too (with
+    /// its `coerced_*` warning). Counted while reading, so `fail_on_warnings`
+    /// acts on it at the swap, `MERGE`, cursor or chunk commit that follows.
+    /// A database source used to fail the write with an Arrow error, and an
+    /// API source stored the type's default (`''`, `0`), so such rows
+    /// collapsed into one.
+    NullKey,
     /// A full refresh left the destination with fewer rows than it had, and
     /// `allow_full_refresh_shrink` permitted it. (Without that flag the same
     /// condition is a hard error, not a warning.)
@@ -2096,6 +2122,7 @@ impl WarningKind {
             WarningKind::CoercedDecimal => "coerced_decimal",
             WarningKind::CoercedScalar => "coerced_scalar",
             WarningKind::NullWatermark => "null_watermark",
+            WarningKind::NullKey => "null_key",
             WarningKind::FullRefreshShrink => "full_refresh_shrink",
             WarningKind::UnclusteredMergeTarget => "unclustered_merge_target",
             WarningKind::IgnoredSourceArchive => "ignored_source_archive",
@@ -2123,12 +2150,13 @@ impl WarningKind {
     }
 
     /// Every kind, in declaration order.
-    pub const ALL: [WarningKind; 23] = [
+    pub const ALL: [WarningKind; 24] = [
         WarningKind::CollapsedBool,
         WarningKind::CoercedDate,
         WarningKind::CoercedDecimal,
         WarningKind::CoercedScalar,
         WarningKind::NullWatermark,
+        WarningKind::NullKey,
         WarningKind::FullRefreshShrink,
         WarningKind::UnindexedWatermark,
         WarningKind::UnclusteredMergeTarget,
@@ -2583,6 +2611,7 @@ mod tests {
             | WarningKind::CoercedDecimal
             | WarningKind::CoercedScalar
             | WarningKind::NullWatermark
+            | WarningKind::NullKey
             | WarningKind::FullRefreshShrink
             | WarningKind::UnindexedWatermark
             | WarningKind::UnclusteredMergeTarget

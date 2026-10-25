@@ -79,6 +79,14 @@ this is where the destinations differ:
   **required** for BigQuery incremental syncs (unlike everywhere else, where it
   is optional). The MERGE bills for bytes scanned but is naturally idempotent.
 
+A row whose `key` is `NULL` can't be deduplicated on either: ClickHouse doesn't
+allow `NULL` in a sorting key, and a `NULL` never matches in a `MERGE`. Every
+mode and source leaves such a row out and counts it in a `null_key` warning
+(before 0.20.12, a database source failed the write and an API source stored
+`''` or `0` there). Likewise, a row whose watermark is `NULL` is left out of a
+`ReplacingMergeTree`, whose version column can't be `NULL`, and counted in
+`null_watermark`.
+
 ### Recreating the destination
 
 `engine`, `order_by`, `partition_by` and `type_overrides` only apply when a

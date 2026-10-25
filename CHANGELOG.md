@@ -9,6 +9,63 @@ any breaking change is called out explicitly.
 
 ## [Unreleased]
 
+### Changed — please read before upgrading
+- **A row with a NULL `key` is left out and counted in a new warning,
+  `null_key`, on every source.** No destination can hold a NULL key:
+  ClickHouse doesn't allow NULL in a sorting key, and in a BigQuery `MERGE` a
+  NULL key never matches, so the row would be inserted again on every run. A
+  database source (PostgreSQL, MySQL, ClickHouse, BigQuery) with a nullable
+  key column failed the write partway, with Arrow's `Column 'code' is
+  declared as non-nullable but contains null values`, which named neither
+  `key` nor a fix; a DataFrame failed the same way. An API source (`HttpApi`,
+  `CleverTap`, `AppsFlyer`) stored the type's default instead (`''`, or `0`
+  for an INTEGER key that didn't parse), with no warning, so such records
+  shared one key and collapsed into one row. Every source now leaves the row
+  out, in every mode, and raises `null_key` naming the key column (as `key`
+  names it), with `count` the rows left out; a row with several NULL keys
+  counts once. `rows_read` includes them and `rows_written` doesn't, an
+  `archive` doesn't hold them either, and an incremental cursor moves past
+  them, as a cursor taken from the source's `MAX` always did.
+  `fail_on_warnings={"null_key"}` stops the run at the first step that would
+  make anything permanent after the read: a full refresh before its swap, an
+  incremental run before its `MERGE` or its cursor, a `chunk_rows` read
+  before the chunk is committed. A run that failed with the Arrow error now
+  succeeds, without those rows: name `null_key` in `fail_on_warnings` to keep
+  it failing. A DataFrame's incremental de-duplication on `key` leaves rows
+  with a NULL key alone, so `null_key` counts each of them. (#49, #45)
+
+### Fixed
+- **A NULL watermark is left out of a `ReplacingMergeTree`, as on a database
+  source, instead of landing as `1970-01-01`.** The watermark is a
+  `ReplacingMergeTree`'s version column, which can't be NULL. An API source's
+  watermark that was missing, or that couldn't be read (a 12-digit number, a
+  year past 2299), landed as `1970-01-01 00:00:00`, so a newer version of a
+  row lost to the one already stored, with only a `coerced_date` warning that
+  said the value was "coerced to NULL" and no `null_watermark`. A database
+  source's read already leaves NULL watermarks out; a value its decoder
+  couldn't read (a MySQL zero-date) failed the insert with an Arrow error.
+  Every source now leaves those rows out and reports them in
+  `null_watermark`, with `count` the rows. Where the destination's watermark
+  can hold NULL (BigQuery, or a ClickHouse table whose version column isn't
+  the watermark), the row still lands with a NULL there. (#49)
+- **A ClickHouse source with a nullable watermark reads into a
+  `ReplacingMergeTree`.** The read casts each column to its destination type,
+  and ClickHouse evaluates that cast on rows the `IS NOT NULL` filter goes on
+  to drop, so a NULL watermark failed the whole read with
+  `Code: 349 CANNOT_INSERT_NULL_IN_ORDINARY_COLUMN`, as did a NULL in a
+  nullable key column. The cast keeps NULL in those two columns now; the
+  filter leaves the NULL-watermark rows out, `null_watermark` counts them as
+  before, and a NULL key is left out with `null_key`. (#49)
+- **`coerced_date`, `coerced_decimal` and `coerced_scalar` say what became of
+  the value.** They said the value was "coerced to NULL" even where the row
+  was then left out, or, from an API source into a ClickHouse column that
+  can't be NULL (an `order_by` column, say), where ClickHouse stored the
+  column's default instead. The message now says the row was left out (and
+  which warning counts it), or that the default was stored. A refused full
+  refresh, and the `full_refresh_shrink` warning, also say how many rows the
+  run left out for a NULL key or watermark, since those count as lost
+  there. (#49)
+
 ## [0.20.11] — 2026-10-25
 
 ### Changed — please read before upgrading

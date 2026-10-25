@@ -632,11 +632,16 @@ class TransferWarning:
       was flattened to a boolean, losing e.g. the difference between 2 and 3.
       See ``tinyint1_as_bool``.
     - ``"coerced_date"`` — a date/datetime became NULL (a zero-date, or a year
-      outside ClickHouse's representable 1900-2299 window).
+      outside ClickHouse's representable 1900-2299 window). In a column the
+      destination can't hold NULL in, the message says what happened instead:
+      the row was left out (``"null_key"``, ``"null_watermark"``), or, from an
+      API source into ClickHouse, the column's default was stored (0.20.12).
     - ``"coerced_decimal"`` — a decimal became NULL (it exceeded the declared
-      ``Decimal(P,S)``, or was NaN/Infinity).
+      ``Decimal(P,S)``, or was NaN/Infinity). In a column the destination
+      can't hold NULL in, as for ``"coerced_date"``.
     - ``"coerced_scalar"`` — an API source's scalar failed to parse and became
-      NULL.
+      NULL. In a column the destination can't hold NULL in, as for
+      ``"coerced_date"``.
     - ``"null_watermark"`` — the watermark column is nullable and rows hold a
       NULL there, so they are excluded from this and every future incremental
       run. The most dangerous of these. Also raised, with ``count`` the rows
@@ -647,7 +652,25 @@ class TransferWarning:
       that can't hold a NULL watermark, such as a ClickHouse
       ``ReplacingMergeTree`` whose version column is the watermark: a first
       read leaves those rows out unread, so only the count reports them
-      (0.20.8).
+      (0.20.8). Into such a destination it is also raised, with ``count`` the
+      rows, for rows the run read and left out because their watermark was
+      NULL: from a source with no read filter (an API, a DataFrame), or a
+      value quickhouse couldn't read (with its ``"coerced_date"``). Those
+      used to land with ``1970-01-01`` and lose to the row already stored
+      (0.20.12).
+    - ``"null_key"`` — rows were left out because a ``key`` column was NULL in
+      them. No destination can hold a NULL key: ClickHouse sorts and replaces
+      rows by it, and a NULL never matches in a BigQuery ``MERGE``, so the row
+      would be added again on every run. ``column`` is the key column and
+      ``count`` the rows left out; a row with several NULL keys counts once.
+      A value quickhouse couldn't read there counts too, beside its
+      ``"coerced_*"`` warning. ``rows_read`` includes these rows and
+      ``rows_written`` doesn't, and an incremental cursor still moves past
+      them. Every source: a database source used to fail the write with an
+      Arrow error, and an API source stored ``''`` or ``0``, so such rows
+      collapsed into one. Counted while reading, so ``fail_on_warnings``
+      stops a full refresh before its swap and an incremental run before its
+      ``MERGE`` or cursor. New in 0.20.12.
     - ``"full_refresh_shrink"`` — a full refresh left the destination smaller,
       permitted by ``allow_full_refresh_shrink``.
     - ``"unclustered_merge_target"`` — a BigQuery ``MERGE`` ran against a
@@ -1290,7 +1313,9 @@ def sync(
       ClickHouse has written its rows, but the cursor isn't saved, so the next
       run reads the same range again. The error names the kind, the column, the
       count and what was left in place. An unknown kind is an error. New in
-      0.20.7.
+      0.20.7. A kind counted while reading, such as ``"null_key"``, is checked
+      at the first of those steps after the read; an append, which writes as
+      it reads and saves its cursor first, is checked after both.
     - ``column_transforms={col: "<SQL expr>"}`` applies a per-column SQL value
       transform in the source SELECT (e.g. ``{"amt": "ROUND(amt, 9)"}``,
       ``{"ts": "ts AT TIME ZONE 'UTC'"}``) over ``source_table=`` — so range

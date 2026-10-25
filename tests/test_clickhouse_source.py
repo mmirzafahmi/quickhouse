@@ -573,3 +573,62 @@ def test_read_idle_timeout_secs_times_the_wait_for_the_first_block(
         assert r.read_secs >= 1.5, r.read_secs
     finally:
         _drop(ch_client, src, dst)
+
+
+def test_a_null_key_is_left_out_with_a_null_key_warning(
+    ch_client, ch_source, ch_target, unique_name
+):
+    """Issue #49: a Nullable source column used as the key failed the write
+    with an Arrow error on its first NULL. The row is left out now, and
+    null_key counts it."""
+    src, dst = f"{unique_name}_src", unique_name
+    _drop(ch_client, src, dst)
+    ch_client.command(
+        f"CREATE TABLE `{src}` (id Int64, code Nullable(String)) ENGINE = MergeTree ORDER BY id"
+    )
+    ch_client.command(f"INSERT INTO `{src}` VALUES (1, 'a'), (2, NULL), (3, 'c')")
+    try:
+        r = quickhouse.sync(
+            ch_source, ch_target, source_table=src, dest_table=dst, mode="full", key=["code"],
+            create_if_missing=True,
+        )
+        assert (r.rows_read, r.rows_written) == (3, 2)
+        assert [(w.column, w.count) for w in r.warnings if w.kind == "null_key"] == [("code", 1)]
+        rows = ch_client.query(f"SELECT id, code FROM `{dst}` ORDER BY id").result_rows
+        assert rows == [(1, "a"), (3, "c")]
+    finally:
+        _drop(ch_client, src, dst)
+
+
+def test_a_nullable_watermark_reads_into_a_replacing_merge_tree(
+    ch_client, ch_source, ch_target, unique_name
+):
+    """Issue #49: the read casts each column to its destination type, and a
+    ReplacingMergeTree's version column (the watermark) can't be NULL, so it
+    cast to the non-Nullable type. ClickHouse evaluates that cast on rows the
+    `IS NOT NULL` filter goes on to drop, and the read failed with
+    `Code: 349 CANNOT_INSERT_NULL_IN_ORDINARY_COLUMN`. The cast keeps NULL
+    now: the filter leaves those rows out, and null_watermark counts them."""
+    src, dst = f"{unique_name}_src", unique_name
+    _drop(ch_client, src, dst)
+    ch_client.command(
+        f"CREATE TABLE `{src}` (id Int64, v Int64, updated_at Nullable(DateTime)) "
+        "ENGINE = MergeTree ORDER BY id SETTINGS index_granularity = 64"
+    )
+    # NULL on every 97th row: 21 of 2,000.
+    ch_client.command(
+        f"INSERT INTO `{src}` SELECT number + 1, number, "
+        "if(number % 97 = 0, NULL, toDateTime('2024-01-01 00:00:00') + number) "
+        "FROM numbers(2000)"
+    )
+    try:
+        r = quickhouse.sync(
+            ch_source, ch_target, source_table=src, dest_table=dst, mode="incremental",
+            watermark="updated_at", key=["id"], create_if_missing=True, state_key=dst,
+        )
+        assert (r.rows_read, r.rows_written) == (1979, 1979)
+        null = [(w.column, w.count) for w in r.warnings if w.kind == "null_watermark"]
+        assert null == [("updated_at", 21)], r.warnings
+        assert ch_client.command(f"SELECT count() FROM `{dst}`") == 1979
+    finally:
+        _drop(ch_client, src, dst)

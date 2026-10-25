@@ -2062,3 +2062,142 @@ def test_an_incremental_run_into_a_table_that_keeps_duplicates_is_reported_befor
         assert ch_client.command(f"SELECT count() FROM `{table}` FINAL") == 10
     finally:
         _drop_ch(ch_client, table)
+
+
+def _null_key_table(pg_conn, table):
+    """Keyed on a nullable `code`, NULL on ids 2 and 4. Id 4 holds the newest
+    write_date."""
+    with pg_conn.cursor() as cur:
+        cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+        cur.execute(f'CREATE TABLE "{table}" (id bigint, code text, write_date timestamp NOT NULL)')
+        cur.execute(
+            f"INSERT INTO \"{table}\" VALUES "
+            "(1, 'A', '2024-01-01'), (2, NULL, '2024-01-02'), (3, 'C', '2024-01-03'), "
+            "(4, NULL, '2024-01-09'), (5, 'E', '2024-01-05')"
+        )
+
+
+def _null_keys(result):
+    return [(w.column, w.count) for w in result.warnings if w.kind == "null_key"]
+
+
+def test_a_null_key_from_postgres_is_left_out_with_a_null_key_warning(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """Issue #49: a NULL in a nullable key column failed the write partway with
+    Arrow's "Column 'code' is declared as non-nullable but contains null
+    values", which named neither `key` nor a fix. The row is left out now, and
+    null_key names the column and counts it. The cursor moves past such a row
+    like past any other row the run read, whether it is the MAX or comes from
+    the rows read."""
+    table = unique_name
+    _null_key_table(pg_conn, table)
+    _drop_ch(ch_client, table)
+    try:
+        full = quickhouse.sync(
+            pg_source, ch_target, dest_table=table, source_table=table, mode="full", key=["code"]
+        )
+        assert (full.rows_read, full.rows_written) == (5, 3)
+        assert _null_keys(full) == [("code", 2)]
+        assert "left out" in [w for w in full.warnings if w.kind == "null_key"][0].message
+        rows = sorted(ch_client.query(f"SELECT code FROM `{table}`").result_rows)
+        assert rows == [("A",), ("C",), ("E",)]
+
+        kw = dict(
+            dest_table=table, source_table=table, mode="incremental", watermark="write_date",
+            key=["code"], create_if_missing=True, state_key=table,
+        )
+        for extra in ({}, {"probe_max_cost": 1.0, "lookback_seconds": 60}):
+            _drop_ch(ch_client, table)
+            r = quickhouse.sync(pg_source, ch_target, **kw, **extra)
+            assert (r.rows_read, r.rows_written) == (5, 3), extra
+            assert _null_keys(r) == [("code", 2)], extra
+            assert r.new_watermark.startswith("2024-01-09"), (extra, r.new_watermark)
+    finally:
+        _drop_ch(ch_client, table)
+
+
+def test_fail_on_null_key_stops_a_postgres_run_before_it_commits(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """Issue #49: null_key is counted while reading, so fail_on_warnings checks
+    it where each run commits. A full refresh stops before its swap, and the
+    destination keeps its rows. An incremental run into a ReplacingMergeTree
+    stops before its cursor is saved, so the next run reads the rows again."""
+    table, inc = unique_name, f"{unique_name}_inc"
+    _null_key_table(pg_conn, table)
+    _drop_ch(ch_client, table)
+    _drop_ch(ch_client, inc)
+    fatal = {"null_key"}
+    try:
+        full = dict(dest_table=table, source_table=table, mode="full", key=["code"])
+        quickhouse.sync(pg_source, ch_target, **full)
+        with pg_conn.cursor() as cur:
+            cur.execute(f"INSERT INTO \"{table}\" VALUES (6, 'F', '2024-01-06')")
+        with pytest.raises(RuntimeError, match="fail_on_warnings: null_key on column 'code'") as err:
+            quickhouse.sync(pg_source, ch_target, fail_on_warnings=fatal, **full)
+        assert "(count 2)" in str(err.value), err.value
+        assert "untouched" in str(err.value), err.value
+        assert ch_client.command(f"SELECT count() FROM `{table}`") == 3
+
+        kw = dict(
+            dest_table=inc, source_table=table, mode="incremental", watermark="write_date",
+            key=["code"], create_if_missing=True, state_key=inc,
+        )
+        with pytest.raises(RuntimeError, match="fail_on_warnings: null_key") as err:
+            quickhouse.sync(pg_source, ch_target, fail_on_warnings=fatal, **kw)
+        assert "the cursor was not saved" in str(err.value), err.value
+        assert ch_client.command(
+            f"SELECT count() FROM _quickhouse_state WHERE source_table = '{inc}'"
+        ) == 0
+        r = quickhouse.sync(pg_source, ch_target, **kw)
+        assert (r.rows_read, r.rows_written) == (6, 4)
+
+        # Staged (validate= stages a ClickHouse incremental run): it stops
+        # before the insert-select from staging, and the gate never runs.
+        gated = []
+        staged = dict(kw, dest_table=f"{inc}_stg", state_key=f"{inc}_stg")
+        with pytest.raises(RuntimeError, match="fail_on_warnings: null_key") as err:
+            quickhouse.sync(
+                pg_source, ch_target, fail_on_warnings=fatal, validate=gated.append, **staged
+            )
+        assert "Nothing was merged in" in str(err.value), err.value
+        assert gated == []
+        assert ch_client.command(f"SELECT count() FROM `{inc}_stg`") == 0
+    finally:
+        _drop_ch(ch_client, table)
+        _drop_ch(ch_client, inc)
+        _drop_ch(ch_client, f"{inc}_stg")
+
+
+def test_a_chunked_read_leaves_null_keys_out_and_keeps_going(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """Issue #49: a chunk_rows read takes its keyset cursor from every row it
+    read, so a chunk whose rows are all left out for a NULL key still moves
+    the cursor on, and the rows around it all land."""
+    table = unique_name
+    with pg_conn.cursor() as cur:
+        cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+        cur.execute(
+            f'CREATE TABLE "{table}" (id bigint PRIMARY KEY, code text, write_date timestamp NOT NULL)'
+        )
+        cur.execute(
+            f"INSERT INTO \"{table}\" SELECT g, "
+            "CASE WHEN g IN (3, 4, 7) THEN NULL ELSE 'c' || g END, "
+            "timestamp '2024-01-01' + g * interval '1 hour' FROM generate_series(1, 9) g"
+        )
+    _drop_ch(ch_client, table)
+    kw = dict(
+        dest_table=table, source_table=table, mode="incremental", watermark="write_date",
+        key=["id", "code"], create_if_missing=True, chunk_rows=2, state_key=table,
+    )
+    try:
+        r = quickhouse.sync(pg_source, ch_target, **kw)
+        assert (r.rows_read, r.rows_written) == (9, 6)
+        assert _null_keys(r) == [("code", 3)]
+        ids = [i for (i,) in ch_client.query(f"SELECT id FROM `{table}` ORDER BY id").result_rows]
+        assert ids == [1, 2, 5, 6, 8, 9]
+        assert _latest_state(ch_client, table) == ("2024-01-01 09:00:00", "", "")
+    finally:
+        _drop_ch(ch_client, table)

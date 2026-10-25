@@ -157,13 +157,16 @@ read a second time replaces its first copy instead of being added again.
 saved date, which catches events that CleverTap receives late, for example from
 phones that were offline. It never reaches back before `from_date`.
 
-### Two warnings to watch
+### Three warnings to watch
 
 - **`incomplete_export`**: the export ended in a way that suggests some records
   were missing, while the run still succeeded. Compare the row count with
   CleverTap's own dashboard for that day.
 - **`coerced_scalar`**: a value didn't match its declared type and became
   `NULL`. Usually a sign that a column's type or path is wrong.
+- **`null_key`**: records with no value in a `key` column were left out, since
+  a key can't be empty. Check the column's path, or pick a key every record
+  has.
 
 Your credentials stay hidden: `print(src)` shows the account ID and passcode
 as `***`.

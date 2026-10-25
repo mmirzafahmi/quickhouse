@@ -4,6 +4,8 @@
 //! [`Source`] enum; everything downstream of "decode into Arrow batches" is
 //! source-agnostic.
 
+use std::borrow::Cow;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -29,6 +31,7 @@ use crate::decode_clickhouse::ChArrowDecoder;
 use crate::decode_mysql::MySqlBatcher;
 use crate::error::{EtlError, Result};
 use crate::memory::{MemoryBudget, Reservation};
+use crate::null_guard::{self, NullFate, NullGuard};
 use crate::sink::{build_sink, ChunkMarker, Sink};
 use crate::source::appsflyer::AppsFlyerSource;
 use crate::source::clevertap::CleverTapSource;
@@ -666,46 +669,97 @@ impl WatermarkTracker {
 /// entries into one entry per `(kind, column)`, which is the granularity a
 /// caller wants: "column `x_state` lost 412 values", not one line per partition.
 #[derive(Clone, Default)]
-struct Warnings(Arc<Mutex<Vec<TransferWarning>>>);
+struct Warnings {
+    raw: Arc<Mutex<Vec<TransferWarning>>>,
+    /// Rows [`NullGuard`] left out, per `(kind, column)` in the order first
+    /// met: tallied here batch by batch, rather than pushed as a warning per
+    /// batch, and turned into one warning each when read.
+    left_out: Arc<Mutex<Vec<(WarningKind, String, u64)>>>,
+    /// What became of a coerced value in each destination column that can't
+    /// hold NULL, which the `coerced_*` texts say: see [`NullFate`].
+    fates: Arc<Mutex<HashMap<String, NullFate>>>,
+}
 
 impl Warnings {
     fn push(&self, w: TransferWarning) {
-        self.0.lock().unwrap().push(w);
+        self.raw.lock().unwrap().push(w);
     }
 
-    /// The first collected warning of a kind in `kinds`, folded over its
-    /// `(kind, column)` as [`Self::drain`] folds it, without taking anything.
-    fn first_of(&self, kinds: &[WarningKind]) -> Option<TransferWarning> {
-        if kinds.is_empty() {
-            return None;
+    /// Count `n` rows [`NullGuard`] left out for a NULL in `column`.
+    fn left_out(&self, kind: WarningKind, column: &str, n: u64) {
+        if n == 0 {
+            return;
         }
-        let raw = self.0.lock().unwrap();
-        let first = raw.iter().find(|w| kinds.contains(&w.kind))?;
-        let mut folded = first.clone();
-        folded.count = raw
-            .iter()
-            .filter(|w| w.kind == first.kind && w.column == first.column)
-            .map(|w| w.count)
-            .sum();
-        restate_folded_coercion(&mut folded);
-        Some(folded)
+        let mut tally = self.left_out.lock().unwrap();
+        match tally.iter_mut().find(|(k, c, _)| *k == kind && c == column) {
+            Some((_, _, count)) => *count += n,
+            None => tally.push((kind, column.to_string(), n)),
+        }
     }
 
-    /// Whether a warning of `kind` about `column` was already collected.
-    fn contains(&self, kind: WarningKind, column: Option<&str>) -> bool {
-        self.0
+    /// Every row [`NullGuard`] has left out so far.
+    fn left_out_total(&self) -> u64 {
+        self.left_out
             .lock()
             .unwrap()
             .iter()
-            .any(|w| w.kind == kind && w.column.as_deref() == column)
+            .map(|(_, _, n)| n)
+            .sum()
     }
 
-    /// Take everything collected, folded per `(kind, column)` and ordered
-    /// most-affected first so a caller reading only the head sees the worst.
-    fn drain(&self) -> Vec<TransferWarning> {
-        let raw = std::mem::take(&mut *self.0.lock().unwrap());
+    /// Record the run's [`NullFate`]s, before anything is read.
+    fn set_null_fates(&self, fates: HashMap<String, NullFate>) {
+        *self.fates.lock().unwrap() = fates;
+    }
+
+    /// [`coercion_message`] for `column`, with what became of its values.
+    fn coercion_text(&self, kind: WarningKind, column: &str, n: u64) -> String {
+        let fate = self.fates.lock().unwrap().get(column).copied();
+        coercion_message(kind, column, n, fate)
+    }
+
+    /// Everything collected, the left-out tallies as a warning each, without
+    /// folding.
+    fn entries(&self, take: bool) -> Vec<TransferWarning> {
+        let (mut raw, left_out) = if take {
+            (
+                std::mem::take(&mut *self.raw.lock().unwrap()),
+                std::mem::take(&mut *self.left_out.lock().unwrap()),
+            )
+        } else {
+            (
+                self.raw.lock().unwrap().clone(),
+                self.left_out.lock().unwrap().clone(),
+            )
+        };
+        raw.extend(
+            left_out
+                .into_iter()
+                .map(|(kind, column, count)| TransferWarning {
+                    kind,
+                    message: null_guard::left_out_message(kind, &column, count),
+                    column: Some(column),
+                    count,
+                    sample: None,
+                }),
+        );
+        raw
+    }
+
+    /// `entries` folded per `(kind, column)`, in the order each first
+    /// appears, each coercion's text restated for its folded count.
+    ///
+    /// Every read that met a coercion reports it — each partition, each
+    /// chunk, each window of a sweep — and each wrote the message from its
+    /// own rows, so the fold kept the first read's number under the run's
+    /// total: 2 partitions that flattened one value each said "1 tinyint(1)
+    /// value(s)" with `count` 2. A table-level warning's message is its call
+    /// site's, and is kept, except that a `null_watermark` from the
+    /// NULL-count probe and one for rows the run read and left out each keep
+    /// their sentence, since each states its own count.
+    fn fold(&self, entries: Vec<TransferWarning>) -> Vec<TransferWarning> {
         let mut folded: Vec<TransferWarning> = Vec::new();
-        for w in raw {
+        for w in entries {
             match folded
                 .iter_mut()
                 .find(|f| f.kind == w.kind && f.column == w.column)
@@ -715,11 +769,58 @@ impl Warnings {
                     if f.sample.is_none() {
                         f.sample = w.sample;
                     }
-                    restate_folded_coercion(f);
+                    if f.kind == WarningKind::NullWatermark && !f.message.contains(&w.message) {
+                        f.message = format!("{} {}", f.message, w.message);
+                    }
                 }
                 None => folded.push(w),
             }
         }
+        for f in &mut folded {
+            let coercion = matches!(
+                f.kind,
+                WarningKind::CollapsedBool
+                    | WarningKind::CoercedDate
+                    | WarningKind::CoercedDecimal
+                    | WarningKind::CoercedScalar
+            );
+            if let (true, Some(column)) = (coercion, f.column.as_deref()) {
+                f.message = self.coercion_text(f.kind, column, f.count);
+            }
+        }
+        folded
+    }
+
+    /// The first collected warning of a kind in `kinds`, folded over its
+    /// `(kind, column)` as [`Self::drain`] folds it, without taking anything.
+    fn first_of(&self, kinds: &[WarningKind]) -> Option<TransferWarning> {
+        if kinds.is_empty() {
+            return None;
+        }
+        self.fold(self.entries(false))
+            .into_iter()
+            .find(|w| kinds.contains(&w.kind))
+    }
+
+    /// Whether a warning of `kind` about `column` was already collected.
+    fn contains(&self, kind: WarningKind, column: Option<&str>) -> bool {
+        self.raw
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|w| w.kind == kind && w.column.as_deref() == column)
+            || self
+                .left_out
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(k, c, _)| *k == kind && Some(c.as_str()) == column)
+    }
+
+    /// Take everything collected, folded per `(kind, column)` and ordered
+    /// most-affected first so a caller reading only the head sees the worst.
+    fn drain(&self) -> Vec<TransferWarning> {
+        let mut folded = self.fold(self.entries(true));
         folded.sort_by(|a, b| {
             b.count
                 .cmp(&a.count)
@@ -727,26 +828,6 @@ impl Warnings {
                 .then_with(|| a.column.cmp(&b.column))
         });
         folded
-    }
-}
-
-/// Restate a folded coercion's message for its folded `count`.
-///
-/// Every read that met a coercion reports it — each partition, each chunk,
-/// each window of a sweep — and each wrote the message from its own rows, so
-/// the fold kept the first read's number under the run's total: 2 partitions
-/// that flattened one value each said "1 tinyint(1) value(s)" with `count` 2.
-/// A table-level warning's message is its call site's, and is kept.
-fn restate_folded_coercion(w: &mut TransferWarning) {
-    let coercion = matches!(
-        w.kind,
-        WarningKind::CollapsedBool
-            | WarningKind::CoercedDate
-            | WarningKind::CoercedDecimal
-            | WarningKind::CoercedScalar
-    );
-    if let (true, Some(column)) = (coercion, w.column.as_deref()) {
-        w.message = coercion_message(w.kind, column, w.count);
     }
 }
 
@@ -1031,6 +1112,11 @@ struct SendCtx {
     /// that land there, which a retried attempt writes again (see
     /// [`run_transfer`]).
     landed: Option<Arc<AtomicU64>>,
+    /// `Some` when the plan has a `key`, or a watermark the destination can't
+    /// hold NULL in: every batch goes through its filter on the way out,
+    /// whatever the source. Decoders build batches with
+    /// [`Self::decode_columns`] so a NULL there reaches it.
+    null_guard: Option<Arc<NullGuard>>,
 }
 
 /// One partition's accumulator of decoded batches, so an insert carries a
@@ -1066,6 +1152,11 @@ struct InsertBuffer {
     /// sends mid-statement, which [`SendCtx::push_batch`] needs to avoid a
     /// deadlock.
     deferred: bool,
+    /// While `deferred`, the rows [`NullGuard`] left out of the statements
+    /// read since the last [`ReadOut::between_windows`], not yet counted as
+    /// warnings: a window that fails and is read again drops them with its
+    /// rows ([`Self::truncate`]), so its rows count once.
+    left_out: Vec<(WarningKind, String, u64)>,
 }
 
 /// A point in an [`InsertBuffer`] to roll back to: see [`InsertBuffer::truncate`].
@@ -1073,6 +1164,7 @@ struct InsertBuffer {
 struct BufferMark {
     takes: u64,
     len: usize,
+    left_out: usize,
 }
 
 impl InsertBuffer {
@@ -1085,6 +1177,7 @@ impl InsertBuffer {
             target,
             takes: 0,
             deferred: false,
+            left_out: Vec::new(),
         }
     }
 
@@ -1121,6 +1214,7 @@ impl InsertBuffer {
         BufferMark {
             takes: self.takes,
             len: self.batches.len(),
+            left_out: self.left_out.len(),
         }
     }
 
@@ -1128,7 +1222,8 @@ impl InsertBuffer {
     /// of a window that failed and is read again. When the buffer was sent
     /// since, everything in it now came after `mark`. What was sent can't be
     /// taken back, which is no different from a window with a buffer of its
-    /// own.
+    /// own. The rows that window left out are dropped from the tally too: a
+    /// send doesn't report them, so all since `mark` are its own.
     fn truncate(&mut self, mark: BufferMark) {
         let keep = if mark.takes == self.takes {
             mark.len.min(self.batches.len())
@@ -1139,6 +1234,7 @@ impl InsertBuffer {
         self.reservations.truncate(keep);
         self.sizes.truncate(keep);
         self.bytes = self.sizes.iter().sum();
+        self.left_out.truncate(mark.left_out);
     }
 }
 
@@ -1174,7 +1270,9 @@ impl<C> ReadOut<C> {
 
     /// Between two windows of a sweep: send the buffer if it is full, and
     /// surface an insert that failed, rather than at the end of the sweep.
+    /// The window before it succeeded, so the rows it left out are counted.
     async fn between_windows(&mut self, ctx: &SendCtx) -> Result<()> {
+        ctx.report_left_out(&mut self.insert_buf);
         if self.insert_buf.full() {
             if let Some(schema) = self.schema.clone() {
                 ctx.flush(&mut self.sends, &mut self.insert_buf, schema)
@@ -1186,6 +1284,7 @@ impl<C> ReadOut<C> {
 
     /// Send what is still buffered and wait for every insert to land.
     async fn finish(mut self, ctx: &SendCtx) -> Result<()> {
+        ctx.report_left_out(&mut self.insert_buf);
         if let Some(schema) = self.schema.take() {
             ctx.flush(&mut self.sends, &mut self.insert_buf, schema)
                 .await;
@@ -1195,6 +1294,16 @@ impl<C> ReadOut<C> {
 }
 
 impl SendCtx {
+    /// The columns a decoder builds this run's batches with: the plan's, with
+    /// the columns [`NullGuard`] checks made nullable, so a NULL there reaches
+    /// [`Self::push_batch`] instead of failing the batch.
+    fn decode_columns<'a>(&self, plan: &'a SelectPlan) -> Cow<'a, [ColumnType]> {
+        match &self.null_guard {
+            Some(g) => Cow::Owned(g.decode_columns(&plan.dest_columns)),
+            None => Cow::Borrowed(&plan.dest_columns),
+        }
+    }
+
     /// The context one keyset chunk writes through: this one, or for a staged
     /// destination a copy aimed at a fresh per-chunk staging table.
     async fn begin_chunk(&self) -> Result<SendCtx> {
@@ -1241,18 +1350,47 @@ impl SendCtx {
     /// buffer's own batches*, and nothing would ever release them. So on
     /// pressure we flush first — handing those reservations to a send task that
     /// will release them — and only then wait.
+    ///
+    /// Also where [`NullGuard`] leaves out the rows the destination can't hold
+    /// (a NULL key, or a NULL watermark where the destination's can't be), and
+    /// counts them as warnings that the next `fail_on_warnings` checkpoint
+    /// sees.
     async fn push_batch(
         &self,
         sends: &mut JoinSet<Result<()>>,
         buffer: &mut InsertBuffer,
         schema: SchemaRef,
         batch: RecordBatch,
-    ) {
+    ) -> Result<()> {
         // Fold the watermark before the batch is handed on: this is the one
         // point every decoded batch from every partition passes through.
+        // Before the guard, so the cursor passes a row left out for a NULL
+        // key, as a cursor taken from the MAX does.
         if let Some(t) = &self.watermark_max {
             t.observe(&batch);
         }
+        let batch = match &self.null_guard {
+            Some(guard) => {
+                let (kept, left_out) = guard.filter(batch)?;
+                for (g, n) in guard.columns().iter().zip(left_out) {
+                    if n == 0 {
+                        continue;
+                    }
+                    // A window of a sweep can fail and be read again: its
+                    // count waits for it to succeed (`ReadOut::between_windows`).
+                    if buffer.deferred {
+                        buffer.left_out.push((g.kind, g.column.clone(), n));
+                    } else {
+                        self.warnings.left_out(g.kind, &g.column, n);
+                    }
+                }
+                if kept.num_rows() == 0 {
+                    return Ok(());
+                }
+                kept
+            }
+            None => batch,
+        };
         let size = batch.get_array_memory_size();
         let reservation = match self.budget.try_reserve(size) {
             Some(r) => r,
@@ -1266,10 +1404,22 @@ impl SendCtx {
         if buffer.push(batch, reservation, size) {
             self.flush(sends, buffer, schema).await;
         }
+        Ok(())
+    }
+
+    /// Count the rows a deferred `buffer` holds back as left out (see
+    /// [`InsertBuffer::left_out`]), once the statements they came from have
+    /// succeeded.
+    fn report_left_out(&self, buffer: &mut InsertBuffer) {
+        for (kind, column, n) in buffer.left_out.drain(..) {
+            self.warnings.left_out(kind, &column, n);
+        }
     }
 
     /// Upload whatever is buffered as one insert, as a background task so
     /// decoding keeps overlapping the network round-trip. No-op when empty.
+    /// `schema` is the decoder's; batches past a [`NullGuard`] go out under
+    /// its strict form, as they are.
     async fn flush(
         &self,
         sends: &mut JoinSet<Result<()>>,
@@ -1279,6 +1429,10 @@ impl SendCtx {
         if buffer.is_empty() {
             return;
         }
+        let schema = match &self.null_guard {
+            Some(guard) => guard.strict_schema(&schema),
+            None => schema,
+        };
         let (batches, reservations) = buffer.take();
         let ctx = self.clone();
         sends.spawn(async move {
@@ -1318,10 +1472,29 @@ struct ArchiveRunInfo {
     kind: &'static str,
     /// Every upload this attempt starts; see [`run_transfer_attempt`].
     uploads: ArchiveUploads,
+    /// The run's [`NullGuard`], so a file holds the rows the destination is
+    /// sent, typed as it types them, and not the rows the guard leaves out.
+    null_guard: Option<Arc<NullGuard>>,
 }
 
 impl ArchiveRunInfo {
-    fn writer_for(&self, partition_label: &str, schema: SchemaRef) -> Result<ArchiveWriter> {
+    /// This info for a run whose batches pass `guard`. Built before the plan
+    /// the guard comes from, so each flow attaches it once it has one.
+    fn with_null_guard(&self, guard: Option<Arc<NullGuard>>) -> Arc<Self> {
+        Arc::new(Self {
+            store: self.store.clone(),
+            prefix: self.prefix.clone(),
+            dest_table: self.dest_table.clone(),
+            run_date: self.run_date.clone(),
+            run_id: self.run_id.clone(),
+            compression: self.compression,
+            kind: self.kind,
+            uploads: self.uploads.clone(),
+            null_guard: guard,
+        })
+    }
+
+    fn open(&self, partition_label: &str, schema: SchemaRef) -> Result<ArchiveWriter> {
         let key = archive_object_key(
             &self.prefix,
             &self.dest_table,
@@ -1329,6 +1502,10 @@ impl ArchiveRunInfo {
             &self.run_id,
             partition_label,
         );
+        let schema = match &self.null_guard {
+            Some(guard) => guard.strict_schema(&schema),
+            None => schema,
+        };
         ArchiveWriter::new(
             self.store.clone(),
             key,
@@ -1337,6 +1514,46 @@ impl ArchiveRunInfo {
             self.kind,
             &self.uploads,
         )
+    }
+
+    fn writer_for(&self, partition_label: &str, schema: SchemaRef) -> Result<ArchiveFile> {
+        Ok(ArchiveFile {
+            writer: self.open(partition_label, schema)?,
+            null_guard: self.null_guard.clone(),
+        })
+    }
+}
+
+/// `batch` as the destination is sent it: without the rows `guard` leaves out.
+fn archived_rows<'a>(
+    guard: Option<&NullGuard>,
+    batch: &'a RecordBatch,
+) -> Result<Cow<'a, RecordBatch>> {
+    match guard {
+        Some(g) => Ok(Cow::Owned(g.filter(batch.clone())?.0)),
+        None => Ok(Cow::Borrowed(batch)),
+    }
+}
+
+/// One partition's archive file. It holds what the destination is sent, so
+/// the rows [`NullGuard`] leaves out aren't archived either.
+struct ArchiveFile {
+    writer: ArchiveWriter,
+    null_guard: Option<Arc<NullGuard>>,
+}
+
+impl ArchiveFile {
+    async fn write(&mut self, batch: &RecordBatch) -> Result<()> {
+        let rows = archived_rows(self.null_guard.as_deref(), batch)?;
+        self.writer.write(&rows).await
+    }
+
+    async fn close(self) -> Result<()> {
+        self.writer.close().await
+    }
+
+    async fn abort(self) {
+        self.writer.abort().await
     }
 }
 
@@ -1375,6 +1592,7 @@ impl ChunkArchive {
         let Some(info) = &self.info else {
             return Ok(());
         };
+        let batch = archived_rows(info.null_guard.as_deref(), batch)?;
         if batch.num_rows() == 0 {
             return Ok(());
         }
@@ -1382,10 +1600,10 @@ impl ChunkArchive {
             Some(w) => w,
             None => {
                 let label = format!("keyset-{:05}", self.chunk);
-                info.writer_for(&label, self.schema.clone())?
+                info.open(&label, self.schema.clone())?
             }
         };
-        self.writer.insert(writer).write(batch).await
+        self.writer.insert(writer).write(&batch).await
     }
 
     /// Finish the current chunk's file. Call once the chunk has landed in the
@@ -1432,6 +1650,8 @@ fn build_archive_run_info(
         compression: cfg.compression(),
         kind: cfg.kind(),
         uploads: uploads.clone(),
+        // Each flow attaches its own once its plan says what it checks.
+        null_guard: None,
     })))
 }
 
@@ -2010,6 +2230,9 @@ async fn run_transfer_impl(
         crate::source::postgres::pin_transformed_wire_types(&mut plan);
     }
     let plan = Arc::new(plan);
+    let null_guard = NullGuard::new(&plan, &cfg).map(Arc::new);
+    warnings.set_null_fates(null_guard::null_fates(&plan, null_guard.as_deref(), false));
+    let archive_info = archive_info.map(|a| a.with_null_guard(null_guard.clone()));
 
     // When the `MAX(watermark)` probe was skipped as too costly, the cursor has
     // to come from the rows this run actually reads. Built here because it
@@ -2409,6 +2632,7 @@ async fn run_transfer_impl(
             watermark_max: watermark_tracker.clone(),
             chunk_stager,
             landed: (!used_staging).then(|| landed.clone()),
+            null_guard: null_guard.clone(),
         };
         let stage_started = Instant::now();
 
@@ -2796,6 +3020,9 @@ async fn run_transfer_bigquery(
     tracing::info!("resolved {} source column(s)", source_cols.len());
 
     let plan: SelectPlan = transform::plan(&source_cols, &cfg, sink.dest_kind())?;
+    let null_guard = NullGuard::new(&plan, &cfg).map(Arc::new);
+    warnings.set_null_fates(null_guard::null_fates(&plan, null_guard.as_deref(), false));
+    let archive_info = archive_info.map(|a| a.with_null_guard(null_guard.clone()));
 
     let mut discarded_state = false;
     let (row_restriction, new_watermark, cursor_check) = if cfg.mode == SyncMode::Incremental {
@@ -2937,6 +3164,7 @@ async fn run_transfer_bigquery(
             watermark_max: None,
             chunk_stager: None,
             landed: (!used_staging).then(|| landed.clone()),
+            null_guard: null_guard.clone(),
         };
         let stage_started = Instant::now();
 
@@ -2950,7 +3178,7 @@ async fn run_transfer_bigquery(
             )
             .await?;
 
-        let mut batcher = BigQueryBatcher::with_batch_bytes(&plan.dest_columns, cfg.batch_rows, cfg.batch_bytes)?;
+        let mut batcher = BigQueryBatcher::with_batch_bytes(&ctx.decode_columns(&plan), cfg.batch_rows, cfg.batch_bytes)?;
         let schema = batcher.schema();
         let mut sends: JoinSet<Result<()>> = JoinSet::new();
         let mut insert_buf = InsertBuffer::new(cfg.insert_bytes);
@@ -2973,7 +3201,7 @@ async fn run_transfer_bigquery(
                 if let Some(w) = archive_writer.as_mut() {
                     w.write(&batch).await?;
                 }
-                ctx.push_batch(&mut sends, &mut insert_buf, schema.clone(), batch).await;
+                ctx.push_batch(&mut sends, &mut insert_buf, schema.clone(), batch).await?;
                 reap(&mut sends, false).await?;
             }
         }
@@ -2981,7 +3209,7 @@ async fn run_transfer_bigquery(
             if let Some(w) = archive_writer.as_mut() {
                 w.write(&batch).await?;
             }
-            ctx.push_batch(&mut sends, &mut insert_buf, schema.clone(), batch).await;
+            ctx.push_batch(&mut sends, &mut insert_buf, schema.clone(), batch).await?;
         }
         if let Some(w) = archive_writer.take() {
             w.close().await?;
@@ -3151,13 +3379,23 @@ async fn guard_full_refresh_shrink(
         Some((dest, staged)) => (Some(dest), staged, " (both counted with FINAL, as merged)"),
         None => (existing, new_rows, ""),
     };
+    // Rows the run read and left out aren't staged, so they count as lost
+    // here, which is what the destination will hold. Say so, since a refusal
+    // returns no warnings to say it.
+    let left_out = match warnings.left_out_total() {
+        0 => String::new(),
+        n => format!(
+            " This run read {n} row(s) it left out for a NULL key or watermark (see the \
+             null_key and null_watermark warnings)."
+        ),
+    };
     match full_refresh_shrink_verdict(existing, new_rows, cfg.allow_full_refresh_shrink) {
         ShrinkVerdict::Proceed => Ok(()),
         ShrinkVerdict::ProceedWithWarning { existing, lost } => {
             let message = format!(
                 "full-refresh will REPLACE '{}' ({existing} row(s)) with only {new_rows} \
                  row(s){counted} — the destination will SHRINK by {lost} row(s). Proceeding \
-                 because allow_full_refresh_shrink=True.",
+                 because allow_full_refresh_shrink=True.{left_out}",
                 cfg.dest_table,
             );
             tracing::warn!("{message}");
@@ -3178,7 +3416,7 @@ async fn guard_full_refresh_shrink(
              refresh replaces the table wholesale and is NOT partition-aware, so if this run \
              covers only part of the destination the rest is destroyed. To add rows instead of \
              replacing them use mode=\"incremental\" with key=, or mode=\"append\". If this \
-             shrink is genuinely intended, set allow_full_refresh_shrink=True.",
+             shrink is genuinely intended, set allow_full_refresh_shrink=True.{left_out}",
             cfg.dest_table,
         ))),
     }
@@ -3399,6 +3637,17 @@ async fn run_transfer_api(
     {
         warn_mixed_decimals(&cfg.dest_table, &decimal, &float, &warnings);
     }
+    // The API decoder declares every column nullable, so a NULL in a column
+    // the guard doesn't check reaches a ClickHouse destination, which stores
+    // the column's default in its place (see `NullFate::Default`).
+    let null_guard = NullGuard::new(&plan, &cfg).map(Arc::new);
+    let defaults_null = sink.dest_kind() == crate::config::DestKind::ClickHouse;
+    warnings.set_null_fates(null_guard::null_fates(
+        &plan,
+        null_guard.as_deref(),
+        defaults_null,
+    ));
+    let archive_info = archive_info.map(|a| a.with_null_guard(null_guard.clone()));
 
     // Per-output-column lookup path, aligned to `plan.source_columns` (which
     // survives include/exclude; keyed on the source name, unaffected by rename).
@@ -3497,9 +3746,10 @@ async fn run_transfer_api(
             watermark_max: None,
             chunk_stager: None,
             landed: None,
+            null_guard: null_guard.clone(),
         };
         let stage_started = Instant::now();
-        let mut batcher = ApiBatcher::new(&plan.dest_columns, &lookups, cfg.batch_rows, cfg.batch_bytes)?;
+        let mut batcher = ApiBatcher::new(&ctx.decode_columns(&plan), &lookups, cfg.batch_rows, cfg.batch_bytes)?;
         let schema = batcher.schema();
         let mut sends: JoinSet<Result<()>> = JoinSet::new();
         let mut insert_buf = InsertBuffer::new(cfg.insert_bytes);
@@ -3580,7 +3830,7 @@ async fn run_transfer_api(
                             if let Some(w) = archive_writer.as_mut() {
                                 w.write(&b).await?;
                             }
-                            ctx.push_batch(&mut sends, &mut insert_buf, schema.clone(), b).await;
+                            ctx.push_batch(&mut sends, &mut insert_buf, schema.clone(), b).await?;
                             reap(&mut sends, false).await?;
                         }
                     }
@@ -3663,7 +3913,7 @@ async fn run_transfer_api(
                         if let Some(w) = archive_writer.as_mut() {
                             w.write(&b).await?;
                         }
-                        ctx.push_batch(&mut sends, &mut insert_buf, schema.clone(), b).await;
+                        ctx.push_batch(&mut sends, &mut insert_buf, schema.clone(), b).await?;
                         reap(&mut sends, false).await?;
                     }
                 }
@@ -3676,7 +3926,7 @@ async fn run_transfer_api(
                         if let Some(w) = archive_writer.as_mut() {
                             w.write(&b).await?;
                         }
-                        ctx.push_batch(&mut sends, &mut insert_buf, schema.clone(), b).await;
+                        ctx.push_batch(&mut sends, &mut insert_buf, schema.clone(), b).await?;
                         reap(&mut sends, false).await?;
                     }
                 }
@@ -3687,7 +3937,7 @@ async fn run_transfer_api(
             if let Some(w) = archive_writer.as_mut() {
                 w.write(&b).await?;
             }
-            ctx.push_batch(&mut sends, &mut insert_buf, schema.clone(), b).await;
+            ctx.push_batch(&mut sends, &mut insert_buf, schema.clone(), b).await?;
         }
         if let Some(w) = archive_writer.take() {
             w.close().await?;
@@ -3883,9 +4133,13 @@ async fn run_transfer_frame(
     // claim about *this* frame that the next one breaks (run 1 has no nulls in
     // `amount`, run 2 does, and the second fails the Arrow schema-consistency
     // check). `key`/`order_by`/`primary_key`/`not_null` still force NOT NULL
-    // where it is actually required.
+    // where it is actually required, and a row with a NULL key is left out
+    // (see `NullGuard`).
     let plan: SelectPlan = transform::plan_with(&source_cols, &cfg, sink.dest_kind(), true)?;
     let plan = Arc::new(plan);
+    let null_guard = NullGuard::new(&plan, &cfg).map(Arc::new);
+    warnings.set_null_fates(null_guard::null_fates(&plan, null_guard.as_deref(), false));
+    let archive_info = archive_info.map(|a| a.with_null_guard(null_guard.clone()));
 
     // `include=`/`exclude=` become an Arrow column projection, applied by the
     // reader itself. `transform::plan` has already validated every name.
@@ -3961,10 +4215,11 @@ async fn run_transfer_frame(
             watermark_max: None,
             chunk_stager: None,
             landed: None,
+            null_guard: null_guard.clone(),
         };
         let stage_started = Instant::now();
         let schema: SchemaRef = Arc::new(Schema::new(
-            plan.dest_columns
+            ctx.decode_columns(&plan)
                 .iter()
                 .map(|c| Field::new(&c.name, c.arrow.clone(), c.nullable))
                 .collect::<Vec<_>>(),
@@ -3996,7 +4251,7 @@ async fn run_transfer_frame(
                     w.write(&slice).await?;
                 }
                 ctx.push_batch(&mut sends, &mut insert_buf, schema.clone(), slice)
-                    .await;
+                    .await?;
                 reap(&mut sends, false).await?;
             }
         }
@@ -4981,7 +5236,7 @@ async fn transfer_keyset_postgres(
         predicate: None,
     };
     let schema =
-        CopyDecoder::with_batch_bytes(&plan.dest_columns, cfg.batch_rows, cfg.batch_bytes)?
+        CopyDecoder::with_batch_bytes(&ctx.decode_columns(plan), cfg.batch_rows, cfg.batch_bytes)?
             .schema();
     let mut archive = ChunkArchive::new(ctx.archive.clone(), schema.clone());
     tracing::info!(
@@ -4993,6 +5248,9 @@ async fn transfer_keyset_postgres(
 
     loop {
         let chunk_ctx = ctx.begin_chunk().await?;
+        // What the chunk writes, which is what its commit lands: the rows it
+        // read less those `NullGuard` left out. Chunked reads are one stream.
+        let written_before = ctx.counters.rows_written.load(Ordering::Relaxed);
         let keyset = Keyset {
             col_quoted: col_quoted.clone(),
             cursor: cursor.clone(),
@@ -5020,8 +5278,11 @@ async fn transfer_keyset_postgres(
         .await??;
         futures::pin_mut!(stream);
         let mut chunks = CopyChunks::new(stream);
-        let mut decoder =
-            CopyDecoder::with_batch_bytes(&plan.dest_columns, cfg.batch_rows, cfg.batch_bytes)?;
+        let mut decoder = CopyDecoder::with_batch_bytes(
+            &ctx.decode_columns(plan),
+            cfg.batch_rows,
+            cfg.batch_bytes,
+        )?;
         let mut sends: JoinSet<Result<()>> = JoinSet::new();
         let mut insert_buf = InsertBuffer::new(cfg.insert_bytes);
         let mut cursor_candidate: Option<i128> = None;
@@ -5051,7 +5312,7 @@ async fn transfer_keyset_postgres(
                 archive.write(&batch).await?;
                 chunk_ctx
                     .push_batch(&mut sends, &mut insert_buf, schema.clone(), batch)
-                    .await;
+                    .await?;
                 if let Some(t) = &ctx.throttle {
                     t.acquire(rows).await;
                 }
@@ -5071,7 +5332,7 @@ async fn transfer_keyset_postgres(
             archive.write(&batch).await?;
             chunk_ctx
                 .push_batch(&mut sends, &mut insert_buf, schema.clone(), batch)
-                .await;
+                .await?;
             if let Some(t) = &ctx.throttle {
                 t.acquire(rows).await;
             }
@@ -5092,7 +5353,8 @@ async fn transfer_keyset_postgres(
         // Land the chunk in the destination before its cursor is committed
         // below (a no-op where the flush above already did).
         check_fatal(cfg, ctx.sink.as_ref(), &ctx.warnings, Before::Chunk)?;
-        ctx.end_chunk(&chunk_ctx, rows_this_chunk).await?;
+        let written = ctx.counters.rows_written.load(Ordering::Relaxed) - written_before;
+        ctx.end_chunk(&chunk_ctx, written).await?;
         if rows_this_chunk == 0 {
             break; // empty read — nothing (more) to sync
         }
@@ -5717,7 +5979,7 @@ async fn read_statement_postgres(
     let mut chunks = CopyChunks::new(stream);
 
     let mut decoder =
-        CopyDecoder::with_batch_bytes(&plan.dest_columns, cfg.batch_rows, cfg.batch_bytes)?;
+        CopyDecoder::with_batch_bytes(&ctx.decode_columns(plan), cfg.batch_rows, cfg.batch_bytes)?;
     let schema = decoder.schema();
     *out_schema = Some(schema.clone());
     let mut archive_writer = match &ctx.archive {
@@ -5753,7 +6015,7 @@ async fn read_statement_postgres(
                     w.write(&batch).await?;
                 }
                 ctx.push_batch(sends, insert_buf, schema.clone(), batch)
-                    .await;
+                    .await?;
                 // Pace the read: pausing here applies TCP backpressure to the COPY
                 // stream, slowing the server-side scan. One chunk is already in
                 // hand by this point (that's the overlap above), so the throttle
@@ -5777,7 +6039,7 @@ async fn read_statement_postgres(
                 w.write(&batch).await?;
             }
             ctx.push_batch(sends, insert_buf, schema.clone(), batch)
-                .await;
+                .await?;
             // A statement's last batch counts toward the pace too: a window
             // smaller than one batch is all last batch.
             if let Some(t) = &ctx.throttle {
@@ -5840,7 +6102,7 @@ async fn transfer_keyset_mysql(
         predicate: None,
     };
     let schema =
-        MySqlBatcher::with_batch_bytes(&plan.dest_columns, cfg.batch_rows, cfg.batch_bytes)?
+        MySqlBatcher::with_batch_bytes(&ctx.decode_columns(plan), cfg.batch_rows, cfg.batch_bytes)?
             .schema();
     let mut archive = ChunkArchive::new(ctx.archive.clone(), schema.clone());
     tracing::info!(
@@ -5852,6 +6114,9 @@ async fn transfer_keyset_mysql(
 
     loop {
         let chunk_ctx = ctx.begin_chunk().await?;
+        // What the chunk writes, which is what its commit lands: the rows it
+        // read less those `NullGuard` left out. Chunked reads are one stream.
+        let written_before = ctx.counters.rows_written.load(Ordering::Relaxed);
         let keyset = Keyset {
             col_quoted: col_quoted.clone(),
             cursor: cursor.clone(),
@@ -5867,8 +6132,11 @@ async fn transfer_keyset_mysql(
             Some(keyset),
         );
         tracing::debug!("keyset chunk: {select_sql}");
-        let mut batcher =
-            MySqlBatcher::with_batch_bytes(&plan.dest_columns, cfg.batch_rows, cfg.batch_bytes)?;
+        let mut batcher = MySqlBatcher::with_batch_bytes(
+            &ctx.decode_columns(plan),
+            cfg.batch_rows,
+            cfg.batch_bytes,
+        )?;
         let mut sends: JoinSet<Result<()>> = JoinSet::new();
         let mut insert_buf = InsertBuffer::new(cfg.insert_bytes);
         let mut cursor_candidate: Option<i128> = None;
@@ -5899,7 +6167,7 @@ async fn transfer_keyset_mysql(
                 archive.write(&batch).await?;
                 chunk_ctx
                     .push_batch(&mut sends, &mut insert_buf, schema.clone(), batch)
-                    .await;
+                    .await?;
                 reap(&mut sends, false).await?;
                 if let Some(t) = &ctx.throttle {
                     t.acquire(rows).await;
@@ -5914,7 +6182,7 @@ async fn transfer_keyset_mysql(
             archive.write(&batch).await?;
             chunk_ctx
                 .push_batch(&mut sends, &mut insert_buf, schema.clone(), batch)
-                .await;
+                .await?;
             if let Some(t) = &ctx.throttle {
                 t.acquire(rows).await;
             }
@@ -5933,7 +6201,8 @@ async fn transfer_keyset_mysql(
         // Land the chunk in the destination before its cursor is committed
         // below (a no-op where the flush above already did).
         check_fatal(cfg, ctx.sink.as_ref(), &ctx.warnings, Before::Chunk)?;
-        ctx.end_chunk(&chunk_ctx, rows_this_chunk).await?;
+        let written = ctx.counters.rows_written.load(Ordering::Relaxed) - written_before;
+        ctx.end_chunk(&chunk_ctx, written).await?;
         if rows_this_chunk == 0 {
             break;
         }
@@ -6049,7 +6318,7 @@ async fn read_statement_mysql(
     tracing::debug!("partition {}: {select_sql}", partition.label);
 
     let mut batcher =
-        MySqlBatcher::with_batch_bytes(&plan.dest_columns, cfg.batch_rows, cfg.batch_bytes)?;
+        MySqlBatcher::with_batch_bytes(&ctx.decode_columns(plan), cfg.batch_rows, cfg.batch_bytes)?;
     let schema = batcher.schema();
     *out_schema = Some(schema.clone());
     let mut archive_writer = match &ctx.archive {
@@ -6093,7 +6362,7 @@ async fn read_statement_mysql(
                     w.write(&batch).await?;
                 }
                 ctx.push_batch(sends, insert_buf, schema.clone(), batch)
-                    .await;
+                    .await?;
                 reap(sends, false).await?; // surface any upload error promptly
                                            // Pace the read: pausing before fetching more rows applies
                                            // backpressure to the streaming result set, slowing the scan.
@@ -6108,7 +6377,7 @@ async fn read_statement_mysql(
                 w.write(&batch).await?;
             }
             ctx.push_batch(sends, insert_buf, schema.clone(), batch)
-                .await;
+                .await?;
             // See the equivalent pace in `read_statement_postgres`.
             if let Some(t) = &ctx.throttle {
                 t.acquire(rows).await;
@@ -6303,7 +6572,7 @@ async fn transfer_keyset_clickhouse(
         label: "keyset".into(),
         predicate: None,
     };
-    let schema = ChArrowDecoder::new(&plan.dest_columns, cfg.batch_bytes).schema();
+    let schema = ChArrowDecoder::new(&ctx.decode_columns(plan), cfg.batch_bytes).schema();
     let mut archive = ChunkArchive::new(ctx.archive.clone(), schema.clone());
     tracing::info!(
         "keyset chunked read starting on '{}' (chunk_rows={}, resume_cursor={:?})",
@@ -6314,6 +6583,9 @@ async fn transfer_keyset_clickhouse(
 
     loop {
         let chunk_ctx = ctx.begin_chunk().await?;
+        // What the chunk writes, which is what its commit lands: the rows it
+        // read less those `NullGuard` left out. Chunked reads are one stream.
+        let written_before = ctx.counters.rows_written.load(Ordering::Relaxed);
         let keyset = Keyset {
             col_quoted: col_quoted.clone(),
             cursor: cursor.clone(),
@@ -6322,7 +6594,7 @@ async fn transfer_keyset_clickhouse(
         let select_sql = source.select_sql(
             &plan.source_columns,
             &plan.source_select_exprs,
-            &plan.dest_columns,
+            &ctx.decode_columns(plan),
             base_table,
             base_query,
             &partition,
@@ -6330,7 +6602,7 @@ async fn transfer_keyset_clickhouse(
             Some(keyset),
         );
         tracing::debug!("keyset chunk: {select_sql}");
-        let mut decoder = ChArrowDecoder::new(&plan.dest_columns, cfg.batch_bytes);
+        let mut decoder = ChArrowDecoder::new(&ctx.decode_columns(plan), cfg.batch_bytes);
         let mut sends: JoinSet<Result<()>> = JoinSet::new();
         let mut insert_buf = InsertBuffer::new(cfg.insert_bytes);
         let mut cursor_candidate: Option<i128> = None;
@@ -6358,7 +6630,7 @@ async fn transfer_keyset_clickhouse(
                 archive.write(&batch).await?;
                 chunk_ctx
                     .push_batch(&mut sends, &mut insert_buf, schema.clone(), batch)
-                    .await;
+                    .await?;
                 reap(&mut sends, false).await?;
                 if let Some(t) = &ctx.throttle {
                     t.acquire(rows).await;
@@ -6379,7 +6651,8 @@ async fn transfer_keyset_clickhouse(
         // Land the chunk in the destination before its cursor is committed
         // below (a no-op where the flush above already did).
         check_fatal(cfg, ctx.sink.as_ref(), &ctx.warnings, Before::Chunk)?;
-        ctx.end_chunk(&chunk_ctx, rows_this_chunk).await?;
+        let written = ctx.counters.rows_written.load(Ordering::Relaxed) - written_before;
+        ctx.end_chunk(&chunk_ctx, written).await?;
         if rows_this_chunk == 0 {
             break;
         }
@@ -6458,7 +6731,7 @@ async fn transfer_partition_clickhouse(
     let select_sql = source.select_sql(
         &plan.source_columns,
         &plan.source_select_exprs,
-        &plan.dest_columns,
+        &ctx.decode_columns(plan),
         base_table,
         base_query,
         &partition,
@@ -6467,7 +6740,7 @@ async fn transfer_partition_clickhouse(
     );
     tracing::debug!("partition {}: {select_sql}", partition.label);
 
-    let mut decoder = ChArrowDecoder::new(&plan.dest_columns, cfg.batch_bytes);
+    let mut decoder = ChArrowDecoder::new(&ctx.decode_columns(plan), cfg.batch_bytes);
     let schema = decoder.schema();
     let mut sends: JoinSet<Result<()>> = JoinSet::new();
     let mut insert_buf = InsertBuffer::new(cfg.insert_bytes);
@@ -6499,7 +6772,7 @@ async fn transfer_partition_clickhouse(
                 w.write(&batch).await?;
             }
             ctx.push_batch(&mut sends, &mut insert_buf, schema.clone(), batch)
-                .await;
+                .await?;
             reap(&mut sends, false).await?; // surface any upload error promptly
                                             // Pace the read: pausing before pulling more of the
                                             // response body applies backpressure to the HTTP
@@ -6531,20 +6804,38 @@ async fn transfer_partition_clickhouse(
 /// The sentence describing one coercion kind, naming the column it happened
 /// in. Human-facing only — a caller matching behaviour matches on
 /// [`WarningKind`], which is stable; this text is not.
-fn coercion_message(kind: WarningKind, column: &str, n: u64) -> String {
+///
+/// `fate` is what became of a value read as NULL in a column the destination
+/// can't hold NULL in (`None`: the column holds NULL, and the value landed as
+/// one), so the text never claims a NULL landed where the row was left out or
+/// the column's default was stored instead (#49).
+fn coercion_message(kind: WarningKind, column: &str, n: u64, fate: Option<NullFate>) -> String {
+    let became = match fate {
+        None => "coerced to NULL".to_string(),
+        Some(NullFate::LeftOut(counted)) => format!(
+            "could not be read, and the destination's '{column}' can't be NULL, so the row(s) \
+             holding them were left out (counted in {})",
+            counted.as_str()
+        ),
+        Some(NullFate::Default) => format!(
+            "could not be read, and the destination's '{column}' can't be NULL, so ClickHouse \
+             stored the column's default there instead (for a column with no DEFAULT, the \
+             type's: 1970-01-01, 0 or '')"
+        ),
+    };
     match kind {
         WarningKind::CoercedDate => format!(
             "column '{column}': {n} unrepresentable or out-of-range date/datetime value(s) \
              (zero-dates like '0000-00-00', or years outside ClickHouse's 1900-2299 window \
-             like '9999-12-31') coerced to NULL"
+             like '9999-12-31') {became}"
         ),
         WarningKind::CoercedDecimal => format!(
-            "column '{column}': {n} decimal value(s) coerced to NULL (value exceeded the \
-             declared Decimal(P,S) precision, or was NaN/Infinity)"
+            "column '{column}': {n} decimal value(s) {became} (value exceeded the declared \
+             Decimal(P,S) precision, or was NaN/Infinity)"
         ),
         WarningKind::CoercedScalar => format!(
-            "column '{column}': {n} value(s) coerced to NULL (a non-empty scalar that did not \
-             parse as the declared type)"
+            "column '{column}': {n} value(s) {became} (a non-empty scalar that did not parse \
+             as the declared type)"
         ),
         WarningKind::CollapsedBool => format!(
             "column '{column}': {n} tinyint(1) value(s) outside {{0, 1}} were flattened to a \
@@ -6557,6 +6848,7 @@ fn coercion_message(kind: WarningKind, column: &str, n: u64) -> String {
         // Table-level kinds are raised directly by their own call sites, which
         // know the numbers that make them concrete.
         WarningKind::NullWatermark
+        | WarningKind::NullKey
         | WarningKind::FullRefreshShrink
         | WarningKind::UnclusteredMergeTarget
         | WarningKind::IncompleteExport
@@ -6601,29 +6893,31 @@ fn report_coercions(scope: &str, entries: Vec<(WarningKind, String, u64)>, warni
             column: Some(column.clone()),
             count,
             sample: None,
-            message: coercion_message(kind, &column, count),
+            message: warnings.coercion_text(kind, &column, count),
         });
         by_kind.entry(kind).or_default().push((column, count));
     }
+    let fates = warnings.fates.lock().unwrap().clone();
     for (kind, cols) in by_kind {
         let total: u64 = cols.iter().map(|(_, n)| n).sum();
         let list = cols
             .iter()
-            .map(|(c, n)| format!("{c} ({n})"))
+            .map(|(c, n)| match fates.get(c) {
+                _ if kind == WarningKind::CollapsedBool => format!("{c} ({n})"),
+                None => format!("{c} ({n}, now NULL)"),
+                Some(NullFate::LeftOut(k)) => {
+                    format!("{c} ({n}, rows left out: {})", k.as_str())
+                }
+                Some(NullFate::Default) => format!("{c} ({n}, stored as the column's default)"),
+            })
             .collect::<Vec<_>>()
             .join(", ");
         let what = match kind {
-            WarningKind::CoercedDate => {
-                "unrepresentable or out-of-range date/datetime value(s) \
-                                         coerced to NULL"
-            }
+            WarningKind::CoercedDate => "unrepresentable or out-of-range date/datetime value(s)",
             WarningKind::CoercedDecimal => {
-                "decimal value(s) coerced to NULL (exceeded the declared Decimal(P,S), or \
-                 NaN/Infinity)"
+                "decimal value(s) that exceeded the declared Decimal(P,S), or were NaN/Infinity"
             }
-            WarningKind::CoercedScalar => {
-                "value(s) coerced to NULL (a non-empty scalar that did not parse)"
-            }
+            WarningKind::CoercedScalar => "non-empty scalar(s) that did not parse",
             WarningKind::CollapsedBool => {
                 "tinyint(1) value(s) outside {0, 1} flattened to a boolean, losing their \
                  original value (pass tinyint1_as_bool=False to keep them)"
@@ -9889,6 +10183,7 @@ mod tests {
             watermark_max: None,
             chunk_stager,
             landed: None,
+            null_guard: None,
         }
     }
 
@@ -12495,5 +12790,357 @@ mod tests {
             warn_on_non_replacing_target(&sink, &cfg, &w).await.unwrap();
         }
         assert!(w.drain().is_empty());
+    }
+
+    /// A sink that keeps every insert it is sent, schema and all.
+    #[derive(Default)]
+    struct Collecting(Mutex<Vec<(SchemaRef, Vec<RecordBatch>)>>);
+
+    #[async_trait::async_trait]
+    impl Sink for Collecting {
+        async fn table_exists(&self, _: &str) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn create_table(&self, _: &str, _: &[ColumnType], _: &TransferConfig) -> Result<()> {
+            unimplemented!()
+        }
+        async fn clone_table_structure(&self, _: &str, _: &str) -> Result<()> {
+            unimplemented!()
+        }
+        async fn insert_batches(&self, _: &str, s: SchemaRef, b: &[RecordBatch]) -> Result<u64> {
+            self.0.lock().unwrap().push((s, b.to_vec()));
+            Ok(0)
+        }
+        async fn atomic_swap(&self, _: &str, _: &str, _: &[ColumnType]) -> Result<()> {
+            unimplemented!()
+        }
+        async fn current_row_count(&self, _: &str) -> Result<Option<u64>> {
+            unimplemented!()
+        }
+        async fn drop_table(&self, _: &str) -> Result<()> {
+            unimplemented!()
+        }
+        async fn ensure_state_table(&self, _: &str) -> Result<()> {
+            unimplemented!()
+        }
+        async fn read_last_watermark(&self, _: &TransferConfig) -> Result<Option<String>> {
+            unimplemented!()
+        }
+        async fn persist_watermark(&self, _: &TransferConfig, _: &str, _: u64) -> Result<()> {
+            unimplemented!()
+        }
+        async fn add_missing_columns(
+            &self,
+            _: &str,
+            _: &[ColumnType],
+            _: &TransferConfig,
+        ) -> Result<Vec<String>> {
+            unimplemented!()
+        }
+        fn dest_kind(&self) -> crate::config::DestKind {
+            crate::config::DestKind::ClickHouse
+        }
+        fn namespace(&self) -> &str {
+            "db"
+        }
+    }
+
+    /// `id`, a `code` key and a `ts` watermark that is the version column,
+    /// all three NOT NULL at the destination, as a ClickHouse incremental
+    /// plan has them; and the config that plans it.
+    fn null_guard_plan() -> (SelectPlan, TransferConfig) {
+        let mut cfg = crate::config::default_test_config();
+        cfg.mode = SyncMode::Incremental;
+        cfg.key = vec!["code".into()];
+        cfg.watermark = Some("ts".into());
+        let mut cols = vec![
+            col_typed("id", DataType::Int64),
+            col_typed("code", DataType::Utf8),
+            col_typed("ts", DataType::Int64),
+        ];
+        for c in &mut cols {
+            c.nullable = false;
+        }
+        let plan = SelectPlan {
+            source_columns: vec!["id".into(), "code".into(), "ts".into()],
+            source_select_exprs: vec![None; 3],
+            dest_columns: cols,
+        };
+        (plan, cfg)
+    }
+
+    /// A batch as a decoder builds it under `ctx.decode_columns(plan)`.
+    fn decoded(
+        ctx: &SendCtx,
+        plan: &SelectPlan,
+        rows: &[(i64, Option<&str>, Option<i64>)],
+    ) -> RecordBatch {
+        use arrow_array::{Int64Array, StringArray};
+        let schema = Arc::new(arrow_schema::Schema::new(
+            ctx.decode_columns(plan)
+                .iter()
+                .map(|c| arrow_schema::Field::new(&c.name, c.arrow.clone(), c.nullable))
+                .collect::<Vec<_>>(),
+        ));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    rows.iter().map(|r| r.1).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|r| r.2).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// Issue #49: every batch, whatever the source, leaves out the rows the
+    /// destination can't hold, sends the rest typed as the destination has
+    /// them, and counts what it left out where `fail_on_warnings` looks.
+    #[tokio::test]
+    async fn push_batch_leaves_out_null_keys_and_watermarks_and_counts_them() {
+        let (plan, mut cfg) = null_guard_plan();
+        let sink = Arc::new(Collecting::default());
+        let guard = NullGuard::new(&plan, &cfg).map(Arc::new);
+        let mut ctx = send_ctx(sink.clone(), None);
+        ctx.null_guard = guard;
+        ctx.watermark_max = WatermarkTracker::new("ts", &plan, false).map(Arc::new);
+        // A decoder builds the checked columns nullable, so a NULL reaches
+        // the guard instead of failing the batch.
+        let nullable: Vec<bool> = ctx
+            .decode_columns(&plan)
+            .iter()
+            .map(|c| c.nullable)
+            .collect();
+        assert_eq!(nullable, [false, true, true]);
+
+        let mut sends = JoinSet::new();
+        let mut buf = InsertBuffer::new(1 << 30);
+        let first = decoded(
+            &ctx,
+            &plan,
+            &[
+                (1, Some("a"), Some(10)),
+                (2, None, Some(99)),
+                (3, Some("c"), None),
+            ],
+        );
+        let schema = first.schema();
+        ctx.push_batch(&mut sends, &mut buf, schema.clone(), first)
+            .await
+            .unwrap();
+        // Nothing left of this one: nothing is buffered for it.
+        let second = decoded(&ctx, &plan, &[(4, None, None)]);
+        ctx.push_batch(&mut sends, &mut buf, schema.clone(), second)
+            .await
+            .unwrap();
+        assert_eq!(buf.batches.len(), 1);
+        ctx.flush(&mut sends, &mut buf, schema).await;
+        reap(&mut sends, true).await.unwrap();
+
+        let sent = sink.0.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1);
+        let (schema, batches) = &sent[0];
+        assert!(schema.fields().iter().all(|f| !f.is_nullable()));
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].schema(), *schema);
+        assert_eq!(batches[0].num_rows(), 1);
+        assert_eq!(ctx.counters.rows_written.load(Ordering::Relaxed), 1);
+        // The cursor passes the row left out for its key, as the MAX does.
+        let tracker = ctx.watermark_max.as_ref().unwrap();
+        assert_eq!(tracker.max.load(Ordering::Relaxed), 99);
+
+        // The watermark is checked first, so row 4 counts as a NULL watermark.
+        cfg.fail_on_warnings = vec![WarningKind::NullKey];
+        let err = check_fatal(&cfg, sink.as_ref(), &ctx.warnings, Before::Swap)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with(
+                "fail_on_warnings: null_key on column 'code' (count 1) stopped the run"
+            ),
+            "{err}"
+        );
+        assert!(err.contains("destination is untouched"), "{err}");
+        let out = ctx.warnings.drain();
+        let got: Vec<(WarningKind, Option<&str>, u64)> = out
+            .iter()
+            .map(|w| (w.kind, w.column.as_deref(), w.count))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (WarningKind::NullWatermark, Some("ts"), 2),
+                (WarningKind::NullKey, Some("code"), 1),
+            ]
+        );
+        assert!(out[0]
+            .message
+            .contains("2 row(s) read, which were left out"));
+    }
+
+    /// A window of a sweep that fails is read again, so the rows it left out
+    /// are counted only once a window succeeds, and a failed one's go with
+    /// its buffered rows.
+    #[tokio::test]
+    async fn a_window_read_again_counts_its_left_out_rows_once() {
+        let (plan, cfg) = null_guard_plan();
+        let sink = Arc::new(Collecting::default());
+        let mut ctx = send_ctx(sink.clone(), None);
+        ctx.null_guard = NullGuard::new(&plan, &cfg).map(Arc::new);
+        let mut sends = JoinSet::new();
+        let mut buf = InsertBuffer::new(1 << 30);
+        buf.deferred = true;
+        let window = || decoded(&ctx, &plan, &[(1, Some("a"), Some(1)), (2, None, Some(2))]);
+        let schema = window().schema();
+
+        let mark = buf.mark();
+        ctx.push_batch(&mut sends, &mut buf, schema.clone(), window())
+            .await
+            .unwrap();
+        assert!(!ctx.warnings.contains(WarningKind::NullKey, Some("code")));
+        // The window fails, and is read again.
+        buf.truncate(mark);
+        ctx.push_batch(&mut sends, &mut buf, schema.clone(), window())
+            .await
+            .unwrap();
+        ctx.report_left_out(&mut buf);
+        let out = ctx.warnings.drain();
+        assert_eq!(out.len(), 1);
+        assert_eq!((out[0].kind, out[0].count), (WarningKind::NullKey, 1));
+        assert_eq!(buf.batches.len(), 1);
+    }
+
+    /// Without a key or a guarded watermark, batches pass as they were.
+    #[tokio::test]
+    async fn push_batch_without_a_guard_sends_batches_untouched() {
+        let (plan, _) = null_guard_plan();
+        let sink = Arc::new(Collecting::default());
+        let ctx = send_ctx(sink.clone(), None);
+        assert!(matches!(ctx.decode_columns(&plan), Cow::Borrowed(_)));
+        let mut sends = JoinSet::new();
+        let mut buf = InsertBuffer::new(1 << 30);
+        let batch = decoded(&ctx, &plan, &[(1, Some("a"), Some(1))]);
+        let schema = batch.schema();
+        ctx.push_batch(&mut sends, &mut buf, schema.clone(), batch.clone())
+            .await
+            .unwrap();
+        ctx.flush(&mut sends, &mut buf, schema.clone()).await;
+        reap(&mut sends, true).await.unwrap();
+        let sent = sink.0.lock().unwrap().clone();
+        assert_eq!(sent[0].0, schema);
+        assert_eq!(sent[0].1, vec![batch]);
+        assert!(ctx.warnings.drain().is_empty());
+    }
+
+    #[test]
+    fn left_out_rows_fold_into_one_warning_per_column() {
+        let w = Warnings::default();
+        w.left_out(WarningKind::NullKey, "code", 2);
+        w.left_out(WarningKind::NullKey, "code", 3);
+        w.left_out(WarningKind::NullKey, "code", 0);
+        assert!(w.contains(WarningKind::NullKey, Some("code")));
+        assert!(!w.contains(WarningKind::NullKey, Some("id")));
+        assert_eq!(w.left_out_total(), 5);
+        let fatal = w.first_of(&[WarningKind::NullKey]).unwrap();
+        assert_eq!(fatal.count, 5);
+        assert!(fatal
+            .message
+            .starts_with("key column 'code' was NULL in 5 row(s)"));
+        let out = w.drain();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].message, fatal.message);
+        assert!(w.drain().is_empty());
+    }
+
+    /// A database read reports NULL watermarks it left out unread from a
+    /// count, and the guard reports those a decoder made NULL: one warning,
+    /// both counts, each sentence with its own.
+    #[test]
+    fn a_counted_null_watermark_and_a_left_out_one_keep_both_sentences() {
+        let w = Warnings::default();
+        warn_on_null_watermark("ts", 7, &w);
+        w.left_out(WarningKind::NullWatermark, "ts", 2);
+        let out = w.drain();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].count, 9);
+        assert!(out[0].message.contains("7 row(s) currently have a NULL"));
+        assert!(out[0]
+            .message
+            .contains("NULL in 2 row(s) read, which were left out"));
+        // A read with no watermark at all isn't reported on top of it.
+        let mut cfg = crate::config::default_test_config();
+        cfg.watermark = Some("ts".into());
+        w.left_out(WarningKind::NullWatermark, "ts", 2);
+        warn_on_unwatermarked_read(&cfg, 2, &w);
+        assert_eq!(w.drain().len(), 1);
+    }
+
+    /// Issue #49: a coercion in a column whose NULL rows are left out, or
+    /// whose NULL ClickHouse fills with a default, doesn't say the value was
+    /// coerced to NULL.
+    #[test]
+    fn a_coercion_says_what_became_of_the_value() {
+        let w = Warnings::default();
+        w.set_null_fates(HashMap::from([
+            (
+                "ts".to_string(),
+                NullFate::LeftOut(WarningKind::NullWatermark),
+            ),
+            ("code".to_string(), NullFate::LeftOut(WarningKind::NullKey)),
+            ("sort".to_string(), NullFate::Default),
+        ]));
+        for part in ["a", "b"] {
+            report_coercions(
+                part,
+                vec![
+                    (WarningKind::CoercedDate, "ts".to_string(), 1),
+                    (WarningKind::CoercedScalar, "code".to_string(), 1),
+                    (WarningKind::CoercedDate, "sort".to_string(), 1),
+                    (WarningKind::CoercedDate, "seen".to_string(), 1),
+                ],
+                &w,
+            );
+        }
+        let out = w.drain();
+        let msg = |c: &str| {
+            out.iter()
+                .find(|x| x.column.as_deref() == Some(c))
+                .unwrap()
+                .message
+                .clone()
+        };
+        let ts = msg("ts");
+        assert!(ts.starts_with("column 'ts': 2 unrepresentable"), "{ts}");
+        assert!(!ts.contains("coerced to NULL"), "{ts}");
+        assert!(
+            ts.contains("were left out (counted in null_watermark)"),
+            "{ts}"
+        );
+        assert!(msg("code").contains("left out (counted in null_key)"));
+        assert!(!msg("code").contains("coerced to NULL"));
+        let sort = msg("sort");
+        assert!(sort.contains("stored the column's default"), "{sort}");
+        assert!(!sort.contains("coerced to NULL"), "{sort}");
+        // A column that holds NULL got one.
+        assert!(msg("seen").ends_with("coerced to NULL"), "{}", msg("seen"));
+    }
+
+    #[test]
+    fn the_archive_holds_the_rows_the_destination_is_sent() {
+        let (plan, cfg) = null_guard_plan();
+        let guard = NullGuard::new(&plan, &cfg).unwrap();
+        let mut ctx = send_ctx(Arc::new(Collecting::default()), None);
+        ctx.null_guard = Some(Arc::new(guard.clone()));
+        let batch = decoded(&ctx, &plan, &[(1, Some("a"), Some(1)), (2, None, Some(2))]);
+        assert_eq!(archived_rows(None, &batch).unwrap().num_rows(), 2);
+        let kept = archived_rows(Some(&guard), &batch).unwrap();
+        assert_eq!(kept.num_rows(), 1);
+        assert!(!kept.schema().field(1).is_nullable());
     }
 }

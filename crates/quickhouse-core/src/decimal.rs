@@ -238,6 +238,7 @@ impl CoercionTally {
             WarningKind::CoercedScalar => Some(3),
             // Table-level conditions are raised by `sync`, never tallied here.
             WarningKind::NullWatermark
+            | WarningKind::NullKey
             | WarningKind::FullRefreshShrink
             | WarningKind::UnclusteredMergeTarget
             | WarningKind::IncompleteExport

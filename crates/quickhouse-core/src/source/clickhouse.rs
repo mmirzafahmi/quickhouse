@@ -308,9 +308,12 @@ impl ClickHouseSource {
     ///
     /// `dest_columns` is `SelectPlan::dest_columns`, positionally parallel to
     /// `columns`/`select_exprs`; it supplies the `CAST` target that pins each
-    /// column's Arrow output type (see the module docs). `select_exprs` carries
-    /// `column_transforms`, and the cast wraps the transform rather than
-    /// replacing it.
+    /// column's Arrow output type (see the module docs). A transfer passes
+    /// them with its key and guarded watermark columns made nullable (see
+    /// `null_guard`): ClickHouse evaluates the cast on rows a `WHERE ... IS NOT
+    /// NULL` goes on to drop, and refuses to cast a NULL to a non-`Nullable`
+    /// type (#49). `select_exprs` carries `column_transforms`, and the cast
+    /// wraps the transform rather than replacing it.
     #[allow(clippy::too_many_arguments)]
     pub fn select_sql(
         &self,
