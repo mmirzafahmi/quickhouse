@@ -322,7 +322,8 @@ qh.sync(..., fail_on_warnings={"collapsed_bool", "null_watermark", "coerced_deci
 The check runs inside the transfer, before each step that makes anything
 permanent: before a full refresh's swap, before an incremental `MERGE` or
 insert-select, before the cursor is saved, and before each `chunk_rows` chunk is
-committed. Stopped before its `MERGE` or swap, the destination is untouched. An
+committed. Stopped before its `MERGE` or swap, the destination is untouched (or,
+if the run created it, left empty). An
 incremental that inserts straight into ClickHouse has written its rows, but the
 cursor isn't saved, so once the cause is fixed the next run reads the same range
 again (a `ReplacingMergeTree` converges on it). The error names the kind, the

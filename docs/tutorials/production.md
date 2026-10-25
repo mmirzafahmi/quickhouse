@@ -74,14 +74,15 @@ fail_on_warnings = ["null_watermark", "coerced_decimal"]
 
 A wrong `type`, or a misspelled setting in `[source]` or `[target]`, gets an
 error that names the part of the file, such as
-`[source] unknown type 'postgresql'`. A misspelled setting in `[sync]` shows up
-as a Python `TypeError` that names the setting.
+`[source] unknown type 'postgresql'`. A misspelled setting in `[sync]` stops the
+job before anything runs, and suggests the closest setting:
+`[sync] config error: unknown key 'keys' (did you mean 'key'?)`.
 
-```{warning}
-If an environment variable isn't set, the text `${ORDERS_DB_DSN}` is passed on
-unchanged, and the run fails with a confusing error such as
-`invalid connection string: unexpected EOF`. Check the variable first.
-```
+If a `${NAME}` variable isn't set, the job stops before anything runs and names
+it, with where it's used: `job.toml uses unset environment variable(s):
+ORDERS_DB_DSN ([source] dsn)`. Only the `${NAME}` form is checked. A bare
+`$NAME` that isn't set stays as written, because it can be ordinary text, such
+as a `$` in a password, so always write variables with braces.
 
 A job file only holds plain values, so options that need a Python object only
 work from a script: `archive=` (see [Backing up to cloud storage](backups.md)),

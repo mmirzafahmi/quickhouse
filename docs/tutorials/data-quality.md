@@ -157,7 +157,8 @@ the real one (a `MERGE`, for example), before an incremental run saves its
 position, and before each chunk of a `chunk_rows` read is committed. So:
 
 - **A full refresh, or an incremental sync into BigQuery**, stops before the
-  swap or the `MERGE`, and the destination is untouched.
+  swap or the `MERGE`, and the destination is untouched. If the run created
+  the destination, it is left there, empty.
 - **An incremental sync into ClickHouse** writes rows straight into the table,
   so they are already there when the check runs. It stops before saving its
   position, so the next run reads the same rows again. Once you've fixed the

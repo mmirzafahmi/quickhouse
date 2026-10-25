@@ -80,6 +80,21 @@ any breaking change is called out explicitly.
   `RuntimeError` itself, the way `backup()` already checks `format` up
   front. (#45)
 
+### Documentation
+- **Tutorials.** Fifteen step-by-step pages, from a first sync to running
+  quickhouse in production, built around one example business: choosing
+  columns, incremental syncs, deleted rows, ClickHouse table design, database
+  and API sources, DataFrames, data quality, BigQuery, performance and
+  backups. Linked from the top navigation, the home page and the quickstart.
+- **Fixes found while writing them.** pandas `NaN` arrives as `NULL` (pyarrow
+  and polars keep it as a value); an all-null DataFrame column becomes a
+  nullable string with a warning rather than being refused; ClickHouse `Date`,
+  `Date32`, `DateTime` and `DateTime64` columns keep their declared types at a
+  ClickHouse destination; a ClickHouse source table is read without `FINAL`;
+  `AppsFlyer` writes to ClickHouse as well as BigQuery; `S3Archive` attaches to
+  a BigQuery destination too; and BigQuery's full-refresh swap is a
+  `TRUNCATE` plus `INSERT` transaction, not a copy job. (#46)
+
 ## [0.20.10] — 2026-10-25
 
 ### Changed — please read before upgrading

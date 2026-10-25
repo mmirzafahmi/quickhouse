@@ -35,7 +35,9 @@ interpreted per destination:
 - **ClickHouse** — they shape the `MergeTree`-family DDL.
 - **BigQuery** — `engine` is ignored; `partition_by` must be a bare
   `DATE`/`DATETIME`/`TIMESTAMP` column name (not a SQL expression);
-  `order_by`/`key` become clustering columns (at most 4 total).
+  `order_by`/`key` become clustering columns (at most 4 total; `key` leads for
+  an incremental table, so its `MERGE` can prune, and `order_by` leads
+  otherwise).
 
 quickhouse creates the table for you (`create_if_missing=True` by default) with
 a schema derived from the source. See [Type mapping](../type-mapping.md) for how

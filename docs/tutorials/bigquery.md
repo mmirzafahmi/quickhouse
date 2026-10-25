@@ -167,13 +167,18 @@ rules differ from ClickHouse:
   `TIMESTAMP` column, not an expression. `partition_by="toYYYYMM(created_at)"`
   fails with "for a BigQuery destination this must be a bare column name, not a
   SQL expression like ClickHouse's".
-- Clustering columns are `order_by` followed by `key`, at most four in total.
-  More fails with "BigQuery clustering supports at most 4 columns".
+- Clustering columns are `order_by` and `key`, at most four in total. More
+  fails with "BigQuery clustering supports at most 4 columns". For an
+  incremental table, `key` comes first and `order_by` follows, because the
+  `MERGE` savings below depend on the key leading. For a full refresh or an
+  append, `order_by` comes first.
 
-```{tip}
-For an incremental table, keep the key **first** in the clustering. Either
-leave `order_by` out, so the table is clustered by `key` alone, or start
-`order_by` with the key columns. The `MERGE` savings below depend on it.
+```{note}
+Before quickhouse 0.20.11, `order_by` always came first. An incremental table
+created by an earlier version with both `order_by` and `key` is clustered with
+`order_by` leading, and raises the `unclustered_merge_target` warning described
+below. quickhouse doesn't change an existing table's clustering, so recreate the
+table to fix it.
 ```
 
 Like in ClickHouse, these settings only apply when quickhouse creates the
