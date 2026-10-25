@@ -222,6 +222,7 @@ quickhouse.<span class="n">sync</span>(
     <ul>
       <li><a href="installation.html">Installation</a></li>
       <li><a href="quickstart.html">Quickstart</a></li>
+      <li><a href="tutorials/index.html">Tutorials</a></li>
     </ul>
   </div>
   <div>
@@ -262,6 +263,13 @@ quickhouse.<span class="n">sync</span>(
 
 installation
 quickstart
+```
+
+```{toctree}
+:hidden:
+:caption: Tutorials
+
+tutorials/index
 ```
 
 ```{toctree}

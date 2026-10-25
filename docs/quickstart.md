@@ -98,6 +98,8 @@ qh.BigQuery("my-gcp-project", dataset_id="analytics")
 
 ## Where to next
 
+- [Tutorials](tutorials/index.md) — step-by-step lessons, from your first sync
+  to running quickhouse in production, built around one example business.
 - [Sources](guide/sources/index.md) — every source connection descriptor, auth,
   and the HTTP API sources.
 - [Destinations](guide/destinations/index.md) — ClickHouse and BigQuery, the S3
