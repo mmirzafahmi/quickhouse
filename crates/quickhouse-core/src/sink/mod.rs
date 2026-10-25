@@ -64,6 +64,25 @@ pub(crate) fn missing_columns<'a>(
         .collect()
 }
 
+/// The names of the columns of `written` that the existing table, whose
+/// columns are `existing`, lacks: what a write that doesn't add them leaves
+/// out. Empty for an empty `existing`, which is no table at all (a table has
+/// at least one column). `case_insensitive` as in [`column_key`]. Preserves
+/// `written` order.
+pub(crate) fn dropped_columns(
+    existing: &[String],
+    written: &[ColumnType],
+    case_insensitive: bool,
+) -> Vec<String> {
+    if existing.is_empty() {
+        return Vec::new();
+    }
+    missing_columns(existing, written, case_insensitive)
+        .into_iter()
+        .map(|c| c.name.clone())
+        .collect()
+}
+
 /// The names in `existing` that no column of `written` feeds — the other
 /// direction from [`missing_columns`]: destination columns a write leaves
 /// without a value. `case_insensitive` as in [`column_key`]. Preserves
@@ -243,6 +262,33 @@ pub trait Sink: Send + Sync {
         _columns: &[ColumnType],
     ) -> Result<Vec<String>> {
         Ok(Vec::new())
+    }
+
+    /// The same direction as [`Self::add_missing_columns`], when nothing adds
+    /// them: the names of the `columns` the existing `table` lacks, which a
+    /// write into it leaves out without complaint. Empty when the table
+    /// doesn't exist. See
+    /// [`crate::config::WarningKind::DroppedSourceColumn`]. Default: none, for
+    /// a destination that refuses such a write (BigQuery: `insertAll` and the
+    /// Storage Write API reject a field the table lacks, and the `MERGE` or
+    /// swap names every column).
+    async fn dropped_columns(&self, _table: &str, _columns: &[ColumnType]) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
+    /// The engine of the existing `table` when an incremental run with a
+    /// `key` would add a second copy of each row it writes again rather than
+    /// replace the stored one, and `cfg`'s `engine=` doesn't name such an
+    /// engine (which says the copies are wanted). `None` when the table
+    /// doesn't exist. See
+    /// [`crate::config::WarningKind::NonReplacingIncrementalTarget`]. Default:
+    /// `None`, for a destination whose incremental write is a keyed `MERGE`.
+    async fn non_replacing_engine(
+        &self,
+        _table: &str,
+        _cfg: &TransferConfig,
+    ) -> Result<Option<String>> {
+        Ok(None)
     }
 
     /// Which destination engine this writes to — threaded into `transform::plan`
@@ -541,6 +587,20 @@ mod tests {
             vec!["legacy"]
         );
         assert!(unsourced_columns(Vec::new(), &written, false).is_empty());
+    }
+
+    #[test]
+    fn dropped_columns_are_the_written_columns_the_destination_lacks() {
+        let existing = vec!["id".to_string(), "Name".to_string()];
+        let written = vec![col("id"), col("name"), col("channel")];
+        // Case-sensitive (ClickHouse): "name" isn't "Name", in `written` order.
+        assert_eq!(
+            dropped_columns(&existing, &written, false),
+            vec!["name", "channel"]
+        );
+        assert_eq!(dropped_columns(&existing, &written, true), vec!["channel"]);
+        // No columns at all is no table, which drops nothing: it is created.
+        assert!(dropped_columns(&[], &written, false).is_empty());
     }
 
     #[test]

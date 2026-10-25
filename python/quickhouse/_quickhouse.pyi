@@ -726,6 +726,7 @@ class TransferWarning:
       every row without it, on either. Raised at setup, once per column, with
       ``count`` ``0``; ``column`` is the destination column. Name it in
       ``fail_on_warnings`` to stop the run before anything is written. New in
+      0.20.9.
     - ``"abandoned_resume_marker"`` — the state key held the resume marker of
       an unfinished ``chunk_rows`` read of a different query, so the run
       didn't resume it. Resuming another query's marker read only where the
@@ -736,11 +737,44 @@ class TransferWarning:
       which matters with ``advance_watermark=False``. ``sample`` is the
       marker's cursor. Raised at setup, before anything is written. New in
       0.20.9.
+    - ``"dropped_source_column"`` — a source column (after ``rename``/
+      ``include``/``exclude``) has no column in the existing ClickHouse
+      destination, and ``evolve_schema`` is off, so every row the run writes
+      leaves it out. Turning ``evolve_schema`` on later adds the column but
+      leaves it NULL on those rows, which the cursor has already passed. Not
+      raised for BigQuery, which refuses such a write, nor for a ClickHouse
+      incremental run that stages (for ``validate=``, a retried
+      ``MergeTree`` or ``delete_stale_in_window``), whose insert-select fails
+      on the column instead. Raised at setup, once per column, with ``count``
+      ``0``; ``column`` is the source column. Pass ``evolve_schema=True``, or
+      ``exclude`` the column. New in 0.20.10.
+    - ``"recreated_destination"`` — the destination didn't exist, so the run
+      created it, but its state key still held a saved cursor or a
+      ``chunk_rows`` resume marker: the position of the table it replaces,
+      typically dropped to change an ``engine`` or ``order_by`` that only
+      applies when a table is created. Reading past it would have filled the
+      new table with only the rows after it, so the run starts over as a first
+      run does (``seed_watermark``/``skip_to_max`` apply) and clears the old
+      cursor, unless ``advance_watermark=False``. ``sample`` is the old
+      cursor; pass it as ``seed_watermark`` to start past it on purpose.
+      Raised at setup, before anything is written. Table-level. New in
+      0.20.10.
+    - ``"non_replacing_incremental_target"`` — an incremental run with a
+      ``key`` writes into an existing ClickHouse table whose engine keeps
+      every row it is sent, such as the plain ``MergeTree`` that
+      ``mode="full"`` creates, instead of replacing a row with a newer one of
+      the same key the way a ``ReplacingMergeTree`` does. Each changed row is
+      written again and the table keeps both copies; a first run, with no
+      cursor yet, writes the whole source again. Not raised when ``engine=``
+      names such an engine, which says the copies are wanted, nor for a table
+      the run creates. ``sample`` is the engine. Raised at setup, before
+      anything is written. Table-level. New in 0.20.10.
     """
 
     column: Optional[str]
     """The source column responsible, or ``None`` for a table-level condition.
-    For ``"unsourced_destination_column"``, the destination column."""
+    For ``"unsourced_destination_column"``, the destination column; for
+    ``"dropped_source_column"``, the source column's name before ``rename``."""
 
     count: int
     """How many values/rows tripped it. Aggregated per ``(kind, column)`` across
@@ -1260,8 +1294,11 @@ def sync(
       carries the extra timezone/precision info those need. Not supported for
       a BigQuery source.
     - ``evolve_schema=True`` adds a column to the existing destination (as
-      Nullable) when the source has one the destination lacks, instead of
-      hard-erroring. ADD-only — never drops or retypes a column. Also needed
+      Nullable) when the source has one the destination lacks. ADD-only —
+      never drops or retypes a column. Without it a ClickHouse destination
+      leaves such a column out of every row and raises
+      ``"dropped_source_column"`` (0.20.10), and a BigQuery one fails the
+      write. Also needed
       for ``mode="full"`` against an *existing* destination to pick up a
       genuinely new source column: full-refresh staging now mirrors the
       destination's actual DDL (see the note under ``engine``/``order_by``

@@ -70,11 +70,25 @@ qh.sync(
 Updated rows (same `key`, newer `watermark`) are **deduplicated on `key`**, and
 this is where the destinations differ:
 
-- **ClickHouse** dedupes lazily via `ReplacingMergeTree` at merge time.
+- **ClickHouse** dedupes lazily via `ReplacingMergeTree` at merge time, the
+  engine an incremental run creates. An existing table whose engine keeps
+  every row instead (a plain `MergeTree`, such as `mode="full"` creates) keeps
+  every copy, and the run raises `non_replacing_incremental_target`.
 - **BigQuery** has no engine-level equivalent, so writes are staged and then
   upserted via a `MERGE` statement matched on `key` — which is therefore
   **required** for BigQuery incremental syncs (unlike everywhere else, where it
   is optional). The MERGE bills for bytes scanned but is naturally idempotent.
+
+### Recreating the destination
+
+`engine`, `order_by`, `partition_by` and `type_overrides` only apply when a
+table is created, so dropping the destination and letting the next run create
+it is how you change them. The cursor lives in `_quickhouse_state`, not in the
+table. A run that creates the destination while its state key still holds a
+cursor (or a `chunk_rows` resume marker) starts over, as a first run does, so
+the new table gets every row; it clears the old cursor and raises
+`recreated_destination`, whose `sample` is that cursor. To start the new table
+past it on purpose, pass it as `seed_watermark`.
 
 ### Catching late-arriving rows
 

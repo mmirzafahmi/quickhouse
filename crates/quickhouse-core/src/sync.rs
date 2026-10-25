@@ -1871,19 +1871,16 @@ async fn run_transfer_impl(
     // run), and an in-progress chunk-resume marker (frozen upper + last durable
     // cursor; chunked reads only, and only if a prior run of this read was cut
     // short). Read before the source is probed, because the probes can use the
-    // cursor: see `partitions_above` and `watermark_bounds_the_key`.
-    let (committed, resume) = if cfg.mode == SyncMode::Incremental {
-        let committed = sink.read_last_watermark(&cfg).await?;
-        let resume = if cfg.chunk_rows.is_some() {
-            let marker = sink.read_chunk_state(&cfg).await?;
-            resumable_marker(marker, &cfg, committed.as_deref(), &warnings)
-        } else {
-            None
-        };
-        (committed, resume)
+    // cursor: see `partitions_above` and `watermark_bounds_the_key`. Neither
+    // when this run creates the destination: see `read_saved_state`.
+    let saved = if cfg.mode == SyncMode::Incremental {
+        read_saved_state(sink.as_ref(), &cfg, &warnings).await?
     } else {
-        (None, None)
+        SavedState::default()
     };
+    let resume = resumable_marker(saved.marker, &cfg, saved.committed.as_deref(), &warnings);
+    let committed = saved.committed;
+    let discarded_state = saved.discarded;
     // The lower bound the read starts from, where it is known before the MAX
     // probe: a `skip_to_max` seed is the MAX itself.
     let cursor_hint = committed.clone().or_else(|| match &cfg.seed_watermark {
@@ -2289,11 +2286,21 @@ async fn run_transfer_impl(
     // snapshot, so a stream-derived cursor has to allow for how long it took.
     let read_spans_statements =
         window_plan.is_some() || partitions.len() > 1 || chunk_plan.is_some();
-    // Setup raised its warnings already, and the destination's columns raise
-    // theirs here: one that is fatal stops the run before any table is
-    // created or written.
-    warn_on_unsourced_columns(sink.as_ref(), &cfg, &plan.dest_columns, &warnings).await?;
+    // Setup raised its warnings already, and the destination raises its own
+    // here: one that is fatal stops the run before any table is created or
+    // written.
+    warn_on_destination(
+        sink.as_ref(),
+        &cfg,
+        &plan,
+        force_stage_incremental,
+        &warnings,
+    )
+    .await?;
     check_fatal(&cfg, sink.as_ref(), &warnings, Before::Write)?;
+    if discarded_state {
+        clear_discarded_state(sink.as_ref(), &cfg).await?;
+    }
 
     // --- Ensure destination / staging tables exist. ---
     let target_table = prepare_target(
@@ -2755,11 +2762,15 @@ async fn run_transfer_bigquery(
 
     let plan: SelectPlan = transform::plan(&source_cols, &cfg, sink.dest_kind())?;
 
+    let mut discarded_state = false;
     let (row_restriction, new_watermark, cursor_check) = if cfg.mode == SyncMode::Incremental {
         let watermark = cfg.watermark.as_ref().unwrap();
         ensure_watermark_column(watermark, &source_cols)?;
         ensure_lookback_compatible(watermark, cfg.lookback_seconds, &source_cols)?;
-        let last = sink.read_last_watermark(&cfg).await?;
+        // None when this run creates the destination: see `read_saved_state`.
+        let saved = read_saved_state(sink.as_ref(), &cfg, &warnings).await?;
+        discarded_state = saved.discarded;
+        let last = saved.committed;
         let table_sql = crate::source::bigquery::table_sql(&table_ref);
         let snapshot_max = source
             .max_watermark(&client, &project_id, &table_sql, watermark)
@@ -2841,8 +2852,18 @@ async fn run_transfer_bigquery(
         ));
     }
 
-    warn_on_unsourced_columns(sink.as_ref(), &cfg, &plan.dest_columns, &warnings).await?;
+    warn_on_destination(
+        sink.as_ref(),
+        &cfg,
+        &plan,
+        force_stage_incremental,
+        &warnings,
+    )
+    .await?;
     check_fatal(&cfg, sink.as_ref(), &warnings, Before::Write)?;
+    if discarded_state {
+        clear_discarded_state(sink.as_ref(), &cfg).await?;
+    }
     let target_table = prepare_target(
         &sink,
         &cfg,
@@ -3351,15 +3372,16 @@ async fn run_transfer_api(
         .collect();
 
     // Incremental and append both resume from a persisted date cursor (append
-    // inserts instead of merging); full mode has none.
-    let committed = if matches!(cfg.mode, SyncMode::Incremental | SyncMode::Append) {
+    // inserts instead of merging); full mode has none. None either when this
+    // run creates the destination: see `read_saved_state`.
+    let saved = if matches!(cfg.mode, SyncMode::Incremental | SyncMode::Append) {
         let watermark = cfg.watermark.as_ref().unwrap();
         ensure_watermark_column(watermark, &source_cols)?;
-        sink.read_last_watermark(&cfg).await?
+        read_saved_state(sink.as_ref(), &cfg, &warnings).await?
     } else {
-        None
+        SavedState::default()
     };
-    let (from, to, new_watermark) = derive_api_window(&cfg, &source_cfg, committed)?;
+    let (from, to, new_watermark) = derive_api_window(&cfg, &source_cfg, saved.committed)?;
 
     // Force a staging table for a gated incremental run into a directly-inserting
     // destination (ClickHouse), so the gate has something to validate (see the
@@ -3379,8 +3401,18 @@ async fn run_transfer_api(
         ));
     }
 
-    warn_on_unsourced_columns(sink.as_ref(), &cfg, &plan.dest_columns, &warnings).await?;
+    warn_on_destination(
+        sink.as_ref(),
+        &cfg,
+        &plan,
+        force_stage_incremental,
+        &warnings,
+    )
+    .await?;
     check_fatal(&cfg, sink.as_ref(), &warnings, Before::Write)?;
+    if saved.discarded {
+        clear_discarded_state(sink.as_ref(), &cfg).await?;
+    }
     let target_table = prepare_target(
         &sink,
         &cfg,
@@ -3836,7 +3868,14 @@ async fn run_transfer_frame(
         ));
     }
 
-    warn_on_unsourced_columns(sink.as_ref(), &cfg, &plan.dest_columns, &warnings).await?;
+    warn_on_destination(
+        sink.as_ref(),
+        &cfg,
+        &plan,
+        force_stage_incremental,
+        &warnings,
+    )
+    .await?;
     check_fatal(&cfg, sink.as_ref(), &warnings, Before::Write)?;
     let target_table = prepare_target(
         &sink,
@@ -4506,6 +4545,128 @@ async fn setup_mysql(
         keyset_not_null: false,
         control: Some(ControlConn::MySql(control)),
     })
+}
+
+/// What a run with a cursor starts from, as [`read_saved_state`] reads it.
+#[derive(Debug, Default)]
+struct SavedState {
+    /// The cursor the last fully successful run saved.
+    committed: Option<String>,
+    /// The resume marker an unfinished `chunk_rows` read left.
+    marker: Option<ChunkMarker>,
+    /// Both were set aside because this run creates the destination, and
+    /// [`clear_discarded_state`] clears them before it does.
+    discarded: bool,
+}
+
+/// The cursor `cfg`'s state key saved and, for a `chunk_rows` read, the
+/// resume marker an unfinished run left: where the run starts.
+///
+/// Neither, when the destination doesn't exist and this run is about to
+/// create it. They are the position of the table it replaces, typically
+/// dropped by hand to change an `engine` or `order_by`, which only apply when
+/// a table is created, and starting past them would fill the new table with
+/// only the rows after them. Such a run starts over as a first run does
+/// (`seed_watermark` and `skip_to_max` apply) and raises
+/// [`WarningKind::RecreatedDestination`]. Decided before the source is
+/// probed, since the probes can use the cursor.
+async fn read_saved_state(
+    sink: &dyn Sink,
+    cfg: &TransferConfig,
+    warnings: &Warnings,
+) -> Result<SavedState> {
+    let committed = sink.read_last_watermark(cfg).await?;
+    let marker = if cfg.chunk_rows.is_some() {
+        sink.read_chunk_state(cfg).await?
+    } else {
+        None
+    };
+    if (committed.is_none() && marker.is_none())
+        || !cfg.create_if_missing
+        || sink.table_exists(&cfg.dest_table).await?
+    {
+        return Ok(SavedState {
+            committed,
+            marker,
+            discarded: false,
+        });
+    }
+    let message = recreated_destination_message(cfg, committed.as_deref(), marker.as_ref());
+    tracing::warn!("{message}");
+    warnings.push(TransferWarning {
+        kind: WarningKind::RecreatedDestination,
+        column: None,
+        count: 0,
+        sample: committed.or(marker.map(|m| m.cursor)),
+        message,
+    });
+    Ok(SavedState {
+        committed: None,
+        marker: None,
+        discarded: true,
+    })
+}
+
+/// The [`WarningKind::RecreatedDestination`] message: what the state key
+/// holds, and where the run reads from instead.
+fn recreated_destination_message(
+    cfg: &TransferConfig,
+    committed: Option<&str>,
+    marker: Option<&ChunkMarker>,
+) -> String {
+    let keyset = cfg.keyset_column().unwrap_or_default();
+    let stopped = |m: &ChunkMarker| {
+        format!(
+            "the resume marker of an unfinished chunk_rows read, stopped past {keyset} {}",
+            m.cursor
+        )
+    };
+    let held = match (committed, marker) {
+        (Some(c), Some(m)) => format!("the cursor {c} and {}", stopped(m)),
+        (Some(c), None) => format!("the cursor {c}"),
+        (None, Some(m)) => stopped(m),
+        (None, None) => "nothing".to_string(),
+    };
+    let from = match &cfg.seed_watermark {
+        WatermarkSeed::None => "the start".to_string(),
+        WatermarkSeed::Value(v) => format!("seed_watermark, {v}"),
+        WatermarkSeed::CurrentMax => "the source's current MAX (skip_to_max=True)".to_string(),
+    };
+    let cleared = if cfg.advance_watermark {
+        "and clears it"
+    } else {
+        "but advance_watermark=False leaves it saved, so a run after this one starts past it again"
+    };
+    let instead = committed
+        .map(|c| format!(" To start past it instead, pass seed_watermark='{c}'."))
+        .unwrap_or_default();
+    format!(
+        "destination '{}' does not exist, so this run creates it, but state_key '{}' still \
+         holds {held} from the table it replaces. Starting past it would fill the new table with \
+         only the rows after it, so this run reads from {from}, as a first run does, {cleared}.\
+         {instead}",
+        cfg.dest_table,
+        cfg.effective_state_key(),
+    )
+}
+
+/// Clear the cursor and resume marker [`read_saved_state`] set aside, before
+/// the run creates the destination: a run that fails after that leaves the
+/// next one a first run, not one past the old cursor into the new table, and
+/// so does one that finds nothing to save a cursor for. Not with
+/// `advance_watermark=False`, which never moves the cursor.
+async fn clear_discarded_state(sink: &dyn Sink, cfg: &TransferConfig) -> Result<()> {
+    if !cfg.advance_watermark {
+        return Ok(());
+    }
+    tracing::info!(
+        "clearing the cursor of state_key '{}' into '{}', which belonged to the table this run \
+         replaces",
+        cfg.effective_state_key(),
+        cfg.dest_table
+    );
+    sink.ensure_state_table(&cfg.state_table_name).await?;
+    sink.persist_watermark(cfg, "", 0).await
 }
 
 /// The `(cursor, upper)` of a chunk-resume marker this run may resume: one its
@@ -6358,7 +6519,10 @@ fn coercion_message(kind: WarningKind, column: &str, n: u64) -> String {
         | WarningKind::RetriedAfterPartialWrite
         | WarningKind::StorageWriteCountMismatch
         | WarningKind::UnsourcedDestinationColumn
-        | WarningKind::AbandonedResumeMarker => {
+        | WarningKind::AbandonedResumeMarker
+        | WarningKind::DroppedSourceColumn
+        | WarningKind::RecreatedDestination
+        | WarningKind::NonReplacingIncrementalTarget => {
             format!("column '{column}': {n} affected row(s)")
         }
     }
@@ -6999,9 +7163,10 @@ async fn prepare_target(
                 }
             } else {
                 tracing::debug!("destination table '{}' already exists", cfg.dest_table);
-                // Incremental always evolves: ClickHouse inserts straight into
-                // the dest, and BigQuery's MERGE references its columns — a new
-                // source column would hard-error on either without this.
+                // Without this, a new source column fails a BigQuery run (its
+                // MERGE references the dest's columns), while ClickHouse, which
+                // inserts straight into the dest, leaves it out of every row:
+                // `warn_on_dropped_columns` reports that before the write.
                 if cfg.evolve_schema {
                     let added = sink
                         .add_missing_columns(&cfg.dest_table, dest_columns, cfg)
@@ -7427,6 +7592,23 @@ fn warn_mixed_decimals(table: &str, decimal: &[String], float: &[String], warnin
     });
 }
 
+/// The checks of the existing destination against what this run writes,
+/// raised before anything is written, so a `fail_on_warnings` that names one
+/// stops the run with the destination untouched. `staged` is
+/// `force_stage_incremental`: an incremental run into a destination that
+/// would insert directly stages instead.
+async fn warn_on_destination(
+    sink: &dyn Sink,
+    cfg: &TransferConfig,
+    plan: &SelectPlan,
+    staged: bool,
+    warnings: &Warnings,
+) -> Result<()> {
+    warn_on_unsourced_columns(sink, cfg, &plan.dest_columns, warnings).await?;
+    warn_on_dropped_columns(sink, cfg, plan, staged, warnings).await?;
+    warn_on_non_replacing_target(sink, cfg, warnings).await
+}
+
 /// Raise [`WarningKind::UnsourcedDestinationColumn`] for each column of the
 /// existing destination that the rows this run writes leave without a value.
 /// Checked before anything is written, so a `fail_on_warnings` that names it
@@ -7486,6 +7668,109 @@ fn unsourced_effect(kind: crate::config::DestKind, mode: SyncMode) -> &'static s
         }
         (DestKind::BigQuery, SyncMode::Append) => "Every row this run appends gets NULL there",
     }
+}
+
+/// Raise [`WarningKind::DroppedSourceColumn`] for each column this run writes
+/// that the existing destination lacks and the write leaves out. Nothing is
+/// left out when `evolve_schema` adds the columns, or when an incremental
+/// run stages: its insert-select from staging names every column, and fails
+/// on one the destination lacks.
+async fn warn_on_dropped_columns(
+    sink: &dyn Sink,
+    cfg: &TransferConfig,
+    plan: &SelectPlan,
+    staged: bool,
+    warnings: &Warnings,
+) -> Result<()> {
+    if cfg.evolve_schema || (cfg.mode == SyncMode::Incremental && staged) {
+        return Ok(());
+    }
+    let dropped = sink
+        .dropped_columns(&cfg.dest_table, &plan.dest_columns)
+        .await?;
+    for column in dropped {
+        // Reported by its source name, which `exclude=` takes.
+        let source = plan
+            .dest_columns
+            .iter()
+            .zip(&plan.source_columns)
+            .find(|(c, _)| c.name == column)
+            .map_or(column.as_str(), |(_, s)| s.as_str())
+            .to_string();
+        let message = dropped_column_message(cfg, &source, &column);
+        tracing::warn!("{message}");
+        warnings.push(TransferWarning {
+            kind: WarningKind::DroppedSourceColumn,
+            column: Some(source),
+            count: 0,
+            sample: None,
+            message,
+        });
+    }
+    Ok(())
+}
+
+/// The [`WarningKind::DroppedSourceColumn`] message for source column
+/// `source`, written as `column`.
+fn dropped_column_message(cfg: &TransferConfig, source: &str, column: &str) -> String {
+    let name = if source == column {
+        format!("source column '{source}'")
+    } else {
+        format!("source column '{source}' (renamed '{column}')")
+    };
+    let effect = match cfg.mode {
+        SyncMode::Full => "The refreshed table has no such column",
+        SyncMode::Incremental | SyncMode::Append => {
+            "Turning evolve_schema on later adds the column but leaves it NULL on the rows this \
+             run writes, which a later run writes again only if they change"
+        }
+    };
+    format!(
+        "{name} has no column in '{}' to land in, and with evolve_schema=False every row this \
+         run writes leaves it out. {effect}. Pass evolve_schema=True to add the column, or \
+         exclude it if the destination doesn't need it.",
+        cfg.dest_table,
+    )
+}
+
+/// Raise [`WarningKind::NonReplacingIncrementalTarget`] when an incremental
+/// run with a `key` writes into an existing table whose engine keeps every
+/// copy of a row: there the upsert the key asks for is an append.
+async fn warn_on_non_replacing_target(
+    sink: &dyn Sink,
+    cfg: &TransferConfig,
+    warnings: &Warnings,
+) -> Result<()> {
+    if cfg.mode != SyncMode::Incremental || cfg.key.is_empty() {
+        return Ok(());
+    }
+    let Some(engine) = sink.non_replacing_engine(&cfg.dest_table, cfg).await? else {
+        return Ok(());
+    };
+    let message = non_replacing_target_message(cfg, &engine);
+    tracing::warn!("{message}");
+    warnings.push(TransferWarning {
+        kind: WarningKind::NonReplacingIncrementalTarget,
+        column: None,
+        count: 0,
+        sample: Some(engine),
+        message,
+    });
+    Ok(())
+}
+
+/// The [`WarningKind::NonReplacingIncrementalTarget`] message for a
+/// destination whose engine is `engine`.
+fn non_replacing_target_message(cfg: &TransferConfig, engine: &str) -> String {
+    format!(
+        "destination '{}' is a {engine}, which doesn't replace a stored row with a newer one of \
+         the same key the way a ReplacingMergeTree does. This incremental run with key={:?} \
+         writes each changed row again (a first run, with no cursor yet, the whole source), and \
+         the table keeps both. Drop the table and let the next run create it as a \
+         ReplacingMergeTree (it then reads the source from the start), or pass \
+         engine='{engine}' if the copies are wanted.",
+        cfg.dest_table, cfg.key,
+    )
 }
 
 /// What the destination table already holds, for
@@ -11787,5 +12072,341 @@ mod tests {
                 .to_string()
                 .contains("column_transforms")
         );
+    }
+
+    /// A destination that answers the questions asked of it before the first
+    /// write from fixed values, recording the state writes it gets.
+    #[derive(Default)]
+    struct SetupSink {
+        exists: bool,
+        committed: Option<String>,
+        marker: Option<ChunkMarker>,
+        dropped: Vec<String>,
+        engine: Option<String>,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl SetupSink {
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Sink for SetupSink {
+        async fn table_exists(&self, table: &str) -> Result<bool> {
+            self.calls.lock().unwrap().push(format!("exists {table}"));
+            Ok(self.exists)
+        }
+        async fn create_table(&self, _: &str, _: &[ColumnType], _: &TransferConfig) -> Result<()> {
+            unreachable!()
+        }
+        async fn clone_table_structure(&self, _: &str, _: &str) -> Result<()> {
+            unreachable!()
+        }
+        async fn insert_batches(&self, _: &str, _: SchemaRef, _: &[RecordBatch]) -> Result<u64> {
+            unreachable!()
+        }
+        async fn atomic_swap(&self, _: &str, _: &str, _: &[ColumnType]) -> Result<()> {
+            unreachable!()
+        }
+        async fn current_row_count(&self, _: &str) -> Result<Option<u64>> {
+            unreachable!()
+        }
+        async fn drop_table(&self, _: &str) -> Result<()> {
+            unreachable!()
+        }
+        async fn ensure_state_table(&self, table: &str) -> Result<()> {
+            self.calls.lock().unwrap().push(format!("ensure {table}"));
+            Ok(())
+        }
+        async fn read_last_watermark(&self, _: &TransferConfig) -> Result<Option<String>> {
+            Ok(self.committed.clone())
+        }
+        async fn read_chunk_state(&self, _: &TransferConfig) -> Result<Option<ChunkMarker>> {
+            Ok(self.marker.clone())
+        }
+        async fn persist_watermark(&self, _: &TransferConfig, w: &str, rows: u64) -> Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("persist {w:?} {rows}"));
+            Ok(())
+        }
+        async fn add_missing_columns(
+            &self,
+            _: &str,
+            _: &[ColumnType],
+            _: &TransferConfig,
+        ) -> Result<Vec<String>> {
+            unreachable!()
+        }
+        async fn dropped_columns(&self, _: &str, _: &[ColumnType]) -> Result<Vec<String>> {
+            Ok(self.dropped.clone())
+        }
+        async fn non_replacing_engine(
+            &self,
+            _: &str,
+            _: &TransferConfig,
+        ) -> Result<Option<String>> {
+            Ok(self.engine.clone())
+        }
+        fn dest_kind(&self) -> crate::config::DestKind {
+            crate::config::DestKind::ClickHouse
+        }
+        fn namespace(&self) -> &str {
+            "db"
+        }
+    }
+
+    fn incremental_cfg() -> TransferConfig {
+        let mut cfg = crate::config::default_test_config();
+        cfg.mode = SyncMode::Incremental;
+        cfg.watermark = Some("write_date".into());
+        cfg.key = vec!["id".into()];
+        cfg.dest_table = "orders".into();
+        cfg.state_key = Some("orders:wd".into());
+        cfg
+    }
+
+    fn marker(cursor: &str) -> ChunkMarker {
+        ChunkMarker {
+            cursor: cursor.into(),
+            upper: String::new(),
+            read: String::new(),
+        }
+    }
+
+    /// Issue #36: the cursor of a state key whose destination is gone is the
+    /// position of a table that no longer exists, and a run that creates the
+    /// table again starts over instead of reading past it.
+    #[tokio::test]
+    async fn a_run_that_creates_the_destination_sets_its_old_cursor_aside() {
+        let cfg = incremental_cfg();
+        let sink = SetupSink {
+            committed: Some("2024-01-01 00:00:00".into()),
+            ..Default::default()
+        };
+        let w = Warnings::default();
+        let saved = read_saved_state(&sink, &cfg, &w).await.unwrap();
+        assert_eq!(saved.committed, None);
+        assert!(saved.discarded);
+        let raised = w.drain();
+        assert_eq!(raised.len(), 1);
+        assert_eq!(raised[0].kind, WarningKind::RecreatedDestination);
+        assert_eq!(raised[0].sample.as_deref(), Some("2024-01-01 00:00:00"));
+        assert_eq!(raised[0].column, None);
+        let msg = &raised[0].message;
+        assert!(msg.contains("state_key 'orders:wd'"), "{msg}");
+        assert!(msg.contains("the cursor 2024-01-01 00:00:00"), "{msg}");
+        assert!(msg.contains("reads from the start"), "{msg}");
+        assert!(
+            msg.contains("seed_watermark='2024-01-01 00:00:00'"),
+            "{msg}"
+        );
+
+        // Clearing it is a state write, made only once the run goes ahead.
+        clear_discarded_state(&sink, &cfg).await.unwrap();
+        assert_eq!(
+            sink.calls(),
+            vec![
+                "exists orders",
+                "ensure _quickhouse_state",
+                "persist \"\" 0"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_into_an_existing_destination_keeps_its_cursor() {
+        let cfg = incremental_cfg();
+        let sink = SetupSink {
+            exists: true,
+            committed: Some("5".into()),
+            marker: Some(marker("200")),
+            ..Default::default()
+        };
+        let w = Warnings::default();
+        let saved = read_saved_state(&sink, &cfg, &w).await.unwrap();
+        assert_eq!(saved.committed.as_deref(), Some("5"));
+        // Not a chunked read: its marker isn't asked for.
+        assert_eq!(saved.marker, None);
+        assert!(!saved.discarded);
+        assert!(w.drain().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_first_run_has_no_cursor_to_set_aside() {
+        let cfg = incremental_cfg();
+        let sink = SetupSink::default();
+        let w = Warnings::default();
+        let saved = read_saved_state(&sink, &cfg, &w).await.unwrap();
+        assert!(!saved.discarded);
+        assert!(w.drain().is_empty());
+        // Nothing to set aside, so the destination isn't even looked up.
+        assert!(sink.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_run_that_may_not_create_the_destination_keeps_its_cursor() {
+        // It fails at prepare_target, which says why, with nothing read.
+        let mut cfg = incremental_cfg();
+        cfg.create_if_missing = false;
+        let sink = SetupSink {
+            committed: Some("5".into()),
+            ..Default::default()
+        };
+        let w = Warnings::default();
+        let saved = read_saved_state(&sink, &cfg, &w).await.unwrap();
+        assert_eq!(saved.committed.as_deref(), Some("5"));
+        assert!(w.drain().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_resume_marker_alone_is_set_aside_too() {
+        let mut cfg = incremental_cfg();
+        cfg.chunk_rows = Some(100);
+        cfg.seed_watermark = WatermarkSeed::CurrentMax;
+        let sink = SetupSink {
+            marker: Some(marker("200")),
+            ..Default::default()
+        };
+        let w = Warnings::default();
+        let saved = read_saved_state(&sink, &cfg, &w).await.unwrap();
+        assert_eq!(saved.marker, None);
+        assert!(saved.discarded);
+        let raised = w.drain();
+        assert_eq!(raised[0].sample.as_deref(), Some("200"));
+        let msg = &raised[0].message;
+        assert!(msg.contains("stopped past id 200"), "{msg}");
+        assert!(msg.contains("current MAX (skip_to_max=True)"), "{msg}");
+        // No committed cursor to start past instead.
+        assert!(!msg.contains("seed_watermark='"), "{msg}");
+    }
+
+    #[test]
+    fn a_recreated_destination_message_says_where_the_run_reads_from() {
+        let mut cfg = incremental_cfg();
+        cfg.chunk_rows = Some(100);
+        cfg.seed_watermark = WatermarkSeed::Value("2023-06-01".into());
+        let msg = recreated_destination_message(&cfg, Some("7"), Some(&marker("300")));
+        assert!(
+            msg.contains("the cursor 7 and the resume marker of an unfinished chunk_rows read"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("reads from seed_watermark, 2023-06-01"),
+            "{msg}"
+        );
+        assert!(msg.contains("and clears it"), "{msg}");
+        cfg.advance_watermark = false;
+        let msg = recreated_destination_message(&cfg, Some("7"), None);
+        assert!(
+            msg.contains("advance_watermark=False leaves it saved"),
+            "{msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn advance_watermark_false_leaves_a_discarded_cursor_saved() {
+        let mut cfg = incremental_cfg();
+        cfg.advance_watermark = false;
+        let sink = SetupSink::default();
+        clear_discarded_state(&sink, &cfg).await.unwrap();
+        assert!(sink.calls().is_empty());
+    }
+
+    fn plan_of(cols: &[(&str, &str)]) -> SelectPlan {
+        SelectPlan {
+            source_columns: cols.iter().map(|(s, _)| s.to_string()).collect(),
+            source_select_exprs: vec![None; cols.len()],
+            dest_columns: cols.iter().map(|(_, d)| pcol(d, 0, true)).collect(),
+        }
+    }
+
+    /// Issue #35: a source column the destination lacks is reported by its
+    /// source name, the one `exclude=` takes, and only where the write drops
+    /// it.
+    #[tokio::test]
+    async fn a_dropped_source_column_is_reported_by_its_source_name() {
+        let mut cfg = incremental_cfg();
+        let plan = plan_of(&[("id", "id"), ("chan", "channel"), ("v", "v")]);
+        let sink = SetupSink {
+            dropped: vec!["channel".into(), "v".into()],
+            ..Default::default()
+        };
+        let w = Warnings::default();
+        warn_on_dropped_columns(&sink, &cfg, &plan, false, &w)
+            .await
+            .unwrap();
+        let raised = w.drain();
+        let mut columns: Vec<_> = raised.iter().map(|w| w.column.clone().unwrap()).collect();
+        columns.sort();
+        assert_eq!(columns, vec!["chan", "v"]);
+        assert!(raised
+            .iter()
+            .all(|w| w.kind == WarningKind::DroppedSourceColumn && w.count == 0));
+        let renamed = raised
+            .iter()
+            .find(|w| w.column.as_deref() == Some("chan"))
+            .unwrap();
+        let msg = &renamed.message;
+        assert!(msg.contains("'chan' (renamed 'channel')"), "{msg}");
+        assert!(msg.contains("leaves it NULL"), "{msg}");
+
+        // evolve_schema adds them; a staged incremental run fails on them.
+        cfg.evolve_schema = true;
+        warn_on_dropped_columns(&sink, &cfg, &plan, false, &w)
+            .await
+            .unwrap();
+        cfg.evolve_schema = false;
+        warn_on_dropped_columns(&sink, &cfg, &plan, true, &w)
+            .await
+            .unwrap();
+        assert!(w.drain().is_empty());
+        // A full refresh stages too, but swaps the staged table in whole.
+        cfg.mode = SyncMode::Full;
+        warn_on_dropped_columns(&sink, &cfg, &plan, true, &w)
+            .await
+            .unwrap();
+        let raised = w.drain();
+        assert_eq!(raised.len(), 2);
+        assert!(raised[0]
+            .message
+            .contains("refreshed table has no such column"));
+    }
+
+    /// Issue #37: an incremental run with a key into a table that keeps every
+    /// copy of a row is an append there, and says so.
+    #[tokio::test]
+    async fn an_incremental_run_with_a_key_into_a_table_that_keeps_copies_is_reported() {
+        let mut cfg = incremental_cfg();
+        let sink = SetupSink {
+            engine: Some("MergeTree".into()),
+            ..Default::default()
+        };
+        let w = Warnings::default();
+        warn_on_non_replacing_target(&sink, &cfg, &w).await.unwrap();
+        let raised = w.drain();
+        assert_eq!(raised.len(), 1);
+        assert_eq!(raised[0].kind, WarningKind::NonReplacingIncrementalTarget);
+        assert_eq!(raised[0].sample.as_deref(), Some("MergeTree"));
+        let msg = &raised[0].message;
+        assert!(msg.contains("'orders' is a MergeTree"), "{msg}");
+        assert!(
+            msg.contains("engine='MergeTree' if the copies are wanted"),
+            "{msg}"
+        );
+
+        // Without a key there is nothing to upsert on, and the other modes
+        // don't upsert.
+        cfg.key.clear();
+        warn_on_non_replacing_target(&sink, &cfg, &w).await.unwrap();
+        cfg.key = vec!["id".into()];
+        for mode in [SyncMode::Full, SyncMode::Append] {
+            cfg.mode = mode;
+            warn_on_non_replacing_target(&sink, &cfg, &w).await.unwrap();
+        }
+        assert!(w.drain().is_empty());
     }
 }

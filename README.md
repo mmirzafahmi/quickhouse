@@ -404,7 +404,7 @@ errors are surfaced verbatim rather than wrapped in something generic.
 | `window_bounds` | `(lo, hi)`: the key range a windowed read sweeps, instead of probing `MIN`/`MAX`. Rows outside it aren't read, so it needs `advance_watermark=False`. Implies `windowed` (default `None`) |
 | `retry_max_attempts` | Re-run the whole transfer on a transient *source* error (PG recovery-conflict/cancel; MySQL gone-away/lock-wait/deadlock). `1` = no retry (default) |
 | `column_transforms` | Per-column SQL value transforms over `source_table=` (e.g. `{"ts":"ts AT TIME ZONE 'UTC'"}`), preserving range partitioning. Postgres/MySQL/ClickHouse only |
-| `evolve_schema` | Auto-`ADD COLUMN` (Nullable) when the source has a column the destination lacks, instead of erroring. ADD-only. Default `False` |
+| `evolve_schema` | Auto-`ADD COLUMN` (Nullable) when the source has a column the destination lacks. ADD-only. Default `False`: ClickHouse then leaves the column out and warns (`dropped_source_column`); BigQuery fails the write |
 | `key` | Dedup key (required for BigQuery incremental) |
 | `create_if_missing` | Auto-create the destination table (default `True`) |
 | `engine`, `order_by`, `partition_by`, `primary_key` | DDL knobs, interpreted per destination |

@@ -166,10 +166,17 @@ qh.sync(..., source_table="orders",
 `evolve_schema=True` auto-`ADD COLUMN` (as Nullable) when the source has a column
 the destination lacks. ADD-only — it never drops or retypes a column. Default
 `False`, and then a ClickHouse destination drops such a column from every row it
-writes, without a warning: turn it on, or select only the columns the destination
-has.
+writes. The run reports it: each such source column (after
+`rename`/`include`/`exclude`) raises `dropped_source_column` before anything is
+written. Turning `evolve_schema` on later adds the column but leaves it `NULL`
+on the rows synced in the meantime, since the cursor has passed them, so pass
+`fail_on_warnings={"dropped_source_column"}` to stop the run instead. The fix is
+`evolve_schema=True`, or `exclude=` for a column the destination doesn't need.
+BigQuery refuses such a write rather than drop the column, and so does a
+ClickHouse incremental run that stages (for `validate=`, a retried `MergeTree`
+or `delete_stale_in_window`): neither raises the warning.
 
-The other direction is reported: a destination column that no source column
+The other direction is reported too: a destination column that no source column
 feeds (after `rename`/`include`/`exclude`) raises
 `unsourced_destination_column`, once per column, before anything is written.
 The two destinations treat such a column differently:

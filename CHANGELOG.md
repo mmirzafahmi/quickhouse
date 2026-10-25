@@ -28,7 +28,53 @@ any breaking change is called out explicitly.
   sync ran, its destination is missing rows in the windows it touched:
   re-sync them, or find them with `reconcile_keys`. (#34)
 
+### Added
+- **A warning for source columns a ClickHouse destination drops:
+  `dropped_source_column`.** With `evolve_schema=False`, the default, a source
+  column the existing ClickHouse destination lacks was left out of every row
+  written, in incremental and full mode, and the run succeeded with no
+  warning. ClickHouse's `INSERT ... FORMAT ArrowStream` names no columns and
+  skips an Arrow column the table doesn't have, and a full refresh stages a
+  copy of the destination's structure. Turning `evolve_schema` on afterwards
+  added the column but left it `NULL` on the rows synced in between, which the
+  cursor had passed. A comment in `prepare_target` and the docs said this case
+  was an error. The run now raises the warning once per such source column
+  (after `rename`, `include` and `exclude`), before anything is written, so
+  `fail_on_warnings={"dropped_source_column"}` stops it with the destination
+  untouched. BigQuery refuses such a write instead, as does a ClickHouse
+  incremental run that stages (its insert-select names the column), so
+  neither raises it. It costs one query against the destination's metadata per
+  run. (#35)
+- **A warning for an incremental run into a table that keeps duplicates:
+  `non_replacing_incremental_target`.** An incremental run with a `key`
+  creates a `ReplacingMergeTree`, but into an existing table whose engine keeps
+  every row, such as the plain `MergeTree` that `mode="full"` creates, it
+  appended instead, and nothing said so. The first incremental run after a
+  full refresh, with no cursor yet, doubled the table, and every later run
+  added another copy of each changed row. The run now raises the warning,
+  naming the engine, before anything is written. A `Replicated` engine that
+  keeps duplicates counts too, though retries still don't stage into one. Not
+  raised for a table the run creates, nor when `engine=` names an engine that
+  keeps duplicates, which says the copies are wanted. (#37)
+
 ### Fixed
+- **A recreated incremental destination starts over instead of reading past
+  the old table's cursor.** The cursor lives in `_quickhouse_state`, so
+  dropping the destination, the usual way to change an `engine`, `order_by`,
+  `partition_by` or `type_overrides` that only apply when a table is created,
+  left it in place. The next run created the table again and read only the
+  rows past that cursor: a 1,000-row table came back with 1 row, and the run
+  succeeded without a warning. A run that is about to create the destination
+  while its state key still holds a saved cursor or a `chunk_rows` resume
+  marker now ignores both, before the source is probed, and reads as a first
+  run does (`seed_watermark` and `skip_to_max` apply). It raises
+  `recreated_destination`, naming the state key and the old cursor (also its
+  `sample`), and clears the cursor before creating the table, so a run that
+  fails after that leaves a first run behind it, not one past the old cursor;
+  `advance_watermark=False` leaves it saved. The check costs one query, made
+  only when a cursor exists. `fail_on_warnings={"recreated_destination"}`
+  refuses the run before anything is created. To start the new table past the
+  old cursor on purpose, pass it as `seed_watermark`. (#36)
 - **The full-refresh shrink guard counts a `ReplacingMergeTree` as merged.**
   It compared the rows staged with the destination's plain `count()`, which
   includes an updated row's old versions until ClickHouse merges them away, so

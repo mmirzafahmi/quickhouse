@@ -2052,6 +2052,35 @@ pub enum WarningKind {
     /// cursor. Raised at setup, before anything is written. Table-level:
     /// `column` is `None`.
     AbandonedResumeMarker,
+    /// A source column (after `rename` / `include` / `exclude`) has no column
+    /// in the existing ClickHouse destination, and `evolve_schema` is off, so
+    /// ClickHouse leaves it out of every row the run writes. Turning
+    /// `evolve_schema` on later adds the column but leaves it NULL on those
+    /// rows, which a cursor has already passed. Not raised for BigQuery, which
+    /// refuses such a write, nor for a ClickHouse incremental run that stages
+    /// (its insert-select names the column and fails). Raised at setup,
+    /// before anything is written, once per column with `count` `0`;
+    /// `column` is the source column.
+    DroppedSourceColumn,
+    /// The destination didn't exist, so the run created it, but its state key
+    /// still held a saved cursor or a `chunk_rows` resume marker: the
+    /// position of the table it replaces, typically dropped by hand to change
+    /// an `engine` or `order_by` that only applies when a table is created.
+    /// Starting past it would fill the new table with only the rows after
+    /// it, so the run starts over as a first run does (`seed_watermark`
+    /// applies) and clears the old cursor. `sample` is that cursor. Raised at
+    /// setup, before anything is written. Table-level: `column` is `None`.
+    RecreatedDestination,
+    /// An incremental run with a `key` writes into an existing ClickHouse
+    /// table whose engine keeps every row it is sent (a plain `MergeTree`,
+    /// such as one `mode="full"` created) rather than replacing a row with a
+    /// newer one of the same key the way a `ReplacingMergeTree` does. Each
+    /// changed row is written again and the table keeps both copies; a first
+    /// run, with no cursor yet, writes the whole source again. Not raised when
+    /// `engine=` names such an engine, which says the copies are wanted.
+    /// Raised at setup, before anything is written; `sample` is the engine.
+    /// Table-level: `column` is `None`.
+    NonReplacingIncrementalTarget,
 }
 
 impl WarningKind {
@@ -2080,6 +2109,9 @@ impl WarningKind {
             WarningKind::StorageWriteCountMismatch => "storage_write_count_mismatch",
             WarningKind::UnsourcedDestinationColumn => "unsourced_destination_column",
             WarningKind::AbandonedResumeMarker => "abandoned_resume_marker",
+            WarningKind::DroppedSourceColumn => "dropped_source_column",
+            WarningKind::RecreatedDestination => "recreated_destination",
+            WarningKind::NonReplacingIncrementalTarget => "non_replacing_incremental_target",
         }
     }
 
@@ -2089,7 +2121,7 @@ impl WarningKind {
     }
 
     /// Every kind, in declaration order.
-    pub const ALL: [WarningKind; 20] = [
+    pub const ALL: [WarningKind; 23] = [
         WarningKind::CollapsedBool,
         WarningKind::CoercedDate,
         WarningKind::CoercedDecimal,
@@ -2110,6 +2142,9 @@ impl WarningKind {
         WarningKind::StorageWriteCountMismatch,
         WarningKind::UnsourcedDestinationColumn,
         WarningKind::AbandonedResumeMarker,
+        WarningKind::DroppedSourceColumn,
+        WarningKind::RecreatedDestination,
+        WarningKind::NonReplacingIncrementalTarget,
     ];
 }
 
@@ -2560,7 +2595,10 @@ mod tests {
             | WarningKind::RetriedAfterPartialWrite
             | WarningKind::StorageWriteCountMismatch
             | WarningKind::UnsourcedDestinationColumn
-            | WarningKind::AbandonedResumeMarker => WarningKind::ALL.contains(&k),
+            | WarningKind::AbandonedResumeMarker
+            | WarningKind::DroppedSourceColumn
+            | WarningKind::RecreatedDestination
+            | WarningKind::NonReplacingIncrementalTarget => WarningKind::ALL.contains(&k),
         };
         assert!(WarningKind::ALL.into_iter().all(listed));
     }
