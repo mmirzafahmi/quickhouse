@@ -9,6 +9,8 @@ any breaking change is called out explicitly.
 
 ## [Unreleased]
 
+## [0.20.12] — 2026-10-25
+
 ### Changed — please read before upgrading
 - **A row with a NULL `key` is left out and counted in a new warning,
   `null_key`, on every source.** No destination can hold a NULL key:
