@@ -9,6 +9,8 @@ any breaking change is called out explicitly.
 
 ## [Unreleased]
 
+## [0.20.10] — 2026-10-25
+
 ### Changed — please read before upgrading
 - **`delete_stale_in_window` is refused unless `watermark` is the
   `merge_prune_partition_by` column.** Configurations 0.20.9 accepted now fail
