@@ -252,7 +252,10 @@ impl CoercionTally {
             | WarningKind::RetriedAfterPartialWrite
             | WarningKind::StorageWriteCountMismatch
             | WarningKind::UnsourcedDestinationColumn
-            | WarningKind::AbandonedResumeMarker => None,
+            | WarningKind::AbandonedResumeMarker
+            | WarningKind::DroppedSourceColumn
+            | WarningKind::RecreatedDestination
+            | WarningKind::NonReplacingIncrementalTarget => None,
         }
     }
 

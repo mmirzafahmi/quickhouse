@@ -48,7 +48,7 @@ qh.from_pandas(duckdb.sql("SELECT * FROM orders"), dst, dest_table="orders", mod
       <div class="qh-params__name">mode="incremental"</div>
       <div class="qh-params__type">upsert on key</div>
     </div>
-    <p class="qh-params__desc">Upserts on <code>key</code>, and needs <strong>no watermark</strong> &mdash; unlike every other source.</p>
+    <p class="qh-params__desc">Upserts on <code>key</code>, and needs <strong>no watermark</strong> &mdash; unlike every other source. On ClickHouse the upsert is the <code>ReplacingMergeTree</code> it creates: into an existing table whose engine keeps every row (a plain <code>MergeTree</code>, such as <code>mode="full"</code> creates) it appends, and raises <code>non_replacing_incremental_target</code>.</p>
   </div>
 </div>
 ```

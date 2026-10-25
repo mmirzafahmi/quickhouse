@@ -1056,6 +1056,36 @@ mod tests {
         }
     }
 
+    /// Issue #43: an API source's declared `NUMERIC` decodes as
+    /// `Decimal128(38, 9)` and was created on ClickHouse as `Float64`. It is
+    /// now created as the exact `Decimal(38, 9)`, except in a table whose
+    /// column is already a float, which keeps receiving floats.
+    #[test]
+    fn an_api_numeric_is_created_exact_on_clickhouse_unless_the_column_is_a_float() {
+        let src = crate::decode_api::resolve_api_columns(&[crate::config::ApiColumn {
+            name: "amount".into(),
+            bq_type: "NUMERIC".into(),
+            path: None,
+        }])
+        .unwrap();
+        let fresh = plan(&src, &cfg(), DestKind::ClickHouse).unwrap();
+        assert_eq!(fresh.dest_columns[0].clickhouse_inner, "Decimal(38, 9)");
+        assert_eq!(fresh.dest_columns[0].arrow, DataType::Decimal128(38, 9));
+
+        let floats = ExistingColumns::Known(HashMap::from([(
+            "amount".to_string(),
+            "Nullable(Float64)".to_string(),
+        )]));
+        let kept = plan_for_destination(&src, &cfg(), DestKind::ClickHouse, true, &floats).unwrap();
+        assert_eq!(kept.dest_columns[0].clickhouse_inner, "Float64");
+        // Decoded exactly as before; ClickHouse converts it on insert.
+        assert_eq!(kept.dest_columns[0].arrow, DataType::Decimal128(38, 9));
+        assert_eq!(
+            existing_decimals(&src, &cfg(), DestKind::ClickHouse, &floats),
+            ExistingDecimals::Float
+        );
+    }
+
     #[test]
     fn existing_decimals_ignores_overridden_and_unfit_columns() {
         let src = vec![

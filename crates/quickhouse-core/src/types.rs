@@ -115,7 +115,8 @@ pub struct ColumnType {
     pub arbitrary_precision_decimal: bool,
     /// The precision and scale a decimal column *declares* in the source —
     /// PostgreSQL `numeric(P, S)` (from the column's type modifier), MySQL
-    /// `DECIMAL(P, S)` — when it fits `Decimal128` (`1 <= P <= 38`,
+    /// `DECIMAL(P, S)`, an API source's declared `NUMERIC` (BigQuery's
+    /// `(38, 9)`) — when it fits `Decimal128` (`1 <= P <= 38`,
     /// `0 <= S <= P`). `None` for an unconstrained PostgreSQL `numeric`, for
     /// any source that doesn't report it, and for every non-decimal column.
     /// Drives the default exact mapping in `transform::plan`.

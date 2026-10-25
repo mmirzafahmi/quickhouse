@@ -334,12 +334,16 @@ class CleverTap:
     top level. ``bq_type`` is a BigQuery type name (STRING/INTEGER/FLOAT/
     BOOLEAN/TIMESTAMP/DATETIME/DATE/TIME/NUMERIC/BIGNUMERIC/BYTES/JSON); NUMERIC
     is delivered exactly (declare NUMERIC only for values sent as JSON strings
-    or integers), BIGNUMERIC is lossy (Float64). Nested RECORD/STRUCT types can't
+    or integers), as BigQuery NUMERIC or ClickHouse ``Decimal(38, 9)`` (an
+    existing ClickHouse column that is already ``Float64`` keeps its type),
+    BIGNUMERIC is lossy (Float64). Nested RECORD/STRUCT types can't
     be declared — point a JSON (or STRING) column at a nested object/array via
     ``path`` and it lands as compact JSON text. The top-level ``ts`` is a packed
     ``yyyyMMddHHmmSS`` integer in several regions (e.g. ``sg1``), **not** epoch
     seconds — declare it as TIMESTAMP/DATETIME (or DATE) and it is parsed as UTC
-    civil time; 10-digit epoch seconds are also accepted. ``region`` selects the
+    civil time; 10-digit epoch seconds and 13-digit epoch milliseconds are also
+    accepted. A date or timestamp outside 1900-2299 becomes NULL with a
+    ``coerced_date`` warning. ``region`` selects the
     API host (default ``sg1`` ->
     ``https://sg1.api.clevertap.com``). ``[from_date, to_date]`` (``"YYYY-MM-DD"``)
     is the full-refresh window; in incremental mode ``from_date`` is only the
@@ -726,6 +730,7 @@ class TransferWarning:
       every row without it, on either. Raised at setup, once per column, with
       ``count`` ``0``; ``column`` is the destination column. Name it in
       ``fail_on_warnings`` to stop the run before anything is written. New in
+      0.20.9.
     - ``"abandoned_resume_marker"`` — the state key held the resume marker of
       an unfinished ``chunk_rows`` read of a different query, so the run
       didn't resume it. Resuming another query's marker read only where the
@@ -736,11 +741,44 @@ class TransferWarning:
       which matters with ``advance_watermark=False``. ``sample`` is the
       marker's cursor. Raised at setup, before anything is written. New in
       0.20.9.
+    - ``"dropped_source_column"`` — a source column (after ``rename``/
+      ``include``/``exclude``) has no column in the existing ClickHouse
+      destination, and ``evolve_schema`` is off, so every row the run writes
+      leaves it out. Turning ``evolve_schema`` on later adds the column but
+      leaves it NULL on those rows, which the cursor has already passed. Not
+      raised for BigQuery, which refuses such a write, nor for a ClickHouse
+      incremental run that stages (for ``validate=``, a retried
+      ``MergeTree`` or ``delete_stale_in_window``), whose insert-select fails
+      on the column instead. Raised at setup, once per column, with ``count``
+      ``0``; ``column`` is the source column. Pass ``evolve_schema=True``, or
+      ``exclude`` the column. New in 0.20.10.
+    - ``"recreated_destination"`` — the destination didn't exist, so the run
+      created it, but its state key still held a saved cursor or a
+      ``chunk_rows`` resume marker: the position of the table it replaces,
+      typically dropped to change an ``engine`` or ``order_by`` that only
+      applies when a table is created. Reading past it would have filled the
+      new table with only the rows after it, so the run starts over as a first
+      run does (``seed_watermark``/``skip_to_max`` apply) and clears the old
+      cursor, unless ``advance_watermark=False``. ``sample`` is the old
+      cursor; pass it as ``seed_watermark`` to start past it on purpose.
+      Raised at setup, before anything is written. Table-level. New in
+      0.20.10.
+    - ``"non_replacing_incremental_target"`` — an incremental run with a
+      ``key`` writes into an existing ClickHouse table whose engine keeps
+      every row it is sent, such as the plain ``MergeTree`` that
+      ``mode="full"`` creates, instead of replacing a row with a newer one of
+      the same key the way a ``ReplacingMergeTree`` does. Each changed row is
+      written again and the table keeps both copies; a first run, with no
+      cursor yet, writes the whole source again. Not raised when ``engine=``
+      names such an engine, which says the copies are wanted, nor for a table
+      the run creates. ``sample`` is the engine. Raised at setup, before
+      anything is written. Table-level. New in 0.20.10.
     """
 
     column: Optional[str]
     """The source column responsible, or ``None`` for a table-level condition.
-    For ``"unsourced_destination_column"``, the destination column."""
+    For ``"unsourced_destination_column"``, the destination column; for
+    ``"dropped_source_column"``, the source column's name before ``rename``."""
 
     count: int
     """How many values/rows tripped it. Aggregated per ``(kind, column)`` across
@@ -1059,9 +1097,12 @@ def sync(
     once after the per-run staging table is fully loaded but *before* it is
     promoted (swap / ``MERGE`` / insert). Raising from it aborts the promotion,
     drops staging, and fails the transfer — so rejected data never reaches the
-    destination. Pass a :class:`quickhouse.Validation` to run a Great Expectations
-    suite (``pip install quickhouse[quality]``), or any callable that raises to
-    reject. Works in full-refresh and incremental mode into either destination —
+    destination. ``sync()`` then raises the gate's own exception, unchanged (a
+    :class:`quickhouse.ValidationFailed` keeps its ``.result``), with a note
+    naming the transfer. Pass a :class:`quickhouse.Validation` to run a Great
+    Expectations suite (``pip install quickhouse[quality]``), or any callable
+    that raises to reject. Works in full-refresh and incremental mode into
+    either destination —
     a ClickHouse incremental sync (which normally inserts directly) is
     transparently routed through a staging table when a gate is attached, then
     promoted via ``INSERT … SELECT``. Append mode and ``chunk_rows`` commit
@@ -1260,8 +1301,11 @@ def sync(
       carries the extra timezone/precision info those need. Not supported for
       a BigQuery source.
     - ``evolve_schema=True`` adds a column to the existing destination (as
-      Nullable) when the source has one the destination lacks, instead of
-      hard-erroring. ADD-only — never drops or retypes a column. Also needed
+      Nullable) when the source has one the destination lacks. ADD-only —
+      never drops or retypes a column. Without it a ClickHouse destination
+      leaves such a column out of every row and raises
+      ``"dropped_source_column"`` (0.20.10), and a BigQuery one fails the
+      write. Also needed
       for ``mode="full"`` against an *existing* destination to pick up a
       genuinely new source column: full-refresh staging now mirrors the
       destination's actual DDL (see the note under ``engine``/``order_by``
@@ -1407,6 +1451,19 @@ def sync(
     delete the entire destination history outside the batch, so it is a hard
     config error.
 
+    It also **requires** ``watermark`` to be the ``merge_prune_partition_by``
+    column, and refuses a ``watermark_source_expr``; both are config errors.
+    The DELETE takes every row in the window the batch doesn't hold, so the
+    batch must hold every source row in the window. A read on the window
+    column does: it returns every row past ``cursor - lookback_seconds`` there.
+    A read on an update watermark such as ``write_date`` holds only the rows
+    that changed, and the DELETE would take the unchanged rows between them,
+    which the source still has. The safe set-up is ``watermark`` set to the
+    window column, a ``lookback_seconds`` that covers how long a row can still
+    change or be deleted, and a ``state_key`` of its own. A DataFrame source is
+    exempt, since nothing filters its read: the frame must hold the whole
+    window itself.
+
     .. versionchanged:: 0.15.0
        Supported for a **ClickHouse** destination as well as BigQuery. BigQuery
        expresses it as a ``WHEN NOT MATCHED BY SOURCE`` clause inside the same
@@ -1501,14 +1558,17 @@ def sync(
     - ``read_idle_timeout_secs`` (new in 0.15.0, default ``0`` = off) is the
       thing the name above suggests: fail when **no source rows arrive** for
       that long. The timer wraps the awaits on the source stream and nothing
-      else, so time spent decoding, inserting, or blocked on the memory budget
-      does not count toward it — a slow destination cannot trip it, which is
-      what makes it safe to set tightly. A genuinely hung source does trip it,
-      and the resulting error is classified transient so ``retry_max_attempts``
-      retries the whole transfer. Applies to the PostgreSQL, MySQL, BigQuery and
-      ClickHouse source reads; API sources are paced by their own per-request
-      HTTP timeouts. (For a ClickHouse source it measures the gap between
-      response chunks rather than between rows — the same thing at any
+      else, the wait for a statement's first row included (a stall before it,
+      on a lock or in a slow function, counts as idle time and toward
+      ``read_secs``), so time spent decoding, inserting, or blocked on the
+      memory budget does not count toward it — a slow destination cannot trip
+      it, which is what makes it safe to set tightly. A genuinely hung source
+      does trip it, and the resulting error is classified transient so
+      ``retry_max_attempts`` retries the whole transfer. Applies to the
+      PostgreSQL, MySQL, BigQuery and ClickHouse source reads; API sources are
+      paced by their own per-request HTTP timeouts. (For a ClickHouse source
+      it measures the gap between response chunks rather than between rows —
+      the same thing at any
       meaningful scale, since a block is flushed as it is produced.) Setting this lets ``statement_timeout_secs`` go back to being
       sized for the source database — a guard against a runaway scan — rather
       than for the destination's worst day.

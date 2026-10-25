@@ -13,18 +13,12 @@
 //! missing key or JSON null → NULL (not counted); an unparseable scalar → NULL
 //! plus the matching counter (`invalid_scalars`/`invalid_dates`/`invalid_decimals`).
 //! Every declared column is Nullable, since external data routinely omits keys.
-//! There is no `ch_range` clamp here, unlike every other decode path
-//! (`decode.rs`, `decode_bigquery.rs`, `decode_mysql.rs`). The stated
-//! justification was "the destination is BigQuery-only, whose
-//! DATE/TIMESTAMP range spans 0001–9999" — which stopped being true in
-//! `bc1ab45`, when API sources gained ClickHouse as a destination.
-//!
-//! KNOWN GAP: an API source declaring a DATE/TIMESTAMP column whose value
-//! falls outside ClickHouse's representable window ([`crate::types::ch_range`])
-//! is passed through rather than nulled, so it is rejected or wrapped at the
-//! sink instead of being coerced to NULL with a counter like every other
-//! source. Unreachable while the destination is BigQuery; reachable today
-//! for an API -> ClickHouse transfer.
+//! A date/timestamp that parses but falls outside ClickHouse's representable
+//! window ([`ch_range`]) is coerced to NULL and counted as an unparseable one
+//! is, as on every other decode path (`decode.rs`, `decode_bigquery.rs`,
+//! `decode_mysql.rs`). Before, it was passed through: ClickHouse stored it at
+//! the end of `DateTime64`'s range with no warning, which is how a TIMESTAMP
+//! sent as epoch milliseconds landed as 2299-12-31.
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -44,7 +38,7 @@ use crate::config::{ApiColumn, WarningKind};
 use crate::decimal::{parse_decimal_text, rescale_mantissa, CoercionTally, DecimalText};
 use crate::error::{EtlError, Result};
 use crate::types::bigquery::{canonical_bq_type_name, map_type, parse_bq_type_name};
-use crate::types::ColumnType;
+use crate::types::{ch_range, ColumnType};
 
 /// What happened while coercing one declared value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,7 +47,8 @@ enum ApiCoercion {
     None,
     /// A non-empty scalar (int/float/bool/bytes) failed to parse -> NULL.
     Scalar,
-    /// A date/timestamp value failed to parse -> NULL.
+    /// A date/timestamp value failed to parse, or fell outside ClickHouse's
+    /// 1900–2299 window -> NULL.
     Date,
     /// A NUMERIC value overflowed / failed to parse -> NULL.
     Decimal,
@@ -64,6 +59,15 @@ enum ApiCoercion {
 /// so declared numerics decode exactly (BIGNUMERIC stays Float64 — needs
 /// Decimal256; documented). Rejects an empty list, duplicate names, and
 /// unknown/parameterized type names.
+///
+/// A `NUMERIC` also *declares* `(38, 9)`, BigQuery's own `NUMERIC` precision,
+/// so a destination that takes its types from the plan (ClickHouse) creates it
+/// as the exact `Decimal(38, 9)` it decodes as, through the same
+/// `transform::declared_decimal_default` a PostgreSQL `numeric(P, S)` goes
+/// through — including its rule that an existing non-decimal column keeps its
+/// type. Without it the column was created as `Float64`, and every value
+/// decoded exactly was rounded on insert. A BigQuery destination is
+/// unaffected: its declared types are seeded into `type_overrides`, which win.
 pub fn resolve_api_columns(cols: &[ApiColumn]) -> Result<Vec<ColumnType>> {
     use crate::types::bigquery::type_id as id;
     if cols.is_empty() {
@@ -88,10 +92,10 @@ pub fn resolve_api_columns(cols: &[ApiColumn]) -> Result<Vec<ColumnType>> {
             ))
         })?;
         // Exact decimal for NUMERIC (parity with the DB sources' NUMERIC path).
-        let (arrow, apd) = match type_id {
-            id::NUMERIC => (DataType::Decimal128(38, 9), true),
-            id::BIGNUMERIC => (arrow, true),
-            _ => (arrow, false),
+        let (arrow, apd, declared) = match type_id {
+            id::NUMERIC => (DataType::Decimal128(38, 9), true, Some((38, 9))),
+            id::BIGNUMERIC => (arrow, true, None),
+            _ => (arrow, false, None),
         };
         out.push(ColumnType {
             name: c.name.clone(),
@@ -100,7 +104,7 @@ pub fn resolve_api_columns(cols: &[ApiColumn]) -> Result<Vec<ColumnType>> {
             arrow,
             clickhouse_inner: ch_inner,
             arbitrary_precision_decimal: apd,
-            declared_decimal: None,
+            declared_decimal: declared,
         });
     }
     Ok(out)
@@ -355,40 +359,79 @@ fn json_scalar_text(v: &Value) -> Option<Cow<'_, str>> {
     }
 }
 
-/// Parse a date into Date32 days-from-epoch. Accepts `YYYY-MM-DD`, CleverTap's
-/// packed all-digit civil forms `yyyyMMdd` (8) / `yyyyMMddHHmmSS` (14) — the
-/// leading `yyyyMMdd` is taken as the date — and finally integer epoch seconds.
-/// The packed forms are checked before the epoch-seconds branch for the same
-/// reason as [`parse_ts_micros`] (a 14-digit `ts` is civil, not epoch).
+/// Whether `s` is an integer of exactly 13 digits, sign aside: epoch
+/// milliseconds. Told apart from epoch seconds by length, as the 14-digit
+/// packed civil form is: 13-digit epoch seconds would be past the year 33,000,
+/// while 13-digit epoch milliseconds span 2001-09-09 to 2286-11-20 (and,
+/// negative, back to 1653), which is what an API sending milliseconds sends.
+fn is_epoch_millis(s: &str) -> bool {
+    let digits = s.strip_prefix('-').unwrap_or(s);
+    digits.len() == 13 && digits.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Parse a date into Date32 days-from-epoch, `None` for one that doesn't parse
+/// or falls outside ClickHouse's 1900–2299 window ([`ch_range`]). Accepts
+/// `YYYY-MM-DD`, CleverTap's packed all-digit civil forms `yyyyMMdd` (8) /
+/// `yyyyMMddHHmmSS` (14) — the leading `yyyyMMdd` is taken as the date — a
+/// 13-digit integer as epoch milliseconds, and finally integer epoch seconds.
+/// The packed and millisecond forms are checked before the epoch-seconds branch
+/// for the same reason as in [`parse_ts_micros`].
+///
+/// The range check runs on the `i64` day count, before it is narrowed to the
+/// `i32` Date32 holds: narrowing first wrapped a far-future epoch value around
+/// to an arbitrary day, possibly one inside the window.
 fn parse_date_days(s: &str) -> Option<i32> {
+    let days = i32::try_from(parse_days_unchecked(s)?).ok()?;
+    ch_range::days_in_range(days).then_some(days)
+}
+
+/// [`parse_date_days`] without the range check.
+fn parse_days_unchecked(s: &str) -> Option<i64> {
     let epoch = NaiveDate::from_ymd_opt(1970, 1, 1)?;
     if let Ok(d) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-        return Some(d.signed_duration_since(epoch).num_days() as i32);
+        return Some(d.signed_duration_since(epoch).num_days());
     }
     if (s.len() == 8 || s.len() == 14) && s.bytes().all(|b| b.is_ascii_digit()) {
         if let Ok(d) = NaiveDate::parse_from_str(&s[..8], "%Y%m%d") {
-            return Some(d.signed_duration_since(epoch).num_days() as i32);
+            return Some(d.signed_duration_since(epoch).num_days());
         }
     }
-    // Integer epoch seconds -> day.
-    if let Ok(secs) = s.parse::<i64>() {
-        return Some((secs.div_euclid(86_400)) as i32);
-    }
-    None
+    let n = s.parse::<i64>().ok()?;
+    // Integer epoch milliseconds or seconds -> day.
+    Some(if is_epoch_millis(s) {
+        n.div_euclid(86_400_000)
+    } else {
+        n.div_euclid(86_400)
+    })
 }
 
-/// Parse a timestamp into UTC epoch microseconds. Accepts, in order: RFC3339, a
-/// `YYYY-MM-DD HH:MM:SS` civil string (interpreted as UTC), a 14-digit
-/// `yyyyMMddHHmmSS` packed civil integer (CleverTap's `ts` in several regions —
-/// e.g. `sg1` — is this, NOT epoch seconds), and finally integer epoch seconds.
+/// Parse a timestamp into UTC epoch microseconds, `None` for one that doesn't
+/// parse or falls outside ClickHouse's 1900–2299 window ([`ch_range`]).
+/// Accepts, in order: RFC3339, a `YYYY-MM-DD HH:MM:SS` civil string
+/// (interpreted as UTC), a 14-digit `yyyyMMddHHmmSS` packed civil integer
+/// (CleverTap's `ts` in several regions — e.g. `sg1` — is this, NOT epoch
+/// seconds), a 13-digit integer as epoch milliseconds, and finally integer
+/// epoch seconds.
 ///
 /// The 14-digit packed form is disambiguated from epoch seconds purely by shape:
 /// a genuine 14-digit epoch-seconds value would be ~year 644,000, so an
 /// all-digit string of length 14 is unambiguously the packed civil form. This
 /// is checked BEFORE the epoch-seconds branch — otherwise `20260722193602`
 /// parses as an i64 and `* 1_000_000` overflows to `None`, silently NULLing
-/// every declared TIMESTAMP/DATETIME column (the 0.6.0 CleverTap bug).
+/// every declared TIMESTAMP/DATETIME column (the 0.6.0 CleverTap bug). Epoch
+/// milliseconds are told apart the same way (see [`is_epoch_millis`]); read as
+/// seconds, they landed at ClickHouse's 2299-12-31 limit with no warning.
+///
+/// The range check is what makes the next unit mismatch visible: 12-digit
+/// milliseconds from before 2001, read as seconds, become NULL with a
+/// `coerced_date` warning instead of landing at 2299, and a column of nothing
+/// else is flagged by [`ApiBatcher::fully_coerced_temporal_columns`].
 fn parse_ts_micros(s: &str) -> Option<i64> {
+    parse_micros_unchecked(s).filter(|&micros| ch_range::micros_in_range(micros))
+}
+
+/// [`parse_ts_micros`] without the range check.
+fn parse_micros_unchecked(s: &str) -> Option<i64> {
     if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
         return Some(dt.timestamp_micros());
     }
@@ -400,10 +443,12 @@ fn parse_ts_micros(s: &str) -> Option<i64> {
             return Some(ndt.and_utc().timestamp_micros());
         }
     }
-    if let Ok(secs) = s.parse::<i64>() {
-        return secs.checked_mul(1_000_000);
+    let n = s.parse::<i64>().ok()?;
+    if is_epoch_millis(s) {
+        n.checked_mul(1_000)
+    } else {
+        n.checked_mul(1_000_000)
     }
-    None
 }
 
 /// Batches declared-schema records (`serde_json::Value`) into `RecordBatch`es.
@@ -418,8 +463,9 @@ pub struct ApiBatcher {
     bytes_in_batch: usize,
     pub rows_total: u64,
     /// Per-column counts of the values this batcher coerced to NULL — scalars
-    /// that failed to parse, dates/timestamps that failed to parse, and
-    /// NUMERICs that overflowed. Read back through [`Self::coercions`].
+    /// that failed to parse, dates/timestamps that failed to parse or fell
+    /// outside [`ch_range`], and NUMERICs that overflowed. Read back through
+    /// [`Self::coercions`].
     coercions: CoercionTally,
     /// Per-column output name (aligned to `builders`), for diagnostics.
     col_names: Vec<String>,
@@ -480,9 +526,10 @@ impl ApiBatcher {
     }
 
     /// Declared DATE/TIMESTAMP columns where EVERY non-empty source value failed
-    /// to parse and was set to NULL — a strong signal of a unit/format mismatch
-    /// (e.g. a packed `yyyyMMddHHmmSS` `ts` declared as TIMESTAMP) rather than
-    /// genuinely-null data. Returns `(column, coerced_count, sample_raw_value)`.
+    /// to parse, or fell outside ClickHouse's 1900–2299 window, and was set to
+    /// NULL — a strong signal of a unit/format mismatch (e.g. epoch
+    /// microseconds declared as TIMESTAMP) rather than genuinely-null data.
+    /// Returns `(column, coerced_count, sample_raw_value)`.
     pub fn fully_coerced_temporal_columns(&self) -> Vec<(String, u64, String)> {
         (0..self.col_temporal.len())
             .filter(|&i| {
@@ -515,7 +562,8 @@ impl ApiBatcher {
         self.coercions.total(WarningKind::CoercedScalar)
     }
 
-    /// Total date/timestamp values that failed to parse and became NULL.
+    /// Total date/timestamp values that failed to parse, or fell outside
+    /// ClickHouse's 1900–2299 window, and became NULL.
     pub fn invalid_dates_total(&self) -> u64 {
         self.coercions.total(WarningKind::CoercedDate)
     }
@@ -629,10 +677,29 @@ mod tests {
             "NUMERIC -> exact Decimal128(38,9)"
         );
         assert!(dest[2].arbitrary_precision_decimal);
+        assert_eq!(
+            dest[2].declared_decimal,
+            Some((38, 9)),
+            "NUMERIC declares BigQuery's (38, 9), so ClickHouse creates it exact"
+        );
+        assert_eq!(dest[0].declared_decimal, None);
         assert!(
             dest.iter().all(|c| c.nullable),
             "every declared column is nullable"
         );
+    }
+
+    #[test]
+    fn a_declared_bignumeric_declares_no_precision() {
+        let dest = resolve_api_columns(&[ApiColumn {
+            name: "big".into(),
+            bq_type: "BIGNUMERIC".into(),
+            path: None,
+        }])
+        .unwrap();
+        // Decimal256 isn't supported, so it stays Float64 everywhere.
+        assert_eq!(dest[0].arrow, DataType::Float64);
+        assert_eq!(dest[0].declared_decimal, None);
     }
 
     #[test]
@@ -737,6 +804,114 @@ mod tests {
         // A 14-digit string that isn't a valid datetime (month 13) has no civil
         // reading and overflows the epoch branch -> None (was already NULL).
         assert_eq!(parse_ts_micros("20261399999999"), None);
+    }
+
+    /// Issue #42: an epoch-milliseconds value was multiplied as seconds, and
+    /// landed at ClickHouse's 2299-12-31 limit with no warning.
+    #[test]
+    fn parse_ts_micros_reads_a_13_digit_integer_as_epoch_milliseconds() {
+        // 2024-10-24 06:06:40 UTC, as milliseconds and as seconds.
+        assert_eq!(
+            parse_ts_micros("1729750000000"),
+            Some(1_729_750_000_000_000)
+        );
+        assert_eq!(parse_ts_micros("1729750000"), Some(1_729_750_000_000_000));
+        // The millisecond part is kept.
+        assert_eq!(
+            parse_ts_micros("1729750000123"),
+            Some(1_729_750_000_123_000)
+        );
+        // Negative, 13 digits: 1930-01-01 00:00:00 UTC, as JavaScript sends it.
+        let expected = NaiveDate::from_ymd_opt(1930, 1, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp_micros();
+        assert_eq!(parse_ts_micros("-1262304000000"), Some(expected));
+        // The 14-digit packed civil form is still read as civil time.
+        assert!(parse_ts_micros("20260722193602").is_some());
+    }
+
+    #[test]
+    fn parse_ts_micros_nulls_a_timestamp_outside_1900_to_2299() {
+        // Epoch microseconds (16 digits), read as seconds: the multiply
+        // overflows.
+        assert_eq!(parse_ts_micros("1729750000000000"), None);
+        // 12-digit milliseconds (before 2001-09-09) read as seconds: year 21,970.
+        assert_eq!(parse_ts_micros("631152000000"), None);
+        // 2300-01-01 00:00:00 UTC as epoch seconds: one second past the window.
+        assert_eq!(parse_ts_micros("10413792000"), None);
+        assert_eq!(
+            parse_ts_micros("10413791999"),
+            Some(ch_range::MAX_MICROS - 999_999)
+        );
+        // Civil and RFC3339 forms are checked too.
+        assert_eq!(parse_ts_micros("9999-12-31T00:00:00Z"), None);
+        assert_eq!(parse_ts_micros("1899-12-31 23:59:59"), None);
+        assert_eq!(
+            parse_ts_micros("1900-01-01 00:00:00"),
+            Some(ch_range::MIN_MICROS)
+        );
+        assert_eq!(parse_ts_micros("99991231000000"), None, "packed civil");
+    }
+
+    #[test]
+    fn parse_date_days_reads_epoch_milliseconds_and_nulls_out_of_range_dates() {
+        let d = NaiveDate::from_ymd_opt(2024, 10, 24).unwrap();
+        let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        let days = d.signed_duration_since(epoch).num_days() as i32;
+        assert_eq!(parse_date_days("1729750000000"), Some(days), "milliseconds");
+        assert_eq!(parse_date_days("1729750000"), Some(days), "seconds");
+        assert_eq!(parse_date_days("9999-12-31"), None);
+        assert_eq!(parse_date_days("18991231"), None, "packed yyyyMMdd");
+        assert_eq!(parse_date_days("1900-01-01"), Some(ch_range::MIN_DAYS));
+        assert_eq!(parse_date_days("2299-12-31"), Some(ch_range::MAX_DAYS));
+        // 2^32 + `days` days, as epoch seconds: narrowed to i32 before the
+        // check, it wrapped around to `days` itself and passed.
+        let wraps = ((1_i64 << 32) + i64::from(days)) * 86_400;
+        assert_eq!(parse_date_days(&wraps.to_string()), None);
+    }
+
+    #[test]
+    fn out_of_range_timestamps_are_counted_as_coerced_dates() {
+        let (mut b, _) = batcher();
+        // Milliseconds from 2024, then from 1990: the second has 12 digits, so
+        // it is read as seconds, the year 21,970.
+        for ts in [
+            serde_json::json!(1_729_750_000_000_i64),
+            serde_json::json!(631_152_000_000_i64),
+        ] {
+            b.append_record(&serde_json::json!({"id": 1, "ts": ts}))
+                .unwrap();
+        }
+        let batch = b.finish().unwrap().unwrap();
+        let ts = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(ts.value(0), 1_729_750_000_000_000, "milliseconds");
+        assert!(ts.is_null(1), "out of range -> NULL");
+        assert_eq!(b.invalid_dates_total(), 1);
+        assert_eq!(
+            b.coercions(),
+            vec![(WarningKind::CoercedDate, "ts".to_string(), 1)]
+        );
+        // One value landed, so the column isn't flagged as a unit mismatch.
+        assert!(b.fully_coerced_temporal_columns().is_empty());
+    }
+
+    #[test]
+    fn a_column_of_only_out_of_range_timestamps_is_flagged() {
+        let (mut b, _) = batcher();
+        b.append_record(&serde_json::json!({"id": 1, "ts": 631_152_000_000_i64}))
+            .unwrap();
+        b.finish().unwrap();
+        let flagged = b.fully_coerced_temporal_columns();
+        assert_eq!(flagged.len(), 1);
+        assert_eq!(flagged[0].0, "ts");
+        assert_eq!(flagged[0].2, "631152000000");
     }
 
     #[test]

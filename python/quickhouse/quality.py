@@ -52,11 +52,14 @@ from typing import Callable, Optional
 __all__ = ["Validation", "ValidationFailed"]
 
 
-class ValidationFailed(Exception):
+class ValidationFailed(RuntimeError):
     """Raised when the staged data fails its :class:`Validation` suite.
 
     Carries the Great Expectations validation ``result`` (an
     ``ExpectationSuiteValidationResult``) for inspection / data-docs.
+    :func:`quickhouse.sync` raises this same exception, ``result`` included,
+    with a note naming the transfer it rejected. A ``RuntimeError``, like every
+    other ``sync()`` failure, so code catching ``RuntimeError`` still catches it.
     """
 
     def __init__(self, message: str, result: object = None) -> None:

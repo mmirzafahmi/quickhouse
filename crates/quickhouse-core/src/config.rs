@@ -910,6 +910,19 @@ pub struct TransferConfig {
     /// delta, so it is never allowed unscoped. `false` (default) keeps the
     /// insert-or-update-only merge.
     ///
+    /// **Requires `watermark` to be that same column** (a hard config error
+    /// otherwise, as is a `watermark_source_expr`): the delete takes every row
+    /// in the window the batch doesn't hold, so the batch must hold every
+    /// source row in it. A read filtered on the window column does — it
+    /// returns every row past `cursor - lookback_seconds` there. A read
+    /// filtered on an update watermark like `write_date` holds only the rows
+    /// that changed, and the delete would take the unchanged rows between
+    /// them, which the source still has (#34). The safe set-up: `watermark`
+    /// set to the window column, a `lookback_seconds` that covers how long a
+    /// row can still change or be deleted, and a `state_key` of its own. A
+    /// DataFrame source is exempt, since nothing filters it: the frame must
+    /// hold the whole window itself.
+    ///
     /// **How each destination performs it.**
     /// - BigQuery: a `WHEN NOT MATCHED BY SOURCE AND <window>` clause inside
     ///   the same `MERGE`, so it is atomic with the upsert. BigQuery reports
@@ -1078,7 +1091,9 @@ pub struct TransferConfig {
     /// against the same ceiling, so a table that crosses the line fails every
     /// attempt, on a condition that has nothing to do with the source.
     ///
-    /// This timer measures only the awaits on the source stream itself. Time
+    /// This timer measures only the awaits on the source stream itself,
+    /// including the wait for a statement's first row (#41), which PostgreSQL,
+    /// MySQL and ClickHouse hold back until the statement produces it. Time
     /// spent decoding, inserting, or blocked on the memory budget does not
     /// count toward it, so a slow destination never trips it — which is what
     /// makes it safe to set tightly. A genuinely hung source does trip it,
@@ -1783,6 +1798,53 @@ impl TransferConfig {
                      delete the rows the others land",
                 ));
             }
+            // The same hazard as chunk_rows, from the read itself: the delete
+            // needs the batch to hold every source row in its range of the
+            // window column. A read filtered on that column does, since it
+            // returns every row past `cursor - lookback_seconds` there. One
+            // filtered on another column (an update watermark like
+            // `write_date`) holds only the rows that changed, and the delete
+            // takes the unchanged rows between them, which the source still
+            // has: 989 of 1,000 in #34. A frame is exempt: nothing filters it,
+            // so the window holds whatever the frame does, which only the
+            // caller knows.
+            let window = self.merge_prune_partition_by.as_deref().unwrap_or_default();
+            if shape != SourceShape::Frame {
+                let watermark = self.watermark.as_deref().unwrap_or_default();
+                let landed = self.rename.get(watermark).map_or(watermark, String::as_str);
+                if landed != window {
+                    let renamed = if landed == watermark {
+                        String::new()
+                    } else {
+                        format!(", renamed to '{landed}'")
+                    };
+                    // The source column that lands as the window column.
+                    let wanted = self
+                        .rename
+                        .iter()
+                        .find(|(_, dest)| dest.as_str() == window)
+                        .map_or(window, |(source, _)| source.as_str());
+                    return Err(EtlError::config(format!(
+                        "delete_stale_in_window needs watermark to be the merge_prune_partition_by \
+                         column '{window}', not '{watermark}'{renamed}: the delete removes the \
+                         destination rows in the staged batch's range of '{window}' that the \
+                         batch doesn't hold, and a read filtered on another column holds only \
+                         the rows that changed, so it would delete rows the source still has. \
+                         Set watermark='{wanted}', a lookback_seconds that covers how long a row \
+                         can still change or be deleted, and a state_key of its own (its cursor \
+                         is on '{window}', so it can't share one with a sync on another column)"
+                    )));
+                }
+            }
+            if self.watermark_source_expr.is_some() {
+                return Err(EtlError::config(format!(
+                    "delete_stale_in_window is not supported together with watermark_source_expr: \
+                     the delete needs the read to return every row past the cursor on the window \
+                     column '{window}', and watermark_source_expr filters on an expression \
+                     instead, which quickhouse can't tell is that column. Drop it, so the read \
+                     filters on '{window}' itself"
+                )));
+            }
         }
         Ok(())
     }
@@ -1990,6 +2052,35 @@ pub enum WarningKind {
     /// cursor. Raised at setup, before anything is written. Table-level:
     /// `column` is `None`.
     AbandonedResumeMarker,
+    /// A source column (after `rename` / `include` / `exclude`) has no column
+    /// in the existing ClickHouse destination, and `evolve_schema` is off, so
+    /// ClickHouse leaves it out of every row the run writes. Turning
+    /// `evolve_schema` on later adds the column but leaves it NULL on those
+    /// rows, which a cursor has already passed. Not raised for BigQuery, which
+    /// refuses such a write, nor for a ClickHouse incremental run that stages
+    /// (its insert-select names the column and fails). Raised at setup,
+    /// before anything is written, once per column with `count` `0`;
+    /// `column` is the source column.
+    DroppedSourceColumn,
+    /// The destination didn't exist, so the run created it, but its state key
+    /// still held a saved cursor or a `chunk_rows` resume marker: the
+    /// position of the table it replaces, typically dropped by hand to change
+    /// an `engine` or `order_by` that only applies when a table is created.
+    /// Starting past it would fill the new table with only the rows after
+    /// it, so the run starts over as a first run does (`seed_watermark`
+    /// applies) and clears the old cursor. `sample` is that cursor. Raised at
+    /// setup, before anything is written. Table-level: `column` is `None`.
+    RecreatedDestination,
+    /// An incremental run with a `key` writes into an existing ClickHouse
+    /// table whose engine keeps every row it is sent (a plain `MergeTree`,
+    /// such as one `mode="full"` created) rather than replacing a row with a
+    /// newer one of the same key the way a `ReplacingMergeTree` does. Each
+    /// changed row is written again and the table keeps both copies; a first
+    /// run, with no cursor yet, writes the whole source again. Not raised when
+    /// `engine=` names such an engine, which says the copies are wanted.
+    /// Raised at setup, before anything is written; `sample` is the engine.
+    /// Table-level: `column` is `None`.
+    NonReplacingIncrementalTarget,
 }
 
 impl WarningKind {
@@ -2018,6 +2109,9 @@ impl WarningKind {
             WarningKind::StorageWriteCountMismatch => "storage_write_count_mismatch",
             WarningKind::UnsourcedDestinationColumn => "unsourced_destination_column",
             WarningKind::AbandonedResumeMarker => "abandoned_resume_marker",
+            WarningKind::DroppedSourceColumn => "dropped_source_column",
+            WarningKind::RecreatedDestination => "recreated_destination",
+            WarningKind::NonReplacingIncrementalTarget => "non_replacing_incremental_target",
         }
     }
 
@@ -2027,7 +2121,7 @@ impl WarningKind {
     }
 
     /// Every kind, in declaration order.
-    pub const ALL: [WarningKind; 20] = [
+    pub const ALL: [WarningKind; 23] = [
         WarningKind::CollapsedBool,
         WarningKind::CoercedDate,
         WarningKind::CoercedDecimal,
@@ -2048,6 +2142,9 @@ impl WarningKind {
         WarningKind::StorageWriteCountMismatch,
         WarningKind::UnsourcedDestinationColumn,
         WarningKind::AbandonedResumeMarker,
+        WarningKind::DroppedSourceColumn,
+        WarningKind::RecreatedDestination,
+        WarningKind::NonReplacingIncrementalTarget,
     ];
 }
 
@@ -2498,7 +2595,10 @@ mod tests {
             | WarningKind::RetriedAfterPartialWrite
             | WarningKind::StorageWriteCountMismatch
             | WarningKind::UnsourcedDestinationColumn
-            | WarningKind::AbandonedResumeMarker => WarningKind::ALL.contains(&k),
+            | WarningKind::AbandonedResumeMarker
+            | WarningKind::DroppedSourceColumn
+            | WarningKind::RecreatedDestination
+            | WarningKind::NonReplacingIncrementalTarget => WarningKind::ALL.contains(&k),
         };
         assert!(WarningKind::ALL.into_iter().all(listed));
     }
@@ -2745,14 +2845,14 @@ mod tests {
     #[test]
     fn delete_stale_requires_prune_and_incremental() {
         // Incremental without a prune column -> rejected (would nuke history).
-        let mut c = cfg(SyncMode::Incremental, Some("write_date"));
+        let mut c = cfg(SyncMode::Incremental, Some("create_date"));
         c.delete_stale_in_window = true;
         assert!(c
             .validate()
             .unwrap_err()
             .to_string()
             .contains("merge_prune_partition_by"));
-        // With an immutable prune column -> ok.
+        // With an immutable prune column that the watermark reads -> ok.
         c.merge_prune_partition_by = Some("create_date".into());
         assert!(c.validate().is_ok());
         // Full mode -> rejected.
@@ -2764,6 +2864,58 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("incremental"));
+    }
+
+    #[test]
+    fn delete_stale_is_refused_unless_the_watermark_is_the_window_column() {
+        let stale = |watermark: &str| {
+            let mut c = cfg(SyncMode::Incremental, Some(watermark));
+            c.delete_stale_in_window = true;
+            c.merge_prune_partition_by = Some("create_date".into());
+            c
+        };
+        stale("create_date").validate().unwrap();
+        // #34: a read on an update watermark holds only the rows that
+        // changed, so the delete would take the unchanged rows between them.
+        // The refusal names the set-up that is safe.
+        let msg = stale("write_date").validate().unwrap_err().to_string();
+        for needle in [
+            "not 'write_date'",
+            "watermark='create_date'",
+            "lookback_seconds",
+            "state_key",
+        ] {
+            assert!(msg.contains(needle), "{needle}: {msg}");
+        }
+        // The same for an API source, whose read the watermark filters too.
+        let msg = stale("write_date").validate_api().unwrap_err().to_string();
+        assert!(msg.contains("not 'write_date'"), "{msg}");
+        stale("create_date").validate_api().unwrap();
+        // The window column is a destination column, so a renamed watermark
+        // is compared as the column it lands in.
+        let mut c = stale("created");
+        c.rename = HashMap::from([("created".into(), "create_date".into())]);
+        c.validate().unwrap();
+        let mut c = stale("create_date");
+        c.rename = HashMap::from([("create_date".into(), "created".into())]);
+        refused(&c, "renamed to 'created'");
+        // The fix it names is the source column that lands there.
+        let mut c = stale("write_date");
+        c.rename = HashMap::from([("created".into(), "create_date".into())]);
+        refused(&c, "watermark='created'");
+        // An expression in place of the watermark may read another column,
+        // and quickhouse can't tell.
+        let mut c = stale("create_date");
+        c.watermark_source_expr = Some("create_date_raw".into());
+        refused(&c, "watermark_source_expr");
+        // Nothing filters a frame: the window holds what the frame does.
+        let mut c = cfg(SyncMode::Incremental, None);
+        c.source_table = None;
+        c.delete_stale_in_window = true;
+        c.merge_prune_partition_by = Some("create_date".into());
+        c.validate_frame().unwrap();
+        c.watermark = Some("write_date".into());
+        c.validate_frame().unwrap();
     }
 
     fn refused(c: &TransferConfig, needle: &str) {
@@ -2846,7 +2998,7 @@ mod tests {
         refused(&c, "advance_watermark=False");
         let mut c = backfill();
         c.delete_stale_in_window = true;
-        c.merge_prune_partition_by = Some("create_date".into());
+        c.merge_prune_partition_by = Some("id".into());
         refused(&c, "delete_stale_in_window");
         // A sweep of the whole key range reads what one pass would, so both
         // stay open to it.

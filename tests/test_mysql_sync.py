@@ -2017,3 +2017,34 @@ def test_a_table_max_never_becomes_the_cursor_of_an_excluded_watermark(
         _drop_ch(ch_client, table)
         with mysql_conn.cursor() as cur:
             cur.execute(f"DROP TABLE IF EXISTS `{table}`")
+
+
+def test_read_idle_timeout_secs_times_the_wait_for_the_first_row(
+    mysql_conn, ch_client, mysql_source, ch_target, unique_name
+):
+    """Issue #41, from MySQL: the server sends a result's header with its
+    first rows, so the execute waits as long as the statement takes to
+    produce them, and that wait wasn't timed. It trips the timer now, and a
+    read that outlasts it counts it in read_secs."""
+    table = unique_name
+    _seed_table(mysql_conn, table, 100)
+    _drop_ch(ch_client, table)
+    stalled = "SELECT o.* FROM `{}` o CROSS JOIN (SELECT SLEEP({}) AS z) s"
+    kw = dict(dest_table=table, mode="full", key=["id"], create_if_missing=True)
+    try:
+        started = time.monotonic()
+        with pytest.raises(RuntimeError, match="read_idle_timeout_secs"):
+            quickhouse.sync(
+                mysql_source, ch_target, source_query=stalled.format(table, 6),
+                read_idle_timeout_secs=1, **kw,
+            )
+        assert time.monotonic() - started < 5, "it waited out the stall"
+
+        r = quickhouse.sync(
+            mysql_source, ch_target, source_query=stalled.format(table, 2),
+            read_idle_timeout_secs=10, **kw,
+        )
+        assert r.rows_written == 100
+        assert r.read_secs >= 1.5, r.read_secs
+    finally:
+        _drop_ch(ch_client, table)

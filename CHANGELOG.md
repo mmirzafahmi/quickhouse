@@ -9,6 +9,130 @@ any breaking change is called out explicitly.
 
 ## [Unreleased]
 
+### Changed — please read before upgrading
+- **`delete_stale_in_window` is refused unless `watermark` is the
+  `merge_prune_partition_by` column.** Configurations 0.20.9 accepted now fail
+  with a config error, because they were deleting rows the source still has.
+  The delete removes every destination row in the staged batch's range of the
+  window column that the batch doesn't hold. An incremental read on an update
+  watermark such as `write_date` holds only the rows that changed, so two
+  changed rows far apart on `create_date` took every unchanged row between
+  them: 989 of 1,000 in one run, reported as a success with no warning. A read
+  on the window column returns every row past `cursor - lookback_seconds`
+  there, so its batch holds the whole range. The error gives that set-up:
+  `watermark` set to the window column, a `lookback_seconds` that covers how
+  long a row can still change or be deleted, and a `state_key` of its own.
+  `watermark_source_expr` is refused with it as well, since quickhouse can't
+  tell which column an expression reads. Both destinations, as it is a config
+  check; a DataFrame source, which nothing filters, is exempt. If an affected
+  sync ran, its destination is missing rows in the windows it touched:
+  re-sync them, or find them with `reconcile_keys`. (#34)
+
+### Added
+- **A warning for source columns a ClickHouse destination drops:
+  `dropped_source_column`.** With `evolve_schema=False`, the default, a source
+  column the existing ClickHouse destination lacks was left out of every row
+  written, in incremental and full mode, and the run succeeded with no
+  warning. ClickHouse's `INSERT ... FORMAT ArrowStream` names no columns and
+  skips an Arrow column the table doesn't have, and a full refresh stages a
+  copy of the destination's structure. Turning `evolve_schema` on afterwards
+  added the column but left it `NULL` on the rows synced in between, which the
+  cursor had passed. A comment in `prepare_target` and the docs said this case
+  was an error. The run now raises the warning once per such source column
+  (after `rename`, `include` and `exclude`), before anything is written, so
+  `fail_on_warnings={"dropped_source_column"}` stops it with the destination
+  untouched. BigQuery refuses such a write instead, as does a ClickHouse
+  incremental run that stages (its insert-select names the column), so
+  neither raises it. It costs one query against the destination's metadata per
+  run. (#35)
+- **A warning for an incremental run into a table that keeps duplicates:
+  `non_replacing_incremental_target`.** An incremental run with a `key`
+  creates a `ReplacingMergeTree`, but into an existing table whose engine keeps
+  every row, such as the plain `MergeTree` that `mode="full"` creates, it
+  appended instead, and nothing said so. The first incremental run after a
+  full refresh, with no cursor yet, doubled the table, and every later run
+  added another copy of each changed row. The run now raises the warning,
+  naming the engine, before anything is written. A `Replicated` engine that
+  keeps duplicates counts too, though retries still don't stage into one. Not
+  raised for a table the run creates, nor when `engine=` names an engine that
+  keeps duplicates, which says the copies are wanted. (#37)
+
+### Fixed
+- **A recreated incremental destination starts over instead of reading past
+  the old table's cursor.** The cursor lives in `_quickhouse_state`, so
+  dropping the destination, the usual way to change an `engine`, `order_by`,
+  `partition_by` or `type_overrides` that only apply when a table is created,
+  left it in place. The next run created the table again and read only the
+  rows past that cursor: a 1,000-row table came back with 1 row, and the run
+  succeeded without a warning. A run that is about to create the destination
+  while its state key still holds a saved cursor or a `chunk_rows` resume
+  marker now ignores both, before the source is probed, and reads as a first
+  run does (`seed_watermark` and `skip_to_max` apply). It raises
+  `recreated_destination`, naming the state key and the old cursor (also its
+  `sample`), and clears the cursor before creating the table, so a run that
+  fails after that leaves a first run behind it, not one past the old cursor;
+  `advance_watermark=False` leaves it saved. The check costs one query, made
+  only when a cursor exists. `fail_on_warnings={"recreated_destination"}`
+  refuses the run before anything is created. To start the new table past the
+  old cursor on purpose, pass it as `seed_watermark`. (#36)
+- **The full-refresh shrink guard counts a `ReplacingMergeTree` as merged.**
+  It compared the rows staged with the destination's plain `count()`, which
+  includes an updated row's old versions until ClickHouse merges them away, so
+  a refresh with every one of the source's rows was refused as a shrink. On an
+  engine that merges rows (`ReplacingMergeTree`, `CollapsingMergeTree`,
+  `SummingMergeTree` and the like, `Replicated*` and `Shared*` included), a
+  refresh the plain counts would stop is counted again with `FINAL`, the
+  destination and the staging table both, and decided on those numbers. A
+  shrink once merged is still refused, and the error says the counts used
+  `FINAL`. `FINAL` reads the table where the plain count reads metadata, so a
+  refresh the plain counts pass costs nothing more. (#38)
+- **`read_idle_timeout_secs` times the wait for a source's first row.**
+  PostgreSQL starts a `COPY`, MySQL sends a result's header and ClickHouse
+  sends its response headers only once the statement has produced its first
+  rows, and none of those waits was timed. A query that produced nothing for 6
+  seconds finished despite `read_idle_timeout_secs=2`, with `read_secs` 0.0,
+  and a read stalled on a lock before its first row would have gone unnoticed
+  the same way. The wait now counts as idle time and toward `read_secs`, for
+  PostgreSQL, MySQL (the prepare too) and ClickHouse sources, in a one-pass,
+  chunked or windowed read. (#41)
+- **An API source reads a 13-digit integer `TIMESTAMP` or `DATE` as epoch
+  milliseconds, and nulls a date outside 1900-2299.** Every integer was read
+  as epoch seconds, so the milliseconds many APIs send, `1729750000000` for
+  2024-10-24 06:06:40 UTC, became a date tens of thousands of years ahead, and
+  ClickHouse stored it as 2299-12-31 with no warning. Length tells the two
+  apart, as it already did for CleverTap's 14-digit packed civil form:
+  13-digit epoch seconds would be past the year 33,000. A date or timestamp
+  that parses but falls outside ClickHouse's 1900-2299 window, in any accepted
+  form, now becomes NULL with a `coerced_date` warning, into either
+  destination, as it does from the database sources. So the next unit
+  mismatch shows: 12-digit milliseconds from before 2001 are read as seconds
+  and come out NULL, counted, rather than at 2299. A `DATE` fared worse: a
+  value outside the window failed the whole transfer into ClickHouse with
+  `Code: 321 VALUE_IS_OUT_OF_RANGE_OF_DATA_TYPE`, and a far-future epoch value
+  could wrap around to an arbitrary day inside it. Both are NULL now. (#42)
+- **An API source's declared `NUMERIC` lands in ClickHouse as `Decimal(38, 9)`.**
+  It was decoded exactly, as `Decimal128(38, 9)`, then created on ClickHouse as
+  `Float64`, so `"123.45"` was stored as a float; into BigQuery it was already
+  `NUMERIC`. It now follows the same rules as a PostgreSQL `numeric(P, S)`: the
+  exact type for a table or column created fresh, while an existing column
+  that is already `Float64` keeps its type and keeps receiving floats, with no
+  `ALTER` and no failed insert, and a `NUMERIC` column new to such a table is
+  `Float64` too. Pin `type_overrides={"col": "Float64"}` to keep the old type
+  on a new table. (#43)
+- **A `validate=` gate's exception reaches the caller unchanged.** `sync()`
+  turned whatever the gate raised into a `RuntimeError` holding only its text,
+  so `except quickhouse.ValidationFailed` never ran, its `.result` (the Great
+  Expectations validation result) was out of reach, and a custom gate's
+  exception lost its type. `sync()` now raises the gate's own exception, the
+  same object, with a note naming the transfer
+  (`orders -> orders: data-quality validation rejected the staged data`).
+  The data-quality guide, the `quality` module and the docs home page already
+  said it raised `ValidationFailed`; that is now true. `ValidationFailed` now
+  subclasses `RuntimeError`, so code that caught `RuntimeError` around a gated
+  `sync()`, as the guide's "Failure type across the boundary" note said to,
+  still catches a rejection. A custom gate's own exception type is raised as
+  it is. Every other failure is still a `RuntimeError`. (#40)
+
 ## [0.20.9] — 2026-10-24
 
 ### Added

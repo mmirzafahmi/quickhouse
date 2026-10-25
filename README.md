@@ -255,12 +255,14 @@ Three knobs tune the incremental behavior for these sources:
   own consolidation MERGE downstream. `watermark` drives the resume window; `key`
   isn't required. Avoids per-run table-metadata churn (BigQuery's
   ~5-ops/10s/table limit) since there's no staging create/swap. API sources only.
-- **`delete_stale_in_window=True`** (BigQuery incremental) — also `DELETE`
+- **`delete_stale_in_window=True`** (incremental) — also `DELETE`
   destination rows inside the merged window that are absent from the source pull
   ("replace this window"; a NULL merge key nets to a replace instead of
   duplicating). **Requires `merge_prune_partition_by`** — the DELETE is scoped to
   that immutable column's staging range, so it never touches history outside the
-  batch (a hard error otherwise).
+  batch — **and `watermark` set to that same column**, so the batch holds every
+  source row in the range; on an update watermark it would delete rows the
+  source still has (both are hard errors otherwise).
 
 ### Backup to cloud storage during the transfer
 
@@ -379,7 +381,10 @@ When something goes wrong, `sync()` raises a `RuntimeError` written to be
 actionable on its own: it names the table involved, and for a bad config or an
 unmappable column it says exactly what's wrong and how to fix it (e.g.
 `exclude=` the column or cast it in a `source_query`). Underlying database
-errors are surfaced verbatim rather than wrapped in something generic.
+errors are surfaced verbatim rather than wrapped in something generic. A
+`validate=` gate's rejection is the exception the gate raised:
+`qh.ValidationFailed` (a `RuntimeError` subclass, with the validation `.result`)
+or a custom gate's own type.
 
 ### Full parameter list
 
@@ -402,7 +407,7 @@ errors are surfaced verbatim rather than wrapped in something generic.
 | `window_bounds` | `(lo, hi)`: the key range a windowed read sweeps, instead of probing `MIN`/`MAX`. Rows outside it aren't read, so it needs `advance_watermark=False`. Implies `windowed` (default `None`) |
 | `retry_max_attempts` | Re-run the whole transfer on a transient *source* error (PG recovery-conflict/cancel; MySQL gone-away/lock-wait/deadlock). `1` = no retry (default) |
 | `column_transforms` | Per-column SQL value transforms over `source_table=` (e.g. `{"ts":"ts AT TIME ZONE 'UTC'"}`), preserving range partitioning. Postgres/MySQL/ClickHouse only |
-| `evolve_schema` | Auto-`ADD COLUMN` (Nullable) when the source has a column the destination lacks, instead of erroring. ADD-only. Default `False` |
+| `evolve_schema` | Auto-`ADD COLUMN` (Nullable) when the source has a column the destination lacks. ADD-only. Default `False`: ClickHouse then leaves the column out and warns (`dropped_source_column`); BigQuery fails the write |
 | `key` | Dedup key (required for BigQuery incremental) |
 | `create_if_missing` | Auto-create the destination table (default `True`) |
 | `engine`, `order_by`, `partition_by`, `primary_key` | DDL knobs, interpreted per destination |

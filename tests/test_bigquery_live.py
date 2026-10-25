@@ -94,6 +94,23 @@ def _sync(pg_source, bq_target, table, **kw):
     )
 
 
+def _existing_dest(bq, table):
+    """The destination an earlier version's state refers to. Saved state with
+    no destination means the table was dropped, and the run starts over
+    (#36), so a test of what an earlier version left creates both."""
+    bigquery = pytest.importorskip("google.cloud.bigquery")
+    bq.create_table(
+        bigquery.Table(
+            f"{bq.project}.{BQ_DATASET}.{table}",
+            schema=[
+                bigquery.SchemaField("id", "INTEGER", mode="REQUIRED"),
+                bigquery.SchemaField("amount", "FLOAT"),
+                bigquery.SchemaField("write_date", "DATETIME", mode="REQUIRED"),
+            ],
+        )
+    )
+
+
 def _staging(bq, table):
     return [
         t.table_id
@@ -133,6 +150,7 @@ def test_an_unclustered_state_table_is_clustered_in_place(
         ],
     )
     bq.create_table(old)
+    _existing_dest(bq, dest)
     assert bq.get_table(state).clustering_fields is None
     # What an earlier version left: this destination's cursor, and another's.
     bq.query(
@@ -421,6 +439,7 @@ def test_a_resume_marker_from_0_20_8_resumes_and_another_reads_does_not(
     )
     old.clustering_fields = ["source_table", "dest_table"]
     bq.create_table(old)
+    _existing_dest(bq, dest)
     columns = "(source_table, dest_table, last_watermark, `rows`, run_ts, chunk_cursor, chunk_upper"
     # What 0.20.8 left after committing the chunks up to id 100.
     bq.query(
@@ -477,3 +496,21 @@ def test_a_destination_column_the_source_does_not_feed_is_reported_unless_it_has
     got = _rows(bq, f"SELECT COUNTIF(legacy IS NULL) AS legacy_null, "
                     f"COUNTIF(loaded_at IS NULL) AS loaded_null FROM {_fq(bq, dest)}")[0]
     assert (got.legacy_null, got.loaded_null) == (5, 0)
+
+
+def test_a_dropped_destination_is_rebuilt_whole_on_bigquery(
+    bq, pg_conn, pg_source, bq_target, dest
+):
+    """Issue #36 on BigQuery: dropping the destination left its cursor in the
+    state table, so the next run recreated it with only the rows past that
+    cursor. The run now reads as a first run, and says so."""
+    _seed(pg_conn, dest, range(1, 11))
+    assert _sync(pg_source, bq_target, dest).rows_written == 10
+    bq.delete_table(_fq(bq, dest).strip("`"))
+    _add(pg_conn, dest, range(11, 12), "2024-02-01 00:00:00")
+
+    r = _sync(pg_source, bq_target, dest)
+    assert r.rows_written == 11, "every row, not only the one past the old cursor"
+    (recreated,) = [w for w in r.warnings if w.kind == "recreated_destination"]
+    assert recreated.sample is not None and recreated.sample.startswith("2024-01-01")
+    assert _rows(bq, f"SELECT COUNT(*) AS n FROM {_fq(bq, dest)}")[0].n == 11

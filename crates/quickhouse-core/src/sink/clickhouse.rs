@@ -180,16 +180,38 @@ impl ClickHouseSink {
     /// AS` a `Distributed` table points at the same shards, so it would be no
     /// staging at all.
     pub async fn stage_for_retries(&self, table: &str, cfg: &TransferConfig) -> Result<bool> {
+        let engine = match self.table_engine(table).await? {
+            Some(engine) => engine,
+            None => cfg.effective_engine(),
+        };
+        Ok(stages_for_retries(&engine))
+    }
+
+    /// See [`Sink::non_replacing_engine`] and [`non_replacing`].
+    pub async fn non_replacing_engine(
+        &self,
+        table: &str,
+        cfg: &TransferConfig,
+    ) -> Result<Option<String>> {
+        // Nothing to report whatever the table is, so no need to look.
+        if cfg.engine.as_deref().is_some_and(engine_keeps_duplicates) {
+            return Ok(None);
+        }
+        Ok(non_replacing(
+            self.table_engine(table).await?,
+            cfg.engine.as_deref(),
+        ))
+    }
+
+    /// The engine `system.tables` names for `table` (`MergeTree`,
+    /// `ReplacingMergeTree`, ...), or `None` when the table doesn't exist.
+    async fn table_engine(&self, table: &str) -> Result<Option<String>> {
         let sql = format!(
             "SELECT engine FROM system.tables WHERE database = '{}' AND name = '{}'",
             escape_sql_string(&self.cfg.database),
             escape_sql_string(table),
         );
-        let engine = match self.query_scalar(&sql).await? {
-            Some(engine) => engine,
-            None => cfg.effective_engine(),
-        };
-        Ok(engine_keeps_duplicates(&engine))
+        self.query_scalar(&sql).await
     }
 
     /// See [`Sink::compact_state`]. The state table is a `ReplacingMergeTree`
@@ -272,6 +294,29 @@ impl ClickHouseSink {
             .and_then(|s| s.trim().parse::<u64>().ok()))
     }
 
+    /// See [`Sink::merged_row_count`]: `count()` with `FINAL` when `table`'s
+    /// engine merges rows sharing a sorting key, else `None`.
+    pub async fn merged_row_count(&self, table: &str) -> Result<Option<u64>> {
+        let sql = format!(
+            "SELECT engine FROM system.tables WHERE database = '{}' AND name = '{}'",
+            escape_sql_string(&self.cfg.database),
+            escape_sql_string(table),
+        );
+        match self.query_scalar(&sql).await? {
+            Some(engine) if engine_merges_rows(&engine) => {}
+            _ => return Ok(None),
+        }
+        let sql = format!(
+            "SELECT count() FROM {}.{} FINAL",
+            ident(&self.cfg.database),
+            ident(table)
+        );
+        Ok(self
+            .query_scalar(&sql)
+            .await?
+            .and_then(|s| s.trim().parse::<u64>().ok()))
+    }
+
     /// Run a query returning a single string column, one value per line (the
     /// HTTP interface's default TabSeparated). Blank lines are dropped.
     pub async fn query_column(&self, sql: &str) -> Result<Vec<String>> {
@@ -330,6 +375,28 @@ impl ClickHouseSink {
             .filter_map(|name| crate::source::clickhouse::tsv_field(name))
             .collect();
         Ok(crate::sink::unsourced_columns(existing, columns, false))
+    }
+
+    /// See [`crate::sink::Sink::dropped_columns`]. The insert names no columns
+    /// (`INSERT ... FORMAT ArrowStream`), and ClickHouse skips an Arrow column
+    /// the table doesn't have. Case-sensitive, as ClickHouse column names are.
+    pub async fn dropped_columns(
+        &self,
+        table: &str,
+        columns: &[ColumnType],
+    ) -> Result<Vec<String>> {
+        let sql = format!(
+            "SELECT name FROM system.columns WHERE database = '{}' AND table = '{}'",
+            escape_sql_string(&self.cfg.database),
+            escape_sql_string(table),
+        );
+        let existing: Vec<String> = self
+            .query_column(&sql)
+            .await?
+            .iter()
+            .filter_map(|name| crate::source::clickhouse::tsv_field(name))
+            .collect();
+        Ok(crate::sink::dropped_columns(&existing, columns, false))
     }
 
     /// Generate and run this destination's own `CREATE TABLE` DDL for `table`.
@@ -993,14 +1060,45 @@ fn ready_state_tables() -> &'static std::sync::Mutex<std::collections::HashSet<S
 
 /// Whether a ClickHouse engine (as `system.tables` names it, or as an
 /// `engine=` clause spells it) is a `MergeTree` that keeps a re-inserted row
-/// as a second copy. See [`ClickHouseSink::stage_for_retries`].
-///
-/// A `Replicated*` engine is left out: `CREATE TABLE ... AS` copies its engine
-/// arguments, and with an explicit ZooKeeper path the staging table would
-/// register as a replica of the destination and fail.
+/// as a second copy (a `SummingMergeTree` adds them up) rather than replacing
+/// the stored one. See [`ClickHouseSink::non_replacing_engine`].
 fn engine_keeps_duplicates(engine: &str) -> bool {
-    let name = engine.split('(').next().unwrap_or(engine).trim();
-    name.ends_with("MergeTree") && !name.contains("Replacing") && !name.starts_with("Replicated")
+    let name = engine_name(engine);
+    name.ends_with("MergeTree") && !name.contains("Replacing")
+}
+
+/// Whether an incremental run with retries stages into a table with
+/// `engine`: see [`ClickHouseSink::stage_for_retries`]. One that keeps
+/// duplicates, except a `Replicated*` engine: `CREATE TABLE ... AS` copies
+/// its engine arguments, and with an explicit ZooKeeper path the staging
+/// table would register as a replica of the destination and fail.
+fn stages_for_retries(engine: &str) -> bool {
+    engine_keeps_duplicates(engine) && !engine_name(engine).starts_with("Replicated")
+}
+
+/// The engine of an existing table (`existing`, `None` for no table) worth
+/// reporting to an incremental run with a key: one that keeps every copy of a
+/// row, unless `engine=` (`requested`) names such an engine itself, which says
+/// the copies are wanted.
+fn non_replacing(existing: Option<String>, requested: Option<&str>) -> Option<String> {
+    if requested.is_some_and(engine_keeps_duplicates) {
+        return None;
+    }
+    existing.filter(|engine| engine_keeps_duplicates(engine))
+}
+
+/// An engine's name without its arguments: `MergeTree` for `MergeTree()`.
+fn engine_name(engine: &str) -> &str {
+    engine.split('(').next().unwrap_or(engine).trim()
+}
+
+/// Whether a ClickHouse engine, as `system.tables` names it, merges rows
+/// sharing a sorting key, so only a `FINAL` read counts what it holds. See
+/// [`ClickHouseSink::merged_row_count`].
+fn engine_merges_rows(engine: &str) -> bool {
+    // ClickHouse Cloud spells its engines `Shared*`.
+    let engine = engine.strip_prefix("Shared").unwrap_or(engine);
+    crate::ddl::is_row_merging_engine(engine)
 }
 
 /// ClickHouse's `UNKNOWN_TABLE` (code 60).
@@ -1063,6 +1161,9 @@ impl Sink for ClickHouseSink {
     async fn current_row_count(&self, table: &str) -> Result<Option<u64>> {
         ClickHouseSink::current_row_count(self, table).await
     }
+    async fn merged_row_count(&self, table: &str) -> Result<Option<u64>> {
+        ClickHouseSink::merged_row_count(self, table).await
+    }
     async fn drop_table(&self, table: &str) -> Result<()> {
         ClickHouseSink::drop_table(self, table).await
     }
@@ -1093,6 +1194,16 @@ impl Sink for ClickHouseSink {
     }
     async fn unsourced_columns(&self, table: &str, columns: &[ColumnType]) -> Result<Vec<String>> {
         ClickHouseSink::unsourced_columns(self, table, columns).await
+    }
+    async fn dropped_columns(&self, table: &str, columns: &[ColumnType]) -> Result<Vec<String>> {
+        ClickHouseSink::dropped_columns(self, table, columns).await
+    }
+    async fn non_replacing_engine(
+        &self,
+        table: &str,
+        cfg: &TransferConfig,
+    ) -> Result<Option<String>> {
+        ClickHouseSink::non_replacing_engine(self, table, cfg).await
     }
     fn dest_kind(&self) -> crate::config::DestKind {
         crate::config::DestKind::ClickHouse
@@ -1387,7 +1498,7 @@ mod tests {
             "AggregatingMergeTree",
             "MergeTree()",
         ] {
-            assert!(engine_keeps_duplicates(keeps), "{keeps}");
+            assert!(stages_for_retries(keeps), "{keeps}");
         }
         for collapses in [
             // Not staged: a staging clone could collide on its ZooKeeper path.
@@ -1400,8 +1511,77 @@ mod tests {
             "Null",
             "Buffer",
         ] {
-            assert!(!engine_keeps_duplicates(collapses), "{collapses}");
+            assert!(!stages_for_retries(collapses), "{collapses}");
         }
+    }
+
+    #[test]
+    fn a_mergetree_that_keeps_copies_is_one_whether_or_not_it_is_replicated() {
+        for keeps in [
+            "MergeTree",
+            "MergeTree()",
+            "SharedMergeTree",
+            "SummingMergeTree",
+            // Left out of retry staging (above), but it keeps copies all the
+            // same: an incremental run into it duplicates rows.
+            "ReplicatedMergeTree",
+            "ReplicatedMergeTree('/clickhouse/tables/{shard}/t', '{replica}')",
+        ] {
+            assert!(engine_keeps_duplicates(keeps), "{keeps}");
+        }
+        for replaces in [
+            "ReplacingMergeTree",
+            "ReplacingMergeTree(version)",
+            "ReplicatedReplacingMergeTree",
+            "SharedReplacingMergeTree",
+            "Distributed",
+            "Null",
+            "Buffer",
+        ] {
+            assert!(!engine_keeps_duplicates(replaces), "{replaces}");
+        }
+    }
+
+    #[test]
+    fn only_an_engine_that_merges_rows_is_counted_with_final() {
+        for merges in [
+            "ReplacingMergeTree",
+            "ReplicatedReplacingMergeTree",
+            "SharedReplacingMergeTree",
+            "CollapsingMergeTree",
+            "VersionedCollapsingMergeTree",
+            "SummingMergeTree",
+            "AggregatingMergeTree",
+        ] {
+            assert!(engine_merges_rows(merges), "{merges}");
+        }
+        // A plain MergeTree rejects FINAL (`ILLEGAL_FINAL`), and keeps every
+        // row, so its plain count is already what it holds.
+        for keeps in [
+            "MergeTree",
+            "SharedMergeTree",
+            "ReplicatedMergeTree",
+            "Log",
+            "",
+        ] {
+            assert!(!engine_merges_rows(keeps), "{keeps}");
+        }
+    }
+
+    #[test]
+    fn a_table_that_keeps_copies_is_reported_unless_engine_asks_for_one() {
+        let some = |e: &str| Some(e.to_string());
+        // The issue's case: a MergeTree made by mode="full", and no engine=.
+        assert_eq!(non_replacing(some("MergeTree"), None), some("MergeTree"));
+        assert_eq!(
+            non_replacing(some("SummingMergeTree"), Some("ReplacingMergeTree")),
+            some("SummingMergeTree")
+        );
+        // engine= naming an engine that keeps copies says they're wanted.
+        assert_eq!(non_replacing(some("MergeTree"), Some("MergeTree()")), None);
+        assert_eq!(non_replacing(some("ReplacingMergeTree"), None), None);
+        // No table: this run creates it, with whatever engine= says.
+        assert_eq!(non_replacing(None, None), None);
     }
 
     #[test]

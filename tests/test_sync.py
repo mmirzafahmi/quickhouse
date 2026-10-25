@@ -10,6 +10,7 @@ Run against the services in ``docker-compose.yml`` after building the module:
 
 from __future__ import annotations
 
+import time
 from datetime import datetime, timedelta
 
 import pytest
@@ -1580,5 +1581,427 @@ def test_a_resume_marker_from_another_query_on_the_same_state_key_is_not_resumed
         r = quickhouse.sync(pg_source, ch_target, **second)
         assert r.rows_read == 300, "resumes after the two committed chunks, ids 501-700"
         assert "abandoned_resume_marker" not in {w.kind for w in r.warnings}
+    finally:
+        _drop_ch(ch_client, table)
+
+
+def _dated_table(pg_conn, table: str, rows: int):
+    """`rows` rows created a minute apart, each last written a minute after
+    it was created, as in issue #34's reproduction."""
+    with pg_conn.cursor() as cur:
+        cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+        cur.execute(
+            f"""
+            CREATE TABLE "{table}" (
+                id          bigint PRIMARY KEY,
+                qty         integer NOT NULL,
+                create_date timestamp NOT NULL,
+                write_date  timestamp NOT NULL
+            )
+            """
+        )
+        cur.execute(
+            f"INSERT INTO \"{table}\" SELECT g, g, "
+            "timestamp '2026-07-01' + g * interval '1 minute', "
+            "timestamp '2026-07-01' + (g + 1) * interval '1 minute' "
+            f"FROM generate_series(1, {rows}) g"
+        )
+
+
+def test_delete_stale_in_window_is_refused_unless_the_watermark_is_the_window_column(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """Issue #34: the delete removes every destination row in the staged
+    batch's range of the window column that the batch doesn't hold. An
+    incremental read on write_date holds only the rows that changed, so two
+    changed rows far apart on create_date deleted the 989 unchanged rows
+    between them, and the run reported success. It is a config error now,
+    raised before anything is written, and it names the safe set-up."""
+    table = unique_name
+    _dated_table(pg_conn, table, 1000)
+    _drop_ch(ch_client, table)
+    try:
+        with pytest.raises(RuntimeError, match="watermark='create_date'") as e:
+            quickhouse.sync(
+                pg_source, ch_target, source_table=table, dest_table=table, mode="incremental",
+                watermark="write_date", key=["id"], merge_prune_partition_by="create_date",
+                delete_stale_in_window=True,
+            )
+        assert "lookback_seconds" in str(e.value) and "state_key" in str(e.value)
+        assert ch_client.command(f"EXISTS TABLE `{table}`") == 0
+    finally:
+        _drop_ch(ch_client, table)
+
+
+def test_delete_stale_in_window_on_the_window_column_deletes_only_the_rows_the_source_deleted(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """Issue #34's safe set-up: the watermark is the window column, so the
+    read returns every row past `cursor - lookback_seconds` on it, and the
+    staged range holds every source row in it. Deleting 2 source rows inside
+    the lookback deletes exactly those 2, and the rows before the lookback
+    are left alone."""
+    table = unique_name
+    _dated_table(pg_conn, table, 1000)
+    _drop_ch(ch_client, table)
+    kw = dict(
+        source_table=table, dest_table=table, mode="incremental", watermark="create_date",
+        key=["id"], merge_prune_partition_by="create_date", delete_stale_in_window=True,
+        # 500 minutes: the second run re-reads ids 501-1000.
+        lookback_seconds=500 * 60, state_key=f"{table}:window", create_if_missing=True,
+    )
+    try:
+        first = quickhouse.sync(pg_source, ch_target, **kw)
+        assert (first.rows_written, first.rows_deleted) == (1000, 0)
+
+        with pg_conn.cursor() as cur:
+            cur.execute(f'DELETE FROM "{table}" WHERE id IN (600, 995)')
+        second = quickhouse.sync(pg_source, ch_target, **kw)
+        assert (second.rows_read, second.rows_deleted) == (498, 2), second
+        assert second.warnings == []
+        ids = [r[0] for r in ch_client.query(
+            f"SELECT id FROM `{table}` FINAL ORDER BY id"
+        ).result_rows]
+        assert ids == [i for i in range(1, 1001) if i not in (600, 995)]
+    finally:
+        _drop_ch(ch_client, table)
+
+
+def test_a_full_refresh_over_unmerged_versions_is_refused_only_when_it_shrinks(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """Issue #38: a ReplacingMergeTree keeps an updated row's old version
+    until a merge removes it, so its plain count() can sit above the rows it
+    holds. The shrink guard compared that count with the rows staged, and
+    refused a refresh with every one of the source's rows. It counts both
+    sides with FINAL now, so that refresh goes through, and one that does
+    shrink the table is still refused."""
+    table = unique_name
+    _seed_table(pg_conn, table, 10)
+    _drop_ch(ch_client, table)
+    incremental = dict(
+        source_table=table, dest_table=table, mode="incremental", watermark="write_date",
+        key=["id"], create_if_missing=True,
+    )
+    full = dict(source_table=table, dest_table=table, mode="full", key=["id"])
+
+    def update_with_merges_stopped(ids):
+        # Stopping merges only makes the timing deterministic: a refresh
+        # that runs before ClickHouse merges the parts sees the same.
+        ch_client.command(f"SYSTEM STOP MERGES `{table}`")
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                f'UPDATE "{table}" SET qty = qty + 1, write_date = now() WHERE id IN {ids}'
+            )
+        assert quickhouse.sync(pg_source, ch_target, **incremental).rows_written == 2
+        assert ch_client.command(f"SELECT count() FROM `{table}`") == 12
+        assert ch_client.command(f"SELECT count() FROM `{table}` FINAL") == 10
+
+    try:
+        assert quickhouse.sync(pg_source, ch_target, **incremental).rows_written == 10
+        update_with_merges_stopped((1, 2))
+        r = quickhouse.sync(pg_source, ch_target, **full)
+        assert r.rows_written == 10
+        assert "full_refresh_shrink" not in {w.kind for w in r.warnings}
+        assert ch_client.command(f"SELECT count() FROM `{table}` FINAL") == 10
+
+        # The swapped-in table merges again; stop it, and lose 3 source rows.
+        update_with_merges_stopped((3, 4))
+        with pg_conn.cursor() as cur:
+            cur.execute(f'DELETE FROM "{table}" WHERE id IN (8, 9, 10)')
+        with pytest.raises(
+            RuntimeError,
+            match=r"REPLACE 10 row\(s\) with only 7 row\(s\) \(both counted with FINAL",
+        ):
+            quickhouse.sync(pg_source, ch_target, **full)
+        assert ch_client.command(f"SELECT count() FROM `{table}` FINAL") == 10
+    finally:
+        _drop_ch(ch_client, table)
+
+
+def test_read_idle_timeout_secs_times_the_wait_for_the_first_row(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """Issue #41: PostgreSQL starts a COPY only once the statement's first
+    rows are ready, and that wait wasn't timed. A query that produced nothing
+    for 6 seconds finished despite read_idle_timeout_secs=2, with read_secs
+    0.0. The wait is source time now: it trips the timer, and a read that
+    outlasts it counts it in read_secs."""
+    table = unique_name
+    _seed_table(pg_conn, table, 100)
+    _drop_ch(ch_client, table)
+    stalled = 'SELECT o.* FROM "{}" o CROSS JOIN (SELECT pg_sleep({})) s'
+    kw = dict(dest_table=table, mode="full", key=["id"], create_if_missing=True)
+    try:
+        started = time.monotonic()
+        with pytest.raises(RuntimeError, match="read_idle_timeout_secs"):
+            quickhouse.sync(
+                pg_source, ch_target, source_query=stalled.format(table, 6),
+                read_idle_timeout_secs=1, **kw,
+            )
+        assert time.monotonic() - started < 5, "it waited out the stall"
+
+        r = quickhouse.sync(
+            pg_source, ch_target, source_query=stalled.format(table, 2),
+            read_idle_timeout_secs=10, **kw,
+        )
+        assert r.rows_written == 100
+        assert r.read_secs >= 1.5, r.read_secs
+    finally:
+        _drop_ch(ch_client, table)
+
+
+def _ch_columns(ch_client, table):
+    return [
+        r[0]
+        for r in ch_client.query(
+            "SELECT name FROM system.columns WHERE database = currentDatabase() "
+            f"AND table = '{table}' ORDER BY position"
+        ).result_rows
+    ]
+
+
+def test_a_source_column_the_destination_lacks_is_reported_before_writing(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """Issue #35: with evolve_schema=False a ClickHouse destination leaves a
+    source column it lacks out of every row written, and the run said
+    nothing. Turning evolve_schema on afterwards added the column but left it
+    NULL on the rows synced in between, which the cursor had passed. The run
+    now reports each such column, by its source name, before writing, and
+    fail_on_warnings stops it with the destination untouched."""
+    table = unique_name
+    _seed_table(pg_conn, table, 3)
+    _drop_ch(ch_client, table)
+    kw = dict(
+        dest_table=table, source_table=table, mode="incremental", watermark="write_date",
+        key=["id"], create_if_missing=True, state_key=f"{table}:dropped",
+    )
+    row = f"SELECT name FROM `{table}` FINAL WHERE id = 1"
+    try:
+        first = quickhouse.sync(pg_source, ch_target, **kw)
+        assert first.rows_written == 3
+        assert "dropped_source_column" not in {w.kind for w in first.warnings}
+        with pg_conn.cursor() as cur:
+            cur.execute(f'ALTER TABLE "{table}" ADD COLUMN channel text')
+            cur.execute(
+                f"UPDATE \"{table}\" SET channel = 'app', name = 'changed', "
+                "write_date = '2024-02-01' WHERE id = 1"
+            )
+        fatal = {"dropped_source_column"}
+
+        with pytest.raises(RuntimeError, match="fail_on_warnings: dropped_source_column") as err:
+            quickhouse.sync(pg_source, ch_target, fail_on_warnings=fatal, **kw)
+        assert "on column 'channel'" in str(err.value)
+        assert "Nothing was written" in str(err.value)
+        assert ch_client.query(row).result_rows == [("row-1",)]
+        with pytest.raises(RuntimeError, match="Nothing was written"):
+            quickhouse.sync(pg_source, ch_target, fail_on_warnings=fatal, **dict(kw, mode="full"))
+        # A renamed column goes by the source name, which exclude= takes.
+        with pytest.raises(RuntimeError, match=r"'channel' \(renamed 'chan'\)"):
+            quickhouse.sync(
+                pg_source, ch_target, fail_on_warnings=fatal, rename={"channel": "chan"}, **kw
+            )
+        assert ch_client.query(row).result_rows == [("row-1",)]
+
+        # Without it the run goes ahead, and says what it left out.
+        r = quickhouse.sync(pg_source, ch_target, **kw)
+        assert r.rows_written == 1
+        dropped = [w for w in r.warnings if w.kind == "dropped_source_column"]
+        assert [(w.column, w.count) for w in dropped] == [("channel", 0)], r.warnings
+        assert "evolve_schema=True" in dropped[0].message
+        assert "channel" not in _ch_columns(ch_client, table)
+        assert ch_client.query(row).result_rows == [("changed",)]
+
+        # evolve_schema adds the column, so nothing is left out and nothing is
+        # reported; the row the run above wrote stays NULL there.
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE \"{table}\" SET channel = 'web', write_date = '2024-03-01' WHERE id = 2"
+            )
+        r = quickhouse.sync(pg_source, ch_target, evolve_schema=True, **kw)
+        assert r.rows_written == 1
+        assert "dropped_source_column" not in {w.kind for w in r.warnings}
+        assert ch_client.query(
+            f"SELECT id, channel FROM `{table}` FINAL WHERE id <= 2 ORDER BY id"
+        ).result_rows == [(1, None), (2, "web")]
+    finally:
+        _drop_ch(ch_client, table)
+
+
+def test_a_recreated_destination_starts_over_instead_of_reading_past_its_old_cursor(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """Issue #36: the cursor lives in _quickhouse_state, so dropping the
+    destination (the usual way to change an engine or order_by, which only
+    apply when a table is created) left it behind, and the run that created
+    the table again read only the rows past it: 1,000 rows came back as 1.
+    That run now starts over as a first run does, says so, and clears the old
+    cursor; fail_on_warnings refuses it before anything is created."""
+    table = unique_name
+    _seed_table(pg_conn, table, 1000)
+    _drop_ch(ch_client, table)
+    state_key = f"{table}:recreated"
+    kw = dict(
+        dest_table=table, source_table=table, mode="incremental", watermark="write_date",
+        key=["id"], create_if_missing=True, state_key=state_key,
+    )
+    count = f"SELECT count() FROM `{table}` FINAL"
+    try:
+        first = quickhouse.sync(pg_source, ch_target, **kw)
+        assert first.rows_written == 1000
+        assert "recreated_destination" not in {w.kind for w in first.warnings}
+        # Into the table it made, the cursor holds: nothing new, nothing said.
+        again = quickhouse.sync(pg_source, ch_target, **kw)
+        assert again.rows_written == 0
+        assert "recreated_destination" not in {w.kind for w in again.warnings}
+
+        _drop_ch(ch_client, table)
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE \"{table}\" SET qty = qty + 1, write_date = '2024-02-01' WHERE id = 7"
+            )
+        with pytest.raises(
+            RuntimeError, match="fail_on_warnings: recreated_destination"
+        ) as err:
+            quickhouse.sync(
+                pg_source, ch_target, fail_on_warnings={"recreated_destination"}, **kw
+            )
+        assert "Nothing was written" in str(err.value)
+        assert ch_client.command(f"EXISTS TABLE `{table}`") == 0
+
+        r = quickhouse.sync(pg_source, ch_target, **kw)
+        assert r.rows_written == 1000
+        assert ch_client.command(count) == 1000
+        recreated = [w for w in r.warnings if w.kind == "recreated_destination"]
+        assert len(recreated) == 1, r.warnings
+        assert recreated[0].sample == first.new_watermark
+        assert f"state_key '{state_key}'" in recreated[0].message
+        assert first.new_watermark in recreated[0].message
+        assert r.new_watermark.startswith("2024-02-01")
+
+        # The new table's cursor is the one that counts from here on.
+        r = quickhouse.sync(pg_source, ch_target, **kw)
+        assert r.rows_written == 0
+        assert "recreated_destination" not in {w.kind for w in r.warnings}
+    finally:
+        _drop_ch(ch_client, table)
+
+
+def test_a_recreated_destination_does_not_resume_the_old_tables_chunked_read(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """Issue #36, chunked: a chunk_rows read cut short leaves a resume marker.
+    A rerun into a destination dropped since then resumed past it, so the new
+    table got only the rows after the marker. It reads them all now."""
+    table = unique_name
+    with pg_conn.cursor() as cur:
+        cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+        cur.execute(f'CREATE TABLE "{table}" (id bigint PRIMARY KEY, v int, write_date timestamp)')
+    _drop_ch(ch_client, table)
+    kw = dict(
+        dest_table=table, source_table=table, mode="incremental", watermark="write_date",
+        key=["id"], create_if_missing=True, engine="ReplacingMergeTree", order_by=["id"],
+        chunk_rows=50, state_key=f"{table}:chunked",
+    )
+    try:
+        assert quickhouse.sync(pg_source, ch_target, **kw).rows_written == 0
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                f"INSERT INTO \"{table}\" SELECT g, 0, timestamp '2024-01-01' "
+                "FROM generate_series(1, 200) g"
+            )
+        ch_client.command(f"ALTER TABLE `{table}` ADD CONSTRAINT stop_here CHECK id <= 100")
+        with pytest.raises(RuntimeError, match="stop_here"):
+            quickhouse.sync(pg_source, ch_target, **kw)
+        _drop_ch(ch_client, table)
+
+        r = quickhouse.sync(pg_source, ch_target, **kw)
+        assert r.rows_read == 200
+        assert ch_client.command(f"SELECT count() FROM `{table}` FINAL") == 200
+        recreated = [w for w in r.warnings if w.kind == "recreated_destination"]
+        assert len(recreated) == 1, r.warnings
+        assert recreated[0].sample == "100"
+        assert "stopped past id 100" in recreated[0].message
+    finally:
+        _drop_ch(ch_client, table)
+
+
+def test_an_incremental_run_into_a_table_that_keeps_duplicates_is_reported_before_writing(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """Issue #37: an incremental run with a key creates a ReplacingMergeTree,
+    but into an existing table whose engine keeps every row, such as the
+    MergeTree a full refresh makes, it appended: the first run, with no
+    cursor yet, doubled the table, and each later one added another copy of
+    every changed row, silently. The run now names the engine before
+    writing. engine= naming such an engine says the copies are wanted."""
+    table = unique_name
+    _seed_table(pg_conn, table, 10)
+    _drop_ch(ch_client, table)
+    kw = dict(
+        dest_table=table, source_table=table, mode="incremental", watermark="write_date",
+        key=["id"], create_if_missing=True, state_key=f"{table}:dups",
+    )
+    engine = (
+        "SELECT engine FROM system.tables WHERE database = currentDatabase() "
+        f"AND name = '{table}'"
+    )
+
+    def kinds(r):
+        return {w.kind for w in r.warnings}
+
+    try:
+        full = quickhouse.sync(
+            pg_source, ch_target, dest_table=table, source_table=table, mode="full",
+            key=["id"], create_if_missing=True,
+        )
+        assert full.rows_written == 10
+        assert ch_client.command(engine) == "MergeTree"
+        with pg_conn.cursor() as cur:
+            cur.execute(f"UPDATE \"{table}\" SET qty = qty + 1, write_date = '2024-02-01' WHERE id = 3")
+
+        fatal = {"non_replacing_incremental_target"}
+        with pytest.raises(
+            RuntimeError, match="fail_on_warnings: non_replacing_incremental_target"
+        ) as err:
+            quickhouse.sync(pg_source, ch_target, fail_on_warnings=fatal, **kw)
+        assert "Nothing was written" in str(err.value)
+        assert ch_client.command(f"SELECT count() FROM `{table}`") == 10
+
+        r = quickhouse.sync(pg_source, ch_target, **kw)
+        assert r.rows_written == 10, "no cursor yet, so the whole table again"
+        warned = [w for w in r.warnings if w.kind == "non_replacing_incremental_target"]
+        assert len(warned) == 1, r.warnings
+        assert warned[0].sample == "MergeTree"
+        assert "is a MergeTree" in warned[0].message
+        with pg_conn.cursor() as cur:
+            cur.execute(f"UPDATE \"{table}\" SET qty = qty + 1, write_date = '2024-03-01' WHERE id = 4")
+        r = quickhouse.sync(pg_source, ch_target, **kw)
+        assert r.rows_written == 1
+        assert "non_replacing_incremental_target" in kinds(r)
+        ch_client.command(f"OPTIMIZE TABLE `{table}` FINAL")
+        assert ch_client.query(
+            f"SELECT count(), uniqExact(id) FROM `{table}`"
+        ).result_rows == [(21, 10)]
+
+        # engine= naming an engine that keeps copies is the caller's choice.
+        r = quickhouse.sync(pg_source, ch_target, engine="MergeTree", **kw)
+        assert "non_replacing_incremental_target" not in kinds(r)
+
+        # The fix the message gives: drop the table, and the next run creates
+        # a ReplacingMergeTree and reads the source from the start (#36).
+        _drop_ch(ch_client, table)
+        r = quickhouse.sync(pg_source, ch_target, **kw)
+        assert r.rows_written == 10
+        assert ch_client.command(engine) == "ReplacingMergeTree"
+        assert "non_replacing_incremental_target" not in kinds(r)
+        assert "recreated_destination" in kinds(r)
+        with pg_conn.cursor() as cur:
+            cur.execute(f"UPDATE \"{table}\" SET qty = qty + 1, write_date = '2024-04-01' WHERE id = 5")
+        r = quickhouse.sync(pg_source, ch_target, **kw)
+        assert r.rows_written == 1
+        assert "non_replacing_incremental_target" not in kinds(r)
+        assert ch_client.command(f"SELECT count() FROM `{table}` FINAL") == 10
     finally:
         _drop_ch(ch_client, table)

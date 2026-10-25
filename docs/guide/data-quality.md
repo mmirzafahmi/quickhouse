@@ -114,10 +114,14 @@ quickhouse.sync(src, dst, dest_table="orders", source_table="orders",
 ```
 ```{admonition} Failure type across the boundary
 :class: note
-The gate runs inside the native engine, so a Python exception raised from
-`validate` surfaces from `sync()` as a `RuntimeError` whose message carries the
-original failure (the suite name and staging table). Catch it around the
-`sync()` call to handle a rejected load.
+The exception a gate raises is the one `sync()` raises, unchanged: a
+{class}`quickhouse.ValidationFailed` keeps its `.result` (the Great Expectations
+validation result), and a custom gate's exception keeps its own type, so
+`no_empty_load` above surfaces as its `RuntimeError`. A note on it names the
+transfer, e.g. `orders -> orders: data-quality validation rejected the staged
+data`. Catch `quickhouse.ValidationFailed` around the `sync()` call to handle a
+load the suite rejected. It subclasses `RuntimeError`, the type of every other
+failure, so a broad `except RuntimeError` still catches a rejection too.
 ```
 
 ## Checking values after the fact

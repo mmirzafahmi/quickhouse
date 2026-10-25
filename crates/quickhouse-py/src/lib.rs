@@ -17,7 +17,7 @@
 #![allow(clippy::useless_conversion)]
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Once};
+use std::sync::{Arc, Mutex, Once, PoisonError};
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -25,6 +25,60 @@ use quickhouse_core as core;
 
 fn map_err(e: core::EtlError) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
+}
+
+/// What the transfer error says when the `validate=` gate raised.
+const GATE_REJECTED: &str = "data-quality validation rejected the staged data";
+
+/// The exception `sync()` raises for a failed transfer. When the `validate=`
+/// gate raised, it is that exception, unchanged — `ValidationFailed` with its
+/// `.result`, or a custom gate's own type — with a note naming the transfer:
+/// `"orders -> analytics.orders: data-quality validation rejected the staged
+/// data"`. Any other failure is a `RuntimeError`, as [`map_err`] makes it.
+///
+/// The gate's exception is only ever set when the gate raised, and the core
+/// returns that rejection as the transfer's error: cleanup after it never
+/// replaces it.
+fn transfer_error(py: Python<'_>, e: core::EtlError, gate_error: &Mutex<Option<PyErr>>) -> PyErr {
+    let Some(gate) = gate_error
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take()
+    else {
+        return map_err(e);
+    };
+    // The error's own text repeats the exception's message after the
+    // sentence, so the note keeps only where it happened.
+    let mut note = Vec::new();
+    let mut cur = &e;
+    while let core::EtlError::Context { context, source } = cur {
+        note.push(context.as_str());
+        cur = source.as_ref();
+    }
+    note.push(GATE_REJECTED);
+    add_note(py, &gate, &note.join(": "));
+    gate
+}
+
+/// Attach `note` to `err` as PEP 678 has it: `add_note` on Python 3.11+, and
+/// on older versions the `__notes__` list it would have written, which pytest
+/// and the `exceptiongroup` backport display.
+fn add_note(py: Python<'_>, err: &PyErr, note: &str) {
+    let value = err.value_bound(py);
+    if value.call_method1("add_note", (note,)).is_ok() {
+        return;
+    }
+    let notes = match value.getattr("__notes__") {
+        Ok(notes) => notes,
+        Err(_) => {
+            let notes = pyo3::types::PyList::empty_bound(py).into_any();
+            if value.setattr("__notes__", &notes).is_err() {
+                return;
+            }
+            notes
+        }
+    };
+    let _ = notes.call_method1("append", (note,));
 }
 
 static INIT_LOGGING: Once = Once::new();
@@ -1617,18 +1671,24 @@ fn sync(
     // Build the staged-validation gate (fires once, before the swap/merge).
     // Unlike `on_progress`, a raising callback here is NOT swallowed: it is
     // turned into a transfer error so the promotion is aborted and staging is
-    // dropped. The Python exception is flattened to its string at the core
-    // boundary (core knows only `EtlError`).
+    // dropped. Core knows only `EtlError`, so the exception itself waits in
+    // `gate_error` and is what `sync()` raises once the transfer has failed
+    // (see `transfer_error`). Flattened into a `RuntimeError` holding its
+    // text, as it used to be, a `ValidationFailed` lost its type and `.result`.
+    let gate_error: Arc<Mutex<Option<PyErr>>> = Arc::new(Mutex::new(None));
     let on_staged: Option<core::StagedValidationCb> = validate.map(|cb| {
         let cb = Arc::new(cb);
+        let gate_error = gate_error.clone();
         Arc::new(move |info: &core::StagedInfo| -> core::Result<()> {
             Python::with_gil(|py| {
                 let arg = StagedInfo::from_core(info);
                 match cb.call1(py, (arg,)) {
                     Ok(_) => Ok(()),
-                    Err(e) => Err(core::EtlError::other(format!(
-                        "data-quality validation rejected the staged data: {e}"
-                    ))),
+                    Err(e) => {
+                        let message = format!("{GATE_REJECTED}: {e}");
+                        *gate_error.lock().unwrap_or_else(PoisonError::into_inner) = Some(e);
+                        Err(core::EtlError::other(message))
+                    }
                 }
             })
         }) as core::StagedValidationCb
@@ -1640,7 +1700,7 @@ fn sync(
         .allow_threads(|| {
             core::run_transfer_blocking(source_cfg, dest_cfg, cfg, progress, on_staged)
         })
-        .map_err(map_err)?;
+        .map_err(|e| transfer_error(py, e, &gate_error))?;
 
     // Warnings are re-boxed as Python objects here rather than lazily, so a
     // caller can hold onto `result.warnings` after the GIL is handed back.
