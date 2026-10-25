@@ -27,6 +27,21 @@ fn map_err(e: core::EtlError) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
 }
 
+/// `s` as Python's own `repr()` writes it, for the `__repr__`s here: Rust's
+/// `{:?}` double-quotes a string and writes an `Option` as `Some("...")`
+/// (#45).
+fn py_repr(s: &str) -> String {
+    Python::with_gil(|py| match pyo3::types::PyString::new_bound(py, s).repr() {
+        Ok(r) => r.to_string_lossy().into_owned(),
+        Err(_) => format!("{s:?}"),
+    })
+}
+
+/// [`py_repr`] for an optional string, with `None` written as Python does.
+fn py_repr_opt(s: Option<&str>) -> String {
+    s.map_or_else(|| "None".to_string(), py_repr)
+}
+
 /// What the transfer error says when the `validate=` gate raised.
 const GATE_REJECTED: &str = "data-quality validation rejected the staged data";
 
@@ -324,8 +339,10 @@ impl BigQuery {
 
     fn __repr__(&self) -> String {
         format!(
-            "BigQuery(project_id={:?}, dataset_id={:?}, write_method={:?})",
-            self.project_id, self.dataset_id, self.write_method
+            "BigQuery(project_id={}, dataset_id={}, write_method={})",
+            py_repr_opt(self.project_id.as_deref()),
+            py_repr_opt(self.dataset_id.as_deref()),
+            py_repr(&self.write_method)
         )
     }
 }
@@ -443,8 +460,8 @@ impl CleverTap {
 
     fn __repr__(&self) -> String {
         format!(
-            "CleverTap(event_name={:?}, columns={}, account_id=***, passcode=***)",
-            self.event_name,
+            "CleverTap(event_name={}, columns={}, account_id=***, passcode=***)",
+            py_repr(&self.event_name),
             self.columns.len()
         )
     }
@@ -502,9 +519,9 @@ impl AppsFlyer {
 
     fn __repr__(&self) -> String {
         format!(
-            "AppsFlyer(app_id={:?}, report_type={:?}, columns={}, api_token=***)",
-            self.app_id,
-            self.report_type,
+            "AppsFlyer(app_id={}, report_type={}, columns={}, api_token=***)",
+            py_repr(&self.app_id),
+            py_repr(&self.report_type),
             self.columns.len()
         )
     }
@@ -594,9 +611,9 @@ impl HttpApi {
     fn __repr__(&self) -> String {
         // headers may carry auth — never echo them.
         format!(
-            "HttpApi(url={:?}, method={:?}, columns={}, headers=***)",
-            self.url,
-            self.method,
+            "HttpApi(url={}, method={}, columns={}, headers=***)",
+            py_repr(&self.url),
+            py_repr(&self.method),
             self.columns.len()
         )
     }
@@ -784,8 +801,11 @@ impl S3Archive {
         secret_access_key: Option<String>,
         endpoint: Option<String>,
         compression: String,
-    ) -> Self {
-        S3Archive {
+    ) -> PyResult<Self> {
+        // Checked here, not first at `sync()`, which is too late for a wrong
+        // literal in the constructor call (#45).
+        parse_parquet_compression(&compression)?;
+        Ok(S3Archive {
             bucket,
             prefix,
             region,
@@ -793,13 +813,15 @@ impl S3Archive {
             secret_access_key,
             endpoint,
             compression,
-        }
+        })
     }
 
     fn __repr__(&self) -> String {
         format!(
-            "S3Archive(bucket={:?}, prefix={:?}, endpoint={:?})",
-            self.bucket, self.prefix, self.endpoint
+            "S3Archive(bucket={}, prefix={}, endpoint={})",
+            py_repr(&self.bucket),
+            py_repr(&self.prefix),
+            py_repr_opt(self.endpoint.as_deref())
         )
     }
 }
@@ -840,21 +862,25 @@ impl GcsArchive {
         credentials_json: Option<String>,
         endpoint: Option<String>,
         compression: String,
-    ) -> Self {
-        GcsArchive {
+    ) -> PyResult<Self> {
+        // As for `S3Archive`: a bad literal fails the call that holds it.
+        parse_parquet_compression(&compression)?;
+        Ok(GcsArchive {
             bucket,
             prefix,
             credentials_file,
             credentials_json,
             endpoint,
             compression,
-        }
+        })
     }
 
     fn __repr__(&self) -> String {
         format!(
-            "GcsArchive(bucket={:?}, prefix={:?}, endpoint={:?})",
-            self.bucket, self.prefix, self.endpoint
+            "GcsArchive(bucket={}, prefix={}, endpoint={})",
+            py_repr(&self.bucket),
+            py_repr(&self.prefix),
+            py_repr_opt(self.endpoint.as_deref())
         )
     }
 }
@@ -973,8 +999,9 @@ impl ClickHouse {
 
     fn __repr__(&self) -> String {
         format!(
-            "ClickHouse(url={:?}, database={:?})",
-            self.url, self.database
+            "ClickHouse(url={}, database={})",
+            py_repr(&self.url),
+            py_repr(&self.database)
         )
     }
 }
@@ -1094,8 +1121,11 @@ struct StagedInfo {
 impl StagedInfo {
     fn __repr__(&self) -> String {
         format!(
-            "StagedInfo(staging_table={:?}, database={:?}, dest_kind={:?}, rows_written={})",
-            self.staging_table, self.database, self.dest_kind, self.rows_written
+            "StagedInfo(staging_table={}, database={}, dest_kind={}, rows_written={})",
+            py_repr(&self.staging_table),
+            py_repr(&self.database),
+            py_repr(&self.dest_kind),
+            self.rows_written
         )
     }
 }
@@ -1146,8 +1176,11 @@ struct TransferWarning {
 impl TransferWarning {
     fn __repr__(&self) -> String {
         format!(
-            "TransferWarning(kind={:?}, column={:?}, count={}, sample={:?})",
-            self.kind, self.column, self.count, self.sample
+            "TransferWarning(kind={}, column={}, count={}, sample={})",
+            py_repr(&self.kind),
+            py_repr_opt(self.column.as_deref()),
+            self.count,
+            py_repr_opt(self.sample.as_deref())
         )
     }
 
@@ -1200,7 +1233,7 @@ impl TransferResult {
         format!(
             "TransferResult(rows_read={}, rows_written={}, bytes_written={}, rows_deleted={}, \
              duration_secs={:.3}, read_secs={:.3}, stage_secs={:.3}, promote_secs={:.3}, \
-             new_watermark={:?}, warnings={}, rows_written_failed_attempts={})",
+             new_watermark={}, warnings={}, rows_written_failed_attempts={})",
             self.rows_read,
             self.rows_written,
             self.bytes_written,
@@ -1209,7 +1242,7 @@ impl TransferResult {
             self.read_secs,
             self.stage_secs,
             self.promote_secs,
-            self.new_watermark,
+            py_repr_opt(self.new_watermark.as_deref()),
             self.warnings.len(),
             self.rows_written_failed_attempts,
         )
@@ -1274,9 +1307,9 @@ struct ColumnDrift {
 impl ColumnDrift {
     fn __repr__(&self) -> String {
         format!(
-            "ColumnDrift(column={:?}, compared={}, mismatched={}, null_in_dest_only={}, \
+            "ColumnDrift(column={}, compared={}, mismatched={}, null_in_dest_only={}, \
              null_in_source_only={})",
-            self.column,
+            py_repr(&self.column),
             self.compared,
             self.mismatched,
             self.null_in_dest_only,
@@ -1894,9 +1927,13 @@ struct StateKey {
 impl StateKey {
     fn __repr__(&self) -> String {
         format!(
-            "StateKey(state_key={:?}, dest_table={:?}, last_watermark={:?}, last_run={:?}, \
+            "StateKey(state_key={}, dest_table={}, last_watermark={}, last_run={}, \
              state_rows={})",
-            self.state_key, self.dest_table, self.last_watermark, self.last_run, self.state_rows
+            py_repr(&self.state_key),
+            py_repr(&self.dest_table),
+            py_repr(&self.last_watermark),
+            py_repr(&self.last_run),
+            self.state_rows
         )
     }
 }

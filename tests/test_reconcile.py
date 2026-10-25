@@ -270,6 +270,38 @@ def test_null_watermark_rows_surface_as_a_structured_warning(
     assert r.rows_written == 1
 
 
+def test_result_and_warning_reprs_read_like_python(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """Issue #45: the reprs showed Rust's formatting of an optional string,
+    ``new_watermark=Some("...")`` and ``column=Some("...")``."""
+    src = f"{unique_name}_src"
+    pg_conn.execute(f"DROP TABLE IF EXISTS {src}")
+    pg_conn.execute(f"CREATE TABLE {src} (id bigint PRIMARY KEY, updated_at timestamp)")
+    pg_conn.execute(f"INSERT INTO {src} VALUES (1, '2026-07-01'), (2, NULL)")
+    try:
+        r = qh.sync(
+            pg_source,
+            ch_target,
+            source_table=src,
+            dest_table=unique_name,
+            mode="incremental",
+            watermark="updated_at",
+            key=["id"],
+            create_if_missing=True,
+        )
+        (w,) = [w for w in r.warnings if w.kind == "null_watermark"]
+        assert repr(w) == (
+            "TransferWarning(kind='null_watermark', column='updated_at', count=1, sample=None)"
+        )
+        assert r.new_watermark is not None
+        assert f"new_watermark={r.new_watermark!r}, warnings=1," in repr(r), repr(r)
+        assert "Some(" not in repr(r)
+    finally:
+        pg_conn.execute(f"DROP TABLE IF EXISTS {src}")
+        ch_client.command(f"DROP TABLE IF EXISTS `{unique_name}`")
+
+
 def test_reconcile_keeps_padded_char_keys(pg_conn, ch_client, pg_source, ch_target, unique_name):
     """A char(n) key reaches the destination padded ('XYZ       '), but the
     source keyset rendered it with ::text, which strips the padding. Every short

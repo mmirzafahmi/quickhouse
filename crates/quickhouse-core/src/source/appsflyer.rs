@@ -100,10 +100,13 @@ pub(crate) fn classify_appsflyer(status: u16, head: &str) -> ResponseClass {
 
 /// Parse a CSV report into flat JSON objects keyed by header (column-order
 /// independent). Strips a UTF-8 BOM off the first header; validates every
-/// `expected_headers` entry exists; ragged short rows null-fill.
+/// `expected_headers` entry exists; ragged short rows null-fill. `origin`
+/// names the source in errors (`"AppsFlyer"`, `"HTTP"`): an `HttpApi` CSV is
+/// parsed here too, and its errors used to name AppsFlyer (#45).
 pub(crate) fn csv_bytes_to_records(
     bytes: &[u8],
     expected_headers: &[String],
+    origin: &str,
 ) -> Result<Vec<Value>> {
     // Strip a leading UTF-8 BOM so the first header matches by name.
     let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
@@ -113,19 +116,17 @@ pub(crate) fn csv_bytes_to_records(
         .from_reader(bytes);
     let headers: Vec<String> = rdr
         .headers()
-        .map_err(|e| EtlError::other(format!("AppsFlyer CSV header parse: {e}")))?
+        .map_err(|e| EtlError::other(format!("{origin} CSV header parse: {e}")))?
         .iter()
         .map(str::to_string)
         .collect();
     if headers.is_empty() {
-        return Err(EtlError::other(
-            "AppsFlyer CSV had no header row".to_string(),
-        ));
+        return Err(EtlError::other(format!("{origin} CSV had no header row")));
     }
     for want in expected_headers {
         if !headers.iter().any(|h| h == want) {
             return Err(EtlError::config(format!(
-                "declared column maps to CSV header '{want}', which the AppsFlyer report doesn't \
+                "declared column maps to CSV header '{want}', which the {origin} CSV doesn't \
                  have. Available headers: {}",
                 headers.join(", ")
             )));
@@ -133,7 +134,7 @@ pub(crate) fn csv_bytes_to_records(
     }
     let mut out = Vec::new();
     for rec in rdr.records() {
-        let rec = rec.map_err(|e| EtlError::other(format!("AppsFlyer CSV row parse: {e}")))?;
+        let rec = rec.map_err(|e| EtlError::other(format!("{origin} CSV row parse: {e}")))?;
         let mut obj = Map::with_capacity(headers.len());
         for (i, h) in headers.iter().enumerate() {
             let cell = rec.get(i).unwrap_or(""); // ragged short row -> ""
@@ -209,7 +210,9 @@ impl AppsFlyerSource {
                         .map_err(|e| EtlError::other(format!("AppsFlyer body read: {e}")))?;
                     let head = String::from_utf8_lossy(&bytes[..bytes.len().min(200)]).into_owned();
                     match classify_appsflyer(status, &head) {
-                        ResponseClass::Ok => return csv_bytes_to_records(&bytes, expected_headers),
+                        ResponseClass::Ok => {
+                            return csv_bytes_to_records(&bytes, expected_headers, "AppsFlyer")
+                        }
                         ResponseClass::Transient(msg) if attempt < max => {
                             let delay = retry_after
                                 .map(Duration::from_secs)
@@ -303,8 +306,12 @@ mod tests {
     fn csv_parses_quotes_bom_ragged_and_validates_headers() {
         // BOM on first header + a quoted field with an embedded comma.
         let csv = "\u{feff}id,name\n1,\"Doe, John\"\n2,\n";
-        let recs =
-            csv_bytes_to_records(csv.as_bytes(), &["id".to_string(), "name".to_string()]).unwrap();
+        let recs = csv_bytes_to_records(
+            csv.as_bytes(),
+            &["id".to_string(), "name".to_string()],
+            "AppsFlyer",
+        )
+        .unwrap();
         assert_eq!(recs.len(), 2);
         assert_eq!(recs[0]["id"], "1");
         assert_eq!(
@@ -313,13 +320,22 @@ mod tests {
         );
         assert_eq!(recs[1]["name"], "", "empty cell kept as empty string");
         // Missing declared header -> clear error listing available headers.
-        let err = csv_bytes_to_records(csv.as_bytes(), &["nope".to_string()])
+        let err = csv_bytes_to_records(csv.as_bytes(), &["nope".to_string()], "AppsFlyer")
             .unwrap_err()
             .to_string();
         assert!(err.contains("nope") && err.contains("id"), "{err}");
+        assert!(err.contains("the AppsFlyer CSV"), "{err}");
+        // An HttpApi CSV goes through the same parser, and names itself (#45).
+        let err = csv_bytes_to_records(csv.as_bytes(), &["nope".to_string()], "HTTP")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("the HTTP CSV") && !err.contains("AppsFlyer"),
+            "{err}"
+        );
         // Header-only CSV -> 0 rows.
         assert_eq!(
-            csv_bytes_to_records(b"a,b\n", &["a".to_string()])
+            csv_bytes_to_records(b"a,b\n", &["a".to_string()], "AppsFlyer")
                 .unwrap()
                 .len(),
             0

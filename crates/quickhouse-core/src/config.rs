@@ -764,10 +764,10 @@ pub struct TransferConfig {
     /// backfill needs so it doesn't rewind the regular schedule. Incremental
     /// mode only.
     pub advance_watermark: bool,
-    /// Business/dedup key. ClickHouse: contributes to `ORDER BY` when no
-    /// explicit `order_by` is given. BigQuery: contributes to `Clustering`
-    /// alongside `order_by` (see its docs) — BigQuery has no dedicated key
-    /// concept.
+    /// Business/dedup key, named as the destination column (after `rename`).
+    /// ClickHouse: contributes to `ORDER BY` when no explicit `order_by` is
+    /// given. BigQuery: contributes to `Clustering` alongside `order_by` (see
+    /// its docs) — BigQuery has no dedicated key concept.
     pub key: Vec<String>,
 
     // ---- DDL / auto-create ----
@@ -779,7 +779,9 @@ pub struct TransferConfig {
     /// ClickHouse: `ORDER BY` columns for generated DDL (falls back to `key`
     /// if empty). BigQuery: combined with `key` into `Clustering.fields` (at
     /// most 4 columns total — a clear config error if more are given, not a
-    /// silent truncation).
+    /// silent truncation). `order_by` leads, except in incremental mode, where
+    /// `key` does: the `MERGE`'s key bound prunes only when the key leads the
+    /// clustering.
     pub order_by: Vec<String>,
     /// ClickHouse: a `PARTITION BY` SQL expression (e.g. `toYYYYMM(date)`).
     /// BigQuery: must instead be a bare `DATE`/`TIMESTAMP`/`DATETIME` column

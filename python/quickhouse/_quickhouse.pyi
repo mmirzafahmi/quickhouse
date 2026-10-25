@@ -191,7 +191,10 @@ class BigQuery:
     no `EXCHANGE TABLES` equivalent). ``partition_by`` must be a bare
     ``DATE``/``DATETIME``/``TIMESTAMP`` column name (not a SQL expression like
     ClickHouse's); ``order_by``/``key`` become clustering columns (at most 4
-    total). Incremental mode has no engine-level dedup here (unlike
+    total). ``order_by`` comes first, except in incremental mode, where
+    ``key`` leads so that the ``MERGE``'s key bound can prune; this applies
+    only to tables quickhouse creates, and an existing table keeps its
+    clustering. Incremental mode has no engine-level dedup here (unlike
     ClickHouse's `ReplacingMergeTree`), so it upserts via a ``MERGE``
     statement matched on ``key`` instead — making ``key`` **required** for
     incremental syncs into BigQuery specifically.
@@ -243,7 +246,8 @@ class S3Archive:
     compression:
         Parquet's own internal compression: ``"zstd"`` (default),
         ``"snappy"``, or ``"uncompressed"`` — distinct from ClickHouse's own
-        HTTP transport compression, which is unaffected.
+        HTTP transport compression, which is unaffected. Any other value
+        raises ``RuntimeError`` here, not at ``sync()``.
 
     Note
     ----
@@ -298,7 +302,8 @@ class GcsArchive:
         ``region``.
     compression:
         Parquet's own internal compression: ``"zstd"`` (default),
-        ``"snappy"``, or ``"uncompressed"``.
+        ``"snappy"``, or ``"uncompressed"``. Any other value raises
+        ``RuntimeError`` here, not at ``sync()``.
 
     Note
     ----

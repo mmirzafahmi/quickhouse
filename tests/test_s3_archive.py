@@ -187,7 +187,7 @@ def test_archive_rejects_empty_bucket(pg_source):
     # The bucket check lives in the Rust `into_config()` conversion, which
     # only runs at sync()-time (matching BigQuery's `dataset_id` requiredness
     # check) — constructing ClickHouse(...)/S3Archive(...) alone never
-    # validates anything. This must fail before any real connection is made.
+    # validates the bucket. This must fail before any real connection is made.
     dst = quickhouse.ClickHouse(CH_URL, archive=quickhouse.S3Archive(bucket=""))
     with pytest.raises(RuntimeError, match="non-empty bucket"):
         quickhouse.sync(

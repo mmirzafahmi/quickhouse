@@ -79,7 +79,7 @@ use serde_json::Value;
 
 use async_trait::async_trait;
 
-use crate::config::{BigQueryDestConfig, BigQueryWriteMethod, TransferConfig};
+use crate::config::{BigQueryDestConfig, BigQueryWriteMethod, SyncMode, TransferConfig};
 use crate::error::{EtlError, Result};
 use crate::sink::bigquery_proto::{build_proto_descriptor, encode_row, resolve_fields};
 use crate::sink::{backoff_delay, SendError, Sink, MAX_INSERT_ATTEMPTS};
@@ -2655,8 +2655,21 @@ fn build_table(
         }
     };
 
+    // An incremental run MERGEs on `key`, and its key bound only prunes blocks
+    // when the key leads the clustering (see `sync::clustering_binds`). So the
+    // key goes first there: `order_by` first, as before #44, left every MERGE
+    // into a table quickhouse created scanning all of it, and raising
+    // `unclustered_merge_target` against it. A full refresh or an append runs
+    // no MERGE, so `order_by` keeps the lead. Partitioning is separate from
+    // clustering, so a `merge_prune_partition_by` window on the partition
+    // column still prunes partitions whichever column leads.
+    let (lead, rest) = if cfg.mode == SyncMode::Incremental {
+        (&cfg.key, &cfg.order_by)
+    } else {
+        (&cfg.order_by, &cfg.key)
+    };
     let mut cluster_cols: Vec<String> = Vec::new();
-    for c in cfg.order_by.iter().chain(cfg.key.iter()) {
+    for c in lead.iter().chain(rest.iter()) {
         if !cluster_cols.contains(c) {
             cluster_cols.push(c.clone());
         }
@@ -3245,6 +3258,96 @@ mod tests {
         cfg.key = vec!["a".into()]; // duplicate of order_by[0], must not double up
         let t = build_table("p", "d", "t", &cols, &cfg).unwrap();
         assert_eq!(t.clustering.unwrap().fields, vec!["a", "b"]);
+    }
+
+    /// The columns of the #44 tests: a key, a date to order or partition by,
+    /// and one more.
+    fn merge_cols() -> Vec<ColumnType> {
+        vec![
+            col("id", DataType::Int64, false),
+            col("created_at", DataType::Date32, false),
+            col("tenant", DataType::Int64, false),
+        ]
+    }
+
+    fn clustering_of(cfg: &TransferConfig) -> Vec<String> {
+        build_table("p", "d", "t", &merge_cols(), cfg)
+            .unwrap()
+            .clustering
+            .unwrap()
+            .fields
+    }
+
+    #[test]
+    fn an_incremental_table_is_clustered_by_its_key_before_order_by() {
+        // #44: clustered (created_at, id), every MERGE on id scanned the whole
+        // table, and quickhouse warned about a table it had created itself.
+        let mut cfg = base_cfg();
+        cfg.mode = SyncMode::Incremental;
+        cfg.order_by = vec!["created_at".into()];
+        cfg.key = vec!["id".into()];
+        let fields = clustering_of(&cfg);
+        assert_eq!(fields, vec!["id", "created_at"]);
+        assert!(crate::sync::clustering_binds(Some(&fields), &cfg.key));
+    }
+
+    #[test]
+    fn a_composite_key_leads_in_its_own_order_without_repeating_a_column() {
+        let mut cfg = base_cfg();
+        cfg.mode = SyncMode::Incremental;
+        cfg.order_by = vec!["created_at".into(), "tenant".into()];
+        cfg.key = vec!["tenant".into(), "id".into()];
+        let fields = clustering_of(&cfg);
+        assert_eq!(fields, vec!["tenant", "id", "created_at"]);
+        assert!(crate::sync::clustering_binds(Some(&fields), &cfg.key));
+    }
+
+    #[test]
+    fn a_table_no_merge_runs_against_keeps_order_by_first() {
+        for mode in [SyncMode::Full, SyncMode::Append] {
+            let mut cfg = base_cfg();
+            cfg.mode = mode;
+            cfg.order_by = vec!["created_at".into()];
+            cfg.key = vec!["id".into()];
+            assert_eq!(clustering_of(&cfg), vec!["created_at", "id"], "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn an_incremental_table_is_partitioned_by_date_and_clustered_by_key() {
+        // The partition column a `merge_prune_partition_by` window bounds is
+        // pruned through partitioning, so it doesn't need to lead the
+        // clustering, and the key can.
+        let mut cfg = base_cfg();
+        cfg.mode = SyncMode::Incremental;
+        cfg.partition_by = Some("created_at".into());
+        cfg.merge_prune_partition_by = Some("created_at".into());
+        cfg.order_by = vec!["created_at".into()];
+        cfg.key = vec!["id".into()];
+        let t = build_table("p", "d", "t", &merge_cols(), &cfg).unwrap();
+        assert_eq!(
+            t.time_partitioning.unwrap().field.as_deref(),
+            Some("created_at")
+        );
+        assert_eq!(t.clustering.unwrap().fields, vec!["id", "created_at"]);
+    }
+
+    #[test]
+    fn an_incremental_table_still_takes_at_most_four_clustering_columns() {
+        let cols = (0..5)
+            .map(|i| col(&format!("c{i}"), DataType::Int64, false))
+            .collect::<Vec<_>>();
+        let mut cfg = base_cfg();
+        cfg.mode = SyncMode::Incremental;
+        cfg.key = vec!["c0".into(), "c1".into()];
+        cfg.order_by = vec!["c2".into(), "c3".into(), "c4".into()];
+        let err = build_table("p", "d", "t", &cols, &cfg)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("at most 4") && err.contains("c0, c1, c2"),
+            "{err}"
+        );
     }
 
     #[test]

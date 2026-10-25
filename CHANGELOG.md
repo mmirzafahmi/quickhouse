@@ -9,6 +9,77 @@ any breaking change is called out explicitly.
 
 ## [Unreleased]
 
+### Changed — please read before upgrading
+- **A `key` that names no destination column is a config error.** `key` takes
+  destination names, after `rename`, `include` and `exclude`. A source name
+  that `rename` changes, a column left out, or a typo reached the DDL and
+  failed there with ClickHouse's `Missing columns: 'id' ... (UNKNOWN_IDENTIFIER)`,
+  which named neither the argument nor the rename. The run now stops before
+  anything is read or written, naming the column, the rename that changed it
+  (or that `include`/`exclude` left it out), and the columns the transfer
+  writes. Both destinations; BigQuery column names compare case-insensitively.
+  A run that got past such a key before, because nothing it did used the key
+  (a ClickHouse destination that already existed, or one created with an
+  explicit `order_by`), now fails with this error: fix the key. (#45)
+
+### Fixed
+- **A BigQuery table quickhouse creates for an incremental sync is clustered by
+  `key` first.** The generated clustering put `order_by` before `key`, so with
+  `order_by=["created_at"], key=["id"]` the table was clustered
+  `(created_at, id)`. The `MERGE`'s key bound only prunes when the key leads
+  the clustering, so every merge into it scanned the whole table, and
+  quickhouse raised `unclustered_merge_target` against a table it had created
+  itself. An incremental table is now clustered by `key`, then the `order_by`
+  columns not already in it, still at most 4 columns. A full refresh or an
+  append runs no `MERGE`, so `order_by` keeps the lead there. Partitioning is
+  unchanged, so a `merge_prune_partition_by` window on the partition column
+  prunes as before. Only tables quickhouse creates from now on are affected:
+  an existing table keeps its clustering, and quickhouse doesn't alter it.
+  One clustered `(order_by, key)` keeps raising `unclustered_merge_target`
+  until it is recreated or its clustering is changed in BigQuery. (#44)
+- **Python reprs read like Python.** `repr(TransferResult)` showed
+  `new_watermark=Some("2026-10-23 17:09:09.692213+00")` and
+  `repr(TransferWarning)` `column=Some("priority")`, Rust's formatting of an
+  optional string, though the attributes are a plain `str` or `None`. Every
+  repr now quotes its strings as Python's `repr()` does and writes a missing
+  one as `None`: `TransferResult`, `TransferWarning`, `StagedInfo`,
+  `ColumnDrift`, `StateKey`, and the `BigQuery`, `ClickHouse`, `CleverTap`,
+  `AppsFlyer`, `HttpApi`, `S3Archive` and `GcsArchive` descriptors. (#45)
+- **A typo in the CLI's `[sync]` table is a one-line error.** `keys = ["id"]`
+  ended in `TypeError: sync() got an unexpected keyword argument 'keys'` and a
+  traceback, while a typo in `[source]` or `[target]` got a one-line error. An
+  unknown key now stops the job before `sync()` is called, naming it and the
+  closest key `sync()` takes: `[sync] config error: unknown key 'keys' (did you
+  mean 'key'?)`. A value of the wrong type (`key = "id"`) gets
+  `[sync] config error: ...` instead of a traceback, too. (#45)
+- **The CLI names an unset `${VAR}` instead of running with it.**
+  `os.path.expandvars` leaves an unset variable as literal text, so
+  `dsn = "${PG_DSN}"` with `PG_DSN` unset failed later as
+  `postgres error: invalid connection string: unexpected EOF`. A job that uses
+  an unset `${VAR}` now stops before anything runs, listing each one and
+  where it is (`PG_DSN ([source] dsn)`). An unset bare `$NAME` still stays as
+  written, since it can be text: a `$1` placeholder, or a `$` in a
+  password. (#45)
+- **A `fail_on_warnings` stop no longer calls a table the run created
+  untouched.** A full refresh or a staged incremental run into a destination
+  that didn't exist creates it, empty, before it reads, so a run stopped at
+  the swap or the merge left that table behind while the error said "The
+  destination is untouched". It now says the destination this run created is
+  left empty. (#45)
+- **`reconcile_keys()` refuses a BigQuery or API source before it reads the
+  destination.** It read the destination first, so with the destination table
+  missing it failed with ClickHouse's `Unknown table expression identifier`
+  instead of saying it doesn't support the source. (#45)
+- **An `HttpApi` CSV error names the HTTP source, not AppsFlyer.** The CSV
+  parser is shared with the AppsFlyer source, and its errors said
+  `which the AppsFlyer report doesn't have` for an `HttpApi` too. They now
+  name the source: `which the HTTP CSV doesn't have`. (#45)
+- **`S3Archive` and `GcsArchive` check `compression` when they are built.**
+  `S3Archive(compression="lz4")` was accepted and failed only at `sync()`, with
+  `invalid archive compression "lz4"`. The constructor now raises that
+  `RuntimeError` itself, the way `backup()` already checks `format` up
+  front. (#45)
+
 ## [0.20.10] — 2026-10-25
 
 ### Changed — please read before upgrading

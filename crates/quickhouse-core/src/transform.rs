@@ -318,6 +318,54 @@ fn declared_decimal_default(
     Some(format!("Decimal({p}, {s})"))
 }
 
+/// Refuse a `key` that names no column this transfer writes, before anything
+/// is read or written (#45).
+///
+/// `key` names destination columns, so a source name that `rename` changes,
+/// a column `include`/`exclude` leaves out, or a typo, used to reach the DDL
+/// and fail there with ClickHouse's `UNKNOWN_IDENTIFIER`, naming neither the
+/// argument nor the rename. Case-insensitive for BigQuery, whose column names
+/// are.
+fn ensure_key_columns(
+    source: &[ColumnType],
+    cfg: &TransferConfig,
+    dest_kind: DestKind,
+    dest_columns: &[ColumnType],
+) -> Result<()> {
+    let same = |a: &str, b: &str| match dest_kind {
+        DestKind::BigQuery => a.eq_ignore_ascii_case(b),
+        DestKind::ClickHouse => a == b,
+    };
+    for k in &cfg.key {
+        if dest_columns.iter().any(|c| same(&c.name, k)) {
+            continue;
+        }
+        let in_source = source.iter().any(|c| &c.name == k);
+        let left_out =
+            (!cfg.include.is_empty() && !cfg.include.contains(k)) || cfg.exclude.contains(k);
+        let why = match cfg.rename.get(k) {
+            _ if in_source && left_out => {
+                ": the source has it, but include/exclude leaves it out".to_string()
+            }
+            Some(renamed) if in_source => format!(
+                ": rename turns source column '{k}' into '{renamed}', and key takes the \
+                 destination name, so use '{renamed}'"
+            ),
+            _ => String::new(),
+        };
+        let have = dest_columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(EtlError::config(format!(
+            "key column '{k}' is not a destination column{why}. key names columns as the \
+             destination has them, after rename/include/exclude; this transfer writes: {have}"
+        )));
+    }
+    Ok(())
+}
+
 pub fn plan(
     source: &[ColumnType],
     cfg: &TransferConfig,
@@ -610,6 +658,7 @@ pub fn plan_for_destination(
             declared_decimal: c.declared_decimal,
         });
     }
+    ensure_key_columns(source, cfg, dest_kind, &dest_columns)?;
 
     Ok(SelectPlan {
         source_columns,
@@ -1542,5 +1591,66 @@ mod tests {
             !p.dest_columns[0].nullable,
             "CH ReplacingMergeTree version column must be non-nullable"
         );
+    }
+
+    /// #45: a `key` that names no destination column used to reach the DDL
+    /// and fail with ClickHouse's `UNKNOWN_IDENTIFIER`.
+    #[test]
+    fn a_key_that_names_no_destination_column_is_a_config_error() {
+        let src = vec![c("id"), c("amount")];
+        let mut cfg = cfg();
+        cfg.key = vec!["nope".into()];
+        let err = plan(&src, &cfg, DestKind::ClickHouse).unwrap_err();
+        assert!(matches!(err, EtlError::Config(_)), "{err}");
+        let err = err.to_string();
+        assert!(
+            err.contains("key column 'nope' is not a destination column"),
+            "{err}"
+        );
+        assert!(err.contains("this transfer writes: id, amount"), "{err}");
+    }
+
+    #[test]
+    fn a_key_named_before_its_rename_says_to_use_the_new_name() {
+        let src = vec![c("id"), c("amount")];
+        let mut cfg = cfg();
+        cfg.rename = HashMap::from([("id".to_string(), "order_id".to_string())]);
+        cfg.key = vec!["id".into()];
+        let err = plan(&src, &cfg, DestKind::ClickHouse)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("rename turns source column 'id' into 'order_id'"),
+            "{err}"
+        );
+        assert!(err.contains("use 'order_id'"), "{err}");
+        // The destination name is the one key takes.
+        cfg.key = vec!["order_id".into()];
+        let p = plan(&src, &cfg, DestKind::ClickHouse).unwrap();
+        assert!(
+            !p.dest_columns[0].nullable,
+            "a key column is forced NOT NULL"
+        );
+    }
+
+    #[test]
+    fn a_key_left_out_by_exclude_says_so() {
+        let src = vec![c("id"), c("amount")];
+        let mut cfg = cfg();
+        cfg.exclude = vec!["id".into()];
+        cfg.key = vec!["id".into()];
+        let err = plan(&src, &cfg, DestKind::BigQuery)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("include/exclude leaves it out"), "{err}");
+    }
+
+    #[test]
+    fn a_key_matches_a_bigquery_column_whatever_its_case() {
+        let src = vec![c("id"), c("amount")];
+        let mut cfg = cfg();
+        cfg.key = vec!["ID".into()];
+        assert!(plan(&src, &cfg, DestKind::BigQuery).is_ok());
+        assert!(plan(&src, &cfg, DestKind::ClickHouse).is_err());
     }
 }

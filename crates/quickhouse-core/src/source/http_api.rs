@@ -204,6 +204,7 @@ impl HttpApiSource {
                     out.extend(crate::source::appsflyer::csv_bytes_to_records(
                         &bytes,
                         expected_headers,
+                        "HTTP",
                     )?);
                     break; // CSV: no cursor pagination
                 }
