@@ -255,12 +255,14 @@ Three knobs tune the incremental behavior for these sources:
   own consolidation MERGE downstream. `watermark` drives the resume window; `key`
   isn't required. Avoids per-run table-metadata churn (BigQuery's
   ~5-ops/10s/table limit) since there's no staging create/swap. API sources only.
-- **`delete_stale_in_window=True`** (BigQuery incremental) — also `DELETE`
+- **`delete_stale_in_window=True`** (incremental) — also `DELETE`
   destination rows inside the merged window that are absent from the source pull
   ("replace this window"; a NULL merge key nets to a replace instead of
   duplicating). **Requires `merge_prune_partition_by`** — the DELETE is scoped to
   that immutable column's staging range, so it never touches history outside the
-  batch (a hard error otherwise).
+  batch — **and `watermark` set to that same column**, so the batch holds every
+  source row in the range; on an update watermark it would delete rows the
+  source still has (both are hard errors otherwise).
 
 ### Backup to cloud storage during the transfer
 

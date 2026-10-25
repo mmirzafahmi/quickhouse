@@ -272,6 +272,29 @@ impl ClickHouseSink {
             .and_then(|s| s.trim().parse::<u64>().ok()))
     }
 
+    /// See [`Sink::merged_row_count`]: `count()` with `FINAL` when `table`'s
+    /// engine merges rows sharing a sorting key, else `None`.
+    pub async fn merged_row_count(&self, table: &str) -> Result<Option<u64>> {
+        let sql = format!(
+            "SELECT engine FROM system.tables WHERE database = '{}' AND name = '{}'",
+            escape_sql_string(&self.cfg.database),
+            escape_sql_string(table),
+        );
+        match self.query_scalar(&sql).await? {
+            Some(engine) if engine_merges_rows(&engine) => {}
+            _ => return Ok(None),
+        }
+        let sql = format!(
+            "SELECT count() FROM {}.{} FINAL",
+            ident(&self.cfg.database),
+            ident(table)
+        );
+        Ok(self
+            .query_scalar(&sql)
+            .await?
+            .and_then(|s| s.trim().parse::<u64>().ok()))
+    }
+
     /// Run a query returning a single string column, one value per line (the
     /// HTTP interface's default TabSeparated). Blank lines are dropped.
     pub async fn query_column(&self, sql: &str) -> Result<Vec<String>> {
@@ -1003,6 +1026,15 @@ fn engine_keeps_duplicates(engine: &str) -> bool {
     name.ends_with("MergeTree") && !name.contains("Replacing") && !name.starts_with("Replicated")
 }
 
+/// Whether a ClickHouse engine, as `system.tables` names it, merges rows
+/// sharing a sorting key, so only a `FINAL` read counts what it holds. See
+/// [`ClickHouseSink::merged_row_count`].
+fn engine_merges_rows(engine: &str) -> bool {
+    // ClickHouse Cloud spells its engines `Shared*`.
+    let engine = engine.strip_prefix("Shared").unwrap_or(engine);
+    crate::ddl::is_row_merging_engine(engine)
+}
+
 /// ClickHouse's `UNKNOWN_TABLE` (code 60).
 fn is_unknown_table(e: &EtlError) -> bool {
     let msg = e.to_string();
@@ -1062,6 +1094,9 @@ impl Sink for ClickHouseSink {
     }
     async fn current_row_count(&self, table: &str) -> Result<Option<u64>> {
         ClickHouseSink::current_row_count(self, table).await
+    }
+    async fn merged_row_count(&self, table: &str) -> Result<Option<u64>> {
+        ClickHouseSink::merged_row_count(self, table).await
     }
     async fn drop_table(&self, table: &str) -> Result<()> {
         ClickHouseSink::drop_table(self, table).await
@@ -1401,6 +1436,32 @@ mod tests {
             "Buffer",
         ] {
             assert!(!engine_keeps_duplicates(collapses), "{collapses}");
+        }
+    }
+
+    #[test]
+    fn only_an_engine_that_merges_rows_is_counted_with_final() {
+        for merges in [
+            "ReplacingMergeTree",
+            "ReplicatedReplacingMergeTree",
+            "SharedReplacingMergeTree",
+            "CollapsingMergeTree",
+            "VersionedCollapsingMergeTree",
+            "SummingMergeTree",
+            "AggregatingMergeTree",
+        ] {
+            assert!(engine_merges_rows(merges), "{merges}");
+        }
+        // A plain MergeTree rejects FINAL (`ILLEGAL_FINAL`), and keeps every
+        // row, so its plain count is already what it holds.
+        for keeps in [
+            "MergeTree",
+            "SharedMergeTree",
+            "ReplicatedMergeTree",
+            "Log",
+            "",
+        ] {
+            assert!(!engine_merges_rows(keeps), "{keeps}");
         }
     }
 

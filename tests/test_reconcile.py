@@ -83,9 +83,11 @@ def test_clickhouse_delete_stale_in_window_removes_hard_deleted_rows(
         "the drift this feature exists to fix"
     )
 
-    # Now with the window delete. `advance_watermark=False` re-reads the July
-    # window rather than only what changed since the last cursor, so the batch
-    # is the window's full contents — which is what "replace this window" needs.
+    # Now with the window delete. The watermark is the window column, so the
+    # read returns every July row past the seed rather than only what changed
+    # since the last cursor: the batch is the window's full contents, which is
+    # what "replace this window" needs (#34), and `advance_watermark=False`
+    # leaves the cursor where it was.
     windowed = qh.sync(
         pg_source,
         ch_target,
@@ -95,7 +97,7 @@ def test_clickhouse_delete_stale_in_window_removes_hard_deleted_rows(
         ),
         dest_table=unique_name,
         mode="incremental",
-        watermark="updated_at",
+        watermark="create_date",
         key=["id"],
         seed_watermark="1970-01-01 00:00:00",
         advance_watermark=False,

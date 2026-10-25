@@ -238,11 +238,32 @@ destination rows inside the merged window that the source pull no longer has
 is scoped to that immutable column's staging range so it never touches history
 outside the batch (a hard error otherwise).
 
+It also **requires `watermark` to be that same column** (a config error
+otherwise). The delete takes every destination row in the window that the batch
+doesn't hold, so the batch must hold every source row in the window. A read on
+the window column does: it returns every row past `cursor - lookback_seconds`
+there. A read on an update watermark such as `write_date` holds only the rows
+that changed, and the delete would take the unchanged rows between them, which
+the source still has: two changed rows, ids 5 and 995 of 1,000, once deleted
+the 989 rows between them.
+`watermark_source_expr` is refused with it for the same reason, since quickhouse
+can't tell which column an expression reads.
+
 ```python
 qh.sync(..., mode="incremental", key=["id"],
+        watermark="create_date",
+        lookback_seconds=7 * 86400,          # how long a row can still change
+        state_key="stock_move_line:window",  # a cursor of its own
         merge_prune_partition_by="create_date",
         delete_stale_in_window=True)
 ```
+
+Set `lookback_seconds` to cover how long a row can still change or be deleted
+after its `create_date`: each run re-reads that span and replaces it, and a row
+deleted before it is never seen. Give the sync a `state_key` of its own, since
+its cursor is on `create_date`; it can run next to a regular `write_date` sync
+of the same table, which keeps its own. A DataFrame source is exempt, since
+nothing filters its read: the frame must hold the whole window itself.
 
 - **BigQuery** expresses it as a `WHEN NOT MATCHED BY SOURCE` clause inside the
   same `MERGE`, so it is atomic with the upsert. BigQuery reports one combined

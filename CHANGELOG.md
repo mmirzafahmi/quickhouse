@@ -9,6 +9,47 @@ any breaking change is called out explicitly.
 
 ## [Unreleased]
 
+### Changed — please read before upgrading
+- **`delete_stale_in_window` is refused unless `watermark` is the
+  `merge_prune_partition_by` column.** Configurations 0.20.9 accepted now fail
+  with a config error, because they were deleting rows the source still has.
+  The delete removes every destination row in the staged batch's range of the
+  window column that the batch doesn't hold. An incremental read on an update
+  watermark such as `write_date` holds only the rows that changed, so two
+  changed rows far apart on `create_date` took every unchanged row between
+  them: 989 of 1,000 in one run, reported as a success with no warning. A read
+  on the window column returns every row past `cursor - lookback_seconds`
+  there, so its batch holds the whole range. The error gives that set-up:
+  `watermark` set to the window column, a `lookback_seconds` that covers how
+  long a row can still change or be deleted, and a `state_key` of its own.
+  `watermark_source_expr` is refused with it as well, since quickhouse can't
+  tell which column an expression reads. Both destinations, as it is a config
+  check; a DataFrame source, which nothing filters, is exempt. If an affected
+  sync ran, its destination is missing rows in the windows it touched:
+  re-sync them, or find them with `reconcile_keys`. (#34)
+
+### Fixed
+- **The full-refresh shrink guard counts a `ReplacingMergeTree` as merged.**
+  It compared the rows staged with the destination's plain `count()`, which
+  includes an updated row's old versions until ClickHouse merges them away, so
+  a refresh with every one of the source's rows was refused as a shrink. On an
+  engine that merges rows (`ReplacingMergeTree`, `CollapsingMergeTree`,
+  `SummingMergeTree` and the like, `Replicated*` and `Shared*` included), a
+  refresh the plain counts would stop is counted again with `FINAL`, the
+  destination and the staging table both, and decided on those numbers. A
+  shrink once merged is still refused, and the error says the counts used
+  `FINAL`. `FINAL` reads the table where the plain count reads metadata, so a
+  refresh the plain counts pass costs nothing more. (#38)
+- **`read_idle_timeout_secs` times the wait for a source's first row.**
+  PostgreSQL starts a `COPY`, MySQL sends a result's header and ClickHouse
+  sends its response headers only once the statement has produced its first
+  rows, and none of those waits was timed. A query that produced nothing for 6
+  seconds finished despite `read_idle_timeout_secs=2`, with `read_secs` 0.0,
+  and a read stalled on a lock before its first row would have gone unnoticed
+  the same way. The wait now counts as idle time and toward `read_secs`, for
+  PostgreSQL, MySQL (the prepare too) and ClickHouse sources, in a one-pass,
+  chunked or windowed read. (#41)
+
 ## [0.20.9] — 2026-10-24
 
 ### Added

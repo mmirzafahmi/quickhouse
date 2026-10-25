@@ -2456,6 +2456,7 @@ async fn run_transfer_impl(
             guard_full_refresh_shrink(
                 sink.as_ref(),
                 &cfg,
+                &staging,
                 counters.rows_written.load(Ordering::Relaxed),
                 &warnings,
             )
@@ -2953,6 +2954,7 @@ async fn run_transfer_bigquery(
             guard_full_refresh_shrink(
                 sink.as_ref(),
                 &cfg,
+                &staging,
                 counters.rows_written.load(Ordering::Relaxed),
                 &warnings,
             )
@@ -3057,9 +3059,20 @@ async fn run_transfer_bigquery(
 /// `current_row_count` is best-effort by contract, so a count we cannot read
 /// must not fail the transfer — but it is logged at `warn`, because it means
 /// the guard did not actually run.
+///
+/// The counts compared are the rows each side holds once merged. A ClickHouse
+/// `ReplacingMergeTree` keeps an updated row's old versions until a background
+/// merge removes them, so its plain count can sit above the rows it holds, and
+/// a refresh that loses nothing was refused as a shrink (#38). Where the plain
+/// counts would stop the swap, both sides are counted again with `FINAL` (see
+/// [`merged_counts`]): the destination, and staging, which mirrors its engine
+/// and merges the same way once swapped in. `FINAL` reads the table where the
+/// plain count reads metadata, so a refresh the plain counts pass pays nothing
+/// for it.
 async fn guard_full_refresh_shrink(
     sink: &dyn Sink,
     cfg: &TransferConfig,
+    staging: &str,
     new_rows: u64,
     warnings: &Warnings,
 ) -> Result<()> {
@@ -3074,13 +3087,21 @@ async fn guard_full_refresh_shrink(
             return Ok(());
         }
     };
+    let merged = match existing {
+        Some(n) if n > new_rows => merged_counts(sink, &cfg.dest_table, staging).await,
+        _ => None,
+    };
+    let (existing, new_rows, counted) = match merged {
+        Some((dest, staged)) => (Some(dest), staged, " (both counted with FINAL, as merged)"),
+        None => (existing, new_rows, ""),
+    };
     match full_refresh_shrink_verdict(existing, new_rows, cfg.allow_full_refresh_shrink) {
         ShrinkVerdict::Proceed => Ok(()),
         ShrinkVerdict::ProceedWithWarning { existing, lost } => {
             let message = format!(
-                "full-refresh will REPLACE '{}' ({existing} row(s)) with only {new_rows} row(s) — \
-                 the destination will SHRINK by {lost} row(s). Proceeding because \
-                 allow_full_refresh_shrink=True.",
+                "full-refresh will REPLACE '{}' ({existing} row(s)) with only {new_rows} \
+                 row(s){counted} — the destination will SHRINK by {lost} row(s). Proceeding \
+                 because allow_full_refresh_shrink=True.",
                 cfg.dest_table,
             );
             tracing::warn!("{message}");
@@ -3097,13 +3118,40 @@ async fn guard_full_refresh_shrink(
         }
         ShrinkVerdict::Refuse { existing, lost } => Err(EtlError::config(format!(
             "refusing full-refresh: swapping staging into '{}' would REPLACE {existing} row(s) \
-             with only {new_rows} row(s), shrinking the destination by {lost}. A full refresh \
-             replaces the table wholesale and is NOT partition-aware, so if this run covers only \
-             part of the destination the rest is destroyed. To add rows instead of replacing them \
-             use mode=\"incremental\" with key=, or mode=\"append\". If this shrink is genuinely \
-             intended, set allow_full_refresh_shrink=True.",
+             with only {new_rows} row(s){counted}, shrinking the destination by {lost}. A full \
+             refresh replaces the table wholesale and is NOT partition-aware, so if this run \
+             covers only part of the destination the rest is destroyed. To add rows instead of \
+             replacing them use mode=\"incremental\" with key=, or mode=\"append\". If this \
+             shrink is genuinely intended, set allow_full_refresh_shrink=True.",
             cfg.dest_table,
         ))),
+    }
+}
+
+/// The rows `dest` and `staging` hold once merged, for
+/// [`guard_full_refresh_shrink`], or `None` to keep the plain counts: the
+/// engine keeps every row, or a count failed (logged at `warn`; the plain
+/// counts it falls back to are the stricter pair, so the guard still runs).
+async fn merged_counts(sink: &dyn Sink, dest: &str, staging: &str) -> Option<(u64, u64)> {
+    let counts: Result<Option<(u64, u64)>> = async {
+        let Some(dest) = sink.merged_row_count(dest).await? else {
+            return Ok(None);
+        };
+        Ok(sink
+            .merged_row_count(staging)
+            .await?
+            .map(|staged| (dest, staged)))
+    }
+    .await;
+    match counts {
+        Ok(counts) => counts,
+        Err(e) => {
+            tracing::warn!(
+                "full-refresh shrink guard could not count '{dest}' and '{staging}' as merged \
+                 ({e}); comparing the plain counts."
+            );
+            None
+        }
     }
 }
 
@@ -3598,6 +3646,7 @@ async fn run_transfer_api(
             guard_full_refresh_shrink(
                 sink.as_ref(),
                 &cfg,
+                &staging,
                 counters.rows_written.load(Ordering::Relaxed),
                 &warnings,
             )
@@ -3894,6 +3943,7 @@ async fn run_transfer_frame(
             guard_full_refresh_shrink(
                 sink.as_ref(),
                 &cfg,
+                &staging,
                 counters.rows_written.load(Ordering::Relaxed),
                 &warnings,
             )
@@ -4745,7 +4795,16 @@ async fn transfer_keyset_postgres(
             Some(keyset),
         );
         tracing::debug!("keyset chunk: {copy_sql}");
-        let stream = source.copy_stream(&client, &copy_sql).await?;
+        // Timed like every chunk after it: see `read_statement_postgres`.
+        let idle = cfg.read_idle_timeout_secs;
+        let scope = format!("partition '{}'", partition.label);
+        let stream = await_source(
+            source.copy_stream(&client, &copy_sql),
+            &ctx.counters,
+            idle,
+            &scope,
+        )
+        .await??;
         futures::pin_mut!(stream);
         let mut chunks = CopyChunks::new(stream);
         let mut decoder =
@@ -4760,8 +4819,6 @@ async fn transfer_keyset_postgres(
         // The idle timer wraps the source await and nothing else: it is
         // recorded *inside* `await_source`, at the moment the chunk arrives, so
         // the concurrent decode below neither trips it nor inflates read_secs.
-        let idle = cfg.read_idle_timeout_secs;
-        let scope = format!("partition '{}'", partition.label);
         let mut pending = await_source(chunks.next_chunk(), &ctx.counters, idle, &scope).await?;
         while let Some(bytes) = pending {
             let bytes = bytes?;
@@ -5430,7 +5487,19 @@ async fn read_statement_postgres(
     );
     tracing::debug!("partition {}: {copy_sql}", partition.label);
 
-    let stream = source.copy_stream(client, &copy_sql).await?;
+    // The wait for the first row is timed as well (#41). `copy_out` returns
+    // only once the COPY's first output reaches the client, which PostgreSQL
+    // sends with the first rows, so a statement that stalls before them (on a
+    // lock, or a slow function in a `source_query`) stalls here.
+    let idle = cfg.read_idle_timeout_secs;
+    let scope = format!("partition '{}'", partition.label);
+    let stream = await_source(
+        source.copy_stream(client, &copy_sql),
+        &ctx.counters,
+        idle,
+        &scope,
+    )
+    .await??;
     futures::pin_mut!(stream);
     let mut chunks = CopyChunks::new(stream);
 
@@ -5454,8 +5523,6 @@ async fn read_statement_postgres(
         // The idle timer wraps the source await and nothing else: it is recorded
         // *inside* `await_source`, at the moment the chunk arrives, so the
         // concurrent decode below neither trips it nor inflates read_secs.
-        let idle = cfg.read_idle_timeout_secs;
-        let scope = format!("partition '{}'", partition.label);
         let mut pending = await_source(chunks.next_chunk(), &ctx.counters, idle, &scope).await?;
         while let Some(chunk) = pending {
             let chunk = chunk?;
@@ -5593,13 +5660,14 @@ async fn transfer_keyset_mysql(
         let mut insert_buf = InsertBuffer::new(cfg.insert_bytes);
         let mut cursor_candidate: Option<i128> = None;
 
-        let stmt = conn
-            .prep(select_sql)
-            .await
+        // Timed like every row after it: see `read_statement_mysql`.
+        let idle = cfg.read_idle_timeout_secs;
+        let scope = format!("partition '{}'", partition.label);
+        let stmt = await_source(conn.prep(select_sql), &ctx.counters, idle, &scope)
+            .await?
             .map_err(|e| EtlError::from(e).context("preparing mysql keyset statement"))?;
-        let mut result = conn
-            .exec_iter(stmt, ())
-            .await
+        let mut result = await_source(conn.exec_iter(stmt, ()), &ctx.counters, idle, &scope)
+            .await?
             .map_err(|e| EtlError::from(e).context("executing mysql keyset query"))?;
         let stream = result
             .stream::<mysql_async::Row>()
@@ -5608,8 +5676,6 @@ async fn transfer_keyset_mysql(
             .ok_or_else(|| EtlError::other("mysql keyset query returned no result set"))?;
         futures::pin_mut!(stream);
 
-        let idle = cfg.read_idle_timeout_secs;
-        let scope = format!("partition '{}'", partition.label);
         while let Some(row) = await_source(stream.next(), &ctx.counters, idle, &scope).await? {
             let row = row.map_err(|e| EtlError::from(e).context("reading mysql row"))?;
             if let Some(batch) = batcher.append_row(row)? {
@@ -5786,13 +5852,18 @@ async fn read_statement_mysql(
         // not just for resolve_columns's schema probe: plain query_iter uses the
         // text protocol, which returns every value as Bytes (ASCII text) even
         // for integer/float columns, regardless of the column's real type.
-        let stmt = conn
-            .prep(select_sql)
-            .await
+        //
+        // The wait for the first row is timed as well (#41): MySQL sends the
+        // result's header with its first rows, so `exec_iter` waits as long as
+        // the statement takes to produce them, and a prepare can wait on a
+        // metadata lock.
+        let idle = cfg.read_idle_timeout_secs;
+        let scope = format!("partition '{}'", partition.label);
+        let stmt = await_source(conn.prep(select_sql), &ctx.counters, idle, &scope)
+            .await?
             .map_err(|e| EtlError::from(e).context("preparing mysql statement"))?;
-        let mut result = conn
-            .exec_iter(stmt, ())
-            .await
+        let mut result = await_source(conn.exec_iter(stmt, ()), &ctx.counters, idle, &scope)
+            .await?
             .map_err(|e| EtlError::from(e).context("executing mysql query"))?;
         let stream = result
             .stream::<mysql_async::Row>()
@@ -5801,8 +5872,6 @@ async fn read_statement_mysql(
             .ok_or_else(|| EtlError::other("mysql query returned no result set"))?;
         futures::pin_mut!(stream);
 
-        let idle = cfg.read_idle_timeout_secs;
-        let scope = format!("partition '{}'", partition.label);
         while let Some(row) = await_source(stream.next(), &ctx.counters, idle, &scope).await? {
             let row = row.map_err(|e| EtlError::from(e).context("reading mysql row"))?;
             if let Some(batch) = batcher.append_row(row)? {
@@ -6053,12 +6122,19 @@ async fn transfer_keyset_clickhouse(
         let mut insert_buf = InsertBuffer::new(cfg.insert_bytes);
         let mut cursor_candidate: Option<i128> = None;
 
-        let resp = source.stream_arrow(&select_sql, cfg.batch_rows).await?;
+        // Timed like every chunk after it: see `transfer_partition_clickhouse`.
+        let idle = cfg.read_idle_timeout_secs;
+        let scope = format!("partition '{}'", partition.label);
+        let resp = await_source(
+            source.stream_arrow(&select_sql, cfg.batch_rows),
+            &ctx.counters,
+            idle,
+            &scope,
+        )
+        .await??;
         let body = resp.bytes_stream();
         futures::pin_mut!(body);
 
-        let idle = cfg.read_idle_timeout_secs;
-        let scope = format!("partition '{}'", partition.label);
         while let Some(part) = await_source(body.next(), &ctx.counters, idle, &scope).await? {
             let part = part.map_err(EtlError::from)?;
             for batch in decoder.feed(part)? {
@@ -6187,12 +6263,21 @@ async fn transfer_partition_clickhouse(
         None => None,
     };
 
-    let resp = source.stream_arrow(&select_sql, cfg.batch_rows).await?;
+    // The wait for the first block is timed as well (#41): ClickHouse sends
+    // the response headers with the first block, so the request itself waits
+    // as long as the query takes to produce it.
+    let idle = cfg.read_idle_timeout_secs;
+    let scope = format!("partition '{}'", partition.label);
+    let resp = await_source(
+        source.stream_arrow(&select_sql, cfg.batch_rows),
+        &ctx.counters,
+        idle,
+        &scope,
+    )
+    .await??;
     let body = resp.bytes_stream();
     futures::pin_mut!(body);
 
-    let idle = cfg.read_idle_timeout_secs;
-    let scope = format!("partition '{}'", partition.label);
     while let Some(part) = await_source(body.next(), &ctx.counters, idle, &scope).await? {
         let part = part.map_err(EtlError::from)?;
         for batch in decoder.feed(part)? {
@@ -11474,6 +11559,120 @@ mod tests {
             full_refresh_shrink_verdict(Some(10), 1_000, true),
             ShrinkVerdict::Proceed
         );
+    }
+
+    /// A destination `orders` with staging `orders_stg`: its plain count, the
+    /// two counts once merged (`None` for an engine that keeps every row),
+    /// and the tables it was asked to count as merged.
+    struct Counted {
+        plain: u64,
+        merged: Option<(u64, u64)>,
+        asked: Mutex<Vec<String>>,
+    }
+
+    impl Counted {
+        fn new(plain: u64, merged: Option<(u64, u64)>) -> Self {
+            Counted {
+                plain,
+                merged,
+                asked: Mutex::new(Vec::new()),
+            }
+        }
+        fn asked(&self) -> Vec<String> {
+            self.asked.lock().unwrap().clone()
+        }
+        async fn guard(&self, staged: u64) -> Result<()> {
+            let mut cfg = crate::config::default_test_config();
+            cfg.dest_table = "orders".into();
+            guard_full_refresh_shrink(self, &cfg, "orders_stg", staged, &Warnings::default()).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Sink for Counted {
+        async fn current_row_count(&self, _: &str) -> Result<Option<u64>> {
+            Ok(Some(self.plain))
+        }
+        async fn merged_row_count(&self, table: &str) -> Result<Option<u64>> {
+            self.asked.lock().unwrap().push(table.to_string());
+            Ok(self
+                .merged
+                .map(|(dest, staged)| if table == "orders" { dest } else { staged }))
+        }
+        async fn table_exists(&self, _: &str) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn create_table(&self, _: &str, _: &[ColumnType], _: &TransferConfig) -> Result<()> {
+            unimplemented!()
+        }
+        async fn clone_table_structure(&self, _: &str, _: &str) -> Result<()> {
+            unimplemented!()
+        }
+        async fn insert_batches(&self, _: &str, _: SchemaRef, _: &[RecordBatch]) -> Result<u64> {
+            unimplemented!()
+        }
+        async fn atomic_swap(&self, _: &str, _: &str, _: &[ColumnType]) -> Result<()> {
+            unimplemented!()
+        }
+        async fn drop_table(&self, _: &str) -> Result<()> {
+            unimplemented!()
+        }
+        async fn ensure_state_table(&self, _: &str) -> Result<()> {
+            unimplemented!()
+        }
+        async fn read_last_watermark(&self, _: &TransferConfig) -> Result<Option<String>> {
+            unimplemented!()
+        }
+        async fn persist_watermark(&self, _: &TransferConfig, _: &str, _: u64) -> Result<()> {
+            unimplemented!()
+        }
+        async fn add_missing_columns(
+            &self,
+            _: &str,
+            _: &[ColumnType],
+            _: &TransferConfig,
+        ) -> Result<Vec<String>> {
+            unimplemented!()
+        }
+        fn dest_kind(&self) -> crate::config::DestKind {
+            crate::config::DestKind::ClickHouse
+        }
+        fn namespace(&self) -> &str {
+            "default"
+        }
+    }
+
+    #[tokio::test]
+    async fn the_shrink_guard_compares_a_merging_destination_as_merged() {
+        // A refresh the plain counts pass is never counted with FINAL, which
+        // reads the table.
+        let sink = Counted::new(10, Some((10, 10)));
+        sink.guard(10).await.unwrap();
+        assert!(sink.asked().is_empty());
+        // #38: 12 rows in a ReplacingMergeTree, 2 of them old versions, and 10
+        // staged. Once merged, nothing is lost.
+        let sink = Counted::new(12, Some((10, 10)));
+        sink.guard(10).await.unwrap();
+        assert_eq!(sink.asked(), ["orders", "orders_stg"]);
+        // A shrink once merged is refused, in the merged counts. Staging
+        // holds 10 rows for 8 keys here.
+        let err = Counted::new(12, Some((10, 8)))
+            .guard(10)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("REPLACE 10 row(s) with only 8 row(s) (both counted with FINAL"),
+            "{err}"
+        );
+        // An engine that keeps every row keeps the plain counts.
+        let sink = Counted::new(12, None);
+        let err = sink.guard(10).await.unwrap_err().to_string();
+        assert!(
+            err.contains("REPLACE 12 row(s) with only 10 row(s), shrinking"),
+            "{err}"
+        );
+        assert_eq!(sink.asked(), ["orders"]);
     }
 
     #[test]

@@ -1407,6 +1407,19 @@ def sync(
     delete the entire destination history outside the batch, so it is a hard
     config error.
 
+    It also **requires** ``watermark`` to be the ``merge_prune_partition_by``
+    column, and refuses a ``watermark_source_expr``; both are config errors.
+    The DELETE takes every row in the window the batch doesn't hold, so the
+    batch must hold every source row in the window. A read on the window
+    column does: it returns every row past ``cursor - lookback_seconds`` there.
+    A read on an update watermark such as ``write_date`` holds only the rows
+    that changed, and the DELETE would take the unchanged rows between them,
+    which the source still has. The safe set-up is ``watermark`` set to the
+    window column, a ``lookback_seconds`` that covers how long a row can still
+    change or be deleted, and a ``state_key`` of its own. A DataFrame source is
+    exempt, since nothing filters its read: the frame must hold the whole
+    window itself.
+
     .. versionchanged:: 0.15.0
        Supported for a **ClickHouse** destination as well as BigQuery. BigQuery
        expresses it as a ``WHEN NOT MATCHED BY SOURCE`` clause inside the same
@@ -1501,14 +1514,17 @@ def sync(
     - ``read_idle_timeout_secs`` (new in 0.15.0, default ``0`` = off) is the
       thing the name above suggests: fail when **no source rows arrive** for
       that long. The timer wraps the awaits on the source stream and nothing
-      else, so time spent decoding, inserting, or blocked on the memory budget
-      does not count toward it — a slow destination cannot trip it, which is
-      what makes it safe to set tightly. A genuinely hung source does trip it,
-      and the resulting error is classified transient so ``retry_max_attempts``
-      retries the whole transfer. Applies to the PostgreSQL, MySQL, BigQuery and
-      ClickHouse source reads; API sources are paced by their own per-request
-      HTTP timeouts. (For a ClickHouse source it measures the gap between
-      response chunks rather than between rows — the same thing at any
+      else, the wait for a statement's first row included (a stall before it,
+      on a lock or in a slow function, counts as idle time and toward
+      ``read_secs``), so time spent decoding, inserting, or blocked on the
+      memory budget does not count toward it — a slow destination cannot trip
+      it, which is what makes it safe to set tightly. A genuinely hung source
+      does trip it, and the resulting error is classified transient so
+      ``retry_max_attempts`` retries the whole transfer. Applies to the
+      PostgreSQL, MySQL, BigQuery and ClickHouse source reads; API sources are
+      paced by their own per-request HTTP timeouts. (For a ClickHouse source
+      it measures the gap between response chunks rather than between rows —
+      the same thing at any
       meaningful scale, since a block is flushed as it is produced.) Setting this lets ``statement_timeout_secs`` go back to being
       sized for the source database — a guard against a runaway scan — rather
       than for the destination's worst day.

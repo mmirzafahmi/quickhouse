@@ -191,6 +191,18 @@ pub trait Sink: Send + Sync {
     /// Best-effort/diagnostic — callers use it for warnings, not correctness.
     async fn current_row_count(&self, table: &str) -> Result<Option<u64>>;
 
+    /// The rows `table` holds once its engine has merged every row it will,
+    /// or `None` when that is [`Self::current_row_count`]: the engine keeps
+    /// every row, or the table doesn't exist. A ClickHouse
+    /// `ReplacingMergeTree` holds an updated row's old versions until a
+    /// background merge removes them, so its plain count can sit above the
+    /// rows it will hold. This one reads the table (`FINAL`), where the plain
+    /// count reads metadata, so callers ask only when the difference matters.
+    /// Default: `None`, for a destination with no such engine.
+    async fn merged_row_count(&self, _table: &str) -> Result<Option<u64>> {
+        Ok(None)
+    }
+
     async fn drop_table(&self, table: &str) -> Result<()>;
 
     /// Create the internal watermark-tracking table (named `state_table`).

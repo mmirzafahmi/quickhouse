@@ -10,6 +10,7 @@ Run against the services in ``docker-compose.yml`` after building the module:
 
 from __future__ import annotations
 
+import time
 from datetime import datetime, timedelta
 
 import pytest
@@ -1580,5 +1581,171 @@ def test_a_resume_marker_from_another_query_on_the_same_state_key_is_not_resumed
         r = quickhouse.sync(pg_source, ch_target, **second)
         assert r.rows_read == 300, "resumes after the two committed chunks, ids 501-700"
         assert "abandoned_resume_marker" not in {w.kind for w in r.warnings}
+    finally:
+        _drop_ch(ch_client, table)
+
+
+def _dated_table(pg_conn, table: str, rows: int):
+    """`rows` rows created a minute apart, each last written a minute after
+    it was created, as in issue #34's reproduction."""
+    with pg_conn.cursor() as cur:
+        cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+        cur.execute(
+            f"""
+            CREATE TABLE "{table}" (
+                id          bigint PRIMARY KEY,
+                qty         integer NOT NULL,
+                create_date timestamp NOT NULL,
+                write_date  timestamp NOT NULL
+            )
+            """
+        )
+        cur.execute(
+            f"INSERT INTO \"{table}\" SELECT g, g, "
+            "timestamp '2026-07-01' + g * interval '1 minute', "
+            "timestamp '2026-07-01' + (g + 1) * interval '1 minute' "
+            f"FROM generate_series(1, {rows}) g"
+        )
+
+
+def test_delete_stale_in_window_is_refused_unless_the_watermark_is_the_window_column(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """Issue #34: the delete removes every destination row in the staged
+    batch's range of the window column that the batch doesn't hold. An
+    incremental read on write_date holds only the rows that changed, so two
+    changed rows far apart on create_date deleted the 989 unchanged rows
+    between them, and the run reported success. It is a config error now,
+    raised before anything is written, and it names the safe set-up."""
+    table = unique_name
+    _dated_table(pg_conn, table, 1000)
+    _drop_ch(ch_client, table)
+    try:
+        with pytest.raises(RuntimeError, match="watermark='create_date'") as e:
+            quickhouse.sync(
+                pg_source, ch_target, source_table=table, dest_table=table, mode="incremental",
+                watermark="write_date", key=["id"], merge_prune_partition_by="create_date",
+                delete_stale_in_window=True,
+            )
+        assert "lookback_seconds" in str(e.value) and "state_key" in str(e.value)
+        assert ch_client.command(f"EXISTS TABLE `{table}`") == 0
+    finally:
+        _drop_ch(ch_client, table)
+
+
+def test_delete_stale_in_window_on_the_window_column_deletes_only_the_rows_the_source_deleted(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """Issue #34's safe set-up: the watermark is the window column, so the
+    read returns every row past `cursor - lookback_seconds` on it, and the
+    staged range holds every source row in it. Deleting 2 source rows inside
+    the lookback deletes exactly those 2, and the rows before the lookback
+    are left alone."""
+    table = unique_name
+    _dated_table(pg_conn, table, 1000)
+    _drop_ch(ch_client, table)
+    kw = dict(
+        source_table=table, dest_table=table, mode="incremental", watermark="create_date",
+        key=["id"], merge_prune_partition_by="create_date", delete_stale_in_window=True,
+        # 500 minutes: the second run re-reads ids 501-1000.
+        lookback_seconds=500 * 60, state_key=f"{table}:window", create_if_missing=True,
+    )
+    try:
+        first = quickhouse.sync(pg_source, ch_target, **kw)
+        assert (first.rows_written, first.rows_deleted) == (1000, 0)
+
+        with pg_conn.cursor() as cur:
+            cur.execute(f'DELETE FROM "{table}" WHERE id IN (600, 995)')
+        second = quickhouse.sync(pg_source, ch_target, **kw)
+        assert (second.rows_read, second.rows_deleted) == (498, 2), second
+        assert second.warnings == []
+        ids = [r[0] for r in ch_client.query(
+            f"SELECT id FROM `{table}` FINAL ORDER BY id"
+        ).result_rows]
+        assert ids == [i for i in range(1, 1001) if i not in (600, 995)]
+    finally:
+        _drop_ch(ch_client, table)
+
+
+def test_a_full_refresh_over_unmerged_versions_is_refused_only_when_it_shrinks(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """Issue #38: a ReplacingMergeTree keeps an updated row's old version
+    until a merge removes it, so its plain count() can sit above the rows it
+    holds. The shrink guard compared that count with the rows staged, and
+    refused a refresh with every one of the source's rows. It counts both
+    sides with FINAL now, so that refresh goes through, and one that does
+    shrink the table is still refused."""
+    table = unique_name
+    _seed_table(pg_conn, table, 10)
+    _drop_ch(ch_client, table)
+    incremental = dict(
+        source_table=table, dest_table=table, mode="incremental", watermark="write_date",
+        key=["id"], create_if_missing=True,
+    )
+    full = dict(source_table=table, dest_table=table, mode="full", key=["id"])
+
+    def update_with_merges_stopped(ids):
+        # Stopping merges only makes the timing deterministic: a refresh
+        # that runs before ClickHouse merges the parts sees the same.
+        ch_client.command(f"SYSTEM STOP MERGES `{table}`")
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                f'UPDATE "{table}" SET qty = qty + 1, write_date = now() WHERE id IN {ids}'
+            )
+        assert quickhouse.sync(pg_source, ch_target, **incremental).rows_written == 2
+        assert ch_client.command(f"SELECT count() FROM `{table}`") == 12
+        assert ch_client.command(f"SELECT count() FROM `{table}` FINAL") == 10
+
+    try:
+        assert quickhouse.sync(pg_source, ch_target, **incremental).rows_written == 10
+        update_with_merges_stopped((1, 2))
+        r = quickhouse.sync(pg_source, ch_target, **full)
+        assert r.rows_written == 10
+        assert "full_refresh_shrink" not in {w.kind for w in r.warnings}
+        assert ch_client.command(f"SELECT count() FROM `{table}` FINAL") == 10
+
+        # The swapped-in table merges again; stop it, and lose 3 source rows.
+        update_with_merges_stopped((3, 4))
+        with pg_conn.cursor() as cur:
+            cur.execute(f'DELETE FROM "{table}" WHERE id IN (8, 9, 10)')
+        with pytest.raises(
+            RuntimeError,
+            match=r"REPLACE 10 row\(s\) with only 7 row\(s\) \(both counted with FINAL",
+        ):
+            quickhouse.sync(pg_source, ch_target, **full)
+        assert ch_client.command(f"SELECT count() FROM `{table}` FINAL") == 10
+    finally:
+        _drop_ch(ch_client, table)
+
+
+def test_read_idle_timeout_secs_times_the_wait_for_the_first_row(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """Issue #41: PostgreSQL starts a COPY only once the statement's first
+    rows are ready, and that wait wasn't timed. A query that produced nothing
+    for 6 seconds finished despite read_idle_timeout_secs=2, with read_secs
+    0.0. The wait is source time now: it trips the timer, and a read that
+    outlasts it counts it in read_secs."""
+    table = unique_name
+    _seed_table(pg_conn, table, 100)
+    _drop_ch(ch_client, table)
+    stalled = 'SELECT o.* FROM "{}" o CROSS JOIN (SELECT pg_sleep({})) s'
+    kw = dict(dest_table=table, mode="full", key=["id"], create_if_missing=True)
+    try:
+        started = time.monotonic()
+        with pytest.raises(RuntimeError, match="read_idle_timeout_secs"):
+            quickhouse.sync(
+                pg_source, ch_target, source_query=stalled.format(table, 6),
+                read_idle_timeout_secs=1, **kw,
+            )
+        assert time.monotonic() - started < 5, "it waited out the stall"
+
+        r = quickhouse.sync(
+            pg_source, ch_target, source_query=stalled.format(table, 2),
+            read_idle_timeout_secs=10, **kw,
+        )
+        assert r.rows_written == 100
+        assert r.read_secs >= 1.5, r.read_secs
     finally:
         _drop_ch(ch_client, table)

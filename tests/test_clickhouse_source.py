@@ -20,6 +20,8 @@ Run against the services in ``docker-compose.yml`` after building the module:
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 import quickhouse
@@ -539,3 +541,35 @@ def test_reconcile_keys_measures_drift_from_a_clickhouse_source(
         assert result.missing_keys == 0
     finally:
         _drop(ch_client, src_table, dest_table)
+
+
+def test_read_idle_timeout_secs_times_the_wait_for_the_first_block(
+    ch_client, ch_source, ch_target, unique_name
+):
+    """Issue #41, from ClickHouse: the server sends the response headers with
+    the first block, so the request waits as long as the query takes to
+    produce it, and that wait wasn't timed. It trips the timer now, and a
+    read that outlasts it counts it in read_secs."""
+    src, dst = f"{unique_name}_src", unique_name
+    _seed_source(ch_client, src, 100)
+    _drop(ch_client, dst)
+    # sleep() takes at most 3 seconds per block.
+    stalled = "SELECT o.* FROM `{}` o CROSS JOIN (SELECT sleep({}) AS z) s"
+    kw = dict(dest_table=dst, mode="full", key=["id"], create_if_missing=True)
+    try:
+        started = time.monotonic()
+        with pytest.raises(RuntimeError, match="read_idle_timeout_secs"):
+            quickhouse.sync(
+                ch_source, ch_target, source_query=stalled.format(src, 3),
+                read_idle_timeout_secs=1, **kw,
+            )
+        assert time.monotonic() - started < 3, "it waited out the stall"
+
+        r = quickhouse.sync(
+            ch_source, ch_target, source_query=stalled.format(src, 2),
+            read_idle_timeout_secs=10, **kw,
+        )
+        assert r.rows_written == 100
+        assert r.read_secs >= 1.5, r.read_secs
+    finally:
+        _drop(ch_client, src, dst)
