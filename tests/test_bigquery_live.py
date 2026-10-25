@@ -593,8 +593,8 @@ def test_a_null_key_is_left_out_of_a_merge_into_a_nullable_key_column(
     r = quickhouse.sync(pg_source, bq_target, **kw)
     assert (r.rows_read, r.rows_written) == (1, 0)
     assert null_keys(r) == [("code", 1)]
-    got = _rows(bq, f"SELECT COUNT(*) AS n, COUNTIF(code IS NULL) AS nulls FROM {_fq(bq, dest)}")
-    assert (got[0].n, got[0].nulls) == (2, 0)
+    got = _rows(bq, f"SELECT COUNT(*) AS n, COUNTIF(code IS NULL) AS null_codes FROM {_fq(bq, dest)}")
+    assert (got[0].n, got[0].null_codes) == (2, 0)
 
 
 def test_a_bigquery_source_leaves_out_a_null_key(bq, bq_source, ch_client, ch_target, dest):
