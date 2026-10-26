@@ -14,7 +14,7 @@
   </a>
   <a class="qh-mode" href="#append-bronze-landing">
     <div class="qh-mode__name">append</div>
-    <div class="qh-mode__desc">Bronze landing for HTTP sources — no staging, no dedup.</div>
+    <div class="qh-mode__desc">Bronze landing for HTTP sources, DataFrames and CSV — no merge, no dedup.</div>
   </a>
 </div>
 ```
@@ -335,12 +335,19 @@ whose columns differ looks converged to it. For that, see
 (append-bronze-landing)=
 ## Append (bronze landing)
 
-`mode="append"` (HTTP API sources only) inserts each window's rows straight into
-the destination with **no** staging/merge/swap and no dedup — a bronze-landing
-write for when you run your own consolidation MERGE downstream. `watermark`
-drives the resume window; `key` isn't required. It avoids per-run
+`mode="append"` (HTTP API and DataFrame sources into any destination, and any
+source into a [CSV destination](destinations/csv.md)) inserts each window's rows
+straight into the destination with **no** staging/merge/swap and no dedup — a
+bronze-landing write for when you run your own consolidation MERGE downstream.
+`watermark` drives the resume window; `key` isn't required. It avoids per-run
 table-metadata churn (BigQuery's ~5-ops/10s/table limit) since there's no
 staging create/swap.
+
+A CSV destination is the exception to "no staging": it writes an append's parts
+into a staging folder and moves them into the table's folder once every row is
+read, so a failed run leaves nothing behind. CSV can't upsert, so it refuses
+`mode="incremental"`; there, `mode="append"` with `watermark=` is how a
+database source reads only the rows past its cursor (new in 0.21.0).
 
 ```python
 qh.sync(

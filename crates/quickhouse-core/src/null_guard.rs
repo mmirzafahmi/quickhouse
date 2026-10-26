@@ -163,6 +163,12 @@ impl NullGuard {
     /// column whose source declares it NOT NULL can't receive a NULL (the
     /// plan keeps a type a decoder can make NULL nullable), and isn't checked.
     pub(crate) fn new(plan: &SelectPlan, cfg: &TransferConfig, dest: DestKind) -> Option<Self> {
+        // Every CSV field can be empty: a NULL is written as one, wherever it
+        // is, so nothing is left out or defaulted (the plan makes no CSV
+        // column NOT NULL either).
+        if dest == DestKind::Csv {
+            return None;
+        }
         let mut columns = Vec::new();
         if let Some(w) = cfg.watermark.as_deref() {
             let at = plan.source_columns.iter().position(|c| c == w);
@@ -204,7 +210,7 @@ impl NullGuard {
         // The plan matches these options on the exact destination name.
         let engine = match dest {
             DestKind::ClickHouse => crate::ddl::engine_parameter_columns(&cfg.effective_engine()),
-            DestKind::BigQuery => Vec::new(),
+            DestKind::BigQuery | DestKind::Csv => Vec::new(),
         };
         let mut defaulted = Vec::new();
         for (idx, d) in plan.dest_columns.iter().enumerate() {
@@ -935,6 +941,9 @@ mod tests {
             .unwrap()
             .defaulted()
             .is_empty());
+        // A CSV field can be empty: nothing is left out or defaulted.
+        c.key = vec!["id".into()];
+        assert!(NullGuard::new(&plan, &c, DestKind::Csv).is_none());
     }
 
     #[test]

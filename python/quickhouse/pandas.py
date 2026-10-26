@@ -453,7 +453,7 @@ def from_pandas(
     index: bool = False,
     **sync_kwargs: Any,
 ) -> "TransferResult":
-    """Write an in-memory DataFrame into ClickHouse or BigQuery.
+    """Write an in-memory DataFrame into ClickHouse, BigQuery or CSV files.
 
     Parameters
     ----------
@@ -462,8 +462,9 @@ def from_pandas(
         ``polars.DataFrame``, a DuckDB relation, or anything exposing the Arrow
         PyCapsule interface (``__arrow_c_stream__``).
     target:
-        A :class:`quickhouse.ClickHouse` or :class:`quickhouse.BigQuery`
-        descriptor — the same objects :func:`quickhouse.sync` takes.
+        A :class:`quickhouse.ClickHouse`, :class:`quickhouse.BigQuery` or
+        :class:`quickhouse.Csv` descriptor — the same objects
+        :func:`quickhouse.sync` takes.
     dest_table:
         Destination table name.
     index:
@@ -483,7 +484,9 @@ def from_pandas(
     Modes
     -----
     ``mode="full"`` replaces the table through a staged atomic swap.
-    ``mode="append"`` inserts straight in, with no staging and no dedup.
+    ``mode="append"`` inserts straight in, with no staging and no dedup (a
+    :class:`quickhouse.Csv` target stages the parts and moves them in at the
+    end, and refuses ``mode="incremental"``).
     ``mode="incremental"`` upserts on ``key`` — and needs **no watermark**,
     unlike a database source: the frame you passed *is* the delta. Rows sharing
     a key within the frame are deduped, with a warning: last-wins by default,

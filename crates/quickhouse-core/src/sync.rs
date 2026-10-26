@@ -21,8 +21,8 @@ use tokio::task::JoinSet;
 
 use crate::archive::{archive_object_key, build_store, ArchiveUploads, ArchiveWriter};
 use crate::config::{
-    ApiColumn, ArchiveConfig, DestinationConfig, ParquetCompression, SourceConfig, SourceShape,
-    SyncMode, TransferConfig, TransferResult, TransferWarning, WarningKind, WatermarkSeed,
+    ApiColumn, ArchiveConfig, DestinationConfig, ParquetCompression, SourceConfig, SyncMode,
+    TransferConfig, TransferResult, TransferWarning, WarningKind, WatermarkSeed,
 };
 use crate::decode::CopyDecoder;
 use crate::decode_api::{resolve_api_columns, ApiBatcher};
@@ -183,6 +183,20 @@ async fn promote_staged_incremental(
     }
     sink.drop_table(staging).await?;
     Ok(rows_deleted)
+}
+
+/// Move a staged append into the destination and drop staging: the append of
+/// a destination that stages every write ([`Sink::stages_direct_writes`],
+/// CSV), which no gate can be attached to and nothing merges.
+async fn promote_staged_append(
+    sink: &dyn Sink,
+    dest_table: &str,
+    staging: &str,
+    columns: &[ColumnType],
+) -> Result<()> {
+    tracing::info!("appending the staged rows to '{dest_table}'");
+    sink.insert_select(dest_table, staging, columns).await?;
+    sink.drop_table(staging).await
 }
 
 /// Per-chunk staging for a keyset-chunked read (`chunk_rows`) into a
@@ -854,6 +868,11 @@ enum Before {
     Merge,
     /// The same, into a destination this run created empty.
     MergeIntoNew,
+    /// A staged append's move into the destination (CSV), with the cursor
+    /// saved right after it.
+    Append,
+    /// The same, into a destination this run created empty.
+    AppendIntoNew,
     /// The cursor is saved, with the rows already in the destination.
     Cursor,
     /// A `chunk_rows` chunk is committed.
@@ -887,6 +906,15 @@ impl Before {
         }
     }
 
+    /// [`Self::swap`] for a staged append's checkpoint.
+    fn append(created_dest: bool) -> Self {
+        if created_dest {
+            Before::AppendIntoNew
+        } else {
+            Before::Append
+        }
+    }
+
     fn describe(self) -> &'static str {
         match self {
             Before::Write => {
@@ -906,6 +934,14 @@ impl Before {
             Before::MergeIntoNew => {
                 "Nothing was merged in (the staged rows were dropped before the merge), so the \
                  destination this run created is left empty, and the cursor was not saved."
+            }
+            Before::Append => {
+                "Nothing was appended (the staged rows were dropped before they were moved into \
+                 the destination), and the cursor was not saved."
+            }
+            Before::AppendIntoNew => {
+                "Nothing was appended (the staged rows were dropped before they were moved in), \
+                 so the destination this run created is left empty, and the cursor was not saved."
             }
             Before::Cursor => {
                 "The rows are already in the destination, but the cursor was not saved, so once \
@@ -960,7 +996,13 @@ fn check_fatal(
     }
     if matches!(
         at,
-        Before::Swap | Before::SwapIntoNew | Before::Merge | Before::MergeIntoNew | Before::Chunk
+        Before::Swap
+            | Before::SwapIntoNew
+            | Before::Merge
+            | Before::MergeIntoNew
+            | Before::Append
+            | Before::AppendIntoNew
+            | Before::Chunk
     ) {
         if let Some(w) = warnings.first_of(&[WarningKind::StorageWriteCountMismatch]) {
             return Err(fatal_warning_error(&w, at, false));
@@ -1132,6 +1174,10 @@ struct SendCtx {
     /// through its filter on the way out, whatever the source. Decoders build
     /// batches with [`Self::decode_columns`] so a NULL there reaches it.
     null_guard: Option<Arc<NullGuard>>,
+    /// Which stream of the read this writes: a parallel partition's label,
+    /// or `"all"`. Handed to [`Sink::insert_stream_batches`], so a CSV
+    /// destination writes each partition's rows into parts of its own.
+    stream: Arc<str>,
 }
 
 /// One partition's accumulator of decoded batches, so an insert carries a
@@ -1455,7 +1501,7 @@ impl SendCtx {
             let rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
             let bytes = ctx
                 .sink
-                .insert_batches(&ctx.target_table, schema, &batches)
+                .insert_stream_batches(&ctx.target_table, &ctx.stream, schema, &batches)
                 .await?;
             ctx.counters.rows_written.fetch_add(rows, Ordering::Relaxed);
             ctx.counters
@@ -1913,14 +1959,17 @@ async fn run_transfer_impl(
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let mut cfg = cfg;
+    // A CSV destination refuses what it can't do (incremental, the options
+    // that only shape a database table or its MERGE, a validate= gate) before
+    // anything else is checked, naming each.
+    if let DestinationConfig::Csv(_) = &dest {
+        crate::sink::csv::refuse_unsupported_options(&cfg, on_staged.is_some())?;
+    }
     // Each source shape has its own rules: an API source has no
     // source_table/source_query and rejects a few DB-only knobs, and a frame
     // additionally has no source to filter, partition, pace or resume against.
-    match source_cfg.shape() {
-        SourceShape::Api => cfg.validate_api()?,
-        SourceShape::Frame => cfg.validate_frame()?,
-        SourceShape::Db => cfg.validate()?,
-    }
+    // A database source may append only into a CSV destination.
+    cfg.validate_for(source_cfg.shape(), dest.dest_kind())?;
     // Drop mode-irrelevant fields (e.g. a watermark passed with mode="full")
     // so the config that runs matches what's effective — see normalize().
     cfg.normalize();
@@ -2115,11 +2164,15 @@ async fn run_transfer_impl(
             cfg.retry_max_attempts
         );
     }
-    let force_stage_incremental = cfg.mode == SyncMode::Incremental
+    // And every incremental or append write into a destination that stages
+    // them all (CSV, `Sink::stages_direct_writes`): its rows are moved in once
+    // the read is done, so a failed run leaves nothing behind.
+    let force_stage_incremental = (cfg.mode == SyncMode::Incremental
         && !sink.requires_staging_for_incremental()
         && (on_staged.is_some()
             || stage_for_retries
-            || (cfg.delete_stale_in_window && !sink.deletes_stale_within_merge()));
+            || (cfg.delete_stale_in_window && !sink.deletes_stale_within_merge())))
+        || (cfg.mode != SyncMode::Full && sink.stages_direct_writes());
     if cfg.delete_stale_in_window && !sink.supports_row_delete() {
         return Err(EtlError::config(
             "delete_stale_in_window is not supported by this destination (it cannot delete \
@@ -2151,8 +2204,10 @@ async fn run_transfer_impl(
     // cursor; chunked reads only, and only if a prior run of this read was cut
     // short). Read before the source is probed, because the probes can use the
     // cursor: see `partitions_above` and `watermark_bounds_the_key`. Neither
-    // when this run creates the destination: see `read_saved_state`.
-    let saved = if cfg.mode == SyncMode::Incremental {
+    // when this run creates the destination: see `read_saved_state`. An
+    // append (into CSV, the one destination a database source appends to)
+    // keeps a cursor the same way.
+    let saved = if cfg.mode.keeps_cursor() {
         read_saved_state(sink.as_ref(), &cfg, &warnings).await?
     } else {
         SavedState::default()
@@ -2353,9 +2408,7 @@ async fn run_transfer_impl(
     // --- Incremental: build the "since last run" filter from the watermark
     // state read above, and (for chunked reads) the keyset resume plan. ---
     let mut cursor_plan = CursorPlan::default();
-    let (extra_filter, mut new_watermark, chunk_plan, cursor_check) = if cfg.mode
-        == SyncMode::Incremental
-    {
+    let (extra_filter, mut new_watermark, chunk_plan, cursor_check) = if cfg.mode.keeps_cursor() {
         let watermark = cfg.watermark.as_ref().unwrap();
         let (pinned_upper, start_cursor) = resume_bounds(resume.as_ref());
         cursor_plan.pinned = pinned_upper.is_some();
@@ -2457,7 +2510,10 @@ async fn run_transfer_impl(
         // row would fail the insert. Such a read leaves them out, as a read
         // bounded by the MAX does, and the NULL-count probe reports them
         // (`null_watermark`, or `null_check_skipped` when it costs too much).
-        let null_watermark_lands = null_watermark_lands(&plan, watermark);
+        // Nor can an append keep a cursor for such a row: with nothing to
+        // converge on, it would write the row again on every run.
+        let appending = cfg.mode == SyncMode::Append;
+        let null_watermark_lands = null_watermark_lands(&plan, watermark) && !appending;
         let col = watermark_column_sql(source.as_ref(), watermark, source_expr);
         let filter = match filter {
             Some(f)
@@ -2469,10 +2525,16 @@ async fn run_transfer_impl(
                 Some(format!("({f} OR {col} IS NULL)"))
             }
             None if !null_watermark_lands => {
+                let why = if appending {
+                    "an append keeps no cursor for a row whose watermark is NULL, so it would \
+                     write it again on every run"
+                } else {
+                    "the destination's watermark can't be NULL (a ReplacingMergeTree's version \
+                     column, or a key)"
+                };
                 tracing::info!(
-                    "the destination's '{watermark}' can't be NULL (a ReplacingMergeTree's \
-                     version column, or a key), so this unbounded read leaves out rows whose \
-                     '{watermark}' is NULL, as every bounded one does"
+                    "{why}, so this unbounded read leaves out rows whose '{watermark}' is NULL, \
+                     as every bounded one does"
                 );
                 Some(format!("{col} IS NOT NULL"))
             }
@@ -2659,6 +2721,7 @@ async fn run_transfer_impl(
             chunk_stager,
             landed: (!used_staging).then(|| landed.clone()),
             null_guard: null_guard.clone(),
+            stream: Arc::from("all"),
         };
         let stage_started = Instant::now();
 
@@ -2666,7 +2729,10 @@ async fn run_transfer_impl(
             let source = source.clone();
             let plan = plan.clone();
             let cfg = cfg.clone();
-            let ctx = ctx.clone();
+            let ctx = SendCtx {
+                stream: Arc::from(part.label.as_str()),
+                ..ctx.clone()
+            };
             let extra_filter = extra_filter.clone();
             let chunk_plan = chunk_plan.clone();
             let window_plan = window_plan.clone();
@@ -2764,7 +2830,13 @@ async fn run_transfer_impl(
         // stage and have nothing to promote), then persist the new watermark. ---
         let mut rows_deleted = 0u64;
         let rows_read = counters.rows_read.load(Ordering::Relaxed);
-        if cfg.mode == SyncMode::Incremental {
+        // An append (a database source into CSV) keeps its cursor as an
+        // incremental run does, but nothing converges on rows read twice: its
+        // staged rows move in only after every warning the read raises, right
+        // before the cursor that marks them read, and it never rewinds the
+        // cursor to read a margin again.
+        let appending = cfg.mode == SyncMode::Append;
+        if cfg.mode.keeps_cursor() {
             // Before the promotion, so a fail_on_warnings that names it stops
             // the MERGE too.
             let watermark_read = match &watermark_tracker {
@@ -2786,7 +2858,7 @@ async fn run_transfer_impl(
                 // Every chunk was merged as it was read; only the empty
                 // template its tables were cloned from is left.
                 sink.drop_table(&staging).await?;
-            } else if used_staging {
+            } else if used_staging && !appending {
                 check_fatal(&cfg, sink.as_ref(), &warnings, Before::merge(created_dest))?;
                 rows_deleted = promote_staged_incremental(
                     sink.as_ref(),
@@ -2818,7 +2890,7 @@ async fn run_transfer_impl(
             // `stream_cursor_rewind_secs`. Under source_table's MAX, a DATE
             // needs no extra day: that bound keeps out rows changed after
             // the read began, a later day's included.
-            let rewind = if read_spans_statements {
+            let rewind = if read_spans_statements && !appending {
                 stream_cursor_rewind_secs(stage_secs, cfg.lookback_seconds)
             } else {
                 0
@@ -2860,7 +2932,7 @@ async fn run_transfer_impl(
                     );
                 }
             } else if let Some(t) = &watermark_tracker {
-                let rewind = if read_spans_statements {
+                let rewind = if read_spans_statements && !appending {
                     t.stream_rewind_secs(stage_secs, cfg.lookback_seconds)
                 } else {
                     0
@@ -2891,6 +2963,12 @@ async fn run_transfer_impl(
             // so a read of nothing contradicts nothing there.
             if let Some(c) = cursor_check.as_ref().filter(|_| !max_from_table) {
                 c.warn_if_not_advanced(&cfg, rows_read, &warnings);
+            }
+            if appending && used_staging {
+                check_fatal(&cfg, sink.as_ref(), &warnings, Before::append(created_dest))?;
+                promote_staged_append(sink.as_ref(), &cfg.dest_table, &staging, &plan.dest_columns)
+                    .await?;
+                landed.fetch_add(counters.rows_written.load(Ordering::Relaxed), Ordering::Relaxed);
             }
             // Last stop before the cursor moves, after every warning the read
             // and the promotion raise.
@@ -3053,7 +3131,8 @@ async fn run_transfer_bigquery(
     let mut discarded_state = false;
     // No cursor or seed bounds the read: see `warn_on_destination`.
     let mut from_start = false;
-    let (row_restriction, new_watermark, cursor_check) = if cfg.mode == SyncMode::Incremental {
+    // An append (into CSV) keeps its cursor as an incremental run does.
+    let (row_restriction, new_watermark, cursor_check) = if cfg.mode.keeps_cursor() {
         let watermark = cfg.watermark.as_ref().unwrap();
         ensure_watermark_column(watermark, &source_cols)?;
         ensure_lookback_compatible(watermark, cfg.lookback_seconds, &source_cols)?;
@@ -3087,7 +3166,8 @@ async fn run_transfer_bigquery(
         // every row the table has, which BigQuery counts for nothing, so
         // leaving them out is never silent.
         let filter = match filter {
-            None if !null_watermark_lands(&plan, watermark) => {
+            // An append leaves them out too: see the database flow.
+            None if !null_watermark_lands(&plan, watermark) || cfg.mode == SyncMode::Append => {
                 let rows = source.count_rows(&client, &project_id, &table_sql).await?;
                 warn_on_null_watermark(watermark, rows, &warnings);
                 Some(format!("{} IS NOT NULL", quote_my(watermark)))
@@ -3131,11 +3211,15 @@ async fn run_transfer_bigquery(
         && cfg.retry_max_attempts > 1
         && !sink.requires_staging_for_incremental()
         && sink.stage_for_retries(&cfg.dest_table, &cfg).await?;
-    let force_stage_incremental = cfg.mode == SyncMode::Incremental
+    // And every incremental or append write into a destination that stages
+    // them all (CSV, `Sink::stages_direct_writes`): its rows are moved in once
+    // the read is done, so a failed run leaves nothing behind.
+    let force_stage_incremental = (cfg.mode == SyncMode::Incremental
         && !sink.requires_staging_for_incremental()
         && (on_staged.is_some()
             || stage_for_retries
-            || (cfg.delete_stale_in_window && !sink.deletes_stale_within_merge()));
+            || (cfg.delete_stale_in_window && !sink.deletes_stale_within_merge())))
+        || (cfg.mode != SyncMode::Full && sink.stages_direct_writes());
     if cfg.delete_stale_in_window && !sink.supports_row_delete() {
         return Err(EtlError::config(
             "delete_stale_in_window is not supported by this destination (it cannot delete \
@@ -3196,6 +3280,7 @@ async fn run_transfer_bigquery(
             chunk_stager: None,
             landed: (!used_staging).then(|| landed.clone()),
             null_guard: null_guard.clone(),
+            stream: Arc::from("all"),
         };
         let stage_started = Instant::now();
 
@@ -3280,8 +3365,11 @@ async fn run_transfer_bigquery(
             sink.drop_table(&staging).await?;
         }
         let mut rows_deleted = 0u64;
-        if cfg.mode == SyncMode::Incremental {
-            if used_staging {
+        // An append (into CSV) moves its staged rows in after every warning
+        // the read raises, right before its cursor: see the database flow.
+        let appending = cfg.mode == SyncMode::Append;
+        if cfg.mode.keeps_cursor() {
+            if used_staging && !appending {
                 check_fatal(&cfg, sink.as_ref(), &warnings, Before::merge(created_dest))?;
                 rows_deleted = promote_staged_incremental(
                     sink.as_ref(),
@@ -3310,6 +3398,12 @@ async fn run_transfer_bigquery(
             }
             if let Some(c) = &cursor_check {
                 c.warn_if_not_advanced(&cfg, rows_read, &warnings);
+            }
+            if appending && used_staging {
+                check_fatal(&cfg, sink.as_ref(), &warnings, Before::append(created_dest))?;
+                promote_staged_append(sink.as_ref(), &cfg.dest_table, &staging, &plan.dest_columns)
+                    .await?;
+                landed.fetch_add(counters.rows_written.load(Ordering::Relaxed), Ordering::Relaxed);
             }
             check_fatal(&cfg, sink.as_ref(), &warnings, Before::Cursor)?;
             if let Some(w) = &new_watermark {
@@ -3446,9 +3540,14 @@ async fn guard_full_refresh_shrink(
              with only {new_rows} row(s){counted}, shrinking the destination by {lost}. A full \
              refresh replaces the table wholesale and is NOT partition-aware, so if this run \
              covers only part of the destination the rest is destroyed. To add rows instead of \
-             replacing them use mode=\"incremental\" with key=, or mode=\"append\". If this \
-             shrink is genuinely intended, set allow_full_refresh_shrink=True.{left_out}",
+             replacing them use {add}. If this shrink is genuinely intended, set \
+             allow_full_refresh_shrink=True.{left_out}",
             cfg.dest_table,
+            // A CSV destination can't upsert.
+            add = match sink.dest_kind() {
+                crate::config::DestKind::Csv => "mode=\"append\"",
+                _ => "mode=\"incremental\" with key=, or mode=\"append\"",
+            },
         ))),
     }
 }
@@ -3722,10 +3821,13 @@ async fn run_transfer_api(
     // The same is true of a window-scoped delete on a destination whose upsert
     // cannot express one inline: the delete subtracts the staged keys, so it
     // needs the batch materialised in a table before any of it lands.
-    let force_stage_incremental = cfg.mode == SyncMode::Incremental
+    // And every incremental or append write into a destination that stages
+    // them all (CSV, `Sink::stages_direct_writes`).
+    let force_stage_incremental = (cfg.mode == SyncMode::Incremental
         && !sink.requires_staging_for_incremental()
         && (on_staged.is_some()
-            || (cfg.delete_stale_in_window && !sink.deletes_stale_within_merge()));
+            || (cfg.delete_stale_in_window && !sink.deletes_stale_within_merge())))
+        || (cfg.mode != SyncMode::Full && sink.stages_direct_writes());
     if cfg.delete_stale_in_window && !sink.supports_row_delete() {
         return Err(EtlError::config(
             "delete_stale_in_window is not supported by this destination (it cannot delete \
@@ -3780,6 +3882,7 @@ async fn run_transfer_api(
             chunk_stager: None,
             landed: None,
             null_guard: null_guard.clone(),
+            stream: Arc::from("all"),
         };
         let stage_started = Instant::now();
         let mut batcher = ApiBatcher::new(&ctx.decode_columns(&plan), &lookups, cfg.batch_rows, cfg.batch_bytes)?;
@@ -4057,8 +4160,14 @@ async fn run_transfer_api(
         }
         if cfg.mode == SyncMode::Append {
             // Rows were inserted straight into the destination (target_table ==
-            // dest_table): no staging, no merge, no swap. Only persist the
-            // resume cursor.
+            // dest_table): no merge, no swap. Only persist the resume cursor.
+            // Except where the destination stages every write (CSV): there
+            // the rows move in first, once nothing can stop the run.
+            if used_staging {
+                check_fatal(&cfg, sink.as_ref(), &warnings, Before::append(created_dest))?;
+                promote_staged_append(sink.as_ref(), &cfg.dest_table, &staging, &plan.dest_columns)
+                    .await?;
+            }
             if let Some(w) = &new_watermark {
                 if cfg.advance_watermark {
                     tracing::info!("append: persisting new watermark (window end): {w}");
@@ -4197,10 +4306,13 @@ async fn run_transfer_frame(
     // Identical to the DB and API flows: a gated incremental run into a
     // directly-inserting destination needs a staging table for the gate to
     // validate, and so does a window-scoped delete the upsert cannot express.
-    let force_stage_incremental = cfg.mode == SyncMode::Incremental
+    // And every incremental or append write into a destination that stages
+    // them all (CSV, `Sink::stages_direct_writes`).
+    let force_stage_incremental = (cfg.mode == SyncMode::Incremental
         && !sink.requires_staging_for_incremental()
         && (on_staged.is_some()
-            || (cfg.delete_stale_in_window && !sink.deletes_stale_within_merge()));
+            || (cfg.delete_stale_in_window && !sink.deletes_stale_within_merge())))
+        || (cfg.mode != SyncMode::Full && sink.stages_direct_writes());
     if cfg.delete_stale_in_window && !sink.supports_row_delete() {
         return Err(EtlError::config(
             "delete_stale_in_window is not supported by this destination (it cannot delete \
@@ -4253,6 +4365,7 @@ async fn run_transfer_frame(
             chunk_stager: None,
             landed: None,
             null_guard: null_guard.clone(),
+            stream: Arc::from("all"),
         };
         let stage_started = Instant::now();
         let schema: SchemaRef = Arc::new(Schema::new(
@@ -4362,11 +4475,17 @@ async fn run_transfer_frame(
             )
             .await?;
         }
-        // Append inserts straight into the destination: no staging, no merge,
-        // no swap. And a frame has no resumable cursor to persist either way —
-        // which is why there is no `persist_watermark` call anywhere in this
-        // flow, unlike the API one. A run that wrote straight in, or whose
-        // MERGE raised something, can still fail on it.
+        // Append inserts straight into the destination: no merge, no swap,
+        // and no staging, except into a destination that stages every write
+        // (CSV), whose rows move in here. And a frame has no resumable cursor
+        // to persist either way — which is why there is no `persist_watermark`
+        // call anywhere in this flow, unlike the API one. A run that wrote
+        // straight in, or whose MERGE raised something, can still fail on it.
+        if cfg.mode == SyncMode::Append && used_staging {
+            check_fatal(&cfg, sink.as_ref(), &warnings, Before::append(created_dest))?;
+            promote_staged_append(sink.as_ref(), &cfg.dest_table, &staging, &plan.dest_columns)
+                .await?;
+        }
         check_fatal(&cfg, sink.as_ref(), &warnings, Before::Done)?;
 
         let duration_secs = started.elapsed().as_secs_f64();
@@ -4470,7 +4589,7 @@ async fn setup_postgres(
         _ => false,
     };
 
-    // Only needed for incremental mode (the value is discarded otherwise) —
+    // Only needed for a mode with a cursor (the value is discarded otherwise) —
     // skip it in full-refresh so a watermark column left set alongside
     // mode="full" can't add a spurious query or fail on an aggregate edge
     // case (e.g. an empty table's MAX() being NULL) for a result nothing uses.
@@ -4478,7 +4597,7 @@ async fn setup_postgres(
     let mut window_activated = false;
     let mut max_from_table = false;
     let mut report = None;
-    let snapshot_max = if cfg.mode == SyncMode::Incremental {
+    let snapshot_max = if cfg.mode.keeps_cursor() {
         if let Some(w) = watermark {
             ensure_watermark_column(w, &source_cols)?;
             ensure_lookback_compatible(w, cfg.lookback_seconds, &source_cols)?;
@@ -4705,7 +4824,7 @@ async fn setup_mysql(
         .await?;
     warn_on_shifted_timestamps(s, &mut control, &source_cols, cfg, warnings).await;
 
-    // Only needed for incremental mode (the value is discarded otherwise) —
+    // Only needed for a mode with a cursor (the value is discarded otherwise) —
     // skip it in full-refresh so a watermark column left set alongside
     // mode="full" can't add a spurious query or fail on an aggregate edge
     // case (e.g. an empty table's MAX() being NULL) for a result nothing uses.
@@ -4713,7 +4832,7 @@ async fn setup_mysql(
     let mut window_activated = false;
     let mut max_from_table = false;
     let mut report = None;
-    let snapshot_max = if cfg.mode == SyncMode::Incremental {
+    let snapshot_max = if cfg.mode.keeps_cursor() {
         if let Some(w) = watermark {
             ensure_watermark_column(w, &source_cols)?;
             ensure_lookback_compatible(w, cfg.lookback_seconds, &source_cols)?;
@@ -6488,9 +6607,9 @@ async fn setup_clickhouse(
         .await?;
     tracing::debug!("clickhouse schema resolved");
 
-    // Only needed for incremental mode — see `setup_mysql` for why full
+    // Only needed for a mode with a cursor — see `setup_mysql` for why full
     // refresh deliberately skips the probe entirely.
-    let (snapshot_max, watermark_type) = if cfg.mode == SyncMode::Incremental {
+    let (snapshot_max, watermark_type) = if cfg.mode.keeps_cursor() {
         if let Some(w) = watermark {
             ensure_watermark_column(w, &source_cols)?;
             ensure_lookback_compatible(w, cfg.lookback_seconds, &source_cols)?;
@@ -7480,8 +7599,9 @@ async fn prepare_target(
     staging: &str,
     // Stage an *incremental* run that wouldn't otherwise (ClickHouse) so a
     // data-quality gate has a staging table to validate before rows reach the
-    // destination. No effect on full-refresh (always stages) or on a
-    // destination that already stages for its MERGE (BigQuery).
+    // destination, or an incremental or append run into a destination that
+    // stages every write (CSV). No effect on full-refresh (always stages) or
+    // on a destination that already stages for its MERGE (BigQuery).
     force_stage_incremental: bool,
 ) -> Result<(String, bool)> {
     match cfg.mode {
@@ -7527,7 +7647,7 @@ async fn prepare_target(
             // crashed run's orphan, and — for BigQuery — never enters the
             // "recently deleted/recreated" state that blocks streaming inserts.
             tracing::info!("creating staging table '{staging}'");
-            if dest_existed {
+            if dest_existed && sink.stages_from_destination() {
                 // Bug report B4: a swap (ClickHouse's EXCHANGE TABLES) makes
                 // staging's structure the new destination, so staging must
                 // mirror the destination's *actual* engine/ORDER BY/PARTITION
@@ -7553,7 +7673,9 @@ async fn prepare_target(
                 }
             } else {
                 // First run for this destination: no existing DDL to preserve,
-                // so build both dest (above) and staging fresh from `cfg`.
+                // so build both dest (above) and staging fresh from `cfg`. So
+                // too for a destination with no structure to keep (CSV): a
+                // refresh writes this run's columns.
                 sink.create_table(staging, dest_columns, cfg).await?;
             }
             Ok((staging.to_string(), !dest_existed))
@@ -7612,7 +7734,7 @@ async fn prepare_target(
 
             if sink.requires_staging_for_incremental() || force_stage_incremental {
                 tracing::info!("creating staging table '{staging}' for incremental load");
-                if dest_existed {
+                if dest_existed && sink.stages_from_destination() {
                     // Schema follows the destination here too (same fix as
                     // full-refresh, bug report B4): staging is only ever a
                     // transient MERGE source, so it must match what the
@@ -7638,8 +7760,9 @@ async fn prepare_target(
             }
         }
         SyncMode::Append => {
-            // Bronze-landing: insert straight into the destination — no staging,
-            // no merge, no swap, no key, no dedup. Create the dest if missing,
+            // Bronze-landing: insert straight into the destination — no merge,
+            // no swap, no key, no dedup, and no staging unless forced (below).
+            // Create the dest if missing,
             // evolve it (inserts reference its columns), and ensure the state
             // table so the resume cursor can be persisted.
             let dest_existed = sink.table_exists(&cfg.dest_table).await?;
@@ -7671,6 +7794,17 @@ async fn prepare_target(
                 }
             }
             sink.ensure_state_table(&cfg.state_table_name).await?;
+            if force_stage_incremental {
+                // A destination that stages every write (CSV): staging takes
+                // this run's columns, and the rows move in once all are read.
+                tracing::info!("creating staging table '{staging}' for append");
+                if dest_existed && sink.stages_from_destination() {
+                    sink.clone_table_structure(staging, &cfg.dest_table).await?;
+                } else {
+                    sink.create_table(staging, dest_columns, cfg).await?;
+                }
+                return Ok((staging.to_string(), !dest_existed));
+            }
             Ok((cfg.dest_table.clone(), !dest_existed))
         }
     }
@@ -7752,7 +7886,7 @@ fn partitions_above(
 ) -> Option<i64> {
     // With a watermark_source_expr the read compares that expression, not the
     // key, to the cursor.
-    if cfg.mode != SyncMode::Incremental
+    if !cfg.mode.keeps_cursor()
         || source_expr.is_some()
         || cfg.watermark_source_expr.is_some()
         || cfg.watermark.as_deref() != Some(part_col)
@@ -8022,7 +8156,9 @@ fn warn_mixed_decimals(table: &str, decimal: &[String], float: &[String], warnin
 
 /// The checks of the existing destination against what this run writes,
 /// raised before anything is written, so a `fail_on_warnings` that names one
-/// stops the run with the destination untouched. `staged` is
+/// stops the run with the destination untouched. First, a write the
+/// destination can't take at all is refused ([`Sink::check_write`]: a CSV
+/// append whose columns differ from the folder's). `staged` is
 /// `force_stage_incremental`: an incremental run into a destination that
 /// would insert directly stages instead. `from_start` says an incremental
 /// run reads the source from the start: no saved cursor, resume marker or
@@ -8037,6 +8173,8 @@ async fn warn_on_destination(
     overrides: &std::collections::HashMap<String, String>,
     warnings: &Warnings,
 ) -> Result<()> {
+    sink.check_write(&cfg.dest_table, &plan.dest_columns, cfg)
+        .await?;
     warn_on_unsourced_columns(sink, cfg, &plan.dest_columns, warnings).await?;
     warn_on_dropped_columns(sink, cfg, plan, staged, warnings).await?;
     warn_on_ignored_overrides(sink, cfg, plan, overrides, warnings).await?;
@@ -8093,7 +8231,7 @@ async fn warn_on_ignored_overrides(
                 .iter()
                 .find(|(name, _)| name.eq_ignore_ascii_case(&column.name))
                 .map(|(_, ty)| ty),
-            DestKind::ClickHouse => None,
+            DestKind::ClickHouse | DestKind::Csv => None,
         });
         // A column the table lacks is created with the override, under
         // `evolve_schema`, or left out (`dropped_source_column`).
@@ -8107,6 +8245,9 @@ async fn warn_on_ignored_overrides(
         // the type the plan's Arrow decimal maps to, as `build_table` does.
         let wanted = match (kind, by) {
             (DestKind::ClickHouse, _) => column.clickhouse_inner.clone(),
+            // No column types to compare (`CsvSink` reports none, so this is
+            // never reached).
+            (DestKind::Csv, _) => continue,
             (DestKind::BigQuery, IgnoredBy::TypeOverrides) => asked.to_string(),
             (DestKind::BigQuery, IgnoredBy::NumericAsDecimal) => {
                 match crate::types::bigquery::arrow_to_bigquery_type(&column.arrow)
@@ -8148,6 +8289,7 @@ fn same_column_type(kind: crate::config::DestKind, a: &str, b: &str) -> bool {
     match kind {
         DestKind::ClickHouse => normalized_clickhouse_type(a) == normalized_clickhouse_type(b),
         DestKind::BigQuery => normalized_bigquery_type(a) == normalized_bigquery_type(b),
+        DestKind::Csv => a == b,
     }
 }
 
@@ -8313,6 +8455,9 @@ fn unsourced_effect(kind: crate::config::DestKind, mode: SyncMode) -> &'static s
             "Every row this run appends gets the type's default there (NULL when Nullable)"
         }
         (DestKind::BigQuery, SyncMode::Append) => "Every row this run appends gets NULL there",
+        // `CsvSink` reports no such column: an append must match the folder's
+        // columns, and a refresh writes this run's.
+        (DestKind::Csv, _) => "The part files this run writes have no such column",
     }
 }
 
@@ -10490,6 +10635,7 @@ mod tests {
             chunk_stager,
             landed: None,
             null_guard: None,
+            stream: Arc::from("all"),
         }
     }
 

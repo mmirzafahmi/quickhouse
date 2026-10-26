@@ -6,7 +6,8 @@
 `run` executes a single :func:`quickhouse.sync` from a TOML job file with three
 tables — ``[source]``, ``[target]``, and ``[sync]``. ``type`` selects the engine
 (``postgres`` | ``mysql`` | ``bigquery`` | ``clickhouse`` | ``clevertap`` |
-``appsflyer`` for a source, ``clickhouse`` | ``bigquery`` for a target);
+``appsflyer`` for a source, ``clickhouse`` | ``bigquery`` | ``csv`` for a
+target);
 every other key maps straight to that descriptor's constructor / to ``sync()``'s
 keyword arguments; a ``[sync]`` key ``sync()`` doesn't take is refused before
 anything runs. String values are passed through :func:`os.path.expandvars`, so
@@ -31,6 +32,13 @@ Example ``job.toml``::
     mode = "incremental"
     watermark = "updated_at"
     key = ["id"]
+
+A CSV target writes a folder of part files per table under ``path``::
+
+    [target]
+    type = "csv"
+    path = "/data/exports"
+    compression = "gzip"
 """
 
 from __future__ import annotations
@@ -53,7 +61,7 @@ _SOURCES = {
     "clevertap": qh.CleverTap,
     "appsflyer": qh.AppsFlyer,
 }
-_TARGETS = {"clickhouse": qh.ClickHouse, "bigquery": qh.BigQuery}
+_TARGETS = {"clickhouse": qh.ClickHouse, "bigquery": qh.BigQuery, "csv": qh.Csv}
 
 
 def _load_toml(path: str) -> dict:
@@ -132,7 +140,9 @@ def _descriptor(section: dict, registry: dict, role: str):
         sys.exit(f"[{role}] unknown type {typ!r}; expected one of: {', '.join(registry)}")
     try:
         return cls(**section)
-    except TypeError as e:
+    except (TypeError, ValueError) as e:
+        # TypeError: an unknown or missing key. ValueError: a value the
+        # descriptor checks as it is built (Csv's delimiter, say).
         sys.exit(f"[{role}] ({typ}) config error: {e}")
 
 

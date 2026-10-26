@@ -225,6 +225,10 @@ pub fn existing_decimals(
     dest_kind: DestKind,
     existing: &ExistingColumns,
 ) -> ExistingDecimals {
+    // A CSV folder's columns have no types for a new one to follow.
+    if dest_kind == DestKind::Csv {
+        return ExistingDecimals::None;
+    }
     let mut decimal = Vec::new();
     let mut float = Vec::new();
     let included = source
@@ -334,7 +338,7 @@ fn ensure_key_columns(
 ) -> Result<()> {
     let same = |a: &str, b: &str| match dest_kind {
         DestKind::BigQuery => a.eq_ignore_ascii_case(b),
-        DestKind::ClickHouse => a == b,
+        DestKind::ClickHouse | DestKind::Csv => a == b,
     };
     for k in &cfg.key {
         if dest_columns.iter().any(|c| same(&c.name, k)) {
@@ -413,6 +417,13 @@ pub fn plan_for_destination(
     source_may_coerce_to_null: bool,
     existing: &ExistingColumns,
 ) -> Result<SelectPlan> {
+    // A CSV destination keeps no column types, so an existing folder never
+    // holds a default back: every run writes the text of what it reads.
+    let existing = if dest_kind == DestKind::Csv {
+        &ExistingColumns::NoTable
+    } else {
+        existing
+    };
     // 1. Apply include (allowlist) then exclude (denylist) on source names.
     let included: Vec<&ColumnType> = source
         .iter()
@@ -564,7 +575,10 @@ pub fn plan_for_destination(
             && cfg.effective_engine() == "ReplacingMergeTree"
             && dest_kind == DestKind::ClickHouse;
         let is_engine_column = engine_columns.iter().any(|e| e == &dest_name);
-        let force_non_nullable = is_key || is_ch_version_column || is_engine_column;
+        // A CSV field can always be empty, so nothing is NOT NULL there: a
+        // NULL key is written as an empty field, not left out (0.21.0).
+        let force_non_nullable =
+            dest_kind != DestKind::Csv && (is_key || is_ch_version_column || is_engine_column);
         // Date32/Timestamp columns are otherwise forced nullable regardless
         // of the source's own NOT NULL constraint: their decoders coerce
         // unrepresentable values (zero-dates, out-of-ch_range years) to NULL
@@ -634,6 +648,8 @@ pub fn plan_for_destination(
         };
         let nullable = if force_non_nullable {
             false
+        } else if dest_kind == DestKind::Csv {
+            true
         } else {
             // A watermark column can legitimately be NULL in source rows, but a
             // `WHERE watermark > x` predicate makes MySQL's prepared-statement
@@ -1031,6 +1047,38 @@ mod tests {
         )
         .unwrap();
         assert_eq!(p.dest_columns[0].arrow, DataType::Float64);
+    }
+
+    /// A CSV destination (0.21.0): every field can be empty, so no column is
+    /// NOT NULL, whatever the source or a `key` says, and a folder's existing
+    /// columns never hold back a declared decimal (it keeps no types).
+    #[test]
+    fn a_csv_destination_makes_no_column_not_null_and_ignores_existing_types() {
+        let src = vec![
+            typed_col("id", DataType::Int64, false),
+            typed_col("updated_at", ts(None), false),
+            declared_col("amount", 15, 2),
+        ];
+        let mut c = cfg();
+        c.key = vec!["id".into()];
+        c.watermark = Some("updated_at".into());
+        let p =
+            plan_for_destination(&src, &c, DestKind::Csv, true, &ExistingColumns::Unknown).unwrap();
+        assert!(p.dest_columns.iter().all(|d| d.nullable));
+        assert_eq!(p.dest_columns[2].arrow, DataType::Decimal128(15, 2));
+        let floats = ExistingColumns::Known(HashMap::from([(
+            "amount".to_string(),
+            "Float64".to_string(),
+        )]));
+        let p = plan_for_destination(&src, &c, DestKind::Csv, true, &floats).unwrap();
+        assert_eq!(p.dest_columns[2].arrow, DataType::Decimal128(15, 2));
+        assert_eq!(
+            existing_decimals(&src, &c, DestKind::Csv, &floats),
+            ExistingDecimals::None
+        );
+        // The same plan on ClickHouse forces the key NOT NULL.
+        let ch = plan(&src, &c, DestKind::ClickHouse).unwrap();
+        assert!(!ch.dest_columns[0].nullable);
     }
 
     /// BigQuery `NUMERIC` holds at most 9 fractional and 29 integer digits.

@@ -101,3 +101,53 @@ def test_only_unset_braced_variables_are_reported(monkeypatch):
         "QH_TEST_UNSET ([target] settings.role)",
         "QH_TEST_UNSET ([sync] key)",
     ]
+
+
+def test_a_bad_csv_target_value_is_a_one_line_config_error(tmp_path):
+    """``Csv`` checks its values as it is built, raising ``ValueError``, which
+    the CLI reports like a misspelled key (0.21.0)."""
+    err = _run(
+        tmp_path,
+        f"""
+[source]
+type = "postgres"
+dsn = "postgresql://etl:etl@127.0.0.1:1/etl"
+
+[target]
+type = "csv"
+path = "{tmp_path / 'out'}"
+delimiter = ";;"
+
+[sync]
+dest_table = "orders"
+source_table = "orders"
+mode = "full"
+""",
+    )
+    assert err.startswith("[target] (csv) config error: Csv(delimiter=';;')"), err
+    assert not (tmp_path / "out").exists()
+
+
+def test_a_csv_target_refuses_incremental_before_connecting(tmp_path):
+    """The source's port is closed: the run fails on the mode, not on it."""
+    job = tmp_path / "job.toml"
+    job.write_text(
+        f"""
+[source]
+type = "postgres"
+dsn = "postgresql://etl:etl@127.0.0.1:1/etl"
+
+[target]
+type = "csv"
+path = "{tmp_path / 'out'}"
+
+[sync]
+dest_table = "orders"
+source_table = "orders"
+mode = "incremental"
+watermark = "updated_at"
+"""
+    )
+    with pytest.raises(RuntimeError, match='mode="incremental" is not supported for a CSV'):
+        main(["run", str(job)])
+    assert not (tmp_path / "out").exists()

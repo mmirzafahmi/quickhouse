@@ -1,5 +1,5 @@
 """quickhouse — fast PostgreSQL/MySQL/BigQuery/ClickHouse and pandas ETL into
-ClickHouse or BigQuery, powered by a Rust engine.
+ClickHouse, BigQuery or CSV files, powered by a Rust engine.
 
 The heavy lifting (wire-protocol decoding, Arrow batching, parallel streaming,
 and destination ingestion) runs in native Rust. This module is a thin, typed
@@ -41,6 +41,13 @@ the ``source`` — a cross-cluster copy, or publishing a mart into BigQuery:
 >>> dst_ch = quickhouse.ClickHouse("http://ch-b:8123", database="analytics")
 >>> quickhouse.sync(src_ch, dst_ch, dest_table="orders", source_table="orders")
 
+``target`` can also be a :class:`quickhouse.Csv` folder on a local path (new in
+0.21.0): one folder per table, of CSV part files, replaced whole by
+``mode="full"`` and added to by ``mode="append"``:
+
+>>> quickhouse.sync(src, quickhouse.Csv("/data/exports"), dest_table="orders",
+...                 source_table="orders", mode="full")
+
 A DataFrame you already hold goes in through :func:`quickhouse.from_pandas`
 (``pip install quickhouse[pandas]``) — a pandas, polars or pyarrow frame, with
 the same modes, DDL and warnings as any other source. ``mode="incremental"``
@@ -61,6 +68,7 @@ from ._quickhouse import (
     CleverTap,
     ClickHouse,
     ColumnDrift,
+    Csv,
     GcsArchive,
     HttpApi,
     MySQL,
@@ -93,6 +101,7 @@ __all__ = [
     "AppsFlyer",
     "HttpApi",
     "ClickHouse",
+    "Csv",
     "S3Archive",
     "GcsArchive",
     "Progress",

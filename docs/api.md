@@ -84,9 +84,12 @@ Writing an in-memory pandas/polars/pyarrow frame. See the
 
 Connection descriptors accepted as ``sync()``'s ``target`` argument. ``BigQuery``
 (above) also works as a destination when constructed with ``dataset_id``, and
-``ClickHouse`` (above) works in either role.
+``ClickHouse`` (above) works in either role. ``Csv`` writes CSV files to a local
+path (see [CSV files](guide/destinations/csv.md)).
 
 ```{eval-rst}
+.. autoclass:: Csv
+
 .. autoclass:: S3Archive
 
 .. autoclass:: GcsArchive

@@ -5,6 +5,7 @@
 # with S3Archive / GcsArchive) would otherwise be evaluated too early.
 from __future__ import annotations
 
+import os
 from typing import Callable, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 # A declared API-source schema: a list of (name, bq_type) / (name, bq_type,
@@ -624,6 +625,121 @@ class ClickHouse:
         final: Optional[bool] = None,
     ) -> None: ...
 
+class Csv:
+    """CSV files on a local path, as a ``target`` for :func:`sync` (new in
+    0.21.0). A destination only: it can't be a ``source``.
+
+    Each table is a folder under ``path``, written whole by a full refresh and
+    added to by an append::
+
+        <path>/
+          _quickhouse_state.json             append cursors
+          orders/
+            _quickhouse_manifest.json        columns, format, rows per part
+            part-<run_id>-00000.csv          one or more parts per run
+            part-<run_id>-00001.csv
+
+    ``run_id`` is the run's start in nanoseconds, so the parts sort in the
+    order the runs wrote them. Every part has its own header row, so each
+    reads alone, and ``glob("<path>/orders/part-*")`` reads the table::
+
+        dst = qh.Csv("/data/exports")
+        qh.sync(src, dst, dest_table="orders", source_table="orders", mode="full")
+
+        import pandas as pd, glob
+        df = pd.concat(pd.read_csv(f, keep_default_na=False, na_values=[""])
+                       for f in sorted(glob.glob("/data/exports/orders/part-*.csv")))
+
+    Parameters
+    ----------
+    path:
+        The root folder (a ``str`` or :class:`os.PathLike`), created on the
+        first write. Local paths only.
+    delimiter:
+        The field delimiter: one ASCII character other than ``"``, CR or LF.
+        ``"\\t"`` writes tab-separated files.
+    header:
+        Write the column names as the first row of every part. With
+        ``False`` a part holds data rows only; the manifest still names the
+        columns.
+    compression:
+        ``None`` (default) for ``.csv`` parts, or ``"gzip"`` for ``.csv.gz``
+        (one gzip member per part).
+    max_rows_per_file:
+        A part closes and the next one opens after this many rows, so a large
+        table never becomes one huge file. Parallel reads write a part each
+        while they write, so a run writes at least one part per partition that
+        returns rows.
+
+    Notes
+    -----
+    **Format.** UTF-8 and RFC 4180 quoting: a field is quoted when it holds
+    the delimiter, a double quote, CR or LF, each double quote doubled. A NULL
+    is an empty field, and an empty string is written quoted (``""``), so the
+    two read apart. Rows end with ``\\n``. Dates are ``YYYY-MM-DD``; timestamps
+    are ISO 8601 with as many fractional digits as their unit holds (6 for the
+    microseconds every source decodes to): a timezone-aware one in UTC with a
+    ``Z`` (``2024-01-02T03:04:05.000000Z``), a naive one with no offset.
+    Decimals are their exact text at their scale, booleans ``true``/``false``,
+    floats the shortest text that reads back as the same value (``NaN``,
+    ``inf``), and binary base64 (standard alphabet, padded). In a one-column
+    table a NULL row is an empty line, which some readers skip (pandas: pass
+    ``skip_blank_lines=False``).
+
+    **Modes.** ``mode="full"`` writes the new parts into a staging folder
+    beside the table's, then swaps it into place and deletes the old folder:
+    one ``renameat2(RENAME_EXCHANGE)`` on Linux, so a reader sees the old
+    table or the new one and never a mix; two renames elsewhere, where the
+    path is missing for an instant. ``mode="append"`` stages its parts the
+    same way and moves them into the folder once every row is read, then adds
+    them to the manifest. Either way a run that fails leaves nothing behind
+    and the table as it was. ``mode="incremental"`` is refused: CSV can't
+    update rows. ``mode="append"`` with ``watermark=`` reads only the rows past
+    a saved cursor, from a database source too; the cursor is kept in
+    ``<path>/<state_table_name>.json``, keyed by ``state_key`` and
+    ``dest_table``, and listed by :func:`state_keys`. Nothing is
+    deduplicated, so an append never re-reads a margin (``lookback_seconds``
+    is refused) and leaves out a row whose watermark is NULL
+    (``null_watermark``), which no cursor can hold.
+
+    **Columns.** An append's columns (names and order), delimiter, header and
+    compression must match the folder's manifest, or the run is refused before
+    anything is read, naming the difference; ``evolve_schema`` isn't
+    supported. A full refresh writes whatever columns this run reads. Every
+    column can be empty, so nothing is NOT NULL: a NULL ``key`` is written as
+    an empty field, not left out. ``key`` is allowed and only picks the column
+    a parallel read splits on (when ``partition_column`` is unset); nothing is
+    deduplicated. The full-refresh shrink guard counts rows from the manifest.
+
+    **Refused options.** ``engine``, ``order_by``, ``partition_by``,
+    ``primary_key``, ``not_null``, the ``merge_prune_*`` options,
+    ``delete_stale_in_window``, ``type_overrides``, ``evolve_schema`` and
+    ``validate`` don't apply to CSV files, so a run that sets one is refused
+    rather than having it ignored. ``numeric_as_decimal`` applies: it writes an
+    unconstrained ``numeric`` as exact decimal text instead of a float.
+    ``Csv`` takes no ``archive=``: it is files already. :func:`reconcile_keys`
+    and :func:`reconcile_values` don't support it; :func:`state_keys` and
+    :func:`compact_state` (a no-op: one entry per cursor) do.
+
+    **Safety.** quickhouse replaces or adds to a folder only when it holds a
+    ``_quickhouse_manifest.json`` or nothing at all, so a ``dest_table`` that
+    names a folder of other files is refused, not deleted. Writes to the state
+    file and the manifests are serialized per ``path``: by a lock in the
+    process and, on Unix, an ``flock`` on the folder across processes.
+
+    .. versionadded:: 0.21.0
+    """
+
+    def __init__(
+        self,
+        path: Union[str, os.PathLike[str]],
+        *,
+        delimiter: str = ",",
+        header: bool = True,
+        compression: Optional[str] = None,
+        max_rows_per_file: int = 1_000_000,
+    ) -> None: ...
+
 class Progress:
     """Live progress snapshot passed to ``on_progress``."""
 
@@ -641,7 +757,7 @@ class StagedInfo:
 
     staging_table: str
     database: str
-    dest_kind: str  # "clickhouse" | "bigquery"
+    dest_kind: str  # "clickhouse" | "bigquery" | "csv"
     rows_written: int
 
 class TransferWarning:
@@ -1063,7 +1179,7 @@ def sync(
     # already-serialized Arrow IPC stream to the engine. Not part of the public
     # API — use from_pandas() rather than building the bytes yourself.
     source: Union[Postgres, MySQL, BigQuery, ClickHouse, CleverTap, AppsFlyer, HttpApi, bytes],
-    target: Union[ClickHouse, BigQuery],
+    target: Union[ClickHouse, BigQuery, Csv],
     dest_table: str,
     *,
     source_table: Optional[str] = None,
@@ -1123,22 +1239,25 @@ def sync(
     validate: Optional[Callable[[StagedInfo], None]] = None,
 ) -> TransferResult:
     """Transfer one table from PostgreSQL, MySQL, BigQuery or ClickHouse into
-    ClickHouse or BigQuery.
+    ClickHouse, BigQuery or CSV files.
 
     ``source`` may be a ``Postgres``, ``MySQL``, ``BigQuery`` or ``ClickHouse``
-    connection descriptor; ``target`` may be a ``ClickHouse`` or ``BigQuery``
-    one (the same ``BigQuery`` and ``ClickHouse`` classes work for either role
-    — see their doc comments).
+    connection descriptor; ``target`` may be a ``ClickHouse``, ``BigQuery`` or
+    ``Csv`` one (the same ``BigQuery`` and ``ClickHouse`` classes work for
+    either role — see their doc comments; ``Csv``, new in 0.21.0, is a
+    destination only).
     Everything else about the call is identical regardless of which engines
     are used. Either ``source_table`` or ``source_query`` must be provided.
     For ``mode="incremental"``, ``watermark`` is required and only rows newer
     than the last recorded watermark are copied. In ``mode="full"`` the
     watermark is unused and ignored (cleared to ``None``), and the returned
-    ``new_watermark`` is ``None``. ``mode="append"`` (HTTP API sources only)
-    inserts each window's rows straight into the destination with NO
-    staging/merge/swap and no dedup — a bronze-landing write for when you run
-    your own consolidation downstream; ``watermark`` drives the resume window
-    and ``key`` is not required.
+    ``new_watermark`` is ``None``. ``mode="append"`` (HTTP API and DataFrame
+    sources, and any source into a ``Csv`` destination) inserts each window's
+    rows straight into the destination with NO merge/swap and no dedup — a
+    bronze-landing write for when you run your own consolidation downstream;
+    ``watermark`` drives the resume window and ``key`` is not required. A
+    ``Csv`` destination stages an append and moves its parts in once every row
+    is read, and refuses ``mode="incremental"``: see :class:`Csv`.
 
     If ``watermark`` allows NULL and any current row has one, a
     ``WHERE watermark > x`` predicate never matches it — that row is silently
@@ -1710,7 +1829,7 @@ def sync(
     ...
 
 def compact_state(
-    target: Union[ClickHouse, BigQuery],
+    target: Union[ClickHouse, BigQuery, Csv],
     *,
     state_table_name: str = "_quickhouse_state",
 ) -> int:
@@ -1725,11 +1844,14 @@ def compact_state(
     read scans more. The cursor each sync reads is the newest row's, so it is
     the same afterwards, and a sync that writes during the compaction only
     adds a newer row: safe to run between syncs.
+
+    A :class:`Csv` destination's state file holds one entry per cursor, so
+    there is nothing to compact and this returns ``0`` (0.21.0).
     """
     ...
 
 def state_keys(
-    target: Union[ClickHouse, BigQuery],
+    target: Union[ClickHouse, BigQuery, Csv],
     *,
     state_table_name: str = "_quickhouse_state",
     idle_days: Optional[int] = None,
@@ -1738,6 +1860,9 @@ def state_keys(
     written, oldest first. With ``idle_days``, only the keys no sync has
     written in that many days: a renamed ``state_key`` leaves its old rows
     behind for good, which is what these usually are. New in 0.20.7.
+
+    For a :class:`Csv` destination it lists the entries of
+    ``<path>/<state_table_name>.json``, each with ``state_rows`` 1 (0.21.0).
     """
     ...
 
@@ -1817,7 +1942,7 @@ def reconcile_keys(
     Sources: PostgreSQL, MySQL and ClickHouse. A BigQuery source is rejected (it
     is normally itself a mirror rather than the system of record), as is an HTTP
     API source (no keyset query to diff against). Destinations: both ClickHouse
-    and BigQuery.
+    and BigQuery; a :class:`Csv` destination raises (not supported).
     """
     ...
 
@@ -1901,7 +2026,8 @@ def reconcile_values(
         counts are exact regardless.
 
     Sources: PostgreSQL, MySQL and ClickHouse. Destination: ClickHouse; a
-    BigQuery destination raises (not supported yet). Comparing per window by
+    BigQuery destination raises (not supported yet), and so does a
+    :class:`Csv` one. Comparing per window by
     hashing, to make a whole-table check cheap enough to schedule, and
     ``repair=True``, which re-syncs only the keys that differ, come next.
 

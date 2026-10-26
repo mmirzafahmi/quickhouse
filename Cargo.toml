@@ -80,6 +80,9 @@ object_store = { version = "=0.11.2", default-features = false, features = ["aws
 # RFC-4180 CSV parsing for the AppsFlyer Pull API report (quoted fields with
 # embedded commas/newlines, "" escapes) — the only new dep for the API sources.
 csv = "1"
+# gzip for the CSV destination's `.csv.gz` parts (0.21.0). Already in the
+# graph through async-compression; the default miniz_oxide backend is pure Rust.
+flate2 = "1"
 
 # Faster release builds for the shipped wheel.
 [profile.release]

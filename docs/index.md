@@ -10,7 +10,7 @@ sd_hide_title: true
     <div class="qh-hero__pitch">
       <p class="qh-hero__eyebrow">Python API · Rust engine</p>
       <h1>Move whole tables in <em>one</em> function call.</h1>
-      <p class="qh-hero__sub">PostgreSQL, MySQL, BigQuery, or ClickHouse into ClickHouse or BigQuery. Native wire
+      <p class="qh-hero__sub">PostgreSQL, MySQL, BigQuery, or ClickHouse into ClickHouse, BigQuery or CSV files. Native wire
       protocols straight into Apache Arrow — no per-row Python, flat memory.</p>
     </div>
     <div class="qh-hero__actions">
@@ -78,7 +78,7 @@ qh.<span class="n">sync</span>(
   <dl class="qh-stats">
     <div><dt>35s</dt><dd>10M-row merge, MySQL → ClickHouse. <a href="guide/benchmark.html">See the benchmark</a>.</dd></div>
     <div><dt>Arrow</dt><dd>Zero-copy batches end to end. Memory stays flat.</dd></div>
-    <div><dt>5</dt><dd>Sources, two destinations, one uniform API.</dd></div>
+    <div><dt>5</dt><dd>Sources, three destinations, one uniform API.</dd></div>
     <div><dt>0</dt><dd>Toolchains to install. Prebuilt wheels, MIT licensed.</dd></div>
   </dl>
 
@@ -178,8 +178,8 @@ quickhouse.<span class="n">sync</span>(
       </div>
       <div class="qh-newband__checks">
         <div><span>stage &rarr; validate &rarr; promote</span><b>gated</b></div>
-        <div><span>full refresh, both destinations</span><b>✓</b></div>
-        <div><span>incremental, both destinations</span><b>✓</b></div>
+        <div><span>full refresh, ClickHouse &amp; BigQuery</span><b>✓</b></div>
+        <div><span>incremental, ClickHouse &amp; BigQuery</span><b>✓</b></div>
         <div><span>on failure</span><b>ValidationFailed</b></div>
       </div>
     </div>
@@ -205,13 +205,15 @@ quickhouse.<span class="n">sync</span>(
     <div class="qh-flow__lanes" aria-hidden="true">
       <div class="qh-flow__lane" style="--qh-delay:0s"></div>
       <div class="qh-flow__lane" style="--qh-delay:0.75s"></div>
+      <div class="qh-flow__lane" style="--qh-delay:1.5s"></div>
     </div>
     <div class="qh-flow__col">
       <div class="qh-flow__dest"><b>ClickHouse</b><span>ReplacingMergeTree · atomic swap</span></div>
       <div class="qh-flow__dest"><b>BigQuery</b><span>single MERGE on key</span></div>
+      <div class="qh-flow__dest"><b>CSV files</b><span>part files · folder swap</span></div>
     </div>
   </div>
-  <p class="qh-hero__meta">Every source moves into either destination.</p>
+  <p class="qh-hero__meta">Every source moves into every destination.</p>
 </div>
 ```
 

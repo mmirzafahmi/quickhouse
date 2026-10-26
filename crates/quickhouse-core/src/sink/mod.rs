@@ -1,4 +1,5 @@
-//! Destination sinks. The [`Sink`] trait is the destination-agnostic seam:
+//! Destination sinks (ClickHouse, BigQuery, and CSV files since 0.21.0). The
+//! [`Sink`] trait is the destination-agnostic seam:
 //! `sync.rs` builds one from a [`crate::config::DestinationConfig`] via
 //! [`build_sink`] and drives it (DDL, inserts, the full-refresh atomic swap,
 //! incremental watermark state) without knowing the concrete engine. Required
@@ -9,9 +10,12 @@
 pub mod bigquery;
 mod bigquery_proto;
 pub mod clickhouse;
+pub mod csv;
+mod csv_writer;
 
 pub use bigquery::BigQuerySink;
 pub use clickhouse::ClickHouseSink;
+pub use csv::CsvSink;
 
 use std::sync::Arc;
 
@@ -203,6 +207,20 @@ pub trait Sink: Send + Sync {
         batches: &[RecordBatch],
     ) -> Result<u64>;
 
+    /// [`Self::insert_batches`], from one stream of the read: a parallel
+    /// partition's label, or `"all"` for a read with one stream. Default: the
+    /// stream doesn't matter. CSV writes each stream's rows into parts of
+    /// its own, so a parallel read writes at least one part per partition.
+    async fn insert_stream_batches(
+        &self,
+        table: &str,
+        _stream: &str,
+        schema: SchemaRef,
+        batches: &[RecordBatch],
+    ) -> Result<u64> {
+        self.insert_batches(table, schema, batches).await
+    }
+
     /// Atomically replace `dest`'s contents with `staging`'s (both must exist).
     async fn atomic_swap(&self, dest: &str, staging: &str, columns: &[ColumnType]) -> Result<()>;
 
@@ -327,6 +345,39 @@ pub trait Sink: Send + Sync {
     /// `false` (e.g. ClickHouse's `EXCHANGE TABLES` absorbs drift). Pure.
     fn full_refresh_references_dest_columns(&self) -> bool {
         false
+    }
+
+    /// Whether a write that would otherwise go straight into the destination
+    /// (an incremental run that doesn't `MERGE`, or an append) goes into a
+    /// staging table instead, moved in with [`Self::insert_select`] once every
+    /// row is read, so a run that fails leaves nothing in the destination.
+    /// Default `false`. CSV says `true`: a part being written would be
+    /// readable half done, and a failed run's parts would stay. Pure.
+    fn stages_direct_writes(&self) -> bool {
+        false
+    }
+
+    /// Whether a staging table against an existing destination is cloned from
+    /// it ([`Self::clone_table_structure`]) rather than created from this
+    /// run's columns ([`Self::create_table`]). Default `true`: staging must
+    /// match the destination's engine, sort key and column types. CSV says
+    /// `false`: a folder has no structure to keep, and its parts hold what
+    /// each run writes. Pure.
+    fn stages_from_destination(&self) -> bool {
+        true
+    }
+
+    /// Refuse, before anything is read or written, a write of `columns` under
+    /// `cfg` that this destination can't take into the existing `table`. CSV
+    /// refuses a folder it didn't write and an append whose columns or format
+    /// differ from the folder's. Default: every write is taken.
+    async fn check_write(
+        &self,
+        _table: &str,
+        _columns: &[ColumnType],
+        _cfg: &TransferConfig,
+    ) -> Result<()> {
+        Ok(())
     }
 
     /// In-progress chunk-resume marker, or `None`. Default `None` — a
@@ -543,6 +594,7 @@ pub async fn build_sink(dest: DestinationConfig) -> Result<Arc<dyn Sink>> {
     Ok(match dest {
         DestinationConfig::ClickHouse(cfg) => Arc::new(ClickHouseSink::new(cfg)?),
         DestinationConfig::BigQuery(cfg) => Arc::new(BigQuerySink::new(cfg).await?),
+        DestinationConfig::Csv(cfg) => Arc::new(CsvSink::new(cfg)?),
     })
 }
 
