@@ -515,3 +515,26 @@ def test_a_row_with_no_key_is_left_out_with_a_null_key_warning(
         assert rows == [("a", 1), ("c", 3)]
     finally:
         _drop(ch_client, table)
+
+
+@pytest.mark.parametrize("mode", ["full", "incremental", "append"])
+def test_a_null_in_an_order_by_column_of_a_frame_lands_as_the_default(
+    ch_client, ch_target, unique_name, mode
+):
+    """Issue #53: a frame row with a NULL in an order_by column failed the run
+    with Arrow's "declared as non-nullable but contains null values". It
+    lands now with the type's default there, and null_defaulted counts it."""
+    table = unique_name
+    frame = pd.DataFrame({"id": [1, 2, 3, 4], "grp": ["a", None, "c", None], "n": [1, 2, 3, 4]})
+    _drop(ch_client, table)
+    try:
+        result = quickhouse.from_pandas(
+            frame, ch_target, dest_table=table, mode=mode, key=["id"], order_by=["grp", "id"]
+        )
+        assert (result.rows_read, result.rows_written) == (4, 4)
+        defaulted = [(w.column, w.count) for w in result.warnings if w.kind == "null_defaulted"]
+        assert defaulted == [("grp", 2)]
+        rows = ch_client.query(f"SELECT id, grp FROM `{table}` ORDER BY id").result_rows
+        assert rows == [(1, "a"), (2, ""), (3, "c"), (4, "")]
+    finally:
+        _drop(ch_client, table)

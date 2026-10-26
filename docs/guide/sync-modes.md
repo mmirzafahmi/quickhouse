@@ -85,7 +85,12 @@ mode and source leaves such a row out and counts it in a `null_key` warning
 (before 0.20.12, a database source failed the write and an API source stored
 `''` or `0` there). Likewise, a row whose watermark is `NULL` is left out of a
 `ReplacingMergeTree`, whose version column can't be `NULL`, and counted in
-`null_watermark`.
+`null_watermark`. A `NULL` in another column that can't be `NULL` (one in
+`order_by`, `primary_key` or `not_null`, or a collapsing sign) doesn't make the
+row meaningless, so the row is written with the column type's default there
+(`''`, `0`, `1970-01-01`, an `Enum`'s lowest value) and counted in
+`null_defaulted` (before 0.20.13, a database source failed the write and an API
+source stored the default without a word).
 
 ### Recreating the destination
 

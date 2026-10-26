@@ -2203,6 +2203,177 @@ def test_a_chunked_read_leaves_null_keys_out_and_keeps_going(
         _drop_ch(ch_client, table)
 
 
+def _null_grp_table(pg_conn, table):
+    """Keyed on `id`. `grp` is NULL on ids 2 and 4, and `ts`, `amt`, `flag` and
+    `u` on some rows too. write_date grows with id."""
+    with pg_conn.cursor() as cur:
+        cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+        cur.execute(
+            f'CREATE TABLE "{table}" (id bigint PRIMARY KEY, grp text, ts timestamp, '
+            "amt numeric(10, 2), flag boolean, u uuid, write_date timestamp NOT NULL)"
+        )
+        cur.execute(
+            f"INSERT INTO \"{table}\" VALUES "
+            "(1, 'a', '2024-05-01 10:00', 1.50, true, "
+            "'11111111-1111-1111-1111-111111111111', '2024-01-01'), "
+            "(2, NULL, NULL, NULL, NULL, NULL, '2024-01-02'), "
+            "(3, 'c', '2024-05-03 10:00', 3.25, false, "
+            "'33333333-3333-3333-3333-333333333333', '2024-01-03'), "
+            "(4, NULL, '2024-05-04 10:00', 4.00, true, NULL, '2024-01-04'), "
+            "(5, 'e', NULL, NULL, false, '55555555-5555-5555-5555-555555555555', '2024-01-05')"
+        )
+
+
+def _defaulted(result):
+    return sorted((w.column, w.count) for w in result.warnings if w.kind == "null_defaulted")
+
+
+@pytest.mark.parametrize("option", [{"order_by": ["grp", "id"]}, {"not_null": ["grp"]}])
+def test_a_null_in_a_not_null_column_from_postgres_lands_as_the_default(
+    pg_conn, ch_client, pg_source, ch_target, unique_name, option
+):
+    """Issue #53: a NULL in a column the plan makes NOT NULL other than the key
+    (an order_by or not_null column) failed the write partway
+    with Arrow's "Column 'grp' is declared as non-nullable but contains null
+    values". The row lands now, with the type's default there, and
+    null_defaulted names the column, counts the rows and says why."""
+    table = unique_name
+    _null_grp_table(pg_conn, table)
+    _drop_ch(ch_client, table)
+    try:
+        r = quickhouse.sync(
+            pg_source, ch_target, dest_table=table, source_table=table, mode="full",
+            key=["id"], **option,
+        )
+        assert (r.rows_read, r.rows_written) == (5, 5)
+        assert _defaulted(r) == [("grp", 2)]
+        (w,) = [w for w in r.warnings if w.kind == "null_defaulted"]
+        assert f"{next(iter(option))} names it" in w.message, w.message
+        assert "''" in w.message, w.message
+        assert _ch_type(ch_client, table, "grp") == "String"
+        rows = ch_client.query(f"SELECT id, grp FROM `{table}` ORDER BY id").result_rows
+        assert rows == [(1, "a"), (2, ""), (3, "c"), (4, ""), (5, "e")]
+    finally:
+        _drop_ch(ch_client, table)
+
+
+def test_each_not_null_column_takes_its_own_types_default(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """Issue #53: the default is the column type's own: '' for text, 0 for a
+    decimal, false for a boolean, 1970-01-01 for a timestamp, and the zero
+    UUID for a uuid, which ClickHouse can't read from ''. One warning per
+    column, counting its rows."""
+    table = unique_name
+    _null_grp_table(pg_conn, table)
+    _drop_ch(ch_client, table)
+    try:
+        r = quickhouse.sync(
+            pg_source, ch_target, dest_table=table, source_table=table, mode="full",
+            key=["id"], not_null=["grp", "ts", "amt", "flag", "u"],
+        )
+        assert (r.rows_read, r.rows_written) == (5, 5)
+        assert _defaulted(r) == [("amt", 2), ("flag", 1), ("grp", 2), ("ts", 2), ("u", 2)]
+        assert _ch_type(ch_client, table, "u") == "UUID"
+        rows = ch_client.query(
+            f"SELECT grp, ts, toString(amt), flag, toString(u) FROM `{table}` WHERE id = 2"
+        ).result_rows
+        assert rows == [
+            ("", datetime(1970, 1, 1), "0", False, "00000000-0000-0000-0000-000000000000")
+        ]
+    finally:
+        _drop_ch(ch_client, table)
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {},
+        {"chunk_rows": 2},
+        {"windowed": True, "read_window_rows": 2},
+        {"probe_max_cost": 1.0, "lookback_seconds": 60},
+        {"validate": "staged"},
+    ],
+    ids=["direct", "chunked", "windowed", "stream-cursor", "staged"],
+)
+def test_an_incremental_run_stores_the_default_and_counts_it_once(
+    pg_conn, ch_client, pg_source, ch_target, unique_name, extra
+):
+    """Issue #53 on every incremental read shape: each chunk, window and
+    partition counts its own rows, and the run reports one null_defaulted per
+    column with the total."""
+    table = unique_name
+    _null_grp_table(pg_conn, table)
+    _drop_ch(ch_client, table)
+    gated = []
+    if extra.get("validate") == "staged":
+        extra = dict(extra, validate=gated.append)
+    try:
+        r = quickhouse.sync(
+            pg_source, ch_target, dest_table=table, source_table=table, mode="incremental",
+            watermark="write_date", key=["id"], order_by=["grp", "id"], create_if_missing=True,
+            state_key=table, **extra,
+        )
+        assert (r.rows_read, r.rows_written) == (5, 5)
+        assert _defaulted(r) == [("grp", 2)]
+        assert r.new_watermark.startswith("2024-01-05"), r.new_watermark
+        rows = ch_client.query(f"SELECT id, grp FROM `{table}` FINAL ORDER BY id").result_rows
+        assert rows == [(1, "a"), (2, ""), (3, "c"), (4, ""), (5, "e")]
+        if "validate" in extra:
+            assert len(gated) == 1
+    finally:
+        _drop_ch(ch_client, table)
+
+
+def test_a_null_key_in_an_order_by_column_is_left_out_not_defaulted(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """Issue #53 leaves #49's rule alone: a key column in order_by too is
+    still a key, so its NULL rows are left out and counted once, in
+    null_key."""
+    table = unique_name
+    _null_key_table(pg_conn, table)
+    _drop_ch(ch_client, table)
+    try:
+        r = quickhouse.sync(
+            pg_source, ch_target, dest_table=table, source_table=table, mode="full",
+            key=["code"], order_by=["code", "id"], not_null=["code"],
+        )
+        assert (r.rows_read, r.rows_written) == (5, 3)
+        assert _null_keys(r) == [("code", 2)]
+        assert _defaulted(r) == []
+    finally:
+        _drop_ch(ch_client, table)
+
+
+def test_fail_on_null_defaulted_stops_a_full_refresh_before_its_swap(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """Issue #53: null_defaulted is counted while reading, as null_key is, so
+    fail_on_warnings stops a full refresh at its swap, and the destination
+    keeps its rows."""
+    table = unique_name
+    _null_grp_table(pg_conn, table)
+    with pg_conn.cursor() as cur:
+        cur.execute(f"UPDATE \"{table}\" SET grp = 'x' || id")
+    _drop_ch(ch_client, table)
+    kw = dict(dest_table=table, source_table=table, mode="full", key=["id"], order_by=["grp", "id"])
+    try:
+        quickhouse.sync(pg_source, ch_target, **kw)
+        with pg_conn.cursor() as cur:
+            cur.execute(f"UPDATE \"{table}\" SET grp = NULL WHERE id = 3")
+        with pytest.raises(
+            RuntimeError, match="fail_on_warnings: null_defaulted on column 'grp'"
+        ) as err:
+            quickhouse.sync(pg_source, ch_target, fail_on_warnings={"null_defaulted"}, **kw)
+        assert "(count 1)" in str(err.value), err.value
+        assert "untouched" in str(err.value), err.value
+        rows = ch_client.query(f"SELECT id, grp FROM `{table}` ORDER BY id").result_rows
+        assert rows == [(1, "x1"), (2, "x2"), (3, "x3"), (4, "x4"), (5, "x5")]
+    finally:
+        _drop_ch(ch_client, table)
+
+
 def test_a_fail_on_warnings_error_leaves_out_a_count_of_0(
     pg_conn, ch_client, pg_source, ch_target, unique_name
 ):

@@ -571,12 +571,10 @@ pub fn plan_for_destination(
         // unconditionally, and a NOT NULL Arrow field containing a coerced
         // NULL fails downstream with a schema-consistency error instead of
         // transferring cleanly — see `types::may_coerce_to_null`'s docs.
-        // `force_non_nullable` still wins over this: a key or version column
-        // that's also a coercible date type and actually hits a zero-date
-        // will still fail — an inherent conflict between two hard
-        // constraints, not something papered over here (both combinations
-        // are expected to be rare: a business/dedup key or watermark column
-        // with legacy zero-date values).
+        // `force_non_nullable` still wins over this, and a value coerced to
+        // NULL there meets `null_guard::NullGuard`: a key or version column's
+        // row is left out (#49), and any other forced column is written with
+        // the type's default (#53), each with a warning.
         // An arbitrary-precision decimal column overridden to "Decimal(P,
         // S)" gets its Arrow type promoted from Float64 to Decimal128(P,S)
         // so the decoder can decode it exactly (see decimal.rs). Gating on

@@ -9,6 +9,53 @@ any breaking change is called out explicitly.
 
 ## [Unreleased]
 
+### Changed — please read before upgrading
+- **A NULL in an `order_by`, `primary_key` or `not_null` column is written as
+  the column type's default, and counted in a new warning, `null_defaulted`,
+  on every source.** Such a column can't be NULL at the destination:
+  ClickHouse doesn't allow NULL in a sorting key, nor in an engine's sign or
+  version column, and quickhouse creates these columns `REQUIRED` on
+  BigQuery. A database source (PostgreSQL, MySQL, ClickHouse, BigQuery) that
+  read a NULL there failed the write partway, with Arrow's `Column 'grp' is
+  declared as non-nullable but contains null values` (a ClickHouse source:
+  `Code: 349 ... Cannot convert NULL value to non-Nullable type`), which named
+  neither the option nor a fix; a DataFrame failed the same way, and so did a
+  value a decoder couldn't read there, such as a MySQL zero-date. Unlike a
+  NULL key (#49), such a row can be stored meaningfully, so every source now
+  writes it, in every mode, with the column type's default in place of the
+  NULL: `''`, `0`, `false`, `1970-01-01` for a date or timestamp, zero for a
+  decimal, an `Enum`'s lowest value, the zero `UUID`. `null_defaulted` names
+  the destination column, with `count` the rows, and says which option made
+  it NOT NULL; it is raised once per column per run. A column that is also a
+  `key`, or the watermark of a `ReplacingMergeTree`, is still left out and
+  counted once, in `null_key` or `null_watermark`. `rows_written` includes
+  these rows, and an `archive` holds the default as written.
+  `fail_on_warnings={"null_defaulted"}` stops the run where it stops one on
+  `null_key`: a full refresh before its swap, an incremental run before its
+  `MERGE` or its cursor, a `chunk_rows` read before the chunk is committed. A
+  run that failed with the Arrow error now succeeds: name `null_defaulted` in
+  `fail_on_warnings` to keep it failing. quickhouse fills the default itself
+  rather than leave it to ClickHouse's `input_format_null_as_default`, which
+  for an Arrow insert reads `''` into an `Enum`, `UUID` or IP column and fails
+  the insert, so a column `DEFAULT` expression on an existing table isn't
+  used, and a caller's `settings` don't change what is stored. (#53)
+
+### Fixed
+- **An API source's NULL in an `order_by`, `primary_key` or `not_null` column
+  is reported.** `HttpApi`, `CleverTap` and `AppsFlyer` already stored the
+  type's default there on ClickHouse, which filled it in, but a record that
+  simply lacked the field raised no warning: `rows_written=3, warnings []`
+  for a row that landed with `''`. `null_defaulted` counts it now, as on
+  every source. A text column quickhouse plans as an `Enum`, a `UUID` or an
+  IP address (a ClickHouse source's column, or `type_overrides`) gets that
+  type's own default, where ClickHouse's `''` failed the insert. (#53)
+- **`coerced_date`, `coerced_decimal` and `coerced_scalar` point at
+  `null_defaulted`.** A value the decoder couldn't read in such a column is
+  counted by its `coerced_*` kind and by `null_defaulted`. The `coerced_*`
+  message names the default written and leaves why to `null_defaulted`, whose
+  message points back at the `coerced_*` warning, rather than both
+  explaining it. (#53)
+
 ## [0.20.12] — 2026-10-25
 
 ### Changed — please read before upgrading

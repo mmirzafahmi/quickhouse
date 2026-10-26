@@ -2096,3 +2096,55 @@ def test_a_zero_date_watermark_is_left_out_of_a_replacing_merge_tree(
         assert ch_client.query(f"SELECT id FROM `{table}`").result_rows == [(1,)]
     finally:
         _drop_ch(ch_client, table)
+
+
+def test_a_zero_date_or_a_null_in_a_not_null_column_is_written_as_the_default(
+    mysql_conn, ch_client, mysql_source, ch_target, unique_name
+):
+    """Issue #53: a NULL in an order_by column, or a zero-date (read as NULL)
+    in a not_null one, failed the insert with an Arrow error. The rows are
+    written with the type's default now. null_defaulted counts both, and
+    coerced_date counts the zero-date and points at null_defaulted."""
+    table = unique_name
+    with mysql_conn.cursor() as cur:
+        cur.execute(f"DROP TABLE IF EXISTS `{table}`")
+        cur.execute(
+            f"CREATE TABLE `{table}` (id BIGINT PRIMARY KEY, grp VARCHAR(8) NULL, "
+            "shipped_at DATETIME NOT NULL)"
+        )
+        cur.execute("SELECT @@SESSION.sql_mode")
+        (orig_mode,) = cur.fetchone()
+        try:
+            cur.execute("SET SESSION sql_mode = ''")
+            cur.executemany(
+                f"INSERT INTO `{table}` VALUES (%s, %s, %s)",
+                [
+                    (1, "a", "2024-05-01 10:00:00"),
+                    (2, "b", "0000-00-00 00:00:00"),
+                    (3, None, "2024-05-02 10:00:00"),
+                ],
+            )
+        finally:
+            cur.execute("SET SESSION sql_mode = %s", (orig_mode,))
+    _drop_ch(ch_client, table)
+    try:
+        r = quickhouse.sync(
+            mysql_source, ch_target, dest_table=table, source_table=table, mode="full",
+            key=["id"], order_by=["grp", "id"], not_null=["shipped_at"],
+        )
+        assert (r.rows_read, r.rows_written) == (3, 3)
+        defaulted = sorted((w.column, w.count) for w in r.warnings if w.kind == "null_defaulted")
+        assert defaulted == [("grp", 1), ("shipped_at", 1)]
+        (coerced,) = [w for w in r.warnings if w.kind == "coerced_date"]
+        assert (coerced.column, coerced.count) == ("shipped_at", 1)
+        assert "null_defaulted" in coerced.message, coerced.message
+        rows = ch_client.query(
+            f"SELECT id, grp, toString(shipped_at) FROM `{table}` ORDER BY id"
+        ).result_rows
+        assert [(i, g, s[:19]) for i, g, s in rows] == [
+            (1, "a", "2024-05-01 10:00:00"),
+            (2, "b", "1970-01-01 00:00:00"),
+            (3, "", "2024-05-02 10:00:00"),
+        ]
+    finally:
+        _drop_ch(ch_client, table)

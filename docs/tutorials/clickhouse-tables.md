@@ -205,7 +205,12 @@ PARTITION BY toYYYYMM(created_at)
 ORDER BY id
 ```
 
-Only use `not_null` for a column that really never holds `NULL`.
+Only use `not_null` for a column that really never holds `NULL`. If one turns
+up there anyway, or in an `order_by` column, the row is still written, with the
+column type's default (`''`, `0`, `1970-01-01`) in place of the `NULL`, and the
+run raises a `null_defaulted` warning naming the column. Name it in
+`fail_on_warnings` to stop the run instead
+([Catching bad data](data-quality.md)).
 
 ```{tip}
 Keep partitions large: a month suits most tables. Partitioning by day or hour

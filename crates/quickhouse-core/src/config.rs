@@ -1938,9 +1938,9 @@ pub enum WarningKind {
     /// A date/datetime was coerced to NULL: a zero-date, or a year outside
     /// ClickHouse's representable `[1900, 2299]` window. In a column the
     /// destination can't hold NULL in, the row was left out instead
-    /// ([`WarningKind::NullKey`], [`WarningKind::NullWatermark`]), or, from an
-    /// API source into ClickHouse, the column's default was stored; the
-    /// message says which.
+    /// ([`WarningKind::NullKey`], [`WarningKind::NullWatermark`]), or the
+    /// column type's default was written ([`WarningKind::NullDefaulted`],
+    /// which counts it too); the message says which.
     CoercedDate,
     /// A decimal was coerced to NULL: it exceeded the declared `Decimal(P,S)`
     /// precision, or was NaN/Infinity. In a column the destination can't hold
@@ -1974,6 +1974,20 @@ pub enum WarningKind {
     /// API source stored the type's default (`''`, `0`), so such rows
     /// collapsed into one.
     NullKey,
+    /// A column the plan makes NOT NULL, other than a key or the version
+    /// watermark ([`WarningKind::NullKey`], [`WarningKind::NullWatermark`]),
+    /// was NULL in rows the run read, and the column type's default was
+    /// written in its place: `''`, `0`, `false`, `1970-01-01`, an `Enum`'s
+    /// lowest value, the zero `UUID`. Such a column is one `order_by`,
+    /// `primary_key` or `not_null` names, or a ClickHouse engine's sign or
+    /// version column. `column` is the destination column and `count` the
+    /// rows; the message says which option made it NOT NULL. A value the
+    /// decoder couldn't read counts too (with its `coerced_*` warning).
+    /// Counted while reading, so `fail_on_warnings` acts on it as on
+    /// `NullKey`. Before 0.20.13 a database source or a DataFrame failed the
+    /// write with an Arrow error, and an API source stored the default
+    /// silently.
+    NullDefaulted,
     /// A full refresh left the destination with fewer rows than it had, and
     /// `allow_full_refresh_shrink` permitted it. (Without that flag the same
     /// condition is a hard error, not a warning.)
@@ -2145,6 +2159,7 @@ impl WarningKind {
             WarningKind::CoercedScalar => "coerced_scalar",
             WarningKind::NullWatermark => "null_watermark",
             WarningKind::NullKey => "null_key",
+            WarningKind::NullDefaulted => "null_defaulted",
             WarningKind::FullRefreshShrink => "full_refresh_shrink",
             WarningKind::UnclusteredMergeTarget => "unclustered_merge_target",
             WarningKind::IgnoredSourceArchive => "ignored_source_archive",
@@ -2173,13 +2188,14 @@ impl WarningKind {
     }
 
     /// Every kind, in declaration order.
-    pub const ALL: [WarningKind; 25] = [
+    pub const ALL: [WarningKind; 26] = [
         WarningKind::CollapsedBool,
         WarningKind::CoercedDate,
         WarningKind::CoercedDecimal,
         WarningKind::CoercedScalar,
         WarningKind::NullWatermark,
         WarningKind::NullKey,
+        WarningKind::NullDefaulted,
         WarningKind::FullRefreshShrink,
         WarningKind::UnindexedWatermark,
         WarningKind::UnclusteredMergeTarget,
@@ -2641,6 +2657,7 @@ mod tests {
             | WarningKind::CoercedScalar
             | WarningKind::NullWatermark
             | WarningKind::NullKey
+            | WarningKind::NullDefaulted
             | WarningKind::FullRefreshShrink
             | WarningKind::UnindexedWatermark
             | WarningKind::UnclusteredMergeTarget

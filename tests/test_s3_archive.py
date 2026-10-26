@@ -146,6 +146,35 @@ def test_archive_parquet_matches_clickhouse_single_partition(pg_conn, ch_client,
         _drop_ch(ch_client, table)
 
 
+def test_archive_holds_the_default_written_for_a_null_order_by_value(
+    pg_conn, ch_client, pg_source, s3_client, minio_bucket, unique_name
+):
+    """Issue #53: a NULL in an order_by column is written as the type's
+    default, and the archive holds what was written: the default, in a
+    column the Parquet schema says holds no NULL."""
+    table = unique_name
+    _seed_table(pg_conn, table, 4)
+    with pg_conn.cursor() as cur:
+        cur.execute(f'UPDATE "{table}" SET name = NULL WHERE id IN (2, 4)')
+    _drop_ch(ch_client, table)
+    dst = _archive_target(minio_bucket)
+    try:
+        result = quickhouse.sync(
+            pg_source, dst, dest_table=table, source_table=table, mode="full", key=["id"],
+            order_by=["name", "id"], create_if_missing=True, parallelism=1,
+        )
+        assert result.rows_written == 4
+        defaulted = [(w.column, w.count) for w in result.warnings if w.kind == "null_defaulted"]
+        assert defaulted == [("name", 2)]
+        _, archived = _read_parquet_objects(s3_client, minio_bucket, f"lake/{table}/")
+        assert not archived.schema.field("name").nullable
+        rows = sorted(zip(archived.column("id").to_pylist(), archived.column("name").to_pylist()))
+        assert rows == [(1, "row-1"), (2, ""), (3, "row-3"), (4, "")]
+        assert sorted(ch_client.query(f"SELECT id, name FROM `{table}`").result_rows) == rows
+    finally:
+        _drop_ch(ch_client, table)
+
+
 def test_archive_one_parquet_file_per_partition(pg_conn, ch_client, pg_source, s3_client, minio_bucket, unique_name):
     table = unique_name
     n = 2000

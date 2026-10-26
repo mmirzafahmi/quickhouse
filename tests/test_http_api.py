@@ -329,6 +329,63 @@ def test_fail_on_null_key_stops_an_api_full_refresh_before_the_swap(
         _drop(ch_client, table)
 
 
+@pytest.mark.parametrize("option", [{"order_by": ["grp", "id"]}, {"not_null": ["grp"]}])
+def test_a_missing_value_in_a_not_null_column_lands_as_the_default_with_a_warning(
+    ch_client, ch_target, api_url, unique_name, option
+):
+    """Issue #53: a record with no value for an order_by or not_null column
+    landed with the type's default (''), and nothing said so. It still lands
+    that way, as a database source's row now does, and null_defaulted names
+    the column and counts it."""
+    table = unique_name
+    _drop(ch_client, table)
+    url = api_url([{"id": 1, "grp": "a"}, {"id": 2}, {"id": 3, "grp": "c"}])
+    src = quickhouse.HttpApi(
+        url, columns=[("id", "INTEGER"), ("grp", "STRING")], from_date="2024-01-01"
+    )
+    try:
+        r = quickhouse.sync(
+            src, ch_target, dest_table=table, mode="full", key=["id"], create_if_missing=True,
+            **option,
+        )
+        assert (r.rows_read, r.rows_written) == (3, 3)
+        assert _rows(ch_client, table, "id, grp") == [(1, "a"), (2, ""), (3, "c")]
+        w = _only(r, "null_defaulted")
+        assert (w.column, w.count) == ("grp", 1)
+        assert f"{next(iter(option))} names it" in w.message, w.message
+    finally:
+        _drop(ch_client, table)
+
+
+def test_a_value_that_does_not_parse_in_a_not_null_column_counts_in_both_warnings(
+    ch_client, ch_target, api_url, unique_name
+):
+    """Issue #53: a value the decoder couldn't read in a not_null column is
+    counted by coerced_scalar, and with the missing one by null_defaulted.
+    Each text points at the other rather than repeating it."""
+    table = unique_name
+    _drop(ch_client, table)
+    url = api_url([{"id": 1, "n": 5}, {"id": 2, "n": "x2"}, {"id": 3}])
+    src = quickhouse.HttpApi(
+        url, columns=[("id", "INTEGER"), ("n", "INTEGER")], from_date="2024-01-01"
+    )
+    try:
+        r = quickhouse.sync(
+            src, ch_target, dest_table=table, mode="full", key=["id"], not_null=["n"],
+            create_if_missing=True,
+        )
+        assert _rows(ch_client, table, "id, n") == [(1, 5), (2, 0), (3, 0)]
+        coerced = _only(r, "coerced_scalar")
+        assert (coerced.column, coerced.count) == ("n", 1)
+        assert "coerced to NULL" not in coerced.message, coerced.message
+        assert "null_defaulted" in coerced.message, coerced.message
+        defaulted = _only(r, "null_defaulted")
+        assert (defaulted.column, defaulted.count) == ("n", 2)
+        assert "coerced_" in defaulted.message, defaulted.message
+    finally:
+        _drop(ch_client, table)
+
+
 def test_a_type_override_an_existing_column_ignores_is_reported(
     ch_client, ch_target, api_url, unique_name
 ):
