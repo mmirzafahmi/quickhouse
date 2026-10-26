@@ -9,6 +9,8 @@ any breaking change is called out explicitly.
 
 ## [Unreleased]
 
+## [0.21.0] — 2026-10-26
+
 ### Added
 - **A CSV destination: `quickhouse.Csv(path, *, delimiter=",", header=True,
   compression=None, max_rows_per_file=1_000_000)`.** Every source writes into
