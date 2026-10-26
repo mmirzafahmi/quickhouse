@@ -2471,6 +2471,55 @@ def test_a_type_override_an_existing_column_ignores_is_reported_before_writing(
         _drop_ch(ch_client, table)
 
 
+def test_a_numeric_as_decimal_an_existing_column_ignores_is_reported(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """Issue #52: numeric_as_decimal applies only when quickhouse creates the
+    column, so on a table that already held an unconstrained numeric as
+    Float64 it did nothing, and the run said nothing. It now raises
+    ignored_type_override for that column, but only when the caller passes
+    the setting, and not once an override pins the column's own type."""
+    table = unique_name
+    with pg_conn.cursor() as cur:
+        cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+        cur.execute(f'CREATE TABLE "{table}" (id bigint PRIMARY KEY, amount numeric, qty int)')
+        cur.execute(f'INSERT INTO "{table}" VALUES (1, 1.5, 1), (2, 2.25, 2)')
+    _drop_ch(ch_client, table)
+    kw = dict(dest_table=table, source_table=table, mode="full", key=["id"])
+    try:
+        first = quickhouse.sync(pg_source, ch_target, **kw)
+        assert _ignored_overrides(first) == [], first.warnings
+        assert _ch_type(ch_client, table, "amount") == "Nullable(Float64)"
+
+        r = quickhouse.sync(pg_source, ch_target, numeric_as_decimal="Decimal(38, 9)", **kw)
+        assert r.rows_written == 2
+        (w,) = _ignored_overrides(r)
+        assert (w.column, w.sample, w.count) == ("amount", "Nullable(Float64)", 0)
+        assert w.message.startswith(
+            "numeric_as_decimal asks for column 'amount' to be 'Decimal(38, 9)'"
+        ), w.message
+        assert "type_overrides={'amount': 'Float64'}" in w.message, w.message
+        assert _ch_type(ch_client, table, "amount") == "Nullable(Float64)"
+
+        # Pinning the column's own type, as the message suggests, is quiet.
+        r = quickhouse.sync(
+            pg_source, ch_target, numeric_as_decimal="Decimal(38, 9)",
+            type_overrides={"amount": "Float64"}, **kw,
+        )
+        assert _ignored_overrides(r) == [], r.warnings
+
+        # A table numeric_as_decimal created has the type it asks for.
+        _drop_ch(ch_client, table)
+        for _ in range(2):
+            r = quickhouse.sync(pg_source, ch_target, numeric_as_decimal="Decimal(38, 9)", **kw)
+            assert _ignored_overrides(r) == [], r.warnings
+        assert _ch_type(ch_client, table, "amount") == "Nullable(Decimal(38, 9))"
+    finally:
+        _drop_ch(ch_client, table)
+        with pg_conn.cursor() as cur:
+            cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+
+
 def test_a_type_override_an_existing_column_ignores_is_reported_for_a_frame(
     ch_client, ch_target, unique_name
 ):

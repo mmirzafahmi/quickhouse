@@ -876,14 +876,18 @@ class TransferWarning:
       ``type_overrides`` key and ``sample`` the column's existing type.
       ALTER the column, or drop the table so the next run creates it with
       the override. Both destinations, every source. Raised at setup, before
-      anything is written. New in 0.20.12.
+      anything is written. New in 0.20.12. Since 0.20.13 it is also raised
+      for a column ``numeric_as_decimal`` would type, when that setting is
+      passed and the existing column has another type; ``column`` is then
+      the destination column.
     """
 
     column: Optional[str]
     """The source column responsible, or ``None`` for a table-level condition.
     For ``"unsourced_destination_column"``, the destination column; for
     ``"dropped_source_column"``, the source column's name before ``rename``;
-    for ``"ignored_type_override"``, the ``type_overrides`` key."""
+    for ``"ignored_type_override"``, the ``type_overrides`` key, or the
+    destination column for one ``numeric_as_decimal`` would type."""
 
     count: int
     """How many values/rows tripped it. Aggregated per ``(kind, column)`` across

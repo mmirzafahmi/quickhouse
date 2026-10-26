@@ -55,6 +55,18 @@ any breaking change is called out explicitly.
   message names the default written and leaves why to `null_defaulted`, whose
   message points back at the `coerced_*` warning, rather than both
   explaining it. (#53)
+- **`numeric_as_decimal` on an existing table says when it is ignored.** It
+  only types a column quickhouse creates, so on a table that already held an
+  unconstrained `numeric` as `Float64`, `numeric_as_decimal="Decimal(38, 9)"`
+  left the column `Nullable(Float64)` and the run's warnings empty. It now
+  raises `ignored_type_override` for each column it would have typed whose
+  existing type differs, before anything is written, with `column` the
+  destination column and `sample` its type. It is raised only when the
+  setting is passed, so a `Float64` column kept under the default mapping
+  stays quiet, and not for a column `type_overrides` names, whose own entry
+  is checked as before. On BigQuery the type compared is the one the setting
+  creates (`NUMERIC`). The message suggests pinning the column's type with
+  `type_overrides`, which keeps the setting for the other columns. (#52)
 
 ## [0.20.12] — 2026-10-25
 

@@ -8047,8 +8047,10 @@ async fn warn_on_destination(
 /// that names a column the existing destination already has, as another
 /// type: an override only types a column quickhouse creates. An entry is
 /// matched as the plan matches it, by source name, then by destination name.
-/// Nothing to compare when there are no overrides, so the destination isn't
-/// asked then.
+/// `numeric_as_decimal` is the same kind of setting for every
+/// arbitrary-precision decimal no override names, so each column it types is
+/// checked too (#52). Nothing to compare when there are neither, so the
+/// destination isn't asked then.
 async fn warn_on_ignored_overrides(
     sink: &dyn Sink,
     cfg: &TransferConfig,
@@ -8057,7 +8059,7 @@ async fn warn_on_ignored_overrides(
     warnings: &Warnings,
 ) -> Result<()> {
     use crate::config::DestKind;
-    if overrides.is_empty() {
+    if overrides.is_empty() && cfg.numeric_as_decimal.is_none() {
         return Ok(());
     }
     let Some(existing) = sink.column_types(&cfg.dest_table).await? else {
@@ -8065,11 +8067,24 @@ async fn warn_on_ignored_overrides(
     };
     let kind = sink.dest_kind();
     for (source, column) in plan.source_columns.iter().zip(&plan.dest_columns) {
-        let Some((key, asked)) = overrides
+        let explicit = overrides
             .get_key_value(source)
-            .or_else(|| overrides.get_key_value(&column.name))
-        else {
-            continue;
+            .or_else(|| overrides.get_key_value(&column.name));
+        let (by, key, asked) = match explicit {
+            Some((key, asked)) => (IgnoredBy::TypeOverrides, key.as_str(), asked.as_str()),
+            // `numeric_as_decimal` types an arbitrary-precision decimal that
+            // the plan's own overrides leave alone: `cfg`'s, which for an API
+            // source also hold the declared types it seeds, where the caller's
+            // `overrides` don't.
+            None => {
+                let applies = column.arbitrary_precision_decimal
+                    && !cfg.type_overrides.contains_key(source)
+                    && !cfg.type_overrides.contains_key(&column.name);
+                match cfg.numeric_as_decimal.as_deref().filter(|_| applies) {
+                    Some(nad) => (IgnoredBy::NumericAsDecimal, column.name.as_str(), nad),
+                    None => continue,
+                }
+            }
         };
         // BigQuery column names compare case-insensitively; ClickHouse ones
         // don't, and a column only a case apart is a different column there.
@@ -8085,27 +8100,38 @@ async fn warn_on_ignored_overrides(
         let Some(has) = has else {
             continue;
         };
-        // What the override creates: on ClickHouse the plan's type, which
-        // spells a portable DATETIME/TIMESTAMP as the type it stands for.
-        let wanted = match kind {
-            DestKind::ClickHouse => column.clickhouse_inner.as_str(),
-            DestKind::BigQuery => asked.as_str(),
+        // What the setting creates: on ClickHouse the plan's type, which
+        // spells a portable DATETIME/TIMESTAMP as the type it stands for. On
+        // BigQuery an override is itself a BigQuery type, and
+        // `numeric_as_decimal` (a ClickHouse-style `Decimal(P, S)`) creates
+        // the type the plan's Arrow decimal maps to, as `build_table` does.
+        let wanted = match (kind, by) {
+            (DestKind::ClickHouse, _) => column.clickhouse_inner.clone(),
+            (DestKind::BigQuery, IgnoredBy::TypeOverrides) => asked.to_string(),
+            (DestKind::BigQuery, IgnoredBy::NumericAsDecimal) => {
+                match crate::types::bigquery::arrow_to_bigquery_type(&column.arrow)
+                    .and_then(|t| serde_json::to_value(t).ok())
+                {
+                    Some(serde_json::Value::String(t)) => t,
+                    _ => continue,
+                }
+            }
         };
-        if same_column_type(kind, wanted, has) {
+        if same_column_type(kind, &wanted, has) {
             continue;
         }
         // Spelled differently, it may still be the same type under an alias
         // (`numeric(12, 2)`, `Decimal64(2)`): asked only then.
-        if let Some(canonical) = sink.canonical_type(wanted).await {
+        if let Some(canonical) = sink.canonical_type(&wanted).await {
             if same_column_type(kind, &canonical, has) {
                 continue;
             }
         }
-        let message = ignored_override_message(cfg, key, asked, &column.name, has);
+        let message = ignored_override_message(cfg, by, key, asked, &column.name, has);
         tracing::warn!("{message}");
         warnings.push(TransferWarning {
             kind: WarningKind::IgnoredTypeOverride,
-            column: Some(key.clone()),
+            column: Some(key.to_string()),
             count: 0,
             sample: Some(has.clone()),
             message,
@@ -8183,6 +8209,7 @@ fn normalized_bigquery_type(t: &str) -> String {
 /// (as written, `asked`) of destination column `column`, typed `has`.
 fn ignored_override_message(
     cfg: &TransferConfig,
+    by: IgnoredBy,
     key: &str,
     asked: &str,
     column: &str,
@@ -8193,13 +8220,39 @@ fn ignored_override_message(
     } else {
         format!("column '{key}' (renamed '{column}')")
     };
+    let (option, fix) = match by {
+        IgnoredBy::TypeOverrides => ("type_overrides", "remove the override".to_string()),
+        // The setting types every such column, so removing it isn't the fix
+        // for one; an override with the column's own type keeps it quiet.
+        // An override names the inner type; nullability stays the column's.
+        IgnoredBy::NumericAsDecimal => {
+            let bare = has
+                .strip_prefix("Nullable(")
+                .and_then(|t| t.strip_suffix(')'))
+                .unwrap_or(has);
+            (
+                "numeric_as_decimal",
+                format!(
+                    "name the column in type_overrides with that type, \
+                     type_overrides={{'{column}': '{bare}'}}"
+                ),
+            )
+        }
+    };
     format!(
-        "type_overrides asks for {name} to be '{asked}', but destination '{}' already has it \
-         as '{has}', and type_overrides only applies when quickhouse creates a table or adds a \
-         column, so it stays '{has}'. ALTER the column to change its type, or drop the table so \
-         the next run creates it with the override; if '{has}' is right, remove the override.",
+        "{option} asks for {name} to be '{asked}', but destination '{}' already has it as \
+         '{has}', and {option} only applies when quickhouse creates a table or adds a column, \
+         so it stays '{has}'. ALTER the column to change its type, or drop the table so the next \
+         run creates it with that type; if '{has}' is right, {fix}.",
         cfg.dest_table,
     )
+}
+
+/// Which setting asked for a type an existing column ignores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IgnoredBy {
+    TypeOverrides,
+    NumericAsDecimal,
 }
 
 /// Raise [`WarningKind::UnsourcedDestinationColumn`] for each column of the
@@ -13622,6 +13675,124 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    /// A plan column `numeric_as_decimal` types: an arbitrary-precision decimal
+    /// the plan resolved to `inner` (Arrow `arrow`).
+    fn nad_pcol(name: &str, inner: &str, arrow: DataType) -> ColumnType {
+        ColumnType {
+            clickhouse_inner: inner.into(),
+            arrow,
+            arbitrary_precision_decimal: true,
+            ..pcol(name, 0, true)
+        }
+    }
+
+    /// Issue #52: `numeric_as_decimal` only types a column quickhouse creates,
+    /// so on a table that already had the column as `Float64` it did nothing,
+    /// and the run said nothing. Reported like an ignored `type_overrides`
+    /// entry, only for a column the setting would have typed, and only when
+    /// the caller passed it.
+    #[tokio::test]
+    async fn a_numeric_as_decimal_an_existing_column_ignores_is_reported() {
+        let mut cfg = incremental_cfg();
+        cfg.numeric_as_decimal = Some("Decimal(38, 9)".into());
+        // An API source's declared type, seeded into cfg's overrides (not the
+        // caller's): numeric_as_decimal doesn't type that column.
+        cfg.type_overrides = overrides(&[("declared", "Decimal(12, 2)")]);
+        let dec = DataType::Decimal128(38, 9);
+        let plan = SelectPlan {
+            source_columns: ["id", "amount", "rate", "declared", "plain"]
+                .map(String::from)
+                .to_vec(),
+            source_select_exprs: vec![None; 5],
+            dest_columns: vec![
+                typed_pcol("id", "Int64", false),
+                nad_pcol("amount", "Decimal(38, 9)", dec.clone()),
+                nad_pcol("rate", "Decimal(38, 9)", dec.clone()),
+                nad_pcol("declared", "Decimal(12, 2)", DataType::Decimal128(12, 2)),
+                typed_pcol("plain", "Float64", true),
+            ],
+        };
+        let existing = [
+            ("id", "Int64"),
+            ("amount", "Nullable(Float64)"),
+            ("rate", "Nullable(Decimal(38, 9))"),
+            ("declared", "Nullable(Float64)"),
+            ("plain", "Nullable(Float64)"),
+        ];
+        let sink = SetupSink {
+            columns: Some(overrides(&existing)),
+            ..Default::default()
+        };
+        let w = Warnings::default();
+        warn_on_ignored_overrides(&sink, &cfg, &plan, &overrides(&[]), &w)
+            .await
+            .unwrap();
+        let raised = w.drain();
+        assert_eq!(raised.len(), 1, "{raised:?}");
+        assert_eq!(raised[0].kind, WarningKind::IgnoredTypeOverride);
+        assert_eq!(raised[0].column.as_deref(), Some("amount"));
+        assert_eq!(raised[0].sample.as_deref(), Some("Nullable(Float64)"));
+        let msg = &raised[0].message;
+        assert!(
+            msg.starts_with(
+                "numeric_as_decimal asks for column 'amount' to be 'Decimal(38, 9)', but \
+                 destination 'orders' already has it as 'Nullable(Float64)'"
+            ),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("type_overrides={'amount': 'Float64'}"),
+            "{msg}"
+        );
+
+        // Not passed: nothing to check, and the destination isn't asked.
+        cfg.numeric_as_decimal = None;
+        let sink = SetupSink::default();
+        warn_on_ignored_overrides(&sink, &cfg, &plan, &overrides(&[]), &w)
+            .await
+            .unwrap();
+        assert!(w.drain().is_empty());
+        assert!(sink.calls().is_empty(), "{:?}", sink.calls());
+    }
+
+    /// #52 on BigQuery: `numeric_as_decimal` creates the type its Arrow decimal
+    /// maps to (`NUMERIC`), so an existing `NUMERIC` column is the same type and
+    /// a `FLOAT` one isn't.
+    #[tokio::test]
+    async fn a_numeric_as_decimal_compares_bigquery_types() {
+        let mut cfg = incremental_cfg();
+        cfg.numeric_as_decimal = Some("Decimal(38, 9)".into());
+        let dec = DataType::Decimal128(38, 9);
+        let plan = SelectPlan {
+            source_columns: ["amount", "rate"].map(String::from).to_vec(),
+            source_select_exprs: vec![None; 2],
+            dest_columns: vec![
+                nad_pcol("amount", "Decimal(38, 9)", dec.clone()),
+                nad_pcol("rate", "Decimal(38, 9)", dec),
+            ],
+        };
+        let sink = SetupSink {
+            columns: Some(overrides(&[("amount", "FLOAT"), ("RATE", "NUMERIC")])),
+            bigquery: true,
+            ..Default::default()
+        };
+        let w = Warnings::default();
+        warn_on_ignored_overrides(&sink, &cfg, &plan, &overrides(&[]), &w)
+            .await
+            .unwrap();
+        let raised = w.drain();
+        assert_eq!(raised.len(), 1, "{raised:?}");
+        assert_eq!(raised[0].column.as_deref(), Some("amount"));
+        assert_eq!(raised[0].sample.as_deref(), Some("FLOAT"));
+        assert!(
+            raised[0]
+                .message
+                .contains("type_overrides={'amount': 'FLOAT'}"),
+            "{}",
+            raised[0].message
+        );
     }
 
     /// Issue #50: an override only types a column quickhouse creates, so one

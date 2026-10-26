@@ -646,6 +646,29 @@ def test_a_type_override_an_existing_column_ignores_is_reported_on_bigquery(
     assert types["amount"] == "FLOAT"
 
 
+def test_a_numeric_as_decimal_an_existing_column_ignores_is_reported_on_bigquery(
+    bq, pg_conn, pg_source, bq_target, dest
+):
+    """Issue #52 on a BigQuery destination: numeric_as_decimal creates NUMERIC,
+    so an existing FLOAT column it would have typed is reported before
+    anything is written, and pinning the column's own type keeps it quiet."""
+    _existing_dest(bq, dest)
+    _seed(pg_conn, dest, range(1, 6))
+    with pytest.raises(RuntimeError, match="fail_on_warnings: ignored_type_override") as err:
+        _sync(
+            pg_source, bq_target, dest, numeric_as_decimal="Decimal(38, 9)",
+            fail_on_warnings={"ignored_type_override"},
+        )
+    assert "on column 'amount'" in str(err.value)
+    assert "numeric_as_decimal asks" in str(err.value) and "'FLOAT'" in str(err.value)
+    r = _sync(
+        pg_source, bq_target, dest, numeric_as_decimal="Decimal(38, 9)",
+        type_overrides={"amount": "FLOAT"},
+    )
+    assert r.rows_written == 5
+    assert [w for w in r.warnings if w.kind == "ignored_type_override"] == [], r.warnings
+
+
 def test_a_type_override_an_existing_column_ignores_is_reported_from_a_bigquery_source(
     bq, bq_source, ch_client, ch_target, dest
 ):
