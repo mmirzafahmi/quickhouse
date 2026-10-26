@@ -141,6 +141,12 @@ struct Staged {
     columns: Vec<ManifestColumn>,
     next_part: AtomicU64,
     state: Mutex<StagedState>,
+    /// Set by [`Sink::drop_table`]. Held while a part file is created, so
+    /// once the drop has set it no file appears in `dir`: a failed run's
+    /// writes outlive their aborted tasks (`spawn_blocking` work runs to
+    /// the end), and a part opened during the removal left the folder
+    /// behind ("Directory not empty").
+    dropped: Mutex<bool>,
 }
 
 #[derive(Default)]
@@ -859,6 +865,7 @@ impl Sink for CsvSink {
                     columns,
                     next_part: AtomicU64::new(0),
                     state: Mutex::new(StagedState::default()),
+                    dropped: Mutex::new(false),
                 }),
             );
         Ok(())
@@ -896,6 +903,7 @@ impl Sink for CsvSink {
                     columns,
                     next_part: AtomicU64::new(0),
                     state: Mutex::new(StagedState::default()),
+                    dropped: Mutex::new(false),
                 }),
             );
         Ok(())
@@ -1043,8 +1051,13 @@ impl Sink for CsvSink {
             .remove(table);
         let dir = self.table_dir(table)?;
         blocking(move || {
-            // Close (and so release) whatever parts it still has open.
             if let Some(staged) = &staged {
+                // No part is created from here on, by an insert still running.
+                *staged
+                    .dropped
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = true;
+                // Close (and so release) whatever parts it still has open.
                 let mut st = staged.state.lock().unwrap_or_else(PoisonError::into_inner);
                 st.idle.clear();
             }
@@ -1053,11 +1066,7 @@ impl Sink for CsvSink {
                     return Ok(());
                 }
             }
-            match std::fs::remove_dir_all(&dir) {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(io_error("remove", &dir, e)),
-            }
+            remove_dir(&dir)
         })
         .await
     }
@@ -1297,15 +1306,43 @@ impl Sink for CsvSink {
     }
 }
 
-/// Open `staged`'s next part.
+/// Open `staged`'s next part, unless the table was dropped.
 fn new_part(
     staged: &Staged,
     format: &PartFormat,
     run_id: &str,
     names: &[String],
 ) -> Result<PartWriter> {
+    let dropped = staged
+        .dropped
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if *dropped {
+        return Err(EtlError::internal(format!(
+            "csv destination: a write into '{}' after it was dropped",
+            staged.dir.display()
+        )));
+    }
     let n = staged.next_part.fetch_add(1, Ordering::Relaxed);
     PartWriter::create(&staged.dir, format.file_name(run_id, n), format, names)
+}
+
+/// Remove `dir` and everything in it; missing is fine. Retried a few times:
+/// on Windows a file another handle still has open is removed only once that
+/// handle closes, which a part an aborted insert is finishing does shortly.
+fn remove_dir(dir: &Path) -> Result<()> {
+    let mut tries = 0;
+    loop {
+        match std::fs::remove_dir_all(dir) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(_) if tries < 20 => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => return Err(io_error("remove", dir, e)),
+        }
+    }
 }
 
 impl std::fmt::Debug for CsvSink {
@@ -1520,6 +1557,29 @@ mod tests {
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), before);
         assert_eq!(part_files(&dir), before_parts);
         assert_eq!(manifest(&dir).rows, 3);
+    }
+
+    /// A failed run drops its staging while an insert from an aborted task may
+    /// still be writing (its `spawn_blocking` work runs on). That insert opens
+    /// no new part once the drop starts, so the folder is removed whole.
+    #[tokio::test]
+    async fn an_insert_still_running_after_a_drop_opens_no_part() {
+        let tmp = TempDir::new("late");
+        let mut c = csv_cfg(&tmp.0);
+        c.max_rows_per_file = 2;
+        let sink = CsvSink::new(c).unwrap();
+        let cfg = tcfg("t", SyncMode::Full);
+        sink.create_table("t_tmp", &cols(), &cfg).await.unwrap();
+        let staged = sink.staged("t_tmp").unwrap();
+        sink.drop_table("t_tmp").await.unwrap();
+        assert!(!tmp.0.join("t_tmp").exists());
+        // What the late insert does next: open a part (rotating, or its first).
+        let names = staged.names();
+        let Err(err) = new_part(&staged, &sink.format(), &sink.run_id, &names) else {
+            panic!("a part was opened in a dropped table");
+        };
+        assert!(err.to_string().contains("after it was dropped"), "{err}");
+        assert!(!tmp.0.join("t_tmp").exists());
     }
 
     #[tokio::test]
