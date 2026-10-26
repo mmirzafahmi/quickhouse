@@ -678,8 +678,9 @@ class TransferWarning:
     - ``"coerced_date"`` — a date/datetime became NULL (a zero-date, or a year
       outside ClickHouse's representable 1900-2299 window). In a column the
       destination can't hold NULL in, the message says what happened instead:
-      the row was left out (``"null_key"``, ``"null_watermark"``), or, from an
-      API source into ClickHouse, the column's default was stored (0.20.12).
+      the row was left out (``"null_key"``, ``"null_watermark"``, 0.20.12), or
+      the column type's default was written (``"null_defaulted"``, which
+      counts it too, 0.20.13).
     - ``"coerced_decimal"`` — a decimal became NULL (it exceeded the declared
       ``Decimal(P,S)``, or was NaN/Infinity). In a column the destination
       can't hold NULL in, as for ``"coerced_date"``.
@@ -715,6 +716,21 @@ class TransferWarning:
       collapsed into one. Counted while reading, so ``fail_on_warnings``
       stops a full refresh before its swap and an incremental run before its
       ``MERGE`` or cursor. New in 0.20.12.
+    - ``"null_defaulted"`` — a column the plan makes NOT NULL, other than a
+      ``key`` or the version watermark, was NULL in rows the run read, and the
+      column type's default was written in its place: ``''``, ``0``,
+      ``false``, ``1970-01-01``, an ``Enum``'s lowest value, the zero
+      ``UUID``. Such a column is one ``order_by``, ``primary_key`` or
+      ``not_null`` names, or a ClickHouse engine's sign or version column (a
+      REQUIRED column on BigQuery, which quickhouse creates from the same
+      plan). ``column`` is the destination column and ``count`` the rows; the
+      message says which option made it NOT NULL. A value quickhouse couldn't
+      read there counts too, beside its ``"coerced_*"`` warning. The rows are
+      written, so ``rows_written`` includes them, and an archive holds the
+      default as written. Counted while reading, so ``fail_on_warnings``
+      acts on it as on ``"null_key"``. Every source: a database source or a
+      DataFrame used to fail the write with an Arrow error, and an API source
+      stored the default without a word. New in 0.20.13.
     - ``"full_refresh_shrink"`` — a full refresh left the destination smaller,
       permitted by ``allow_full_refresh_shrink``.
     - ``"unclustered_merge_target"`` — a BigQuery ``MERGE`` ran against a
@@ -860,14 +876,18 @@ class TransferWarning:
       ``type_overrides`` key and ``sample`` the column's existing type.
       ALTER the column, or drop the table so the next run creates it with
       the override. Both destinations, every source. Raised at setup, before
-      anything is written. New in 0.20.12.
+      anything is written. New in 0.20.12. Since 0.20.13 it is also raised
+      for a column ``numeric_as_decimal`` would type, when that setting is
+      passed and the existing column has another type; ``column`` is then
+      the destination column.
     """
 
     column: Optional[str]
     """The source column responsible, or ``None`` for a table-level condition.
     For ``"unsourced_destination_column"``, the destination column; for
     ``"dropped_source_column"``, the source column's name before ``rename``;
-    for ``"ignored_type_override"``, the ``type_overrides`` key."""
+    for ``"ignored_type_override"``, the ``type_overrides`` key, or the
+    destination column for one ``numeric_as_decimal`` would type."""
 
     count: int
     """How many values/rows tripped it. Aggregated per ``(kind, column)`` across
@@ -1376,7 +1396,8 @@ def sync(
       ClickHouse has written its rows, but the cursor isn't saved, so the next
       run reads the same range again. The error names the kind, the column, the
       count and what was left in place. An unknown kind is an error. New in
-      0.20.7. A kind counted while reading, such as ``"null_key"``, is checked
+      0.20.7. A kind counted while reading, such as ``"null_key"`` or
+      ``"null_defaulted"``, is checked
       at the first of those steps after the read; an append, which writes as
       it reads and saves its cursor first, is checked after both.
     - ``column_transforms={col: "<SQL expr>"}`` applies a per-column SQL value
@@ -1417,7 +1438,11 @@ def sync(
       explicitly ``REQUIRED``), the generated ``Nullable(...)`` partition key
       is then rejected by ClickHouse. Only affects DDL generated *before* a
       destination table exists — see the ``engine``/``order_by`` note below
-      for how an existing table's nullability is otherwise handled.
+      for how an existing table's nullability is otherwise handled. A NULL
+      read in such a column, or in an ``order_by``/``primary_key`` one that
+      isn't a ``key``, is written as the column type's default and counted as
+      ``"null_defaulted"`` (0.20.13; before, a database source failed the
+      write).
     - A decimal column that declares its precision (PostgreSQL
       ``numeric(P, S)``, MySQL ``DECIMAL(P, S)``, ``P <= 38``) lands as the
       exact ``Decimal(P, S)`` by default, for a table or column created fresh

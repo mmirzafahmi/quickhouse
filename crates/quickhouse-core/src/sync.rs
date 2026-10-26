@@ -671,12 +671,14 @@ impl WatermarkTracker {
 #[derive(Clone, Default)]
 struct Warnings {
     raw: Arc<Mutex<Vec<TransferWarning>>>,
-    /// Rows [`NullGuard`] left out, per `(kind, column)` in the order first
-    /// met: tallied here batch by batch, rather than pushed as a warning per
-    /// batch, and turned into one warning each when read.
-    left_out: Arc<Mutex<Vec<(WarningKind, String, u64)>>>,
-    /// What became of a coerced value in each destination column that can't
-    /// hold NULL, which the `coerced_*` texts say: see [`NullFate`].
+    /// Rows [`NullGuard`] left out (`null_key`, `null_watermark`) or wrote
+    /// a default into (`null_defaulted`), per `(kind, column)` in the order
+    /// first met: tallied here batch by batch, rather than pushed as a
+    /// warning per batch, and turned into one warning each when read.
+    null_rows: Arc<Mutex<Vec<(WarningKind, String, u64)>>>,
+    /// What became of a NULL in each destination column that can't hold
+    /// one, which the `coerced_*` and `null_defaulted` texts say: see
+    /// [`NullFate`].
     fates: Arc<Mutex<HashMap<String, NullFate>>>,
 }
 
@@ -685,24 +687,27 @@ impl Warnings {
         self.raw.lock().unwrap().push(w);
     }
 
-    /// Count `n` rows [`NullGuard`] left out for a NULL in `column`.
-    fn left_out(&self, kind: WarningKind, column: &str, n: u64) {
+    /// Count `n` rows [`NullGuard`] left out or wrote a default into, for a
+    /// NULL in `column`, under `kind`.
+    fn null_rows(&self, kind: WarningKind, column: &str, n: u64) {
         if n == 0 {
             return;
         }
-        let mut tally = self.left_out.lock().unwrap();
+        let mut tally = self.null_rows.lock().unwrap();
         match tally.iter_mut().find(|(k, c, _)| *k == kind && c == column) {
             Some((_, _, count)) => *count += n,
             None => tally.push((kind, column.to_string(), n)),
         }
     }
 
-    /// Every row [`NullGuard`] has left out so far.
+    /// Every row [`NullGuard`] has left out so far. Not the rows it wrote a
+    /// default into: those were written.
     fn left_out_total(&self) -> u64 {
-        self.left_out
+        self.null_rows
             .lock()
             .unwrap()
             .iter()
+            .filter(|(k, _, _)| *k != WarningKind::NullDefaulted)
             .map(|(_, _, n)| n)
             .sum()
     }
@@ -714,35 +719,39 @@ impl Warnings {
 
     /// [`coercion_message`] for `column`, with what became of its values.
     fn coercion_text(&self, kind: WarningKind, column: &str, n: u64) -> String {
-        let fate = self.fates.lock().unwrap().get(column).copied();
-        coercion_message(kind, column, n, fate)
+        let fate = self.fates.lock().unwrap().get(column).cloned();
+        coercion_message(kind, column, n, fate.as_ref())
     }
 
-    /// Everything collected, the left-out tallies as a warning each, without
-    /// folding.
+    /// Everything collected, the [`Self::null_rows`] tallies as a warning
+    /// each, without folding.
     fn entries(&self, take: bool) -> Vec<TransferWarning> {
-        let (mut raw, left_out) = if take {
+        let (mut raw, null_rows) = if take {
             (
                 std::mem::take(&mut *self.raw.lock().unwrap()),
-                std::mem::take(&mut *self.left_out.lock().unwrap()),
+                std::mem::take(&mut *self.null_rows.lock().unwrap()),
             )
         } else {
             (
                 self.raw.lock().unwrap().clone(),
-                self.left_out.lock().unwrap().clone(),
+                self.null_rows.lock().unwrap().clone(),
             )
         };
-        raw.extend(
-            left_out
-                .into_iter()
-                .map(|(kind, column, count)| TransferWarning {
-                    kind,
-                    message: null_guard::left_out_message(kind, &column, count),
-                    column: Some(column),
-                    count,
-                    sample: None,
-                }),
-        );
+        let fates = self.fates.lock().unwrap();
+        raw.extend(null_rows.into_iter().map(|(kind, column, count)| {
+            let message = if kind == WarningKind::NullDefaulted {
+                null_guard::defaulted_message(&column, count, fates.get(&column))
+            } else {
+                null_guard::left_out_message(kind, &column, count)
+            };
+            TransferWarning {
+                kind,
+                message,
+                column: Some(column),
+                count,
+                sample: None,
+            }
+        }));
         raw
     }
 
@@ -810,7 +819,7 @@ impl Warnings {
             .iter()
             .any(|w| w.kind == kind && w.column.as_deref() == column)
             || self
-                .left_out
+                .null_rows
                 .lock()
                 .unwrap()
                 .iter()
@@ -1117,10 +1126,11 @@ struct SendCtx {
     /// that land there, which a retried attempt writes again (see
     /// [`run_transfer`]).
     landed: Option<Arc<AtomicU64>>,
-    /// `Some` when the plan has a `key`, or a watermark the destination can't
-    /// hold NULL in: every batch goes through its filter on the way out,
-    /// whatever the source. Decoders build batches with
-    /// [`Self::decode_columns`] so a NULL there reaches it.
+    /// `Some` when the plan has a `key`, a watermark the destination can't
+    /// hold NULL in, or another column an option makes NOT NULL (`order_by`,
+    /// `primary_key`, `not_null`, an engine parameter): every batch goes
+    /// through its filter on the way out, whatever the source. Decoders build
+    /// batches with [`Self::decode_columns`] so a NULL there reaches it.
     null_guard: Option<Arc<NullGuard>>,
 }
 
@@ -1157,11 +1167,12 @@ struct InsertBuffer {
     /// sends mid-statement, which [`SendCtx::push_batch`] needs to avoid a
     /// deadlock.
     deferred: bool,
-    /// While `deferred`, the rows [`NullGuard`] left out of the statements
-    /// read since the last [`ReadOut::between_windows`], not yet counted as
-    /// warnings: a window that fails and is read again drops them with its
-    /// rows ([`Self::truncate`]), so its rows count once.
-    left_out: Vec<(WarningKind, String, u64)>,
+    /// While `deferred`, the rows [`NullGuard`] left out of (or wrote a
+    /// default into in) the statements read since the last
+    /// [`ReadOut::between_windows`], not yet counted as warnings: a window
+    /// that fails and is read again drops them with its rows
+    /// ([`Self::truncate`]), so its rows count once.
+    null_rows: Vec<(WarningKind, String, u64)>,
 }
 
 /// A point in an [`InsertBuffer`] to roll back to: see [`InsertBuffer::truncate`].
@@ -1169,7 +1180,7 @@ struct InsertBuffer {
 struct BufferMark {
     takes: u64,
     len: usize,
-    left_out: usize,
+    null_rows: usize,
 }
 
 impl InsertBuffer {
@@ -1182,7 +1193,7 @@ impl InsertBuffer {
             target,
             takes: 0,
             deferred: false,
-            left_out: Vec::new(),
+            null_rows: Vec::new(),
         }
     }
 
@@ -1219,7 +1230,7 @@ impl InsertBuffer {
         BufferMark {
             takes: self.takes,
             len: self.batches.len(),
-            left_out: self.left_out.len(),
+            null_rows: self.null_rows.len(),
         }
     }
 
@@ -1227,8 +1238,8 @@ impl InsertBuffer {
     /// of a window that failed and is read again. When the buffer was sent
     /// since, everything in it now came after `mark`. What was sent can't be
     /// taken back, which is no different from a window with a buffer of its
-    /// own. The rows that window left out are dropped from the tally too: a
-    /// send doesn't report them, so all since `mark` are its own.
+    /// own. The rows that window left out or defaulted are dropped from the
+    /// tally too: a send doesn't report them, so all since `mark` are its own.
     fn truncate(&mut self, mark: BufferMark) {
         let keep = if mark.takes == self.takes {
             mark.len.min(self.batches.len())
@@ -1239,7 +1250,7 @@ impl InsertBuffer {
         self.reservations.truncate(keep);
         self.sizes.truncate(keep);
         self.bytes = self.sizes.iter().sum();
-        self.left_out.truncate(mark.left_out);
+        self.null_rows.truncate(mark.null_rows);
     }
 }
 
@@ -1275,9 +1286,10 @@ impl<C> ReadOut<C> {
 
     /// Between two windows of a sweep: send the buffer if it is full, and
     /// surface an insert that failed, rather than at the end of the sweep.
-    /// The window before it succeeded, so the rows it left out are counted.
+    /// The window before it succeeded, so the rows it left out or defaulted
+    /// are counted.
     async fn between_windows(&mut self, ctx: &SendCtx) -> Result<()> {
-        ctx.report_left_out(&mut self.insert_buf);
+        ctx.report_null_rows(&mut self.insert_buf);
         if self.insert_buf.full() {
             if let Some(schema) = self.schema.clone() {
                 ctx.flush(&mut self.sends, &mut self.insert_buf, schema)
@@ -1289,7 +1301,7 @@ impl<C> ReadOut<C> {
 
     /// Send what is still buffered and wait for every insert to land.
     async fn finish(mut self, ctx: &SendCtx) -> Result<()> {
-        ctx.report_left_out(&mut self.insert_buf);
+        ctx.report_null_rows(&mut self.insert_buf);
         if let Some(schema) = self.schema.take() {
             ctx.flush(&mut self.sends, &mut self.insert_buf, schema)
                 .await;
@@ -1357,9 +1369,10 @@ impl SendCtx {
     /// will release them — and only then wait.
     ///
     /// Also where [`NullGuard`] leaves out the rows the destination can't hold
-    /// (a NULL key, or a NULL watermark where the destination's can't be), and
-    /// counts them as warnings that the next `fail_on_warnings` checkpoint
-    /// sees.
+    /// (a NULL key, or a NULL watermark where the destination's can't be),
+    /// writes the column type's default in place of a NULL in another column
+    /// that can't be NULL, and counts both as warnings that the next
+    /// `fail_on_warnings` checkpoint sees.
     async fn push_batch(
         &self,
         sends: &mut JoinSet<Result<()>>,
@@ -1376,23 +1389,20 @@ impl SendCtx {
         }
         let batch = match &self.null_guard {
             Some(guard) => {
-                let (kept, left_out) = guard.filter(batch)?;
-                for (g, n) in guard.columns().iter().zip(left_out) {
-                    if n == 0 {
-                        continue;
-                    }
+                let filtered = guard.filter(batch)?;
+                for (kind, column, n) in guard.tallies(&filtered) {
                     // A window of a sweep can fail and be read again: its
                     // count waits for it to succeed (`ReadOut::between_windows`).
                     if buffer.deferred {
-                        buffer.left_out.push((g.kind, g.column.clone(), n));
+                        buffer.null_rows.push((kind, column.to_string(), n));
                     } else {
-                        self.warnings.left_out(g.kind, &g.column, n);
+                        self.warnings.null_rows(kind, column, n);
                     }
                 }
-                if kept.num_rows() == 0 {
+                if filtered.batch.num_rows() == 0 {
                     return Ok(());
                 }
-                kept
+                filtered.batch
             }
             None => batch,
         };
@@ -1412,12 +1422,12 @@ impl SendCtx {
         Ok(())
     }
 
-    /// Count the rows a deferred `buffer` holds back as left out (see
-    /// [`InsertBuffer::left_out`]), once the statements they came from have
-    /// succeeded.
-    fn report_left_out(&self, buffer: &mut InsertBuffer) {
-        for (kind, column, n) in buffer.left_out.drain(..) {
-            self.warnings.left_out(kind, &column, n);
+    /// Count the rows a deferred `buffer` holds back as left out or
+    /// defaulted (see [`InsertBuffer::null_rows`]), once the statements they
+    /// came from have succeeded.
+    fn report_null_rows(&self, buffer: &mut InsertBuffer) {
+        for (kind, column, n) in buffer.null_rows.drain(..) {
+            self.warnings.null_rows(kind, &column, n);
         }
     }
 
@@ -1478,7 +1488,8 @@ struct ArchiveRunInfo {
     /// Every upload this attempt starts; see [`run_transfer_attempt`].
     uploads: ArchiveUploads,
     /// The run's [`NullGuard`], so a file holds the rows the destination is
-    /// sent, typed as it types them, and not the rows the guard leaves out.
+    /// sent, typed as it types them: not the rows the guard leaves out, and
+    /// the default it writes in place of a NULL, not the NULL.
     null_guard: Option<Arc<NullGuard>>,
 }
 
@@ -1529,19 +1540,27 @@ impl ArchiveRunInfo {
     }
 }
 
-/// `batch` as the destination is sent it: without the rows `guard` leaves out.
+/// `batch` as the destination is sent it: without the rows `guard` leaves out,
+/// and with the defaults it writes in place of a NULL.
 fn archived_rows<'a>(
     guard: Option<&NullGuard>,
     batch: &'a RecordBatch,
 ) -> Result<Cow<'a, RecordBatch>> {
     match guard {
-        Some(g) => Ok(Cow::Owned(g.filter(batch.clone())?.0)),
+        Some(g) => Ok(Cow::Owned(g.filter(batch.clone())?.batch)),
         None => Ok(Cow::Borrowed(batch)),
     }
 }
 
+/// What becomes of a NULL in each column `guard` checks (none without one),
+/// for the warning texts.
+fn null_fates(guard: Option<&NullGuard>) -> HashMap<String, NullFate> {
+    guard.map(NullGuard::fates).unwrap_or_default()
+}
+
 /// One partition's archive file. It holds what the destination is sent, so
-/// the rows [`NullGuard`] leaves out aren't archived either.
+/// the rows [`NullGuard`] leaves out aren't archived either, and a default it
+/// writes in place of a NULL is archived as written.
 struct ArchiveFile {
     writer: ArchiveWriter,
     null_guard: Option<Arc<NullGuard>>,
@@ -2235,8 +2254,8 @@ async fn run_transfer_impl(
         crate::source::postgres::pin_transformed_wire_types(&mut plan);
     }
     let plan = Arc::new(plan);
-    let null_guard = NullGuard::new(&plan, &cfg).map(Arc::new);
-    warnings.set_null_fates(null_guard::null_fates(&plan, null_guard.as_deref(), false));
+    let null_guard = NullGuard::new(&plan, &cfg, sink.dest_kind()).map(Arc::new);
+    warnings.set_null_fates(null_fates(null_guard.as_deref()));
     let archive_info = archive_info.map(|a| a.with_null_guard(null_guard.clone()));
 
     // When the `MAX(watermark)` probe was skipped as too costly, the cursor has
@@ -3027,8 +3046,8 @@ async fn run_transfer_bigquery(
     tracing::info!("resolved {} source column(s)", source_cols.len());
 
     let plan: SelectPlan = transform::plan(&source_cols, &cfg, sink.dest_kind())?;
-    let null_guard = NullGuard::new(&plan, &cfg).map(Arc::new);
-    warnings.set_null_fates(null_guard::null_fates(&plan, null_guard.as_deref(), false));
+    let null_guard = NullGuard::new(&plan, &cfg, sink.dest_kind()).map(Arc::new);
+    warnings.set_null_fates(null_fates(null_guard.as_deref()));
     let archive_info = archive_info.map(|a| a.with_null_guard(null_guard.clone()));
 
     let mut discarded_state = false;
@@ -3652,16 +3671,11 @@ async fn run_transfer_api(
     {
         warn_mixed_decimals(&cfg.dest_table, &decimal, &float, &warnings);
     }
-    // The API decoder declares every column nullable, so a NULL in a column
-    // the guard doesn't check reaches a ClickHouse destination, which stores
-    // the column's default in its place (see `NullFate::Default`).
-    let null_guard = NullGuard::new(&plan, &cfg).map(Arc::new);
-    let defaults_null = sink.dest_kind() == crate::config::DestKind::ClickHouse;
-    warnings.set_null_fates(null_guard::null_fates(
-        &plan,
-        null_guard.as_deref(),
-        defaults_null,
-    ));
+    // The API decoder declares every column nullable, so every column the
+    // plan makes NOT NULL is one the guard checks: a key, a version
+    // watermark, or one an option names (see `NullGuard::new`).
+    let null_guard = NullGuard::new(&plan, &cfg, sink.dest_kind()).map(Arc::new);
+    warnings.set_null_fates(null_fates(null_guard.as_deref()));
     let archive_info = archive_info.map(|a| a.with_null_guard(null_guard.clone()));
 
     // Per-output-column lookup path, aligned to `plan.source_columns` (which
@@ -4152,12 +4166,13 @@ async fn run_transfer_frame(
     // claim about *this* frame that the next one breaks (run 1 has no nulls in
     // `amount`, run 2 does, and the second fails the Arrow schema-consistency
     // check). `key`/`order_by`/`primary_key`/`not_null` still force NOT NULL
-    // where it is actually required, and a row with a NULL key is left out
-    // (see `NullGuard`).
+    // where it is actually required: a row with a NULL key is left out, and
+    // a NULL in one of the others is written as the type's default (see
+    // `NullGuard`).
     let plan: SelectPlan = transform::plan_with(&source_cols, &cfg, sink.dest_kind(), true)?;
     let plan = Arc::new(plan);
-    let null_guard = NullGuard::new(&plan, &cfg).map(Arc::new);
-    warnings.set_null_fates(null_guard::null_fates(&plan, null_guard.as_deref(), false));
+    let null_guard = NullGuard::new(&plan, &cfg, sink.dest_kind()).map(Arc::new);
+    warnings.set_null_fates(null_fates(null_guard.as_deref()));
     let archive_info = archive_info.map(|a| a.with_null_guard(null_guard.clone()));
 
     // `include=`/`exclude=` become an Arrow column projection, applied by the
@@ -6867,9 +6882,10 @@ async fn transfer_partition_clickhouse(
 ///
 /// `fate` is what became of a value read as NULL in a column the destination
 /// can't hold NULL in (`None`: the column holds NULL, and the value landed as
-/// one), so the text never claims a NULL landed where the row was left out or
-/// the column's default was stored instead (#49).
-fn coercion_message(kind: WarningKind, column: &str, n: u64, fate: Option<NullFate>) -> String {
+/// one), so the text never claims a NULL landed where the row was left out
+/// (#49) or the column type's default was written instead (#53). The warning
+/// that counts the row says why the column can't be NULL; this one names it.
+fn coercion_message(kind: WarningKind, column: &str, n: u64, fate: Option<&NullFate>) -> String {
     let became = match fate {
         None => "coerced to NULL".to_string(),
         Some(NullFate::LeftOut(counted)) => format!(
@@ -6877,10 +6893,10 @@ fn coercion_message(kind: WarningKind, column: &str, n: u64, fate: Option<NullFa
              holding them were left out (counted in {})",
             counted.as_str()
         ),
-        Some(NullFate::Default) => format!(
-            "could not be read, and the destination's '{column}' can't be NULL, so ClickHouse \
-             stored the column's default there instead (for a column with no DEFAULT, the \
-             type's: 1970-01-01, 0 or '')"
+        Some(NullFate::Default { shown, .. }) => format!(
+            "could not be read, and the destination's '{column}' can't be NULL, so {shown}, the \
+             column type's default, was written in their place (counted in null_defaulted too, \
+             which says why)"
         ),
     };
     match kind {
@@ -6909,6 +6925,7 @@ fn coercion_message(kind: WarningKind, column: &str, n: u64, fate: Option<NullFa
         // know the numbers that make them concrete.
         WarningKind::NullWatermark
         | WarningKind::NullKey
+        | WarningKind::NullDefaulted
         | WarningKind::FullRefreshShrink
         | WarningKind::UnclusteredMergeTarget
         | WarningKind::IncompleteExport
@@ -6969,7 +6986,9 @@ fn report_coercions(scope: &str, entries: Vec<(WarningKind, String, u64)>, warni
                 Some(NullFate::LeftOut(k)) => {
                     format!("{c} ({n}, rows left out: {})", k.as_str())
                 }
-                Some(NullFate::Default) => format!("{c} ({n}, stored as the column's default)"),
+                Some(NullFate::Default { shown, .. }) => {
+                    format!("{c} ({n}, written as {shown}: null_defaulted)")
+                }
             })
             .collect::<Vec<_>>()
             .join(", ");
@@ -8028,8 +8047,10 @@ async fn warn_on_destination(
 /// that names a column the existing destination already has, as another
 /// type: an override only types a column quickhouse creates. An entry is
 /// matched as the plan matches it, by source name, then by destination name.
-/// Nothing to compare when there are no overrides, so the destination isn't
-/// asked then.
+/// `numeric_as_decimal` is the same kind of setting for every
+/// arbitrary-precision decimal no override names, so each column it types is
+/// checked too (#52). Nothing to compare when there are neither, so the
+/// destination isn't asked then.
 async fn warn_on_ignored_overrides(
     sink: &dyn Sink,
     cfg: &TransferConfig,
@@ -8038,7 +8059,7 @@ async fn warn_on_ignored_overrides(
     warnings: &Warnings,
 ) -> Result<()> {
     use crate::config::DestKind;
-    if overrides.is_empty() {
+    if overrides.is_empty() && cfg.numeric_as_decimal.is_none() {
         return Ok(());
     }
     let Some(existing) = sink.column_types(&cfg.dest_table).await? else {
@@ -8046,11 +8067,24 @@ async fn warn_on_ignored_overrides(
     };
     let kind = sink.dest_kind();
     for (source, column) in plan.source_columns.iter().zip(&plan.dest_columns) {
-        let Some((key, asked)) = overrides
+        let explicit = overrides
             .get_key_value(source)
-            .or_else(|| overrides.get_key_value(&column.name))
-        else {
-            continue;
+            .or_else(|| overrides.get_key_value(&column.name));
+        let (by, key, asked) = match explicit {
+            Some((key, asked)) => (IgnoredBy::TypeOverrides, key.as_str(), asked.as_str()),
+            // `numeric_as_decimal` types an arbitrary-precision decimal that
+            // the plan's own overrides leave alone: `cfg`'s, which for an API
+            // source also hold the declared types it seeds, where the caller's
+            // `overrides` don't.
+            None => {
+                let applies = column.arbitrary_precision_decimal
+                    && !cfg.type_overrides.contains_key(source)
+                    && !cfg.type_overrides.contains_key(&column.name);
+                match cfg.numeric_as_decimal.as_deref().filter(|_| applies) {
+                    Some(nad) => (IgnoredBy::NumericAsDecimal, column.name.as_str(), nad),
+                    None => continue,
+                }
+            }
         };
         // BigQuery column names compare case-insensitively; ClickHouse ones
         // don't, and a column only a case apart is a different column there.
@@ -8066,27 +8100,38 @@ async fn warn_on_ignored_overrides(
         let Some(has) = has else {
             continue;
         };
-        // What the override creates: on ClickHouse the plan's type, which
-        // spells a portable DATETIME/TIMESTAMP as the type it stands for.
-        let wanted = match kind {
-            DestKind::ClickHouse => column.clickhouse_inner.as_str(),
-            DestKind::BigQuery => asked.as_str(),
+        // What the setting creates: on ClickHouse the plan's type, which
+        // spells a portable DATETIME/TIMESTAMP as the type it stands for. On
+        // BigQuery an override is itself a BigQuery type, and
+        // `numeric_as_decimal` (a ClickHouse-style `Decimal(P, S)`) creates
+        // the type the plan's Arrow decimal maps to, as `build_table` does.
+        let wanted = match (kind, by) {
+            (DestKind::ClickHouse, _) => column.clickhouse_inner.clone(),
+            (DestKind::BigQuery, IgnoredBy::TypeOverrides) => asked.to_string(),
+            (DestKind::BigQuery, IgnoredBy::NumericAsDecimal) => {
+                match crate::types::bigquery::arrow_to_bigquery_type(&column.arrow)
+                    .and_then(|t| serde_json::to_value(t).ok())
+                {
+                    Some(serde_json::Value::String(t)) => t,
+                    _ => continue,
+                }
+            }
         };
-        if same_column_type(kind, wanted, has) {
+        if same_column_type(kind, &wanted, has) {
             continue;
         }
         // Spelled differently, it may still be the same type under an alias
         // (`numeric(12, 2)`, `Decimal64(2)`): asked only then.
-        if let Some(canonical) = sink.canonical_type(wanted).await {
+        if let Some(canonical) = sink.canonical_type(&wanted).await {
             if same_column_type(kind, &canonical, has) {
                 continue;
             }
         }
-        let message = ignored_override_message(cfg, key, asked, &column.name, has);
+        let message = ignored_override_message(cfg, by, key, asked, &column.name, has);
         tracing::warn!("{message}");
         warnings.push(TransferWarning {
             kind: WarningKind::IgnoredTypeOverride,
-            column: Some(key.clone()),
+            column: Some(key.to_string()),
             count: 0,
             sample: Some(has.clone()),
             message,
@@ -8164,6 +8209,7 @@ fn normalized_bigquery_type(t: &str) -> String {
 /// (as written, `asked`) of destination column `column`, typed `has`.
 fn ignored_override_message(
     cfg: &TransferConfig,
+    by: IgnoredBy,
     key: &str,
     asked: &str,
     column: &str,
@@ -8174,13 +8220,39 @@ fn ignored_override_message(
     } else {
         format!("column '{key}' (renamed '{column}')")
     };
+    let (option, fix) = match by {
+        IgnoredBy::TypeOverrides => ("type_overrides", "remove the override".to_string()),
+        // The setting types every such column, so removing it isn't the fix
+        // for one; an override with the column's own type keeps it quiet.
+        // An override names the inner type; nullability stays the column's.
+        IgnoredBy::NumericAsDecimal => {
+            let bare = has
+                .strip_prefix("Nullable(")
+                .and_then(|t| t.strip_suffix(')'))
+                .unwrap_or(has);
+            (
+                "numeric_as_decimal",
+                format!(
+                    "name the column in type_overrides with that type, \
+                     type_overrides={{'{column}': '{bare}'}}"
+                ),
+            )
+        }
+    };
     format!(
-        "type_overrides asks for {name} to be '{asked}', but destination '{}' already has it \
-         as '{has}', and type_overrides only applies when quickhouse creates a table or adds a \
-         column, so it stays '{has}'. ALTER the column to change its type, or drop the table so \
-         the next run creates it with the override; if '{has}' is right, remove the override.",
+        "{option} asks for {name} to be '{asked}', but destination '{}' already has it as \
+         '{has}', and {option} only applies when quickhouse creates a table or adds a column, \
+         so it stays '{has}'. ALTER the column to change its type, or drop the table so the next \
+         run creates it with that type; if '{has}' is right, {fix}.",
         cfg.dest_table,
     )
+}
+
+/// Which setting asked for a type an existing column ignores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IgnoredBy {
+    TypeOverrides,
+    NumericAsDecimal,
 }
 
 /// Raise [`WarningKind::UnsourcedDestinationColumn`] for each column of the
@@ -13158,6 +13230,7 @@ mod tests {
         for c in &mut cols {
             c.nullable = false;
         }
+        cols[1].clickhouse_inner = "String".into();
         let plan = SelectPlan {
             source_columns: vec!["id".into(), "code".into(), "ts".into()],
             source_select_exprs: vec![None; 3],
@@ -13203,7 +13276,7 @@ mod tests {
     async fn push_batch_leaves_out_null_keys_and_watermarks_and_counts_them() {
         let (plan, mut cfg) = null_guard_plan();
         let sink = Arc::new(Collecting::default());
-        let guard = NullGuard::new(&plan, &cfg).map(Arc::new);
+        let guard = NullGuard::new(&plan, &cfg, crate::config::DestKind::ClickHouse).map(Arc::new);
         let mut ctx = send_ctx(sink.clone(), None);
         ctx.null_guard = guard;
         ctx.watermark_max = WatermarkTracker::new("ts", &plan, false).map(Arc::new);
@@ -13289,7 +13362,8 @@ mod tests {
         let (plan, cfg) = null_guard_plan();
         let sink = Arc::new(Collecting::default());
         let mut ctx = send_ctx(sink.clone(), None);
-        ctx.null_guard = NullGuard::new(&plan, &cfg).map(Arc::new);
+        ctx.null_guard =
+            NullGuard::new(&plan, &cfg, crate::config::DestKind::ClickHouse).map(Arc::new);
         let mut sends = JoinSet::new();
         let mut buf = InsertBuffer::new(1 << 30);
         buf.deferred = true;
@@ -13306,7 +13380,7 @@ mod tests {
         ctx.push_batch(&mut sends, &mut buf, schema.clone(), window())
             .await
             .unwrap();
-        ctx.report_left_out(&mut buf);
+        ctx.report_null_rows(&mut buf);
         let out = ctx.warnings.drain();
         assert_eq!(out.len(), 1);
         assert_eq!((out[0].kind, out[0].count), (WarningKind::NullKey, 1));
@@ -13335,12 +13409,88 @@ mod tests {
         assert!(ctx.warnings.drain().is_empty());
     }
 
+    /// Issue #53: a NULL in a column an option makes NOT NULL (here
+    /// `order_by`) is written as the type's default, sent typed as the
+    /// destination has it, and counted where `fail_on_warnings` looks. A row
+    /// written that way isn't one left out, which the full-refresh shrink
+    /// check reports.
+    #[tokio::test]
+    async fn push_batch_writes_the_default_for_a_null_in_an_order_by_column_and_counts_it() {
+        let (plan, mut cfg) = null_guard_plan();
+        cfg.key = vec![];
+        cfg.watermark = None;
+        cfg.order_by = vec!["code".into()];
+        let sink = Arc::new(Collecting::default());
+        let mut ctx = send_ctx(sink.clone(), None);
+        ctx.null_guard =
+            NullGuard::new(&plan, &cfg, crate::config::DestKind::ClickHouse).map(Arc::new);
+        ctx.warnings
+            .set_null_fates(null_fates(ctx.null_guard.as_deref()));
+        let mut sends = JoinSet::new();
+        let mut buf = InsertBuffer::new(1 << 30);
+        let rows = [
+            (1, Some("a"), Some(1)),
+            (2, None, Some(2)),
+            (3, None, Some(3)),
+        ];
+        let batch = decoded(&ctx, &plan, &rows);
+        let schema = batch.schema();
+        assert!(schema.field(1).is_nullable());
+        ctx.push_batch(&mut sends, &mut buf, schema.clone(), batch)
+            .await
+            .unwrap();
+        ctx.flush(&mut sends, &mut buf, schema).await;
+        reap(&mut sends, true).await.unwrap();
+
+        let sent = sink.0.lock().unwrap().clone();
+        let (schema, batches) = &sent[0];
+        assert!(!schema.field(1).is_nullable());
+        let codes = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
+        assert_eq!(
+            codes.iter().collect::<Vec<_>>(),
+            [Some("a"), Some(""), Some("")]
+        );
+        assert_eq!(ctx.counters.rows_written.load(Ordering::Relaxed), 3);
+        assert_eq!(ctx.warnings.left_out_total(), 0);
+
+        cfg.fail_on_warnings = vec![WarningKind::NullDefaulted];
+        let err = check_fatal(&cfg, sink.as_ref(), &ctx.warnings, Before::Swap)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with(
+                "fail_on_warnings: null_defaulted on column 'code' (count 2) stopped the run"
+            ),
+            "{err}"
+        );
+        let out = ctx.warnings.drain();
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            (out[0].kind, out[0].column.as_deref(), out[0].count),
+            (WarningKind::NullDefaulted, Some("code"), 2)
+        );
+        assert!(
+            out[0].message.contains("written with ''"),
+            "{}",
+            out[0].message
+        );
+        assert!(
+            out[0].message.contains("order_by names it"),
+            "{}",
+            out[0].message
+        );
+    }
+
     #[test]
     fn left_out_rows_fold_into_one_warning_per_column() {
         let w = Warnings::default();
-        w.left_out(WarningKind::NullKey, "code", 2);
-        w.left_out(WarningKind::NullKey, "code", 3);
-        w.left_out(WarningKind::NullKey, "code", 0);
+        w.null_rows(WarningKind::NullKey, "code", 2);
+        w.null_rows(WarningKind::NullKey, "code", 3);
+        w.null_rows(WarningKind::NullKey, "code", 0);
         assert!(w.contains(WarningKind::NullKey, Some("code")));
         assert!(!w.contains(WarningKind::NullKey, Some("id")));
         assert_eq!(w.left_out_total(), 5);
@@ -13362,7 +13512,7 @@ mod tests {
     fn a_counted_null_watermark_and_a_left_out_one_keep_both_sentences() {
         let w = Warnings::default();
         warn_on_null_watermark("ts", 7, &w);
-        w.left_out(WarningKind::NullWatermark, "ts", 2);
+        w.null_rows(WarningKind::NullWatermark, "ts", 2);
         let out = w.drain();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].count, 9);
@@ -13373,14 +13523,14 @@ mod tests {
         // A read with no watermark at all isn't reported on top of it.
         let mut cfg = crate::config::default_test_config();
         cfg.watermark = Some("ts".into());
-        w.left_out(WarningKind::NullWatermark, "ts", 2);
+        w.null_rows(WarningKind::NullWatermark, "ts", 2);
         warn_on_unwatermarked_read(&cfg, 2, &w);
         assert_eq!(w.drain().len(), 1);
     }
 
-    /// Issue #49: a coercion in a column whose NULL rows are left out, or
-    /// whose NULL ClickHouse fills with a default, doesn't say the value was
-    /// coerced to NULL.
+    /// Issues #49 and #53: a coercion in a column whose NULL rows are left
+    /// out, or whose NULL is written as the type's default, doesn't say the
+    /// value was coerced to NULL.
     #[test]
     fn a_coercion_says_what_became_of_the_value() {
         let w = Warnings::default();
@@ -13390,7 +13540,13 @@ mod tests {
                 NullFate::LeftOut(WarningKind::NullWatermark),
             ),
             ("code".to_string(), NullFate::LeftOut(WarningKind::NullKey)),
-            ("sort".to_string(), NullFate::Default),
+            (
+                "sort".to_string(),
+                NullFate::Default {
+                    by: crate::null_guard::NotNullBy::OrderBy,
+                    shown: "1970-01-01".into(),
+                },
+            ),
         ]));
         for part in ["a", "b"] {
             report_coercions(
@@ -13422,7 +13578,11 @@ mod tests {
         assert!(msg("code").contains("left out (counted in null_key)"));
         assert!(!msg("code").contains("coerced to NULL"));
         let sort = msg("sort");
-        assert!(sort.contains("stored the column's default"), "{sort}");
+        assert!(
+            sort.contains("so 1970-01-01, the column type's default, was written"),
+            "{sort}"
+        );
+        assert!(sort.contains("null_defaulted"), "{sort}");
         assert!(!sort.contains("coerced to NULL"), "{sort}");
         // A column that holds NULL got one.
         assert!(msg("seen").ends_with("coerced to NULL"), "{}", msg("seen"));
@@ -13431,7 +13591,7 @@ mod tests {
     #[test]
     fn the_archive_holds_the_rows_the_destination_is_sent() {
         let (plan, cfg) = null_guard_plan();
-        let guard = NullGuard::new(&plan, &cfg).unwrap();
+        let guard = NullGuard::new(&plan, &cfg, crate::config::DestKind::ClickHouse).unwrap();
         let mut ctx = send_ctx(Arc::new(Collecting::default()), None);
         ctx.null_guard = Some(Arc::new(guard.clone()));
         let batch = decoded(&ctx, &plan, &[(1, Some("a"), Some(1)), (2, None, Some(2))]);
@@ -13439,6 +13599,34 @@ mod tests {
         let kept = archived_rows(Some(&guard), &batch).unwrap();
         assert_eq!(kept.num_rows(), 1);
         assert!(!kept.schema().field(1).is_nullable());
+    }
+
+    /// Issue #53: a NULL the guard writes a default for is archived as that
+    /// default, as the destination holds it.
+    #[test]
+    fn the_archive_holds_the_default_the_destination_is_written() {
+        let (plan, mut cfg) = null_guard_plan();
+        cfg.key = vec!["id".into()];
+        cfg.order_by = vec!["code".into(), "id".into()];
+        let guard = NullGuard::new(&plan, &cfg, crate::config::DestKind::ClickHouse).unwrap();
+        let mut ctx = send_ctx(Arc::new(Collecting::default()), None);
+        ctx.null_guard = Some(Arc::new(guard.clone()));
+        let rows = [
+            (1, Some("a"), Some(1)),
+            (2, None, Some(2)),
+            (3, Some("c"), None),
+        ];
+        let batch = decoded(&ctx, &plan, &rows);
+        let archived = archived_rows(Some(&guard), &batch).unwrap();
+        // Row 3's watermark is NULL: left out of the archive as of the write.
+        assert_eq!(archived.num_rows(), 2);
+        assert!(archived.schema().fields().iter().all(|f| !f.is_nullable()));
+        let codes = archived
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
+        assert_eq!(codes.iter().collect::<Vec<_>>(), [Some("a"), Some("")]);
     }
 
     /// Issue #50: the message said a first run with no cursor writes the
@@ -13487,6 +13675,124 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    /// A plan column `numeric_as_decimal` types: an arbitrary-precision decimal
+    /// the plan resolved to `inner` (Arrow `arrow`).
+    fn nad_pcol(name: &str, inner: &str, arrow: DataType) -> ColumnType {
+        ColumnType {
+            clickhouse_inner: inner.into(),
+            arrow,
+            arbitrary_precision_decimal: true,
+            ..pcol(name, 0, true)
+        }
+    }
+
+    /// Issue #52: `numeric_as_decimal` only types a column quickhouse creates,
+    /// so on a table that already had the column as `Float64` it did nothing,
+    /// and the run said nothing. Reported like an ignored `type_overrides`
+    /// entry, only for a column the setting would have typed, and only when
+    /// the caller passed it.
+    #[tokio::test]
+    async fn a_numeric_as_decimal_an_existing_column_ignores_is_reported() {
+        let mut cfg = incremental_cfg();
+        cfg.numeric_as_decimal = Some("Decimal(38, 9)".into());
+        // An API source's declared type, seeded into cfg's overrides (not the
+        // caller's): numeric_as_decimal doesn't type that column.
+        cfg.type_overrides = overrides(&[("declared", "Decimal(12, 2)")]);
+        let dec = DataType::Decimal128(38, 9);
+        let plan = SelectPlan {
+            source_columns: ["id", "amount", "rate", "declared", "plain"]
+                .map(String::from)
+                .to_vec(),
+            source_select_exprs: vec![None; 5],
+            dest_columns: vec![
+                typed_pcol("id", "Int64", false),
+                nad_pcol("amount", "Decimal(38, 9)", dec.clone()),
+                nad_pcol("rate", "Decimal(38, 9)", dec.clone()),
+                nad_pcol("declared", "Decimal(12, 2)", DataType::Decimal128(12, 2)),
+                typed_pcol("plain", "Float64", true),
+            ],
+        };
+        let existing = [
+            ("id", "Int64"),
+            ("amount", "Nullable(Float64)"),
+            ("rate", "Nullable(Decimal(38, 9))"),
+            ("declared", "Nullable(Float64)"),
+            ("plain", "Nullable(Float64)"),
+        ];
+        let sink = SetupSink {
+            columns: Some(overrides(&existing)),
+            ..Default::default()
+        };
+        let w = Warnings::default();
+        warn_on_ignored_overrides(&sink, &cfg, &plan, &overrides(&[]), &w)
+            .await
+            .unwrap();
+        let raised = w.drain();
+        assert_eq!(raised.len(), 1, "{raised:?}");
+        assert_eq!(raised[0].kind, WarningKind::IgnoredTypeOverride);
+        assert_eq!(raised[0].column.as_deref(), Some("amount"));
+        assert_eq!(raised[0].sample.as_deref(), Some("Nullable(Float64)"));
+        let msg = &raised[0].message;
+        assert!(
+            msg.starts_with(
+                "numeric_as_decimal asks for column 'amount' to be 'Decimal(38, 9)', but \
+                 destination 'orders' already has it as 'Nullable(Float64)'"
+            ),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("type_overrides={'amount': 'Float64'}"),
+            "{msg}"
+        );
+
+        // Not passed: nothing to check, and the destination isn't asked.
+        cfg.numeric_as_decimal = None;
+        let sink = SetupSink::default();
+        warn_on_ignored_overrides(&sink, &cfg, &plan, &overrides(&[]), &w)
+            .await
+            .unwrap();
+        assert!(w.drain().is_empty());
+        assert!(sink.calls().is_empty(), "{:?}", sink.calls());
+    }
+
+    /// #52 on BigQuery: `numeric_as_decimal` creates the type its Arrow decimal
+    /// maps to (`NUMERIC`), so an existing `NUMERIC` column is the same type and
+    /// a `FLOAT` one isn't.
+    #[tokio::test]
+    async fn a_numeric_as_decimal_compares_bigquery_types() {
+        let mut cfg = incremental_cfg();
+        cfg.numeric_as_decimal = Some("Decimal(38, 9)".into());
+        let dec = DataType::Decimal128(38, 9);
+        let plan = SelectPlan {
+            source_columns: ["amount", "rate"].map(String::from).to_vec(),
+            source_select_exprs: vec![None; 2],
+            dest_columns: vec![
+                nad_pcol("amount", "Decimal(38, 9)", dec.clone()),
+                nad_pcol("rate", "Decimal(38, 9)", dec),
+            ],
+        };
+        let sink = SetupSink {
+            columns: Some(overrides(&[("amount", "FLOAT"), ("RATE", "NUMERIC")])),
+            bigquery: true,
+            ..Default::default()
+        };
+        let w = Warnings::default();
+        warn_on_ignored_overrides(&sink, &cfg, &plan, &overrides(&[]), &w)
+            .await
+            .unwrap();
+        let raised = w.drain();
+        assert_eq!(raised.len(), 1, "{raised:?}");
+        assert_eq!(raised[0].column.as_deref(), Some("amount"));
+        assert_eq!(raised[0].sample.as_deref(), Some("FLOAT"));
+        assert!(
+            raised[0]
+                .message
+                .contains("type_overrides={'amount': 'FLOAT'}"),
+            "{}",
+            raised[0].message
+        );
     }
 
     /// Issue #50: an override only types a column quickhouse creates, so one

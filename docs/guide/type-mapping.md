@@ -216,6 +216,14 @@ isn't reported: `Decimal(12,2)` for a `Nullable(Decimal(12, 2))` column,
 `FLOAT`. To get the override's type, `ALTER` the column, or drop the table and
 let the next run create it.
 
+`numeric_as_decimal` works the same way: it types the arbitrary-precision
+decimals of a table quickhouse creates, and leaves an existing column as it is.
+Passed for a destination whose column already has another type, such as a
+`Float64` from before the setting was used, it raises the same
+`ignored_type_override` for that column, with `column` the destination column.
+To keep the existing type and the setting for other columns, pin the column
+with `type_overrides`, for example `type_overrides={"amount": "Float64"}`.
+
 ## Not yet supported
 
 Arrays and composite (`RECORD`/`STRUCT`) types aren't mapped yet. For API sources,

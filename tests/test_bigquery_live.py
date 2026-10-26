@@ -646,6 +646,29 @@ def test_a_type_override_an_existing_column_ignores_is_reported_on_bigquery(
     assert types["amount"] == "FLOAT"
 
 
+def test_a_numeric_as_decimal_an_existing_column_ignores_is_reported_on_bigquery(
+    bq, pg_conn, pg_source, bq_target, dest
+):
+    """Issue #52 on a BigQuery destination: numeric_as_decimal creates NUMERIC,
+    so an existing FLOAT column it would have typed is reported before
+    anything is written, and pinning the column's own type keeps it quiet."""
+    _existing_dest(bq, dest)
+    _seed(pg_conn, dest, range(1, 6))
+    with pytest.raises(RuntimeError, match="fail_on_warnings: ignored_type_override") as err:
+        _sync(
+            pg_source, bq_target, dest, numeric_as_decimal="Decimal(38, 9)",
+            fail_on_warnings={"ignored_type_override"},
+        )
+    assert "on column 'amount'" in str(err.value)
+    assert "numeric_as_decimal asks" in str(err.value) and "'FLOAT'" in str(err.value)
+    r = _sync(
+        pg_source, bq_target, dest, numeric_as_decimal="Decimal(38, 9)",
+        type_overrides={"amount": "FLOAT"},
+    )
+    assert r.rows_written == 5
+    assert [w for w in r.warnings if w.kind == "ignored_type_override"] == [], r.warnings
+
+
 def test_a_type_override_an_existing_column_ignores_is_reported_from_a_bigquery_source(
     bq, bq_source, ch_client, ch_target, dest
 ):
@@ -671,5 +694,106 @@ def test_a_type_override_an_existing_column_ignores_is_reported_from_a_bigquery_
         assert r.rows_written == 3
         got = [(w.column, w.sample) for w in r.warnings if w.kind == "ignored_type_override"]
         assert got == [("id", "Int64")], r.warnings
+    finally:
+        ch_client.command(f"DROP TABLE IF EXISTS `{dest}`")
+
+
+def _seed_null_grp(pg_conn, table):
+    """`grp`, `amt`, `ts` and `flag` NULL on id 2; `grp` NULL on id 4 too."""
+    with pg_conn.cursor() as cur:
+        cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+        cur.execute(
+            f'CREATE TABLE "{table}" (id bigint PRIMARY KEY, grp text, amt numeric(10, 2), '
+            "ts timestamp, flag boolean, write_date timestamp NOT NULL)"
+        )
+        cur.execute(
+            f"INSERT INTO \"{table}\" VALUES "
+            "(1, 'a', 1.50, '2024-05-01 10:00', true, '2024-01-01'), "
+            "(2, NULL, NULL, NULL, NULL, '2024-01-02'), "
+            "(3, 'c', 3.25, '2024-05-03 10:00', false, '2024-01-03'), "
+            "(4, NULL, 4.00, '2024-05-04 10:00', true, '2024-01-04')"
+        )
+
+
+def _defaulted(r):
+    return sorted((w.column, w.count) for w in r.warnings if w.kind == "null_defaulted")
+
+
+@pytest.mark.parametrize("write_method", ["storage_write", "insert_all"])
+def test_a_null_in_a_required_column_is_written_as_its_default(
+    bq, pg_conn, pg_source, dest, write_method
+):
+    """Issue #53 on BigQuery: quickhouse creates an order_by or not_null
+    column REQUIRED, and a NULL there failed the write with an Arrow error.
+    BigQuery fills no default for a NULL in a REQUIRED column, so quickhouse
+    writes the type's own: '' for STRING, 0 for NUMERIC, false for BOOL, the
+    epoch for DATETIME. null_defaulted counts each column."""
+    _seed_null_grp(pg_conn, dest)
+    target = quickhouse.BigQuery(
+        project_id=BQ_PROJECT, dataset_id=BQ_DATASET, write_method=write_method
+    )
+    r = quickhouse.sync(
+        pg_source, target, dest_table=dest, source_table=dest, mode="full", key=["id"],
+        order_by=["grp"], not_null=["amt", "ts", "flag"], create_if_missing=True,
+    )
+    assert (r.rows_read, r.rows_written) == (4, 4)
+    assert _defaulted(r) == [("amt", 1), ("flag", 1), ("grp", 2), ("ts", 1)]
+    modes = {f.name: f.mode for f in bq.get_table(_fq(bq, dest).strip("`")).schema}
+    assert {modes[c] for c in ("grp", "amt", "ts", "flag")} == {"REQUIRED"}, modes
+    got = _rows(
+        bq,
+        f"SELECT id, grp, CAST(amt AS STRING) AS amt, CAST(ts AS STRING) AS ts, flag "
+        f"FROM {_fq(bq, dest)} ORDER BY id",
+    )
+    assert [(x.id, x.grp, x.amt, x.ts, x.flag) for x in got] == [
+        (1, "a", "1.5", "2024-05-01 10:00:00", True),
+        (2, "", "0", "1970-01-01 00:00:00", False),
+        (3, "c", "3.25", "2024-05-03 10:00:00", False),
+        (4, "", "4", "2024-05-04 10:00:00", True),
+    ]
+
+
+def test_a_merge_writes_the_default_for_a_null_in_a_not_null_column(
+    bq, pg_conn, pg_source, bq_target, dest
+):
+    """Issue #53 through a BigQuery MERGE: a row read with a NULL in a
+    not_null column is inserted, and later updated, with the default there,
+    and each run counts what it read. fail_on_warnings stops the run before
+    its MERGE."""
+    _seed_null_grp(pg_conn, dest)
+    r = _sync(pg_source, bq_target, dest, not_null=["grp"])
+    assert (r.rows_read, r.rows_written) == (4, 4)
+    assert _defaulted(r) == [("grp", 2)]
+    with pg_conn.cursor() as cur:
+        cur.execute(f"UPDATE \"{dest}\" SET grp = NULL, write_date = '2024-02-01' WHERE id = 1")
+    with pytest.raises(RuntimeError, match="fail_on_warnings: null_defaulted on column 'grp'"):
+        _sync(pg_source, bq_target, dest, not_null=["grp"], fail_on_warnings={"null_defaulted"})
+    assert _rows(bq, f"SELECT grp FROM {_fq(bq, dest)} WHERE id = 1")[0].grp == "a"
+    r = _sync(pg_source, bq_target, dest, not_null=["grp"])
+    assert (r.rows_read, r.rows_written) == (1, 1)
+    assert _defaulted(r) == [("grp", 1)]
+    got = _rows(bq, f"SELECT id, grp FROM {_fq(bq, dest)} ORDER BY id")
+    assert [(x.id, x.grp) for x in got] == [(1, ""), (2, ""), (3, "c"), (4, "")]
+
+
+def test_a_bigquery_source_writes_the_default_for_a_null_order_by_value(
+    bq, bq_source, ch_client, ch_target, dest
+):
+    """Issue #53 on the BigQuery-source flow, into ClickHouse: a NULL in an
+    order_by column failed the write with an Arrow error."""
+    bq.query(
+        f"CREATE OR REPLACE TABLE {_fq(bq, dest)} (id INT64, grp STRING) AS "
+        "SELECT * FROM UNNEST([STRUCT(1 AS id, 'a' AS grp), STRUCT(2, NULL), STRUCT(3, 'c')])"
+    ).result()
+    ch_client.command(f"DROP TABLE IF EXISTS `{dest}`")
+    try:
+        r = quickhouse.sync(
+            bq_source, ch_target, dest_table=dest, source_table=f"{BQ_DATASET}.{dest}",
+            mode="full", key=["id"], order_by=["grp", "id"], create_if_missing=True,
+        )
+        assert (r.rows_read, r.rows_written) == (3, 3)
+        assert _defaulted(r) == [("grp", 1)]
+        rows = ch_client.query(f"SELECT id, grp FROM `{dest}` ORDER BY id").result_rows
+        assert rows == [(1, "a"), (2, ""), (3, "c")]
     finally:
         ch_client.command(f"DROP TABLE IF EXISTS `{dest}`")

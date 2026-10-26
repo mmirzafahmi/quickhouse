@@ -601,6 +601,52 @@ def test_a_null_key_is_left_out_with_a_null_key_warning(
         _drop(ch_client, src, dst)
 
 
+def test_a_null_enum_low_cardinality_or_uuid_order_by_column_lands_as_its_default(
+    ch_client, ch_source, ch_target, unique_name
+):
+    """Issue #53: a Nullable source column in order_by failed the read, since
+    the source was asked to cast its NULL to a type that can't hold one. The
+    row lands now with the destination type's own default, which for an Enum
+    is its lowest value and for a UUID the zero UUID (neither reads from ''),
+    and null_defaulted counts each column."""
+    src, dst = f"{unique_name}_src", unique_name
+    _drop(ch_client, src, dst)
+    ch_client.command(
+        f"CREATE TABLE `{src}` (id Int64, e Nullable(Enum8('b' = 2, 'a' = 1)), "
+        "lc LowCardinality(Nullable(String)), u Nullable(UUID)) ENGINE = MergeTree ORDER BY id"
+    )
+    ch_client.command(
+        f"INSERT INTO `{src}` VALUES (1, 'b', 'x', '11111111-1111-1111-1111-111111111111'), "
+        "(2, NULL, NULL, NULL)"
+    )
+    try:
+        r = quickhouse.sync(
+            ch_source, ch_target, source_table=src, dest_table=dst, mode="full", key=["id"],
+            order_by=["e", "lc", "u", "id"], create_if_missing=True,
+        )
+        assert (r.rows_read, r.rows_written) == (2, 2)
+        defaulted = sorted((w.column, w.count) for w in r.warnings if w.kind == "null_defaulted")
+        assert defaulted == [("e", 1), ("lc", 1), ("u", 1)]
+        types = dict(
+            ch_client.query(
+                "SELECT name, type FROM system.columns WHERE database = currentDatabase() "
+                f"AND table = '{dst}'"
+            ).result_rows
+        )
+        assert types["e"] == "Enum8('a' = 1, 'b' = 2)"
+        assert types["lc"] == "LowCardinality(String)"
+        assert types["u"] == "UUID"
+        rows = ch_client.query(
+            f"SELECT id, toString(e), lc, toString(u) FROM `{dst}` ORDER BY id"
+        ).result_rows
+        assert rows == [
+            (1, "b", "x", "11111111-1111-1111-1111-111111111111"),
+            (2, "a", "", "00000000-0000-0000-0000-000000000000"),
+        ]
+    finally:
+        _drop(ch_client, src, dst)
+
+
 def test_a_nullable_watermark_reads_into_a_replacing_merge_tree(
     ch_client, ch_source, ch_target, unique_name
 ):

@@ -82,7 +82,7 @@ names; the wording of the messages can change between versions.
 
 ### The warnings worth knowing
 
-quickhouse has more than twenty kinds of warning. These six mean your data
+quickhouse has more than twenty kinds of warning. These seven mean your data
 changed, so they deserve the most attention:
 
 - **`null_watermark`**: some rows have an empty (`NULL`) watermark, so an
@@ -91,6 +91,10 @@ changed, so they deserve the most attention:
 - **`null_key`**: some rows have an empty (`NULL`) value in a `key` column, so
   they were left out: a key can't be empty in the destination. `count` says
   how many.
+- **`null_defaulted`**: some rows have an empty (`NULL`) value in a column the
+  destination can't leave empty, such as one in `order_by` or `not_null`, so
+  the column type's default (`''`, `0`, `1970-01-01`) was written there
+  instead. The rows are kept; the message names the column and the option.
 - **`collapsed_bool`**: a MySQL `tinyint(1)` held numbers other than 0 and 1,
   and they were squeezed into true/false, as you just saw.
 - **`coerced_decimal`**: a decimal number didn't fit the column's declared size
@@ -98,7 +102,8 @@ changed, so they deserve the most attention:
 - **`coerced_date`**: a date couldn't be stored, such as MySQL's `0000-00-00` or
   a year outside ClickHouse's range of 1900 to 2299, so it was stored as
   `NULL`. In a key or watermark column that can't be `NULL`, the row is left
-  out instead, and the message says so.
+  out instead, and in another column that can't be `NULL` the type's default
+  is written (`null_defaulted`); the message says which.
 - **`full_refresh_shrink`**: a full refresh left the table smaller than before.
   You only see it when you allowed that with `allow_full_refresh_shrink=True`.
 
@@ -218,8 +223,9 @@ No warnings, and `priority` holds 0, 1, 2 and 3 again.
 
 ```{tip}
 A good starting set for `fail_on_warnings` is the warnings that mean data was
-lost: `null_watermark`, `null_key`, `collapsed_bool`, `coerced_decimal`,
-`coerced_date`, `dropped_source_column` and `unsourced_destination_column`.
+lost: `null_watermark`, `null_key`, `null_defaulted`, `collapsed_bool`,
+`coerced_decimal`, `coerced_date`, `dropped_source_column` and
+`unsourced_destination_column`.
 Leave out any you've decided to accept, such as `coerced_date` on a legacy
 table you know is full of `0000-00-00` dates.
 ```

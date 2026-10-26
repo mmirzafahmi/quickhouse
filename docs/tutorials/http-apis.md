@@ -166,7 +166,8 @@ phones that were offline. It never reaches back before `from_date`.
   `NULL`. Usually a sign that a column's type or path is wrong.
 - **`null_key`**: records with no value in a `key` column were left out, since
   a key can't be empty. Check the column's path, or pick a key every record
-  has.
+  has. A record with no value in an `order_by` or `not_null` column is kept,
+  with the type's default there, and counted in `null_defaulted`.
 
 Your credentials stay hidden: `print(src)` shows the account ID and passcode
 as `***`.
