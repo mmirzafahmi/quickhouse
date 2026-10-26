@@ -9,6 +9,8 @@ any breaking change is called out explicitly.
 
 ## [Unreleased]
 
+## [0.20.13] — 2026-10-26
+
 ### Changed — please read before upgrading
 - **A NULL in an `order_by`, `primary_key` or `not_null` column is written as
   the column type's default, and counted in a new warning, `null_defaulted`,
