@@ -621,6 +621,45 @@ pub struct BigQueryDestConfig {
     pub archive: Option<ArchiveConfig>,
 }
 
+/// Compression of the part files a CSV destination writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CsvCompression {
+    /// Plain `.csv` files.
+    #[default]
+    None,
+    /// One gzip member per part, `.csv.gz`.
+    Gzip,
+}
+
+impl CsvCompression {
+    /// How the manifest and error messages name it: `None` or `"gzip"`, as
+    /// the Python descriptor takes it.
+    pub fn label(&self) -> Option<&'static str> {
+        match self {
+            CsvCompression::None => None,
+            CsvCompression::Gzip => Some("gzip"),
+        }
+    }
+}
+
+/// Where to write to, when the destination is CSV files on a local path
+/// (new in 0.21.0). Each table is a folder, `<path>/<dest_table>/`, holding one
+/// or more part files and a `_quickhouse_manifest.json`; see
+/// [`crate::sink::csv`] for the layout, the format and the swap.
+#[derive(Debug, Clone)]
+pub struct CsvDestConfig {
+    /// The root folder. Created on the first write when it doesn't exist.
+    pub path: std::path::PathBuf,
+    /// The field delimiter: one ASCII character other than `"`, CR or LF.
+    pub delimiter: u8,
+    /// Write the column names as the first row of every part.
+    pub header: bool,
+    pub compression: CsvCompression,
+    /// A part file closes and the next one opens after this many rows, so a
+    /// large table never becomes one huge file. At least 1.
+    pub max_rows_per_file: u64,
+}
+
 /// Which destination engine to write to. Mirrors [`SourceConfig`]. `sync.rs`
 /// builds the matching [`crate::sink::Sink`] from this and dispatches DDL,
 /// inserts, atomic full-refresh swap, and incremental watermark state through
@@ -629,6 +668,7 @@ pub struct BigQueryDestConfig {
 pub enum DestinationConfig {
     ClickHouse(ClickHouseConfig),
     BigQuery(BigQueryDestConfig),
+    Csv(CsvDestConfig),
 }
 
 impl DestinationConfig {
@@ -637,6 +677,7 @@ impl DestinationConfig {
         match self {
             DestinationConfig::ClickHouse(_) => "clickhouse",
             DestinationConfig::BigQuery(_) => "bigquery",
+            DestinationConfig::Csv(_) => "csv",
         }
     }
 
@@ -644,16 +685,19 @@ impl DestinationConfig {
         match self {
             DestinationConfig::ClickHouse(_) => DestKind::ClickHouse,
             DestinationConfig::BigQuery(_) => DestKind::BigQuery,
+            DestinationConfig::Csv(_) => DestKind::Csv,
         }
     }
 
     /// The optional Parquet data-lake archive, whichever destination this is.
-    /// Both destinations archive identically, so `sync.rs` reads it through
-    /// here rather than matching on the variant.
+    /// Both database destinations archive identically, so `sync.rs` reads it
+    /// through here rather than matching on the variant. A CSV destination
+    /// takes no archive: it is files already.
     pub fn archive(&self) -> Option<&ArchiveConfig> {
         match self {
             DestinationConfig::ClickHouse(c) => c.archive.as_ref(),
             DestinationConfig::BigQuery(c) => c.archive.as_ref(),
+            DestinationConfig::Csv(_) => None,
         }
     }
 }
@@ -666,17 +710,29 @@ impl DestinationConfig {
 pub enum DestKind {
     ClickHouse,
     BigQuery,
+    /// CSV files (0.21.0). Every column can be empty, so the plan makes none
+    /// NOT NULL, and there are no column types to keep.
+    Csv,
 }
 
 /// Full-refresh reloads everything; Incremental upserts rows past a watermark;
-/// Append inserts rows past a watermark WITHOUT staging/merge/dedup (a
-/// bronze-landing write — the caller de-duplicates downstream). Append is
-/// currently supported only for HTTP API sources.
+/// Append inserts rows past a watermark WITHOUT merge/dedup (a bronze-landing
+/// write — the caller de-duplicates downstream). Append is supported for HTTP
+/// API and DataFrame sources into any destination, and for database sources
+/// into a CSV destination, which can't upsert.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncMode {
     Full,
     Incremental,
     Append,
+}
+
+impl SyncMode {
+    /// Whether a run in this mode reads past a saved cursor and saves a new
+    /// one: incremental and append. A full refresh reads everything.
+    pub fn keeps_cursor(self) -> bool {
+        matches!(self, SyncMode::Incremental | SyncMode::Append)
+    }
 }
 
 /// How to seed the incremental cursor on the **first** run for a state
@@ -1434,8 +1490,8 @@ impl TransferConfig {
             return e.clone();
         }
         match self.mode {
-            // Append is API-only (BigQuery dest, no engine concept); a plain
-            // MergeTree is the sensible fallback for the ClickHouse-DDL path.
+            // Append never upserts, so a plain MergeTree is the sensible
+            // engine for the ClickHouse-DDL path.
             SyncMode::Full | SyncMode::Append => "MergeTree".to_string(),
             SyncMode::Incremental => "ReplacingMergeTree".to_string(),
         }
@@ -1571,7 +1627,25 @@ impl TransferConfig {
         self.validate_impl(SourceShape::Frame)
     }
 
+    /// The validation for a `shape` source writing into a `dest` destination:
+    /// the shape's own rules ([`Self::validate`], [`Self::validate_api`],
+    /// [`Self::validate_frame`]), except that a database source may append
+    /// into a CSV destination. CSV can't upsert, so append is how it keeps a
+    /// cursor (0.21.0). The CSV destination's own option checks are
+    /// [`crate::sink::csv::refuse_unsupported_options`].
+    pub fn validate_for(&self, shape: SourceShape, dest: DestKind) -> crate::error::Result<()> {
+        self.validate_with(shape, dest == DestKind::Csv)
+    }
+
     fn validate_impl(&self, shape: SourceShape) -> crate::error::Result<()> {
+        self.validate_with(shape, false)
+    }
+
+    fn validate_with(
+        &self,
+        shape: SourceShape,
+        db_append_allowed: bool,
+    ) -> crate::error::Result<()> {
         use crate::error::EtlError;
         let noun = shape.label();
         if shape == SourceShape::Db && self.source_table.is_none() && self.source_query.is_none() {
@@ -1641,13 +1715,15 @@ impl TransferConfig {
                 "lookback_seconds only applies to incremental mode",
             ));
         }
-        // Append is a bronze-landing write: no staging, no merge, no swap. It
-        // makes sense wherever the caller already knows the rows are new — an
-        // API window, or a frame they just built.
-        if self.mode == SyncMode::Append && shape == SourceShape::Db {
+        // Append is a bronze-landing write: no merge, no swap. It makes sense
+        // wherever the caller already knows the rows are new — an API window,
+        // or a frame they just built — and from a database source into a CSV
+        // destination, which can't upsert.
+        if self.mode == SyncMode::Append && shape == SourceShape::Db && !db_append_allowed {
             return Err(EtlError::config(
                 "append mode is currently supported only for HTTP API sources \
-                 (CleverTap/AppsFlyer) and DataFrame sources",
+                 (CleverTap/AppsFlyer/HttpApi), DataFrame sources, and a database source into \
+                 a CSV destination",
             ));
         }
         if shape == SourceShape::Frame {

@@ -183,6 +183,12 @@ pub async fn reconcile_keys(
     // Same one-time rustls provider selection every entry point needs; see
     // `sync::run_transfer_impl` for why it lives at the entry point.
     let _ = rustls::crypto::ring::default_provider().install_default();
+    if let DestinationConfig::Csv(_) = &dest {
+        return Err(EtlError::config(
+            "reconcile_keys is not supported for a CSV destination: it reads the destination's \
+             keys with a query, and part files have none to run",
+        ));
+    }
     cfg.validate()?;
     // Before the destination is read, so an unsupported source is what the
     // error names, not whatever the destination read failed on first (#45).

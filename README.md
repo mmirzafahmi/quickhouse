@@ -1,6 +1,6 @@
 # quickhouse
 
-**Move tables from PostgreSQL, MySQL, BigQuery, or ClickHouse into ClickHouse or BigQuery — fast, in one function call.**
+**Move tables from PostgreSQL, MySQL, BigQuery, or ClickHouse into ClickHouse, BigQuery or CSV files — fast, in one function call.**
 
 quickhouse is a small, typed Python API on top of a native Rust engine. You
 hand it a source, a destination, and a table name; it figures out the schema,
@@ -29,7 +29,7 @@ print(result)   # rows_read, rows_written, bytes_written, duration_secs, new_wat
 ### When to use quickhouse
 
 Reach for it when you want to move whole tables — full refresh or incremental —
-from PostgreSQL/MySQL/BigQuery/ClickHouse into ClickHouse or BigQuery, fast, from your own
+from PostgreSQL/MySQL/BigQuery/ClickHouse into ClickHouse, BigQuery or CSV files, fast, from your own
 Python jobs with almost no setup. It fits cron/Airflow/Dagster tasks and one-off
 backfills well.
 
@@ -40,19 +40,21 @@ source↔destination pairs — quickhouse deliberately supports a focused, fast 
 
 ### Supported sources and destinations
 
-| Source | → ClickHouse | → BigQuery |
-|---|:--:|:--:|
-| PostgreSQL | ✅ | ✅ |
-| MySQL | ✅ | ✅ |
-| BigQuery | ✅ | ✅ |
-| ClickHouse | ✅ | ✅ |
-| CleverTap (HTTP API) | ✅ | ✅ |
-| AppsFlyer (HTTP API) | ✅ | ✅ |
-| pandas / polars / pyarrow DataFrame | ✅ | ✅ |
+| Source | → ClickHouse | → BigQuery | → CSV files |
+|---|:--:|:--:|:--:|
+| PostgreSQL | ✅ | ✅ | ✅ |
+| MySQL | ✅ | ✅ | ✅ |
+| BigQuery | ✅ | ✅ | ✅ |
+| ClickHouse | ✅ | ✅ | ✅ |
+| CleverTap (HTTP API) | ✅ | ✅ | ✅ |
+| AppsFlyer (HTTP API) | ✅ | ✅ | ✅ |
+| pandas / polars / pyarrow DataFrame | ✅ | ✅ | ✅ |
 
 BigQuery and ClickHouse are each both a source and a destination — so a
 cross-cluster ClickHouse copy, or publishing a ClickHouse mart into BigQuery,
-is an ordinary `sync()`. Some knobs are engine-specific: `column_transforms` /
+is an ordinary `sync()`. CSV files (new in 0.21.0) are a destination: a folder
+of part files per table on a local path, written by `mode="full"` or
+`mode="append"` (`quickhouse.Csv("/data/exports")`). Some knobs are engine-specific: `column_transforms` /
 `read_max_rows_per_sec` apply to the PostgreSQL, MySQL and ClickHouse sources;
 `merge_prune_partition_by` /
 `delete_stale_in_window` apply to BigQuery-destination incremental syncs.

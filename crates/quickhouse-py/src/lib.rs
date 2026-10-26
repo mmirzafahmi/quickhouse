@@ -1,8 +1,9 @@
 //! PyO3 bindings for quickhouse-core.
 //!
-//! Exposes `Postgres`, `MySQL`, `BigQuery`, `ClickHouse`, `sync(...)`, and the
-//! result/progress types. `BigQuery` and `ClickHouse` each double as either a
-//! source or a destination for `sync()` (see their doc comments). The transfer
+//! Exposes `Postgres`, `MySQL`, `BigQuery`, `ClickHouse`, `Csv`, `sync(...)`,
+//! and the result/progress types. `BigQuery` and `ClickHouse` each double as
+//! either a source or a destination for `sync()` (see their doc comments);
+//! `Csv` is a destination only. The transfer
 //! runs on a Tokio runtime inside
 //! `Python::allow_threads`, so the GIL is released for the duration and only
 //! re-acquired to fire `on_progress`.
@@ -19,7 +20,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, Once, PoisonError};
 
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use quickhouse_core as core;
 
@@ -1013,7 +1014,92 @@ impl ClickHouse {
     }
 }
 
-/// Accepts `ClickHouse` or `BigQuery` as `sync()`'s `target` argument.
+/// CSV files on a local path, as a `sync()` target (new in 0.21.0). Each
+/// table is a folder, `<path>/<dest_table>/`, of part files
+/// (`part-<run_id>-<n>.csv`, or `.csv.gz` with `compression="gzip"`) and a
+/// `_quickhouse_manifest.json`. A destination only: it can't be a `source=`.
+///
+/// `delimiter` is one ASCII character other than `"`, CR or LF. `header`
+/// writes the column names as the first row of every part. A part closes and
+/// the next opens every `max_rows_per_file` rows. The values are checked
+/// here, so a bad one fails at construction rather than inside `sync()`.
+#[pyclass]
+#[derive(Clone)]
+struct Csv {
+    path: std::path::PathBuf,
+    delimiter: u8,
+    header: bool,
+    compression: core::CsvCompression,
+    max_rows_per_file: u64,
+}
+
+#[pymethods]
+impl Csv {
+    #[new]
+    #[pyo3(signature = (path, *, delimiter=",".to_string(), header=true, compression=None, max_rows_per_file=1_000_000))]
+    fn new(
+        path: std::path::PathBuf,
+        delimiter: String,
+        header: bool,
+        compression: Option<String>,
+        max_rows_per_file: u64,
+    ) -> PyResult<Self> {
+        if path.as_os_str().is_empty() {
+            return Err(PyValueError::new_err("Csv(path) needs a non-empty path"));
+        }
+        let delimiter = match delimiter.as_bytes() {
+            [b] if core::sink::csv::check_delimiter(*b).is_ok() => *b,
+            _ => {
+                return Err(PyValueError::new_err(format!(
+                    "Csv(delimiter={}): the delimiter must be one ASCII character other than a \
+                     double quote, CR or LF",
+                    py_repr(&delimiter)
+                )))
+            }
+        };
+        let compression = match compression
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            None => core::CsvCompression::None,
+            Some("gzip") => core::CsvCompression::Gzip,
+            Some(_) => {
+                return Err(PyValueError::new_err(format!(
+                    "Csv(compression={}): expected None or 'gzip'",
+                    py_repr_opt(compression.as_deref())
+                )))
+            }
+        };
+        if max_rows_per_file == 0 {
+            return Err(PyValueError::new_err(
+                "Csv(max_rows_per_file=0): it must be at least 1",
+            ));
+        }
+        Ok(Csv {
+            path,
+            delimiter,
+            header,
+            compression,
+            max_rows_per_file,
+        })
+    }
+
+    fn __repr__(&self) -> String {
+        let path = self.path.display().to_string();
+        let delimiter = (self.delimiter as char).to_string();
+        format!(
+            "Csv(path={}, delimiter={}, header={}, compression={}, max_rows_per_file={})",
+            py_repr(&path),
+            py_repr(&delimiter),
+            if self.header { "True" } else { "False" },
+            py_repr_opt(self.compression.label()),
+            self.max_rows_per_file
+        )
+    }
+}
+
+/// Accepts `ClickHouse`, `BigQuery` or `Csv` as `sync()`'s `target` argument.
 ///
 /// `#[allow(clippy::large_enum_variant)]`: the `ClickHouse` descriptor is a few
 /// hundred bytes wider than the `BigQuery` one — its `url`/`database`/`user`/
@@ -1026,6 +1112,7 @@ impl ClickHouse {
 enum AnyDestination {
     ClickHouse(ClickHouse),
     BigQuery(BigQuery),
+    Csv(Csv),
 }
 
 impl AnyDestination {
@@ -1067,6 +1154,13 @@ impl AnyDestination {
                     },
                 ))
             }
+            AnyDestination::Csv(c) => Ok(core::DestinationConfig::Csv(core::CsvDestConfig {
+                path: c.path,
+                delimiter: c.delimiter,
+                header: c.header,
+                compression: c.compression,
+                max_rows_per_file: c.max_rows_per_file,
+            })),
         }
     }
 }
@@ -1145,6 +1239,7 @@ impl StagedInfo {
             dest_kind: match info.dest_kind {
                 core::config::DestKind::ClickHouse => "clickhouse".to_string(),
                 core::config::DestKind::BigQuery => "bigquery".to_string(),
+                core::config::DestKind::Csv => "csv".to_string(),
             },
             rows_written: info.rows_written,
         }
@@ -2003,6 +2098,7 @@ fn _quickhouse(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<AppsFlyer>()?;
     m.add_class::<HttpApi>()?;
     m.add_class::<ClickHouse>()?;
+    m.add_class::<Csv>()?;
     m.add_class::<S3Archive>()?;
     m.add_class::<GcsArchive>()?;
     m.add_class::<Progress>()?;

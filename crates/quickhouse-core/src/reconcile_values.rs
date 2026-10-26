@@ -239,12 +239,18 @@ pub async fn reconcile_values(
     cfg.validate()?;
     let started = Instant::now();
 
-    let DestinationConfig::ClickHouse(dest) = dest else {
-        return Err(EtlError::config(
-            "reconcile_values does not support a BigQuery destination yet (ClickHouse only); \
-             reconcile_keys measures key drift against either",
-        ));
-    };
+    let dest =
+        match dest {
+            DestinationConfig::ClickHouse(dest) => dest,
+            DestinationConfig::BigQuery(_) => return Err(EtlError::config(
+                "reconcile_values does not support a BigQuery destination yet (ClickHouse only); \
+                 reconcile_keys measures key drift against either",
+            )),
+            DestinationConfig::Csv(_) => return Err(EtlError::config(
+                "reconcile_values is not supported for a CSV destination (ClickHouse only): it \
+                 reads the destination's values with a query, and part files have none to run",
+            )),
+        };
     let source = SourceReader::open(&source_cfg)?;
     // The destination is read through the ClickHouse *source* reader: the same
     // casts and Arrow decode a ClickHouse -> anything sync relies on. Its

@@ -50,9 +50,19 @@ key = ["id"]
       <div class="qh-params__name">[target]</div>
       <div class="qh-params__type">type =</div>
     </div>
-    <p class="qh-params__desc"><code>clickhouse</code>, <code>bigquery</code></p>
+    <p class="qh-params__desc"><code>clickhouse</code>, <code>bigquery</code>, <code>csv</code> (new in 0.21.0)</p>
   </div>
 </div>
+```
+
+A `csv` target writes a folder of part files per table under `path` (see
+[CSV files](guide/destinations/csv.md)):
+
+```toml
+[target]
+type = "csv"
+path = "/data/exports"
+compression = "gzip"
 ```
 
 Any other key in a table maps straight to the matching constructor argument

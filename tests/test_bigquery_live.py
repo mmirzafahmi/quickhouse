@@ -797,3 +797,38 @@ def test_a_bigquery_source_writes_the_default_for_a_null_order_by_value(
         assert rows == [(1, "a"), (2, ""), (3, "c")]
     finally:
         ch_client.command(f"DROP TABLE IF EXISTS `{dest}`")
+
+
+def test_a_bigquery_source_into_csv_refreshes_and_appends(bq, bq_source, dest, tmp_path):
+    """A BigQuery source into a CSV destination (0.21.0): a full refresh, then
+    an append that reads only the rows past its cursor."""
+    _bq_table(
+        bq,
+        dest,
+        "STRUCT(1 AS id, DATETIME '2024-01-01 00:00:01' AS updated_at), "
+        "STRUCT(2, CAST(NULL AS DATETIME))",
+    )
+    csv_dst = quickhouse.Csv(tmp_path)
+    source = f"{BQ_DATASET}.{dest}"
+    r = quickhouse.sync(bq_source, csv_dst, dest_table=dest, source_table=source, mode="full")
+    assert r.rows_written == 2
+    [part] = sorted((tmp_path / dest).glob("part-*.csv"))
+    assert sorted(part.read_text().splitlines()) == [
+        "1,2024-01-01T00:00:01.000000",
+        "2,",
+        "id,updated_at",
+    ]
+    app = f"{dest}_app"
+    kw = dict(dest_table=app, source_table=source, mode="append", watermark="updated_at")
+    assert quickhouse.sync(bq_source, csv_dst, **kw).rows_written == 1  # the NULL is left out
+    bq.query(
+        f"INSERT INTO {_fq(bq, dest)} VALUES (3, DATETIME '2024-01-01 00:00:03')"
+    ).result()
+    r = quickhouse.sync(bq_source, csv_dst, **kw)
+    assert r.rows_written == 1
+    lines = [
+        line
+        for p in sorted((tmp_path / app).glob("part-*.csv"))
+        for line in p.read_text().splitlines()[1:]
+    ]
+    assert sorted(lines) == ["1,2024-01-01T00:00:01.000000", "3,2024-01-01T00:00:03.000000"]

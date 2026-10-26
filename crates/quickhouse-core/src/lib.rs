@@ -1,10 +1,11 @@
 //! quickhouse-core — the Rust engine behind the `quickhouse` Python package.
 //!
 //! Streams large PostgreSQL, MySQL, BigQuery or ClickHouse tables into
-//! ClickHouse or BigQuery: native wire protocol (or, for BigQuery, the Storage
-//! Read API; for ClickHouse, `FORMAT ArrowStream` over HTTP) ->
+//! ClickHouse, BigQuery or CSV files: native wire protocol (or, for BigQuery,
+//! the Storage Read API; for ClickHouse, `FORMAT ArrowStream` over HTTP) ->
 //! Apache Arrow -> the destination's native ingestion path (ClickHouse
-//! `FORMAT ArrowStream`, or BigQuery's `insertAll` streaming insert), with
+//! `FORMAT ArrowStream`, BigQuery's `insertAll` streaming insert, or CSV part
+//! files on a local path), with
 //! parallel range partitioning, bounded memory, auto DDL, and full-refresh /
 //! incremental sync modes.
 //!
@@ -36,17 +37,17 @@ pub mod types;
 pub use config::{
     ApiColumn, AppsFlyerConfig, ArchiveConfig, ArrowFrameConfig, BigQueryConfig,
     BigQueryDestConfig, BigQueryWriteMethod, CleverTapConfig, ClickHouseConfig,
-    ClickHouseSourceConfig, Compression, DestinationConfig, GcsArchiveConfig, HttpApiConfig,
-    HttpFormat, MySqlConfig, ParquetCompression, PostgresConfig, S3ArchiveConfig, SourceConfig,
-    SourceShape, SyncMode, TransferConfig, TransferResult, TransferWarning, WarningKind,
-    WatermarkSeed,
+    ClickHouseSourceConfig, Compression, CsvCompression, CsvDestConfig, DestinationConfig,
+    GcsArchiveConfig, HttpApiConfig, HttpFormat, MySqlConfig, ParquetCompression, PostgresConfig,
+    S3ArchiveConfig, SourceConfig, SourceShape, SyncMode, TransferConfig, TransferResult,
+    TransferWarning, WarningKind, WatermarkSeed,
 };
 pub use error::{EtlError, Result};
 pub use reconcile::{reconcile_keys, ReconcileConfig, ReconcileResult};
 pub use reconcile_values::{
     reconcile_values, ColumnDrift, ValueReconcileConfig, ValueReconcileResult,
 };
-pub use sink::{build_sink, BigQuerySink, ClickHouseSink, Sink, StateKey};
+pub use sink::{build_sink, BigQuerySink, ClickHouseSink, CsvSink, Sink, StateKey};
 pub use state::{compact_state, state_keys};
 pub use sync::{run_transfer, Progress, ProgressCb, StagedInfo, StagedValidationCb};
 

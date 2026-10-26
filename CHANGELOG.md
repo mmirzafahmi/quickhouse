@@ -9,6 +9,38 @@ any breaking change is called out explicitly.
 
 ## [Unreleased]
 
+### Added
+- **A CSV destination: `quickhouse.Csv(path, *, delimiter=",", header=True,
+  compression=None, max_rows_per_file=1_000_000)`.** Every source writes into
+  it with the same `sync()` (and `from_pandas()`, and the CLI's `[target]
+  type = "csv"`). Each table is a folder on a local path,
+  `<path>/<dest_table>/`, of part files named `part-<run_id>-<n>.csv` (or
+  `.csv.gz` with `compression="gzip"`), each with its own header row, plus a
+  `_quickhouse_manifest.json` that lists the columns, the format and each
+  part's rows. A part closes every `max_rows_per_file` rows, and a parallel
+  read writes at least one part per partition. `mode="full"` writes the parts
+  into a staging folder and swaps it into place (one
+  `renameat2(RENAME_EXCHANGE)` on Linux, two renames elsewhere), deleting the
+  old folder; `mode="append"` stages its parts the same way and moves them in
+  once every row is read. A run that fails leaves the table as it was and no
+  parts behind. An append with `watermark=` keeps its cursor in
+  `<path>/_quickhouse_state.json`, keyed by `state_key` and `dest_table` like
+  the state table, so a database source can append only the rows past it
+  (a row whose watermark is NULL is left out, with `null_watermark`, since no
+  cursor can hold it); `state_keys()` lists it. The text is UTF-8 with RFC 4180 quoting: a NULL is
+  an empty field and an empty string `""`, dates are `YYYY-MM-DD`, timestamps
+  ISO 8601 (UTC with `Z` when timezone-aware, no offset when naive), decimals
+  exact, booleans `true`/`false`, binary base64. `mode="incremental"` is
+  refused before anything runs (CSV can't update rows; the error points at
+  `mode="append"` with a `watermark`), and so are the options that can't apply:
+  `engine`, `order_by`, `partition_by`, `primary_key`, `not_null`, the
+  `merge_prune_*` options, `delete_stale_in_window`, `type_overrides`,
+  `evolve_schema` and `validate=`. An append whose columns or format differ
+  from the folder's is refused, naming the difference. Nothing is NOT NULL on
+  a CSV destination, so a NULL `key` is written as an empty field rather than
+  left out. `reconcile_keys()` and `reconcile_values()` refuse it. New in
+  0.21.0. (#54)
+
 ## [0.20.13] — 2026-10-26
 
 ### Changed — please read before upgrading
